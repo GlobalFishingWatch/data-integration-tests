@@ -131,10 +131,19 @@ Returns 0 on identical, non-zero on diff. Shells out to `table-check summary --t
 
 ```python
 def drop_tables(prefix: str, *, project: str = "world-fishing-827") -> None: ...
-def query_for_restricted_ssvids(reference_table: str, **selection_kwargs) -> list[str]: ...
+def query_for_restricted_ssvids(
+    reference_table: str,
+    *,
+    mid: date,
+    backfill_days_w: int,
+    seed: int = 42,
+    project: str = "world-fishing-827",
+) -> list[str]: ...
 ```
 
-`query_for_restricted_ssvids` ports `compute_restricted_ssvids` (lines ~540–640): queries the reference `_last_versions` view for triggering closed gaps, picks ~|G|/2 non-triggering ssvids so the complement contains every triggering ssvid. Concrete kwargs to be settled when the function is ported; the public surface is `(reference_table) -> list[str]`.
+`drop_tables` requires the prefix to include project and dataset (`<proj>.<dataset>.<stem>`); it lists the dataset and drops every table/view starting with `<stem>`.
+
+`query_for_restricted_ssvids` ports `compute_restricted_ssvids` (lines ~540–640): queries the reference `_last_versions` view for triggering closed gaps, picks ~|G|/2 non-triggering ssvids so the complement contains every triggering ssvid. The source's `n_hours_before` argument is dropped — it was unused at the call site and the source code itself logged it as such.
 
 ### `dit.dates`
 
