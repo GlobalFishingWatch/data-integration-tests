@@ -29,3 +29,4 @@ select = ["E", "F", "I", "W", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
