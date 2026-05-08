@@ -106,10 +106,19 @@ def run(
     subnetwork: str,
     bq_temp_dataset: str,
     env: dict | None = None,
+    pipeline_builder: Callable[[Mapping[str, Any]], Any],
+    dag_factory_cls: type | None = None,
 ) -> int:
 ```
 
 Source: `mode_equivalence.py` lines 286–399 (`_run_dataflow`). Submission and wait must be split via an internal lock (`_DATAFLOW_SUBMIT_LOCK`); the `_DagFactoryWithTempDataset` override that injects a pre-existing temp dataset must port across.
+
+Two parameters were added during Track 3 to make the runner pipeline-agnostic without re-importing pipe-gaps internals:
+
+* `pipeline_builder` -- required callable. Given the merged Beam options mapping, the workflow returns a built `gfw.common.beam.pipeline.Pipeline`-shaped object (exposes `_pre_hooks`, `_post_hooks`, `apply_dag()`, `.pipeline.run()`). The runner does the lock-split submit/wait around whatever pipeline the workflow built.
+* `dag_factory_cls` -- optional DAG factory class. When `bq_temp_dataset` is set, the runner subclasses it to inject `temp_dataset` into `read_from_bigquery_factory` (the `_DagFactoryWithTempDataset` pattern, ported as a generic wrapper). The wrapped class is forwarded to `pipeline_builder` via the `dag_factory_cls` key in the options mapping; workflows that don't need temp-dataset injection can omit it and ignore the key.
+
+`env` is reserved for parity with the `Runner` protocol but logged-and-ignored: the dataflow runner is in-process so there is no subprocess to forward env to.
 
 ### `dit.compare`
 
