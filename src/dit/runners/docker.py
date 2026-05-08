@@ -42,6 +42,7 @@ def run(
     env: dict | None = None,
     project_name: str | None = None,
     build_from_source: bool = False,
+    entrypoint: str | None = None,
 ) -> int:
     """Invoke a pipeline via docker.
 
@@ -54,6 +55,11 @@ def run(
     A unique compose project name (``-p <name>-<uuid>``) is used per call so
     parallel invocations do not race on docker network creation.
 
+    ``entrypoint`` overrides the image's default ENTRYPOINT (passes through
+    as ``--entrypoint`` to docker / docker compose run). Pipe-gaps' dev
+    image has no default ``pipe-gaps`` entrypoint baked in, so its workflow
+    sets ``entrypoint="pipe-gaps"``.
+
     Returns the docker subprocess exit code.
     """
     base = project_name or "dit-runner"
@@ -61,19 +67,15 @@ def run(
 
     if build_from_source:
         _ensure_built(unique_project)
-        cmd = [
-            "docker", "compose", "-p", unique_project,
-            "run", "--rm",
-            "dev",
-            *args,
-        ]
+        cmd = ["docker", "compose", "-p", unique_project, "run", "--rm"]
+        if entrypoint:
+            cmd.extend(["--entrypoint", entrypoint])
+        cmd.extend(["dev", *args])
     else:
-        cmd = [
-            "docker", "run", "--rm",
-            "--name", unique_project,
-            image_tag,
-            *args,
-        ]
+        cmd = ["docker", "run", "--rm", "--name", unique_project]
+        if entrypoint:
+            cmd.extend(["--entrypoint", entrypoint])
+        cmd.extend([image_tag, *args])
 
     proc_env = None
     if env is not None:

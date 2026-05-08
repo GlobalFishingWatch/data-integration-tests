@@ -38,6 +38,10 @@ Appended chronologically. Each entry is one commit's worth of plan-doc changes; 
 - `env` parameter is kept for `Runner`-protocol parity but the dataflow runner logs-and-ignores it (in-process; no subprocess to forward to).
 - Docker runner: `build_from_source=True` switches to `docker compose -p <name>-<uuid> run --rm dev <args>`; the published path is `docker run --rm --name <name>-<uuid> <image_tag> <args>`. Both keep per-call uniquification to avoid the network race documented in the source.
 
+### 2026-05-08 — Track 4 docker-runner contract extension
+
+- `docs/plan.md` § **Public API contracts (Phase 1) → `dit.runners.docker`**: added `entrypoint: str | None = None`. Required by Track 4: pipe-gaps' dev image has no default `pipe-gaps` entrypoint baked in, so the original test passed `--entrypoint pipe-gaps` to `docker compose run`. Without runner-level support, the workflow would have to bypass the runner. The parameter is a clean opt-in: workflows whose images bake the right entrypoint omit it.
+
 ### 2026-05-08 — Track 6 review fix
 
 - `pyproject.toml`: added `pythonpath = ["src"]` under `[tool.pytest.ini_options]`. Without it, `pytest tests/` fails to import `dit.*` unless run with `PYTHONPATH=src` or after `pip install -e .`. No code changes; tooling-only.
