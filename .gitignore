@@ -33,3 +33,6 @@ sa.json
 
 # Local-only Claude / agent state
 .claude/settings.local.json
+
+# direnv (.envrc.example is committed, .envrc is user-specific)
+.envrc

@@ -43,8 +43,10 @@ Integration-test infrastructure is distributed across three repos by ownership. 
 /mnt/encrypted_data/git/data_integration_tests/
 ├── README.md                          # how to run; SA/perms checklist; image-tag conventions
 ├── pyproject.toml                     # package: data-integration-tests, console: dit
-├── requirements.txt                   # google-cloud-bigquery, click, pyyaml, gfw-common[bq,beam], apache-beam[gcp]
+├── requirements.txt                   # click, pyyaml, google-cloud-bigquery (framework-only; workflow deps come from Makefile targets)
 ├── requirements-dev.txt               # pytest, ruff
+├── Makefile                           # install-pipe-gaps / install-port-visits / install-pipe-events / install-all
+├── .envrc.example                     # direnv template; sets PROJECTS for the Makefile
 ├── src/
 │   └── dit/
 │       ├── __init__.py

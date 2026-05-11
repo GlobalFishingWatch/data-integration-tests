@@ -22,6 +22,14 @@ Read these in order before coding:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-08 — Restructure install: drop workflow deps from base, add Makefile
+
+- `requirements.txt`: dropped `gfw-common[bq,beam]` and `apache-beam[gcp]`. Neither is imported by anything under `src/dit/` (verified by grep) — `gfw-common` is workflow-shaped and pipe-gaps declares it as a direct dep (`gfw-common[bq,beam]~=0.10`), so installing pipe-gaps brings it transitively. apache-beam is in the same boat (lazy-imported by `dit.runners.dataflow`; transitively pulled by `gfw-common[beam]`). Keeping them in the base required every consumer of `dit` to depend on the GFW private index even if they only used the docker runner.
+- Added `Makefile` with `install-pipe-gaps` / `install-port-visits` / `install-pipe-events` / `install-all` targets. Each runs a single `pip install -e ".[dev]" -e $(PROJECTS)/<pipeline>` so workflow deps install **editable** — switching branches in `pipe-gaps` etc. is picked up without a reinstall. pyproject `[project.optional-dependencies]` was considered but rejected: PEP 508 `@ file://...` extras install as built wheels, defeating editable mode and creating a stale-snapshot footgun when iterating on pipe-gaps branches.
+- `PROJECTS` defaults to `$(realpath ..)` (sibling checkouts). Override via env var or by copying `.envrc.example` → `.envrc` (gitignored; loaded by direnv).
+- `docs/plan.md` § "Repo layout (Phase 1, concrete)": updated `requirements.txt` comment to reflect the framework-only deps and added `Makefile` / `.envrc.example` to the tree.
+- `README.md`: install section now points at `make install-pipe-gaps` and documents the `PROJECTS` env var.
+
 ### 2026-05-08 — Initial architectural alignment (pre-implementation)
 
 - Added `docs/plan.md` § **Architecture: three-repo split** — explicit ownership boundaries between processing repos, `composer-dags-production`, and `data_integration_tests`, plus where `table_identical_checks` sits.

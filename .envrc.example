@@ -1,0 +1,8 @@
+# Copy to .envrc, adjust paths, and run `direnv allow` (or `source .envrc`).
+#
+# Used by the Makefile install targets to locate sibling pipeline checkouts.
+# Leave unset if your pipe-gaps / anchorages_pipeline / pipe-events checkouts
+# live in the directory immediately above this repo -- the Makefile defaults
+# to that.
+
+export PROJECTS="${PROJECTS:-/mnt/encrypted_data/git}"

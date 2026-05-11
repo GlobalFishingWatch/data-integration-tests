@@ -15,10 +15,20 @@ The `dit` CLI drives Python workflow files that orchestrate phases (pipeline inv
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
-pip install -e ".[dev]"
+make install-pipe-gaps      # or install-port-visits / install-pipe-events / install-all
 ```
 
-`gfw-common` may require an internal package index; align with your team's standard `pip` configuration.
+`dit` is intentionally pipeline-agnostic; workflow dependencies (`pipe-gaps`, `anchorages_pipeline`, `pipe-events`) are not in `dit`'s base `requirements.txt`. The Makefile targets install them editable from local sibling checkouts, so switching branches in `pipe-gaps` etc. is picked up without a reinstall.
+
+By default the Makefile assumes sibling checkouts (`$(realpath ..)`). If yours live elsewhere, either:
+
+```bash
+PROJECTS=/path/to/your/projects make install-pipe-gaps
+```
+
+or copy `.envrc.example` to `.envrc` (committed-untracked; loaded automatically by [direnv](https://direnv.net/)) and adjust the path.
+
+For the framework only (no workflow deps), `make install` works — but the dataflow runner won't load without a workflow install bringing `apache-beam[gcp]` transitively.
 
 ## Run
 
