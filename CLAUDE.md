@@ -18,6 +18,25 @@ Read these in order before coding:
 - **No workflow lives in two places.** Canonical home is `dit/workflows/<pipeline>/`; in-repo workflows in processing repos are allowed for spikes only.
 - **Plan changes get logged.** Whenever an architectural decision changes, update `docs/plan.md` and append the change to the **Plan changelog** below in the same commit. Subagents treat `docs/plan.md` + this changelog as the alignment surface.
 
+## Installing pipeline dependencies
+
+`dit` is pipeline-agnostic; per-pipeline workflow deps (`pipe-gaps`, `anchorages_pipeline`, `pipe-events`) install separately via Makefile targets. `PROJECTS` (default: `$(realpath ..)`, i.e. sibling checkouts) tells the Makefile where to find them; override via env var or by copying `.envrc.example` → `.envrc` for direnv. See README for the full table; the operational summary:
+
+| When | Target |
+|---|---|
+| Active dev on a pipeline (fast inner loop, edits picked up live) | `make install-<pipeline>` |
+| Reproducible install of a specific committed ref (~5-10s; non-editable) | `make install-<pipeline>-ref REF=<sha-or-branch>` |
+| Snapshot the current working tree onto a temp branch and install from it | `make snapshot-<pipeline>` |
+| Target ref's transitive deps drifted (rare) — drop `--no-deps` | append `FULLDEPS=1` |
+| GC the `dit-snapshot-*` branches across all pipeline checkouts | `make clean-snapshots` |
+
+Notes:
+
+- The framework-only `make install` works without any pipeline; the dataflow runner won't load until a workflow install brings `apache-beam[gcp]` transitively.
+- `make snapshot-<pipeline>` uses `git stash create` which captures **tracked** changes only — `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot.
+- Snapshot branches stick around for traceability (recoverable via `git checkout dit-snapshot-<epoch>` in the pipeline repo) until `make clean-snapshots`.
+- The non-editable install modes (`-ref`, snapshot) point the debugger at the installed copy under `venv/lib/python3.x/site-packages/<pipeline>/`, not your dev tree. If you're stepping through pipeline source, use the editable target instead.
+
 ## Plan changelog
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
