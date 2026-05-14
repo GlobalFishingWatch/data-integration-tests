@@ -72,6 +72,12 @@ DEFAULT_DATAFLOW_TEMP_BUCKET = os.environ.get("DIT_DATAFLOW_TEMP_BUCKET", "pipe-
 DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
     "DIT_DATAFLOW_SUBNETWORK", "regions/us-central1/subnetworks/gfw-internal-us-central1"
 )
+# Pre-existing BQ dataset Beam uses as its temp dataset for ReadFromBigQuery
+# EXPORT staging; lets the SA skip bigquery.datasets.create. Inherits
+# ${PROJECT}.${DIT_DEST_DATASET} unless overridden.
+DEFAULT_BQ_TEMP_DATASET = os.environ.get(
+    "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{DEFAULT_DEST_DATASET}"
+)
 
 # Workflow-specific defaults (no env var; one-off overrides via CLI flag).
 # Staging cohort: 2020-01-01 -> 2020-12-31, reduced AIS data.
@@ -225,6 +231,7 @@ def _run_slice(
         f"--anchorage_table={args.named_anchorages}",
         f"--input_table={_messages_table(args)}",
         f"--output_table={_thinned_table(args, suffix, mode)}",
+        f"--temp_dataset={args.bq_temp_dataset}",
         *_pipeline_options(args),
     ]
     logger.info("thin_port_messages %s [%s, %s]", mode, slice_start, slice_end)
@@ -246,6 +253,7 @@ def _run_slice(
         f"--vessel_id_table={_segment_info_table(args)}",
         f"--output_table={_visits_table(args, suffix, mode)}",
         f"--bad_segs={_bad_segs_sql(args)}",
+        f"--temp_dataset={args.bq_temp_dataset}",
         *_pipeline_options(args),
     ]
     logger.info("port_visits %s [%s, %s]", mode, args.start, slice_end)
@@ -329,6 +337,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "docker: run DirectRunner inside the container (for local sanity checks).")
     p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                    help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
+    p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET,
+                   help="Pre-existing BQ dataset for Beam EXPORT staging; "
+                        "env-var fallback DIT_BQ_TEMP_DATASET (defaults to "
+                        "${PROJECT}.${DIT_DEST_DATASET}).")
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
                    help=f"Staging dataset stem (default {DEFAULT_SOURCE_DATASET_STEM}); "
                         "_internal and _published are appended.")
