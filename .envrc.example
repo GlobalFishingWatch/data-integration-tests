@@ -1,8 +1,35 @@
-# Copy to .envrc, adjust paths, and run `direnv allow` (or `source .envrc`).
+# Copy to .envrc, adjust, and run `direnv allow` (or `source .envrc`).
 #
-# Used by the Makefile install targets to locate sibling pipeline checkouts.
-# Leave unset if your pipe-gaps / anchorages_pipeline / pipe-events checkouts
-# live in the directory immediately above this repo -- the Makefile defaults
-# to that.
+# Per-user / per-deployment overrides for dit. All are optional -- defaults
+# in the workflow files match GFW team conventions. Leave a line commented
+# (or delete it) if you're happy with the default.
 
-export PROJECTS="${PROJECTS:-/mnt/encrypted_data/git}"
+# === Pipeline-checkout locations (used by Makefile install-* targets) ===
+# Where your sibling pipeline checkouts live. Defaults to $(realpath ..)
+# i.e. the directory immediately above this repo.
+# export PROJECTS="${PROJECTS:-/mnt/encrypted_data/git}"
+
+# === Per-user infra knobs (used by workflow defaults) ===
+# All workflows resolve these via os.environ.get("DIT_<NAME>", "<default>").
+# CLI flags (e.g. --dest-dataset) override env vars per-invocation.
+
+# BQ dataset that holds the per-mode output tables (port_visits_*, three_way_*, ...).
+# Default: tech_great_expectations (team-shared).
+# export DIT_DEST_DATASET="scratch_<your_name>"
+
+# Service account that Dataflow workers run as. Must have BQ data-editor on
+# DIT_DEST_DATASET, BQ job-user on the execution project, and read on the
+# source datasets and staging bucket.
+# Default: automated-testing@world-fishing-827.iam.gserviceaccount.com
+# export DIT_DATAFLOW_SA="..."
+
+# Dataflow region and matching GCS bucket / subnetwork. The defaults match
+# the SA's GCS write permissions (pipe-temp-us-central-ttl7 in us-central1).
+# export DIT_DATAFLOW_REGION="us-central1"
+# export DIT_DATAFLOW_TEMP_BUCKET="pipe-temp-us-central-ttl7"
+# export DIT_DATAFLOW_SUBNETWORK="regions/us-central1/subnetworks/gfw-internal-us-central1"
+
+# (pipe-gaps workflow only) Pre-existing BQ dataset used as Beam's temp
+# dataset for ReadFromBigQuery (avoids needing bigquery.datasets.create).
+# Default: ${PROJECT}.${DIT_DEST_DATASET}.
+# export DIT_BQ_TEMP_DATASET="world-fishing-827.scratch_<your_name>"

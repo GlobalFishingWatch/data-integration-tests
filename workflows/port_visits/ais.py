@@ -61,8 +61,19 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 PROJECT = "world-fishing-827"
-DEST_DATASET = "tech_great_expectations"
 
+# Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
+DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
+DEFAULT_DATAFLOW_SA = os.environ.get(
+    "DIT_DATAFLOW_SA", "automated-testing@world-fishing-827.iam.gserviceaccount.com"
+)
+DEFAULT_DATAFLOW_REGION = os.environ.get("DIT_DATAFLOW_REGION", "us-central1")
+DEFAULT_DATAFLOW_TEMP_BUCKET = os.environ.get("DIT_DATAFLOW_TEMP_BUCKET", "pipe-temp-us-central-ttl7")
+DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
+    "DIT_DATAFLOW_SUBNETWORK", "regions/us-central1/subnetworks/gfw-internal-us-central1"
+)
+
+# Workflow-specific defaults (no env var; one-off overrides via CLI flag).
 # Staging cohort: 2020-01-01 -> 2020-12-31, reduced AIS data.
 DEFAULT_SOURCE_DATASET_STEM = "pipe_ais_test_202408290000"
 
@@ -74,13 +85,6 @@ DEFAULT_END = "2020-12-31"     # inclusive
 DEFAULT_TAIL_DAYS = 3
 
 DEFAULT_IMAGE_TAG = "gfw/pipe-anchorages:v4.6.4"
-
-# Dataflow knobs -- match pipe-gaps' staging defaults (see
-# workflows/pipe_gaps/mode_equivalence.py for source of these values).
-DEFAULT_DATAFLOW_SA = "automated-testing@world-fishing-827.iam.gserviceaccount.com"
-DEFAULT_DATAFLOW_REGION = "us-central1"
-DEFAULT_DATAFLOW_TEMP_BUCKET = "pipe-temp-us-central-ttl7"
-DEFAULT_DATAFLOW_SUBNETWORK = "regions/us-central1/subnetworks/gfw-internal-us-central1"
 
 # Comparison contract for port-visits (truncate shape, no SCD-2).
 COMPARE_KEYS = ("visit_id",)
@@ -180,12 +184,12 @@ def _bad_segs_sql(args: argparse.Namespace) -> str:
     )
 
 
-def _thinned_table(suffix: str, mode: str) -> str:
-    return f"{PROJECT}.{DEST_DATASET}.port_events_{suffix}_{mode}"
+def _thinned_table(args: argparse.Namespace, suffix: str, mode: str) -> str:
+    return f"{PROJECT}.{args.dest_dataset}.port_events_{suffix}_{mode}"
 
 
-def _visits_table(suffix: str, mode: str) -> str:
-    return f"{PROJECT}.{DEST_DATASET}.port_visits_{suffix}_{mode}"
+def _visits_table(args: argparse.Namespace, suffix: str, mode: str) -> str:
+    return f"{PROJECT}.{args.dest_dataset}.port_visits_{suffix}_{mode}"
 
 
 # --------------------------------------------------------------------------
@@ -212,7 +216,7 @@ def _run_slice(
         f"--end_date={slice_end.isoformat()}",
         f"--anchorage_table={args.named_anchorages}",
         f"--input_table={_messages_table(args)}",
-        f"--output_table={_thinned_table(suffix, mode)}",
+        f"--output_table={_thinned_table(args, suffix, mode)}",
         *_pipeline_options(args),
     ]
     logger.info("thin_port_messages %s [%s, %s]", mode, slice_start, slice_end)
@@ -230,9 +234,9 @@ def _run_slice(
         "port_visits",
         f"--start_date={args.start}",
         f"--end_date={slice_end.isoformat()}",
-        f"--thinned_message_table={_thinned_table(suffix, mode)}",
+        f"--thinned_message_table={_thinned_table(args, suffix, mode)}",
         f"--vessel_id_table={_segment_info_table(args)}",
-        f"--output_table={_visits_table(suffix, mode)}",
+        f"--output_table={_visits_table(args, suffix, mode)}",
         f"--bad_segs={_bad_segs_sql(args)}",
         *_pipeline_options(args),
     ]
@@ -289,13 +293,13 @@ def execute_bftruncate(args: argparse.Namespace, suffix: str) -> None:
 # Comparisons
 # --------------------------------------------------------------------------
 
-def compare_all(suffix: str) -> int:
+def compare_all(args: argparse.Namespace, suffix: str) -> int:
     modes = ["1_bf", "2_bfd", "3_bftruncate"]
     overall = 0
     for a, b in itertools.combinations(modes, 2):
         rc = dit_compare.compare_tables(
-            _visits_table(suffix, a),
-            _visits_table(suffix, b),
+            _visits_table(args, suffix, a),
+            _visits_table(args, suffix, b),
             keys=COMPARE_KEYS,
             view_suffix=COMPARE_VIEW_SUFFIX,
         )
@@ -315,6 +319,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--runner", choices=["dataflow", "docker"], default="dataflow",
                    help="dataflow: submit DataflowRunner from inside the container (default). "
                         "docker: run DirectRunner inside the container (for local sanity checks).")
+    p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
+                   help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
                    help=f"Staging dataset stem (default {DEFAULT_SOURCE_DATASET_STEM}); "
                         "_internal and _published are appended.")
@@ -368,7 +374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.skip_comparisons:
         return 0
-    return compare_all(suffix)
+    return compare_all(args, suffix)
 
 
 if __name__ == "__main__":

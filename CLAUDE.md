@@ -41,6 +41,19 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-14 — Per-user infra knobs via DIT_* env vars
+
+- Both workflows now resolve user-overridable infra knobs through `os.environ.get("DIT_<NAME>", "<default>")` with corresponding CLI flags that override env vars per-invocation. Set up so a single `export DIT_DEST_DATASET=scratch_chris` in `.envrc` redirects all output tables for personal dev without editing source.
+- The knob set (applies to both workflows except where noted):
+  - `DIT_DEST_DATASET` -> output dataset for per-mode tables (new — was hardcoded).
+  - `DIT_DATAFLOW_SA` -> service account for Dataflow workers.
+  - `DIT_DATAFLOW_REGION` / `DIT_DATAFLOW_TEMP_BUCKET` / `DIT_DATAFLOW_SUBNETWORK` -> dataflow placement.
+  - `DIT_BQ_TEMP_DATASET` -> pipe-gaps-only; defaults to `${PROJECT}.${DIT_DEST_DATASET}` if unset.
+- Added `--dest-dataset` CLI flag to both workflows (was missing on both). Other infra flags already existed.
+- Per-workflow `DEST_DATASET` constant removed; table-name helpers now take `args` and read `args.dest_dataset`. Callsites in `_run_slice` and `compare_all` updated.
+- `PROJECT` and pipeline-specific knobs (image tag, source dataset stem, tuning params, dates) deliberately kept as constants/CLI flags only -- they're not "per-user infra" and an env-var explosion adds more noise than value.
+- `.envrc.example` rewritten to document the full env-var set with team defaults inline; users uncomment what they want to override. README's install section already points at `.envrc.example`.
+
 ### 2026-05-14 — Phase 2 spike: AIS-staging port-visits workflow
 
 - Added `workflows/port_visits/ais.py` — first port-visits workflow (AIS staging cohort, 2020-only, reduced data). Three modes (bf / bfd / bftruncate); two-step thin_port_messages → port_visits chain per slice; partitioned-write semantics in both pipe-anchorages steps mean re-runs over overlapping date ranges are idempotent (verified by reading pipe-anchorages source).

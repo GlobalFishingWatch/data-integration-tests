@@ -30,8 +30,22 @@ logger = logging.getLogger(__name__)
 
 
 PROJECT = "world-fishing-827"
-DEST_DATASET = "tech_great_expectations"
 
+# Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
+DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
+DEFAULT_DATAFLOW_SA = os.environ.get(
+    "DIT_DATAFLOW_SA", "automated-testing@world-fishing-827.iam.gserviceaccount.com"
+)
+DEFAULT_BQ_TEMP_DATASET = os.environ.get(
+    "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{DEFAULT_DEST_DATASET}"
+)
+DEFAULT_DATAFLOW_REGION = os.environ.get("DIT_DATAFLOW_REGION", "us-central1")
+DEFAULT_DATAFLOW_TEMP_BUCKET = os.environ.get("DIT_DATAFLOW_TEMP_BUCKET", "pipe-temp-us-central-ttl7")
+DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
+    "DIT_DATAFLOW_SUBNETWORK", "regions/us-central1/subnetworks/gfw-internal-us-central1"
+)
+
+# Workflow-specific defaults (no env var; one-off overrides via CLI flag).
 DEFAULT_SOURCE_DATASET = "pipe_ais_test_202408290000_published"
 
 DEFAULT_MIN_GAP_LENGTH = 1.0
@@ -43,12 +57,6 @@ DEFAULT_BACKFILL_DAYS_W = 4
 DEFAULT_START = "2020-01-01"
 DEFAULT_END = "2021-01-01"
 DEFAULT_TAIL_DAYS = 4
-
-DEFAULT_DATAFLOW_SA = "automated-testing@world-fishing-827.iam.gserviceaccount.com"
-DEFAULT_BQ_TEMP_DATASET = f"{PROJECT}.{DEST_DATASET}"
-DEFAULT_DATAFLOW_REGION = "us-central1"
-DEFAULT_DATAFLOW_TEMP_BUCKET = "pipe-temp-us-central-ttl7"
-DEFAULT_DATAFLOW_SUBNETWORK = "regions/us-central1/subnetworks/gfw-internal-us-central1"
 
 DEFAULT_IMAGE_TAG = "gfw/pipe-gaps:dev"
 
@@ -356,6 +364,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--skip-pipelines", action="store_true")
     p.add_argument("--skip-comparisons", action="store_true")
     p.add_argument("--parallel", "--async", dest="parallel", action="store_true")
+    p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
+                   help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
     p.add_argument("--service-account", default=DEFAULT_DATAFLOW_SA)
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--dataflow-region", default=DEFAULT_DATAFLOW_REGION)
@@ -401,7 +411,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dataflow_subnetwork=args.dataflow_subnetwork or None,
     )
 
-    base = f"{PROJECT}.{DEST_DATASET}.three_way_{suffix}"
+    base = f"{PROJECT}.{args.dest_dataset}.three_way_{suffix}"
     bf_table = f"{base}_1_bf"
     bfd_table = f"{base}_2_bfd"
     bft_table = f"{base}_3_bftruncate"
