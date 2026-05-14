@@ -142,6 +142,14 @@ def _dataflow_pipeline_options(args: argparse.Namespace) -> list[str]:
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
         "--wait_for_job",
+        # pipe-anchorages requires --labels to be non-None
+        # (cloud_to_labels in transforms/sink.py iterates without a None guard).
+        # Mirrors composer's LabelsConfig.as_dataflow_cli_arguments shape.
+        "--labels=environment=integration_test",
+        "--labels=resource_creator=dit",
+        "--labels=project=core_pipeline",
+        "--labels=workflow=port_visits_ais",
+        "--labels=stage=testing",
     ]
 
 
