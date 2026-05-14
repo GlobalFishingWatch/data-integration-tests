@@ -41,6 +41,14 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-14 — Phase 2 spike: AIS-staging port-visits workflow
+
+- Added `workflows/port_visits/ais.py` — first port-visits workflow (AIS staging cohort, 2020-only, reduced data). Three modes (bf / bfd / bftruncate); two-step thin_port_messages → port_visits chain per slice; partitioned-write semantics in both pipe-anchorages steps mean re-runs over overlapping date ranges are idempotent (verified by reading pipe-anchorages source).
+- This is the **abstraction-validation step**: first real exercise of `dit.compare.compare_tables(view_suffix="", keys=["visit_id"])` (truncate shape, no SCD-2) and the docker runner's `entrypoint` extension (`entrypoint="pipe-anchorages"`).
+- Default `--runner=dataflow` matches what gaps recently used. The runner here is `dit.runners.docker` + Beam pipeline options inside the container (`--runner=DataflowRunner --wait_for_job ...`). Different from pipe-gaps' workflow which uses `dit.runners.dataflow` in-process — pipe-anchorages doesn't expose a `gfw.common.beam.pipeline.Pipeline`-shaped object the in-process runner could consume, so the workflow submits via the container CLI like composer's `KubernetesPodOperator` does. This divergence is worth knowing when Phase 5 considers extracting a unified runner primitive.
+- Date semantics: AIS workflow uses **inclusive** `--start`/`--end` to match pipe-anchorages' CLI. Pipe-gaps' workflow uses **half-open** dates. The wart is unavoidable given the downstream tools' contracts and is documented in the workflow header.
+- `_git_info` was lifted verbatim from `workflows/pipe_gaps/mode_equivalence.py`. When pipe-events lands as the third consumer (Phase 3), promote into `dit.git_info`.
+
 ### 2026-05-14 — Add reproducible-install targets (snapshot + specific-ref)
 
 - Added six Makefile targets covering reproducible pipeline installs alongside the editable ones:
