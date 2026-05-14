@@ -92,6 +92,14 @@ DEFAULT_TAIL_DAYS = 3
 
 DEFAULT_IMAGE_TAG = "gfw/pipe-anchorages:v4.6.4"
 
+# Dataflow worker container image -- needs pipe_anchorages installed (workers
+# unpickle DoFns from pipe_anchorages.*). Published path in GFW's Artifact
+# Registry. Distinct from DEFAULT_IMAGE_TAG (which names the local image
+# docker run uses for the submission process).
+DEFAULT_WORKER_IMAGE = (
+    "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4"
+)
+
 # Comparison contract for port-visits (truncate shape, no SCD-2).
 COMPARE_KEYS = ("visit_id",)
 COMPARE_VIEW_SUFFIX = ""
@@ -147,6 +155,7 @@ def _dataflow_pipeline_options(args: argparse.Namespace) -> list[str]:
         f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
+        f"--sdk_container_image={args.worker_image}",
         "--wait_for_job",
         # pipe-anchorages requires --labels to be non-None
         # (cloud_to_labels in transforms/sink.py iterates without a None guard).
@@ -351,6 +360,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--tail-days", type=int, default=DEFAULT_TAIL_DAYS,
                    help="Number of tail days for bfd / bftruncate iteration.")
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
+    p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
+                   help="Dataflow worker container image with pipe_anchorages installed; "
+                        "passed to Beam as --sdk_container_image.")
     p.add_argument("--build-from-source", action="store_true",
                    help="Fall back to `docker compose run dev` when no published image is available.")
     p.add_argument("--suffix", default=None,
