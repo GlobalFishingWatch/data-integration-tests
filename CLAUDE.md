@@ -22,6 +22,17 @@ Read these in order before coding:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-14 — Add reproducible-install targets (snapshot + specific-ref)
+
+- Added six Makefile targets covering reproducible pipeline installs alongside the editable ones:
+  - `install-<pipeline>-ref REF=<sha-or-branch>`: `pip install --force-reinstall --no-deps "git+file://<dir>@<ref>"` — non-editable, exactly that commit, ~5-10s.
+  - `snapshot-<pipeline>`: uses `git stash create` to capture tracked working-tree changes into a real commit (working tree untouched), anchors on a `dit-snapshot-<epoch>` branch so git GC keeps it alive, then installs from that ref.
+  - `clean-snapshots`: GCs the `dit-snapshot-*` branches across all three pipeline checkouts.
+- Added `scripts/snapshot-install.sh` and `scripts/clean-snapshots.sh` to keep the git plumbing out of the Makefile recipes. `set -euo pipefail`, single-purpose, ~30 lines each.
+- `FULLDEPS=1` toggles `--no-deps` off for the rare case where the target ref bumped or added a transitive dep.
+- Trade-offs vs editable installs documented in `README.md`: the non-editable mode adds ~5-10s pip rebuild per iteration (acceptable given the integration-test cadence) and points the debugger at the installed snapshot rather than your dev tree (the only un-mitigated cost). `git stash create` captures **tracked** changes only — untracked source files need `git add` first.
+- These targets are also the foundation for cross-version testing per `docs/framework-vision.md` § 6: same Makefile + script can install `pipe-gaps@main` and `pipe-gaps@pr-NNN` side-by-side for a single workflow invocation.
+
 ### 2026-05-08 — Restructure install: drop workflow deps from base, add Makefile
 
 - `requirements.txt`: dropped `gfw-common[bq,beam]` and `apache-beam[gcp]`. Neither is imported by anything under `src/dit/` (verified by grep) — `gfw-common` is workflow-shaped and pipe-gaps declares it as a direct dep (`gfw-common[bq,beam]~=0.10`), so installing pipe-gaps brings it transitively. apache-beam is in the same boat (lazy-imported by `dit.runners.dataflow`; transitively pulled by `gfw-common[beam]`). Keeping them in the base required every consumer of `dit` to depend on the GFW private index even if they only used the docker runner.
