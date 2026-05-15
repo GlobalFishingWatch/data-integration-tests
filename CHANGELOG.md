@@ -9,6 +9,8 @@ The project is pre-1.0; entries are grouped chronologically under `[Unreleased]`
 ### 2026-05-15
 
 #### Added
+- **`ditbox` Cloud Build tooling image.** `docker/ditbox/Dockerfile` plus `docker/ditbox/cloudbuild.yaml` and a `make publish-ditbox` target. The image (`us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox:<sha>` / `:latest`) carries Python 3.11 + git + gcloud (incl. `bq`) + docker CLI + `dit`'s pre-installed runtime deps. Deliberately ships *without* dit itself or pipeline deps baked in — both install per-run from the cloudbuild yaml so iteration on either stays fast.
+- `table-identical-checks @ git+https://github.com/GlobalFishingWatch/table_identical_checks.git@master` added to `requirements.txt` so a fresh `pip install dit` brings `table-check` transitively (it's a real dep of `dit.compare`).
 - **Cross-version experiments capability.** Three-part feature for diffing pipeline outputs across multiple pipeline-version bindings against pinned source data:
   - `dit.bq.snapshot_table(src, dst, *, as_of=…, expiration=…, project=…, if_not_exists=False)` and `dit.bq.snapshot_dataset(src_dataset, dst_dataset, *, tables=…, as_of=…, expiration=…, project=…)` for source-data pinning via BQ `CREATE SNAPSHOT TABLE`.
   - `--experiment-id <slug>` / `DIT_EXPERIMENT_ID` flag in `workflows/pipe_gaps/mode_equivalence.py` and `workflows/port_visits/ais.py`. Slug becomes the leftmost slot of the output-table suffix; clusters N related runs under one BQ-prefix-scannable name. Auto-default `solo_<6-hex>` for non-experiment runs (clearly marks them as "not part of a cross-version experiment"). Regex `^[a-z0-9][a-z0-9_-]{0,31}$`.

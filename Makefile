@@ -24,7 +24,8 @@ DEPS_FLAG = $(if $(FULLDEPS),,--no-deps)
     install-pipe-gaps install-port-visits install-pipe-events install-all \
     install-pipe-gaps-ref install-port-visits-ref install-pipe-events-ref \
     snapshot-pipe-gaps snapshot-port-visits snapshot-pipe-events \
-    clean-snapshots
+    clean-snapshots \
+    publish-ditbox
 
 # === Framework only ===
 
@@ -77,3 +78,15 @@ snapshot-pipe-events:
 
 clean-snapshots:
 	scripts/clean-snapshots.sh "$(PIPE_GAPS_DIR)" "$(PORT_VISITS_DIR)" "$(PIPE_EVENTS_DIR)"
+
+# === Cloud Build: ditbox image ===
+#
+# Builds and pushes the ditbox tooling image used by cloudbuild-dit.yaml runs.
+# Tags both :latest and :<short-sha>. The build context is the repo root so the
+# Dockerfile can COPY requirements.txt.
+
+publish-ditbox:
+	gcloud builds submit \
+	    --config=docker/ditbox/cloudbuild.yaml \
+	    --substitutions=_GIT_SHA=$$(git rev-parse --short HEAD) \
+	    .
