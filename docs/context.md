@@ -48,9 +48,8 @@ window (every daily-tail iter ≥ 2), the correct ON message often lives in
 that window's `end` list rather than its `first_message` — so the function
 skips past it and returns the next boundary's first message, ~24h too late.
 Result: 8 gaps had their `end_timestamp` shifted forward by 12-26h in the
-incremental modes vs the range-mode oracle. **Not yet fixed.** The proposed
-fix iterates `start ∪ end` of all boundaries and returns the earliest in-range
-candidate.
+incremental modes vs the range-mode oracle. **Fix proposed:** iterate
+`start ∪ end` of all boundaries and return the earliest in-range candidate.
 
 Both bugs were invisible to pipe-gaps' unit tests because the unit tests don't
 exercise the v1-seed surviving multiple daily-reprocessing rounds. The
@@ -114,10 +113,8 @@ These will feed `workflows/port_visits/params.yaml` in Phase 2.
 - `pipe-gaps` branch
   `PIPELINE-3900-pipe-gaps-fix-missing-gaps-in-vms-when-range-load-processed-gaps-are-reprocessed`
   has Bug 1's fix in the working tree (uncommitted as of last cutover) plus
-  base_gap fix. Bug 2 is **not** fixed; the integration test surfaces it as 8
-  diff rows on `_1_bf` vs `_2_bfd`.
-- Production VMS gaps continues to run with the candidate fix on
-  `PIPELINE-3900` if/when it merges.
+  base_gap fix. Bug 2's fix is proposed; the integration test surfaces it as
+  8 diff rows on `_1_bf` vs `_2_bfd`.
 
 ## What "next-level" looks like beyond Phase 3
 
