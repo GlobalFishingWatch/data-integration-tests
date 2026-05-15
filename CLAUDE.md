@@ -43,6 +43,15 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — `--experiment-id` / `DIT_EXPERIMENT_ID` for cross-version run linkage
+
+- Output-table suffix shape grows a leftmost slot: `<experiment_id>_<commit>[_dirty]_<uuid>`. Leftmost so BQ prefix scans cluster by experiment naturally. `<uuid>` slot preserved so parallel mode-equivalence runs sharing a commit still don't clobber each other. `--suffix` (full manual override) bypasses the experiment-id slot entirely — byte-equivalent backward-compat guarantee.
+- New `--experiment-id <slug>` flag on both `workflows/pipe_gaps/mode_equivalence.py` and `workflows/port_visits/ais.py`. Env-var fallback `DIT_EXPERIMENT_ID` (matches the established `DIT_*` convention; empty string treated as unset). Auto-default `solo_<6-hex>` when neither flag nor env var is set — the literal `solo_` prefix marks "not part of a cross-version experiment" so BQ filtering can ignore them. Validation regex `^[a-z0-9][a-z0-9_-]{0,31}$` compiled once at module level; invalid input raises `SystemExit` with a clear message (applied to both CLI input and env-var defaults).
+- This is **the second half of the cross-version experiments capability** that started with the `dit.bq.snapshot_*` helpers (entry above). The two halves are decoupled on purpose: snapshots pin source data; experiment-id clusters output tables. Either is useful alone; together they enable end-to-end byte-equivalence runs across pipeline versions.
+- `_git_info` stays duplicated across the two workflows. Anchored in decision 7 (duplicate-until-3): defer extraction to `dit.git_info` until pipe-events lands (Phase 3); this change is parallel edits, not shared-behaviour drift.
+- Backward-compat guarantees honoured: (1) when neither flag nor env var is set, the auto-generated `solo_<6-hex>_<commit>_<uuid>` is still unique-per-invocation (the `<uuid>` ensures uniqueness; `solo_<6-hex>` adds clustering); (2) `--suffix` full override produces byte-identical output to today; (3) `--allow-dirty-tree` semantics unchanged (`_dirty` still appears between commit and uuid).
+- No changes to table-name builders, comparison logic, runners, or `dit.bq` / `dit.compare` / `dit.dates`. No `docs/plan.md` text changes — no architectural decision changed; this is a thin workflow-side feature. `README.md` § Features: "Workflow file conventions" bullet extended to mention the new flag/env var and the `solo_<6-hex>` default shape.
+
 ### 2026-05-15 — `dit.bq` snapshot helpers for source-data pinning
 
 - Added `dit.bq.snapshot_table(source, dest, *, as_of=None, expiration=None, project=..., if_not_exists=False)` and `dit.bq.snapshot_dataset(source_dataset, dest_dataset, *, tables=None, as_of=None, expiration=None, project=...)`. Both shell out to `CREATE SNAPSHOT TABLE … CLONE …` DDL; the dataset variant lists tables and loops, skipping any already present in dest (idempotent) and raising if dest dataset doesn't exist.

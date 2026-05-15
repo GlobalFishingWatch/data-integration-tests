@@ -43,6 +43,7 @@ import concurrent.futures
 import itertools
 import logging
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -104,6 +105,27 @@ DEFAULT_WORKER_IMAGE = (
 COMPARE_KEYS = ("visit_id",)
 COMPARE_VIEW_SUFFIX = ""
 
+# BQ-table-name-safe slug; max 32 chars. Compiled once.
+_EXPERIMENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def _default_experiment_id() -> str:
+    """Auto-generate a per-invocation experiment id when none is provided.
+
+    The literal ``solo_`` prefix marks "not part of a cross-version
+    experiment" so BQ filtering can ignore them.
+    """
+    return f"solo_{uuid.uuid4().hex[:6]}"
+
+
+def _validate_experiment_id(value: str) -> str:
+    if not _EXPERIMENT_ID_RE.match(value):
+        raise SystemExit(
+            f"error: invalid --experiment-id {value!r}: must match "
+            f"{_EXPERIMENT_ID_RE.pattern} (BQ-table-name safe; max 32 chars)."
+        )
+    return value
+
 
 # --------------------------------------------------------------------------
 # Suffix / git info  (lifted from workflows/pipe_gaps/mode_equivalence.py;
@@ -139,7 +161,8 @@ def _resolve_suffix(args: argparse.Namespace, repo_dir: str) -> str:
             "error: working tree is dirty; pass --allow-dirty-tree, or commit/stash first."
         )
     uid = uuid.uuid4().hex[:6]
-    return f"{commit}_dirty_{uid}" if dirty else f"{commit}_{uid}"
+    body = f"{commit}_dirty_{uid}" if dirty else f"{commit}_{uid}"
+    return f"{args.experiment_id}_{body}"
 
 
 # --------------------------------------------------------------------------
@@ -367,6 +390,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Fall back to `docker compose run dev` when no published image is available.")
     p.add_argument("--suffix", default=None,
                    help="Output-table suffix; auto-generated from git HEAD when omitted.")
+    env_experiment_id = os.environ.get("DIT_EXPERIMENT_ID") or None
+    p.add_argument(
+        "--experiment-id",
+        type=_validate_experiment_id,
+        default=(
+            _validate_experiment_id(env_experiment_id)
+            if env_experiment_id
+            else _default_experiment_id()
+        ),
+        help="Slug prepended to the output-table suffix (<experiment_id>_<commit>_<uuid>) "
+             "for cross-version run linkage. Env-var fallback DIT_EXPERIMENT_ID. "
+             "Auto-default solo_<6-hex> when unset. Regex ^[a-z0-9][a-z0-9_-]{0,31}$. "
+             "Bypassed entirely when --suffix is set.",
+    )
     p.add_argument("--allow-dirty-tree", action="store_true",
                    help="Permit auto-suffix on a dirty working tree.")
     p.add_argument("--skip-pipelines", action="store_true",
@@ -388,6 +425,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     suffix = _resolve_suffix(args, repo_dir=os.getcwd())
+    logger.info("experiment_id: %s", args.experiment_id)
     logger.info("suffix: %s", suffix)
     logger.info("source dataset: %s_{internal,published}", args.source_dataset_stem)
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -65,6 +66,27 @@ RUNNERS = ("docker", "dataflow")
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
 
+# BQ-table-name-safe slug; max 32 chars. Compiled once.
+_EXPERIMENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def _default_experiment_id() -> str:
+    """Auto-generate a per-invocation experiment id when none is provided.
+
+    The literal ``solo_`` prefix marks "not part of a cross-version
+    experiment" so BQ filtering can ignore them.
+    """
+    return f"solo_{uuid.uuid4().hex[:6]}"
+
+
+def _validate_experiment_id(value: str) -> str:
+    if not _EXPERIMENT_ID_RE.match(value):
+        raise SystemExit(
+            f"error: invalid --experiment-id {value!r}: must match "
+            f"{_EXPERIMENT_ID_RE.pattern} (BQ-table-name safe; max 32 chars)."
+        )
+    return value
+
 
 def _git_info(repo_dir: str) -> tuple[str, bool]:
     short = subprocess.run(
@@ -88,12 +110,12 @@ def _resolve_suffix(args: argparse.Namespace, repo_dir: str) -> str:
             "Commit your changes so the run is traceable, or pass --allow-dirty-tree to "
             "override (the suffix will include 'dirty' to flag this)."
         )
-    suffix = (
+    body = (
         f"{commit}_dirty_{uuid.uuid4().hex[:6]}"
         if dirty
         else f"{commit}_{uuid.uuid4().hex[:6]}"
     )
-    return suffix
+    return f"{args.experiment_id}_{body}"
 
 
 def _make_config(
@@ -360,6 +382,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    choices=["True", "False"])
     p.add_argument("--skip-open-gaps", action="store_true")
     p.add_argument("--suffix", default=None)
+    env_experiment_id = os.environ.get("DIT_EXPERIMENT_ID") or None
+    p.add_argument(
+        "--experiment-id",
+        type=_validate_experiment_id,
+        default=(
+            _validate_experiment_id(env_experiment_id)
+            if env_experiment_id
+            else _default_experiment_id()
+        ),
+        help="Slug prepended to the output-table suffix (<experiment_id>_<commit>_<uuid>) "
+             "for cross-version run linkage. Env-var fallback DIT_EXPERIMENT_ID. "
+             "Auto-default solo_<6-hex> when unset. Regex ^[a-z0-9][a-z0-9_-]{0,31}$. "
+             "Bypassed entirely when --suffix is set.",
+    )
     p.add_argument("--allow-dirty-tree", action="store_true")
     p.add_argument("--skip-pipelines", action="store_true")
     p.add_argument("--skip-comparisons", action="store_true")
@@ -390,6 +426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     end = date.fromisoformat(args.end)
     repo_dir = os.getcwd()
     suffix = _resolve_suffix(args, repo_dir)
+    logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
 
     source_messages = args.source_messages or f"{args.source_dataset}.messages"
