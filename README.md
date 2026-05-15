@@ -15,12 +15,14 @@ The framework is intentionally thin — a small library plus per-pipeline workfl
 - **Workflow file conventions**: per-pipeline workflows live in `workflows/<pipeline>/<name>.py` and expose `main(argv) -> int`. Output tables tagged with `<commit>_<uuid>` for provenance; `--allow-dirty-tree` opt-in for dirty-tree runs.
 - **Three install modes** per pipeline: editable (fast inner loop), specific-ref (`REF=<sha-or-branch>`), and snapshot (`git stash create` → anchored on a `dit-snapshot-<epoch>` branch). See Usage § Install modes below.
 - **Per-user infra knobs via `DIT_*` env vars**: `DIT_DEST_DATASET`, `DIT_DATAFLOW_SA`, `DIT_DATAFLOW_REGION`, `DIT_DATAFLOW_TEMP_BUCKET`, `DIT_DATAFLOW_SUBNETWORK`, `DIT_BQ_TEMP_DATASET`. Plays cleanly with direnv via `.envrc.example`.
+- **Pipeline integration contract** ([`docs/pipeline-contract.md`](docs/pipeline-contract.md)) — what a pipeline must expose to be cleanly testable by `dit`, with an adoption matrix tracking where each current pipeline stands.
 
 Pipeline-shape primitives (`Phase`/`Mode`/`Mutation`/`Oracle` dataclasses, mutation library, phase-sharing via BQ COPY, golden-table regression mode) are **deliberately not extracted yet** — see Roadmap below for why and when.
 
 ## Read first
 
 - [`docs/plan.md`](docs/plan.md) — implementation plan, three-repo split, public API contracts, Phase 1 task breakdown.
+- [`docs/pipeline-contract.md`](docs/pipeline-contract.md) — what a GFW pipeline must expose to be cleanly integration-testable; adoption matrix for the three current pipelines. Audience: pipeline maintainers.
 - [`docs/context.md`](docs/context.md) — background, source bugs the framework caught, branch state at handoff.
 - [`docs/framework-vision.md`](docs/framework-vision.md) — long-term shape (don't optimise for it; Phase 1 stays imperative).
 - [`CLAUDE.md`](CLAUDE.md) — working agreements and Plan changelog.

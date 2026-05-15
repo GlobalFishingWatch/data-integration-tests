@@ -18,6 +18,7 @@ Read these in order before coding:
 - **No workflow lives in two places.** Canonical home is `dit/workflows/<pipeline>/`; in-repo workflows in processing repos are allowed for spikes only.
 - **Plan changes get logged.** Whenever an architectural decision changes, update `docs/plan.md` and append the change to the **Plan changelog** below in the same commit. Subagents treat `docs/plan.md` + this changelog as the alignment surface.
 - **README Features and Roadmap sections stay current.** The README is the operational dashboard for outsiders and future maintainers. Whenever a feature lands, drops, or shifts shape — or a roadmap phase advances status, completes, or gets re-scoped — update `README.md` § "Features" or § "Roadmap" in the same commit. Treat both sections with the same discipline as the Plan changelog: out-of-date is worse than under-detailed.
+- **Pipeline-contract audits.** When adding a pipeline to `dit`'s scope (or when an existing pipeline's interface changes), audit it against `docs/pipeline-contract.md` and update the adoption matrix in the same commit. Workflow-side workarounds for missing contract items require a Plan-changelog entry explaining the trade-off — the integration-test workflow must not silently carry pipeline-specific workarounds.
 
 ## Installing pipeline dependencies
 
