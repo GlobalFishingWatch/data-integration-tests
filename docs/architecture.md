@@ -103,7 +103,7 @@ Single pipeline version, exercises that bf / bfd / bftruncate produce equivalent
 ```mermaid
 sequenceDiagram
     actor U as User
-    participant W as workflows/&lt;pipeline&gt;/mode_equiv.py
+    participant W as workflows/[pipeline]/mode_equiv.py
     participant DF as Dataflow workers
     participant BQ as BigQuery
     participant TIC as table-check (subprocess)
@@ -116,7 +116,7 @@ sequenceDiagram
         W->>DF: submit job mode=3_bftruncate
         W->>DF: submit job mode=4_mutate_recover [pipe-gaps only]
     end
-    DF-->>BQ: writes &lt;suffix&gt;_&lt;mode&gt; tables
+    DF-->>BQ: writes [suffix]_[mode] tables
     DF-->>W: wait_for_job returns (all done)
     loop pairwise diffs
         W->>TIC: table-check summary table_a table_b --keys ...
@@ -138,23 +138,23 @@ sequenceDiagram
     participant Git as Git (worktrees)
     participant BQ as BigQuery
     participant DF as Dataflow
-    participant AR as gcr.io/wf827/dit/&lt;pipeline&gt;
+    participant AR as gcr.io/wf827/dit/[pipeline]
     participant TIC as table-check
 
-    U->>XV: dit run<br/>--binding before=&lt;ref-A&gt;<br/>--binding after=&lt;ref-B&gt;<br/>--binding-worker-image after=&lt;built-img&gt;
+    U->>XV: dit run<br/>--binding before=[ref-A]<br/>--binding after=[ref-B]<br/>--binding-worker-image after=[built-img]
     XV->>BQ: snapshot source @ --pin-source-at
-    Note over BQ: dit_exp_&lt;exp-id&gt;_{internal,published}<br/>(7-day TTL)
+    Note over BQ: dit_exp_[exp-id]_{internal,published}<br/>(7-day TTL)
 
     par bindings run concurrently (ThreadPoolExecutor)
         XV->>Git: worktree add at ref A
         XV->>DF: ais.py with default worker-image
         and
         XV->>Git: worktree add at ref B
-        XV->>DF: ais.py with --worker-image=&lt;built&gt;
+        XV->>DF: ais.py with --worker-image=[built]
     end
 
     AR-->>DF: workers pull per-binding image
-    DF-->>BQ: writes port_visits_&lt;exp&gt;-{before,after}_&lt;mode&gt;
+    DF-->>BQ: writes port_visits_[exp]-{before,after}_[mode]
     DF-->>XV: jobs complete (both bindings)
 
     loop pairwise diffs<br/>(skip pairs where binding failed)
@@ -184,7 +184,7 @@ flowchart LR
         ghhook --> trig[Cloud Build trigger<br/>in pipeline repo<br/>Terraform-owned]
     end
 
-    laptop -->|--source=$PROJECTS/&lt;pipeline&gt;| cb
+    laptop -->|--source=$PROJECTS/[pipeline]| cb
     trig -.->|references| yaml
     trig --> cb
 
