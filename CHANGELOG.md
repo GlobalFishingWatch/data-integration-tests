@@ -9,6 +9,7 @@ The project is pre-1.0; entries are grouped chronologically under `[Unreleased]`
 ### 2026-05-15
 
 #### Added
+- **[`docs/conventions.md`](docs/conventions.md)** — codifies the prod-infra boundary (dit is testing-shaped, never writes to `gfw-int-infrastructure` or to prod-shaped namespaces in wf827) and the dit image namespace (`gcr.io/world-fishing-827/dit/*` with documented tag conventions and standard build-and-push workflow). README and CLAUDE.md § Working agreements both reference it.
 - **Parallel bindings + per-binding worker-image override in `cross_version_ais.py`.** Bindings now run concurrently by default (via `ThreadPoolExecutor`); `--sequential-bindings` opts out for debugging. Each subprocess's output is line-prefixed `[<binding>] ` so parallel runs interleave readably. Failure semantics flipped: a failing binding no longer aborts siblings — they all run to completion, and diff pairs touching a failed binding are reported as `SKIPPED`. Overall exit code is non-zero iff any binding failed.
 - **`--binding-worker-image NAME=IMAGE`** (repeatable) — per-binding override for `ais.py`'s `--worker-image`. **Required for any cross-version comparison that exercises worker-side code** (which is most pipeline changes — Beam PTransforms, DoFns). Without it, every binding's Dataflow workers pull the same published image, and the test becomes a no-op (only the submission-side orchestrator differs between bindings). See the module docstring for the manual docker-build-and-push workflow until an in-orchestrator builder lands.
 - **Cloud Build ad-hoc runtime.** Ship `dit` runs to Cloud Build with `make dit-cloud PIPELINE=… WORKFLOW=… ARGS="…"`. The pipeline checkout flows through as the build source; dit is cloned fresh per run from `_DIT_REF` (default `main`). 24h timeout, runs as `automated-testing@`. See `cloudbuild-dit.yaml` substitutions for the full parameter shape.
@@ -26,6 +27,7 @@ The project is pre-1.0; entries are grouped chronologically under `[Unreleased]`
 - Plan changelog entries documenting the synthetic `tests/temp_dataset_for_integration_tests` and `tests/pipeline_1465_for_integration_tests` branches in `anchorages_pipeline` for the PIPELINE-1465 cross-version test.
 
 #### Changed
+- **ditbox + cloudbuild-dit yamls now target `gcr.io/world-fishing-827/dit/ditbox`** instead of `gfw-int-infrastructure/core/ditbox`. The original target was unreachable from our IAM (no `uploadArtifacts` in `gfw-int-infrastructure`). The new path lives under the existing wf827 `gcr.io` AR repo, in the dit-namespaced `dit/` subpath — only `uploadArtifacts` needed (project-level grant we already have).
 - **Phase 2 AIS-staging verification: passed.** Mode-equivalence holds for port-visits across bf / bfd / bftruncate on the 2020 AIS-staging cohort. Three pairwise comparisons green on `visit_id`.
 
 #### Fixed

@@ -19,6 +19,7 @@ Read these in order before coding:
 - **Plan changes get logged.** Whenever an architectural decision changes, update `docs/plan.md` and append the change to the **Plan changelog** below in the same commit. Subagents treat `docs/plan.md` + this changelog as the alignment surface.
 - **README Features and Roadmap sections stay current.** The README is the operational dashboard for outsiders and future maintainers. Whenever a feature lands, drops, or shifts shape — or a roadmap phase advances status, completes, or gets re-scoped — update `README.md` § "Features" or § "Roadmap" in the same commit. Treat both sections with the same discipline as the Plan changelog: out-of-date is worse than under-detailed.
 - **Pipeline-contract audits.** When adding a pipeline to `dit`'s scope (or when an existing pipeline's interface changes), audit it against `docs/pipeline-contract.md` and update the adoption matrix in the same commit. Workflow-side workarounds for missing contract items require a Plan-changelog entry explaining the trade-off — the integration-test workflow must not silently carry pipeline-specific workarounds.
+- **Stay clear of prod-relevant infrastructure.** dit is a testing-shaped consumer of GFW infrastructure: read access is unrestricted, but writes go only to dit-namespaced paths. Concretely — never push to `gfw-int-infrastructure/*` (the canonical pipeline image registry) and never push to prod-shaped namespaces inside wf827 (`gcr.io/world-fishing-827/anchorages_pipeline/`, `encounters_pipeline/`, `advanced_fishing_detection/`, etc.). All dit images go under `gcr.io/world-fishing-827/dit/*` instead — see [`docs/conventions.md`](docs/conventions.md) for the namespace + standard build-and-push workflow. The only explicit exception: creating branches in pipeline repos with potential fixes that might eventually merge to prod is in scope (branch existing is normal dev workflow; the merge is owned by whoever holds the button, not dit).
 - **Don't manually delete shared `dit_exp_*` datasets.** `cross_version_ais.py` snapshot datasets carry a 7-day `default_table_expiration_ms` and self-clean. Manual `bq rm` of these datasets can clobber in-flight runs that share an experiment-id namespace — a smoke-test cleanup with a colliding `--experiment-id` already broke one real run mid-flight (snapshot deleted out from under live Dataflow workers reading from it). Smoke tests must use disjoint experiment-ids (e.g. `dit-smoke-<timestamp>`) and let the TTL clean up; production runs should never `bq rm` snapshot datasets at all.
 - **CHANGELOG.md is the user-facing change log.** `CHANGELOG.md` records what's available to users of `dit` (CLI flags, new helpers, new workflows, fixes). The Plan changelog in this file is dev-internal — plan-doc evolution, design refinements, why a commit happened. Both get an entry when a user-visible feature lands; CHANGELOG framed for users, Plan changelog framed for the next maintainer.
 
@@ -44,6 +45,18 @@ Notes:
 ## Plan changelog
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
+
+### 2026-05-15 — Image-namespace convention codified: `gcr.io/world-fishing-827/dit/*`
+
+Two related decisions consolidated into a single convention, documented in [`docs/conventions.md`](docs/conventions.md) and reinforced by a Working agreement bullet above:
+
+**Prod-infra boundary.** dit's user (christian.homberg@globalfishingwatch.org) is not in `gcp-backend-engineering-team`. Project-level `uploadArtifacts` on `world-fishing-827`: yes; on `gfw-int-infrastructure`: no; `repositories.create` anywhere: no. This isn't a deficiency to work around — it's the right shape: dit is testing, not production, and the IAM mirrors that. The boundary is now explicit in working agreements: stay in `world-fishing-827`, stay out of `gfw-int-infrastructure`, and stay clear of prod-shaped image namespaces even inside wf827. The one exception is creating branches in pipeline repos with potential fixes; the branch existing is dev workflow, not prod-touching.
+
+**Image namespace.** All dit images go under `gcr.io/world-fishing-827/dit/*`. Path within the existing `gcr.io` AR repo, not a new repo — needs only `uploadArtifacts` (which we have). Tag conventions: `<image>:<sha>` for ditbox, `<pipeline>:<experiment-id>-<binding-name>` for per-binding worker images. Wf827 + same-project = no cross-project IAM for Dataflow worker pulls.
+
+**Code changes in the same commit:** updated `docker/ditbox/cloudbuild.yaml` `_IMAGE` substitution and `cloudbuild-dit.yaml` step `name:` from the previous (unreachable) `gfw-int-infrastructure/core/ditbox` to `gcr.io/world-fishing-827/dit/ditbox`. The first `make publish-ditbox` attempt failed with `Permission 'artifactregistry.repositories.uploadArtifacts' denied` against the old path; the corrected target works under existing perms.
+
+Memory entries [[prod-infra-boundary]] and [[dit-image-namespace]] persist this across sessions.
 
 ### 2026-05-15 — Cross-version worker-image gap surfaced; parallel bindings + per-binding override
 

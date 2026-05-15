@@ -12,7 +12,11 @@
 # The build context is the repo root so the Dockerfile can `COPY requirements.txt`.
 
 substitutions:
-  _IMAGE: us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox
+  # dit images live under gcr.io/world-fishing-827/dit/* (see docs/conventions.md
+  # and CLAUDE.md § Working agreements). Same-project as Dataflow workers;
+  # only needs uploadArtifacts on world-fishing-827 (project-level), no
+  # repositories.create.
+  _IMAGE: gcr.io/world-fishing-827/dit/ditbox
   _GIT_SHA: dev
 
 steps:

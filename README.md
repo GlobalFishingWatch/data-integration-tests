@@ -24,6 +24,7 @@ Pipeline-shape primitives (`Phase`/`Mode`/`Mutation`/`Oracle` dataclasses, mutat
 ## Read first
 
 - [`docs/plan.md`](docs/plan.md) — implementation plan, three-repo split, public API contracts, Phase 1 task breakdown.
+- [`docs/conventions.md`](docs/conventions.md) — prod-infra boundary, dit image namespace (`gcr.io/world-fishing-827/dit/*`), standard build-and-push workflow.
 - [`docs/pipeline-contract.md`](docs/pipeline-contract.md) — what a GFW pipeline must expose to be cleanly integration-testable; adoption matrix for the three current pipelines. Audience: pipeline maintainers.
 - [`docs/context.md`](docs/context.md) — background, source bugs the framework caught, branch state at handoff.
 - [`docs/framework-vision.md`](docs/framework-vision.md) — long-term shape (don't optimise for it; Phase 1 stays imperative).

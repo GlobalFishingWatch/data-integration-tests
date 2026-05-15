@@ -30,7 +30,9 @@ substitutions:
 
 steps:
   - id: dit-run
-    name: us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox:latest
+    # ditbox lives under gcr.io/world-fishing-827/dit/* per the dit-image
+    # convention (see docs/conventions.md and CLAUDE.md § Working agreements).
+    name: gcr.io/world-fishing-827/dit/ditbox:latest
     entrypoint: bash
     args:
       - -c
