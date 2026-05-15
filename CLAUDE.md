@@ -41,6 +41,21 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — Phase 2 AIS-staging verification: passed; integration findings
+
+First end-to-end run of `workflows/port_visits/ais.py --runner dataflow --parallel --build-from-source` against the staging cohort. Suffix `cb916bf_94dde7`, output in `world-fishing-827.tech_great_expectations.port_visits_..._{1_bf,2_bfd,3_bftruncate}`. All three pairwise comparisons returned `rc=0` on `visit_id` — **port-visits is mode-equivalent across bf / bfd / bftruncate on the 2020 AIS-staging cohort.**
+
+Four integration issues surfaced during the run; each is now fixed or documented:
+
+1. **`--labels` required by pipe-anchorages** (fixed, `18689dc`). `transforms/sink.cloud_to_labels` iterates `cloud_options.labels` without a None guard. `_dataflow_pipeline_options` now emits five `--labels=k=v` flags matching the shape composer uses.
+2. **No `--temp_dataset` plumbing in pipe-anchorages** (fixed by local upstream patch). The `automated-testing@` SA lacks `bigquery.datasets.create`, so Beam's auto-named `beam_temp_dataset_<uuid>` fails. Pipe-gaps' workflow sidesteps this in-process via `_DagFactoryWithTempDataset`; pipe-anchorages runs Beam inside a container with no equivalent hook. Local patch on `anchorages_pipeline@dit-temp-dataset-support` (commit `cb916bf`) adds a `--temp_dataset` CLI flag + threads it through `QuerySource` to `ReadFromBigQuery`. Our workflow surfaces it as `--bq-temp-dataset` with `DIT_BQ_TEMP_DATASET` env-var fallback (`9227cb8`). **Upstream PR pending team review.**
+3. **Workers couldn't `import pipe_anchorages`** (fixed, `3a400ee`). Default Beam SDK image doesn't have pipe_anchorages installed. Workflow now passes `--sdk_container_image=us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4`. Default is the published v4.6.4 image; workers don't need the local `--temp_dataset` patch because that change only affects local pipeline construction.
+4. **SA needs dataEditor on the output dataset.** `scratch_christian_homberg_ttl120d` doesn't grant `automated-testing@` `bigquery.tables.create`. `.envrc` switched to `DIT_DEST_DATASET=tech_great_expectations` (team-shared, SA pre-blessed). Personal scratch usage requires a one-time IAM grant — documented in `.envrc`.
+
+**Known follow-up — `dit.runners.docker` network-cleanup defect.** The `build_from_source` path runs `docker compose -p <unique-uuid> run --rm dev …` per invocation, which leaves a `<project>_default` bridge network behind even after the container exits. Across many runs Docker's address pool (default 172.16-172.31, /24 each) fills up and new networks fail with "all predefined address pools have been fully subnetted." Worked around once via `docker network prune`, but the runner should `docker compose -p <name> down` after each invocation. Not blocking, but worth fixing alongside Phase 2 (relevant to anyone running `--build-from-source` workflows repeatedly).
+
+**No plan-doc text changes this entry** — purely a record of what worked and what got patched along the way. The `docs/plan.md` § Phase 2 verification path stands.
+
 ### 2026-05-14 — Per-user infra knobs via DIT_* env vars
 
 - Both workflows now resolve user-overridable infra knobs through `os.environ.get("DIT_<NAME>", "<default>")` with corresponding CLI flags that override env vars per-invocation. Set up so a single `export DIT_DEST_DATASET=scratch_chris` in `.envrc` redirects all output tables for personal dev without editing source.
