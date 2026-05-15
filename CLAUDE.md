@@ -6,9 +6,10 @@ This repo houses `dit`, the cross-pipeline integration-test framework for GFW da
 
 Read these in order before coding:
 
-1. [`docs/context.md`](docs/context.md) — background, source bugs the framework caught, branch state at handoff.
-2. [`docs/plan.md`](docs/plan.md) — the implementation plan. Sections worth bookmarking: **Architecture: three-repo split**, **Public API contracts (Phase 1)**, **Phase 1 subagent task breakdown**.
-3. [`docs/framework-vision.md`](docs/framework-vision.md) — long-term shape. Don't optimise for it; Phase 1 stays imperative.
+1. [`docs/architecture.md`](docs/architecture.md) — visual reference: repo ownership, run modes, workflow flows, Cloud Build runtime, image namespace. Mermaid diagrams; renders on GitHub.
+2. [`docs/context.md`](docs/context.md) — background, source bugs the framework caught, branch state at handoff.
+3. [`docs/plan.md`](docs/plan.md) — the implementation plan. Sections worth bookmarking: **Architecture: three-repo split**, **Public API contracts (Phase 1)**, **Phase 1 subagent task breakdown**.
+4. [`docs/framework-vision.md`](docs/framework-vision.md) — long-term shape. Don't optimise for it; Phase 1 stays imperative.
 
 ## Working agreements
 

@@ -23,6 +23,7 @@ Pipeline-shape primitives (`Phase`/`Mode`/`Mutation`/`Oracle` dataclasses, mutat
 
 ## Read first
 
+- [`docs/architecture.md`](docs/architecture.md) — visual reference: repo ownership, run modes, workflow flows, Cloud Build runtime, image namespace. Mermaid diagrams that render on GitHub.
 - [`docs/plan.md`](docs/plan.md) — implementation plan, three-repo split, public API contracts, Phase 1 task breakdown.
 - [`docs/conventions.md`](docs/conventions.md) — prod-infra boundary, dit image namespace (`gcr.io/world-fishing-827/dit/*`), standard build-and-push workflow.
 - [`docs/pipeline-contract.md`](docs/pipeline-contract.md) — what a GFW pipeline must expose to be cleanly integration-testable; adoption matrix for the three current pipelines. Audience: pipeline maintainers.
