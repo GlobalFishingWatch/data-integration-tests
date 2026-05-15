@@ -184,7 +184,7 @@ flowchart LR
         ghhook --> trig[Cloud Build trigger<br/>in pipeline repo<br/>Terraform-owned]
     end
 
-    laptop -->|--source=$PROJECTS/[pipeline]| cb
+    laptop -->|"--source=$PROJECTS/[pipeline]"| cb
     trig -.->|references| yaml
     trig --> cb
 
