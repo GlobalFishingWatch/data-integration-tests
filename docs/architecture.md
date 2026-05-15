@@ -12,7 +12,7 @@ Other reference material:
 
 ## 1. System context — repos, what each owns
 
-GFW data pipelines are split across three repo flavours; dit is one of them. The comparison engine (`table_identical_checks`) lives in its own repo and is consumed by dit as a subprocess.
+The work around GFW data pipelines is split across three categories of repo: **processing** (the pipeline source itself — one repo per pipeline), **orchestration** (prod params + DAGs, in `composer-dags-production`), and **testing** (integration tests in this repo, plus the BQ comparison engine in `table_identical_checks`). Each pipeline (`pipe-gaps`, `anchorages_pipeline`, `pipe-events`) is a single repo in the processing category; dit sits in the testing category and consumes `table_identical_checks` as a subprocess.
 
 ```mermaid
 flowchart LR
