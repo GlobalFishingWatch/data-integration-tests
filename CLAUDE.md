@@ -43,6 +43,31 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — Synthetic branches for the PIPELINE-1465 cross-version test
+
+To resolve the precondition flagged in the cross-version-glue entry below (every binding must support `--temp_dataset`), created two branches in `/mnt/encrypted_data/git/anchorages_pipeline`:
+
+- **`tests/temp_dataset_for_integration_tests`** — points at `cb916bf` (current `dit-temp-dataset-support` HEAD). Has the `--temp_dataset` patch on top of `4df3726` (current main). No port-gap fix.
+- **`tests/pipeline_1465_for_integration_tests`** — based on the above, with `c1906ec` (`Fix PORT_GAP_BEGIN anchorage when vessel silently changes port`) cherry-picked on top. New HEAD is `657c584`.
+
+Minimal A-vs-B diff: 3 files, 115 insertions — `CHANGES.md` (entry), `pipe_anchorages/transforms/create_in_out_events.py` (the 6-line behaviour fix), and `tests/test_create_in_out_events.py` (regression test). Nothing else differs, so any output divergence from the cross-version run is attributable to the fix.
+
+Dry-run validated through `cross_version_ais.py` with these bindings on 2026-05-15:
+
+```
+dit run workflows/port_visits/cross_version_ais.py \
+    --experiment-id pipeline-1465 \
+    --pin-source-at 2026-05-15T10:00:00Z \
+    --binding before=tests/temp_dataset_for_integration_tests \
+    --binding after=tests/pipeline_1465_for_integration_tests \
+    --modes 1_bf \
+    --runner dataflow --parallel --build-from-source
+```
+
+The dry-run goes through `git rev-parse` of both refs (`cb916bf` and `657c584`), creates `dit_exp_pipeline_1465_{internal,published}` snapshot datasets, snapshots the three input tables at the pin timestamp, sets up and tears down worktrees for each binding. Removing `--dry-run` flips this into the real run.
+
+Both branches are **local-only and intentionally untracked upstream**; they're scaffolding for the integration test, not branches to be merged. When the `--temp_dataset` PR lands upstream, the better long-term shape is to rebase the bindings on top of the merged version and drop these synthetic branches.
+
 ### 2026-05-15 — Cross-version experiment glue (port-visits AIS)
 
 `workflows/port_visits/cross_version_ais.py` ties together the BQ snapshot helpers (`42ef37f`) and experiment-ID linkage (`244521d`) into an end-to-end command. Given `--experiment-id`, `--pin-source-at <iso>`, and N `--binding name=ref` pairs, it:
