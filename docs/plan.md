@@ -311,12 +311,22 @@ Today the orchestrator runs on the user's laptop. Babysitting a 12-hour cross-ve
 
 **Why Cloud Build:** GFW already uses it (per `anchorages_pipeline/cloudbuild/`); 24h step timeout covers AIS-full; serverless billing (~$4/day worst case for a 24h run; dominated by Dataflow worker-hours anyway); native docker host; auth via build-step SA; triggerable three ways without code change (`gcloud builds submit` ad-hoc, GitHub webhook for PRs, Cloud Scheduler for nightly).
 
-**What needs to land** (rough estimate: half a day of plumbing):
+**Architecture — centralized yaml, per-pipeline triggers.** The boundary tracks decision 7 (pipeline repos own *what gets tested when*; dit owns *how the test runs*):
+
+- **`data_integration_tests/cloudbuild-dit.yaml`** is the single source of truth. Parameterised by substitutions (workflow path, experiment-id, bindings, etc.). Evolves frequently as the framework matures; one PR updates every consumer.
+- **Each pipeline repo owns its own Cloud Build trigger** (Terraform-managed inline-config, or a thin delegating yaml — implementation detail per team). The trigger references dit's canonical yaml content (synced via `scripts/sync-cloud-build-triggers.sh` when the yaml changes). PR status checks fire from the pipeline repo's trigger, so they land in the right repo's UI.
+- **Ad-hoc / CLI usage needs no per-pipeline trigger:** `gcloud builds submit --config=data_integration_tests/cloudbuild-dit.yaml --source=<pipeline-dir>` works from anywhere. Same yaml, different entry point.
+
+This lets dit ship and be useful with zero pipeline-repo changes (the ad-hoc path). Per-pipeline triggers come as each pipeline becomes cross-version-ready — anchorages_pipeline first (has Terraform-managed triggers already + cross-version capability today), pipe-gaps after its cross-version parity work, pipe-events after Phase 3.
+
+**What needs to land** (rough estimate: half a day of plumbing for the ad-hoc path; per-pipeline triggers added afterward as opt-in):
 
 1. **`ditbox` container image** in `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox:<tag>` — Python + gcloud CLI + docker CLI + `dit` pre-installed. Pre-publishes the workflows too so Cloud Build steps don't need to clone `data_integration_tests`.
-2. **`cloudbuild-dit.yaml`** in `data_integration_tests` — parameterised single yaml driven by substitutions; serves cross-version, single-run, and PR-check use cases.
+2. **`cloudbuild-dit.yaml`** in `data_integration_tests` — parameterised single yaml driven by substitutions; serves cross-version, single-run, and PR-check use cases. **This is the canonical source of truth for the dit build steps.**
 3. **`make dit-cloud-…`** target — wraps `gcloud builds submit --source=$(PIPELINE_DIR)` so the pipeline working tree (including uncommitted changes via `git stash create` + temp tag) flows through as the Cloud Build context. Solves the "python editable emulation" need for on-demand runs.
-4. **Result reporting.** Cloud Build URL on submit; Slack/email on completion; PR comment with diff summary in PR-mode (later).
+4. **`scripts/sync-cloud-build-triggers.sh`** — propagates the canonical yaml content into each registered pipeline repo's trigger config when the yaml changes. Optional in the first cut (ad-hoc path doesn't need it).
+5. **Per-pipeline trigger** — added in each pipeline repo's existing Terraform / Cloud Build config (e.g. `anchorages_pipeline/cloudbuild/main.tf`). One trigger per pipeline; references the synced yaml; fires on PR events. Pipeline-team-owned; opt-in.
+6. **Result reporting.** Cloud Build URL on submit; Slack/email on completion; PR comment with diff summary in PR-mode (later).
 
 **Latency budget for on-demand runs:** laptop submit ~15-30 sec; first Dataflow job running 3-5 min from keystroke (cold), 1-2 min (warm).
 
