@@ -8,6 +8,9 @@ The project is pre-1.0; entries are grouped chronologically under `[Unreleased]`
 
 ### 2026-05-15
 
+#### Changed
+- **Git workflow shifted to feature-branch + squash-merge.** Non-trivial changes now live on short-lived `<type>/<short-slug>` branches (types: feat / fix / docs / refactor / test / chore). PRs request Copilot as reviewer; squash-merge to `main` after sign-off so `main` gets one clean commit per feature. Releases will be tagged as `v0.X.Y` (pre-1.0 — increment minor freely). Recorded in CLAUDE.md § Working agreements. Trivial one-line fixes still go straight to `main`.
+
 #### Added
 - **[`docs/architecture.md`](docs/architecture.md)** — visual reference for the project: system-context diagram (three-repo split + TIC integration), run-mode table (ad-hoc / Cloud Build / PR-triggered / scheduled), mode-equivalence + cross-version workflow sequences, Cloud Build runtime flow, and the image-namespace tree. Mermaid + ASCII; renders natively on GitHub. Pointed at from README + CLAUDE.md "Read first" lists.
 - **[`docs/conventions.md`](docs/conventions.md)** — codifies the prod-infra boundary (dit is testing-shaped, never writes to `gfw-int-infrastructure` or to prod-shaped namespaces in wf827) and the dit image namespace (`gcr.io/world-fishing-827/dit/*` with documented tag conventions and standard build-and-push workflow). README and CLAUDE.md § Working agreements both reference it.
