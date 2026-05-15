@@ -43,6 +43,15 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — `dit.bq` snapshot helpers for source-data pinning
+
+- Added `dit.bq.snapshot_table(source, dest, *, as_of=None, expiration=None, project=..., if_not_exists=False)` and `dit.bq.snapshot_dataset(source_dataset, dest_dataset, *, tables=None, as_of=None, expiration=None, project=...)`. Both shell out to `CREATE SNAPSHOT TABLE … CLONE …` DDL; the dataset variant lists tables and loops, skipping any already present in dest (idempotent) and raising if dest dataset doesn't exist.
+- This is **the first half of an upcoming cross-version experiments capability** — snapshot the inputs once so cross-version test runs (`pipe-gaps@main` vs `@pr-NNN`, etc.) only see differences attributable to the pipeline code, not source-data drift. The second half (experiment-ID linkage into output-table suffixes) is being designed by a parallel agent and is intentionally not coupled to these helpers; consumers can use the snapshots today without the experiment plumbing.
+- BQ snapshots chosen over time-travel-in-queries: pipeline-agnostic (no source changes to pipe-gaps / pipe-anchorages / pipe-events), persists beyond BQ's 7-day time-travel window, and storage is delta-only. Docstring on `snapshot_table` carries the rationale.
+- Lazy-imports `google.cloud.bigquery` inside both helpers (deviates from the existing top-import in `dit/bq.py`, but matches the spec instruction; in-place rewrite of the existing helpers' imports was out of scope).
+- `tests/test_bq.py` (new): 11 mock-based tests covering DDL shape (plain / `as_of` / `expiration` / `if_not_exists` / both clauses / custom project) plus dataset-level cases (list-and-snapshot, table filter, skip-existing, raise-on-missing-dest, forward kwargs).
+- Docs updated in the same commit: `docs/plan.md` § "Public API contracts → `dit.bq`" now lists both signatures with one-line notes; `README.md` § Features extends the BQ utilities bullet to mention the snapshot helpers.
+
 ### 2026-05-15 — Fix `dit.runners.docker` network-teardown defect
 
 Follow-up to the defect flagged in the prior 2026-05-15 entry. `dit.runners.docker.run` (build_from_source path) now wraps the docker invocation in a `try/finally` and calls a new `_teardown_compose_network()` helper that runs `docker network rm <project>_default` after each call. Used `docker network rm` directly rather than `docker compose -p <name> down` so cleanup doesn't depend on a compose file being present in CWD; external volumes (e.g. the `gcp` auth volume) aren't touched. Idempotent — silently no-ops if the network is gone, in use, or never existed. No contract change to `docker.run()`; signature identical.

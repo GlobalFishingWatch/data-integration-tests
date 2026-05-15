@@ -151,11 +151,33 @@ def query_for_restricted_ssvids(
     seed: int = 42,
     project: str = "world-fishing-827",
 ) -> list[str]: ...
+def snapshot_table(
+    source_table: str,
+    dest_table: str,
+    *,
+    as_of: datetime | None = None,
+    expiration: datetime | None = None,
+    project: str = "world-fishing-827",
+    if_not_exists: bool = False,
+) -> None: ...
+def snapshot_dataset(
+    source_dataset: str,
+    dest_dataset: str,
+    *,
+    tables: Sequence[str] | None = None,
+    as_of: datetime | None = None,
+    expiration: datetime | None = None,
+    project: str = "world-fishing-827",
+) -> list[str]: ...
 ```
 
 `drop_tables` requires the prefix to include project and dataset (`<proj>.<dataset>.<stem>`); it lists the dataset and drops every table/view starting with `<stem>`.
 
 `query_for_restricted_ssvids` ports `compute_restricted_ssvids` (lines ~540–640): queries the reference `_last_versions` view for triggering closed gaps, picks ~|G|/2 non-triggering ssvids so the complement contains every triggering ssvid. The source's `n_hours_before` argument is dropped — it was unused at the call site and the source code itself logged it as such.
+
+`snapshot_table` emits `CREATE SNAPSHOT TABLE [IF NOT EXISTS] <dest> CLONE <src> [FOR SYSTEM_TIME AS OF …] [OPTIONS(expiration_timestamp=…)]`. Used for source-data pinning so cross-version pipeline runs compare against frozen inputs instead of drifting upstream tables.
+
+`snapshot_dataset` snapshots every table in `source_dataset` (or just `tables` if specified) into an existing `dest_dataset`. Idempotent — skips tables already present in dest; raises if dest dataset is missing. Returns the fully-qualified ids of the snapshots it created.
 
 ### `dit.dates`
 

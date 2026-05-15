@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from typing import Sequence
 
 from google.cloud import bigquery
 
@@ -119,3 +120,97 @@ def query_for_restricted_ssvids(
     )
 
     return list(restricted)
+
+
+def snapshot_table(
+    source_table: str,
+    dest_table: str,
+    *,
+    as_of: datetime | None = None,
+    expiration: datetime | None = None,
+    project: str = DEFAULT_PROJECT,
+    if_not_exists: bool = False,
+) -> None:
+    """Snapshot ``source_table`` to ``dest_table`` via ``CREATE SNAPSHOT TABLE``.
+
+    BQ snapshots are preferred over time-travel-in-queries for source-data
+    pinning: they're pipeline-agnostic (no changes to pipe-gaps /
+    pipe-anchorages / pipe-events queries), they persist beyond the source's
+    time-travel window (default 7 days), and they're cheap storage-wise --
+    only the delta from the source is billed.
+
+    Both table ids are fully-qualified ``project.dataset.table`` strings.
+    ``as_of`` pins the snapshot to a past timestamp (must be inside BQ's
+    time-travel window). ``expiration`` auto-deletes the snapshot at that
+    timestamp; ``None`` persists indefinitely. ``if_not_exists`` emits
+    ``CREATE SNAPSHOT TABLE IF NOT EXISTS`` for idempotent re-runs.
+    """
+    from google.cloud import bigquery
+
+    parts = ["CREATE SNAPSHOT TABLE"]
+    if if_not_exists:
+        parts.append("IF NOT EXISTS")
+    parts.append(f"`{dest_table}` CLONE `{source_table}`")
+    if as_of is not None:
+        parts.append(f'FOR SYSTEM_TIME AS OF TIMESTAMP("{as_of.isoformat()}")')
+    if expiration is not None:
+        parts.append(
+            f'OPTIONS(expiration_timestamp=TIMESTAMP("{expiration.isoformat()}"))'
+        )
+    sql = " ".join(parts)
+
+    logger.info("snapshotting %s -> %s", source_table, dest_table)
+    client = bigquery.Client(project=project)
+    client.query(sql).result()
+
+
+def snapshot_dataset(
+    source_dataset: str,
+    dest_dataset: str,
+    *,
+    tables: Sequence[str] | None = None,
+    as_of: datetime | None = None,
+    expiration: datetime | None = None,
+    project: str = DEFAULT_PROJECT,
+) -> list[str]:
+    """Snapshot every table in ``source_dataset`` into ``dest_dataset``.
+
+    Both dataset ids are ``project.dataset`` strings. If ``tables`` is given,
+    only those table names (bare, not fully-qualified) are snapshotted.
+    Tables already present in ``dest_dataset`` are skipped, so re-runs are
+    idempotent. Raises if ``dest_dataset`` does not exist. Returns the list
+    of created snapshot table-ids (fully-qualified).
+    """
+    from google.cloud import bigquery
+    from google.cloud.exceptions import NotFound
+
+    client = bigquery.Client(project=project)
+
+    try:
+        client.get_dataset(dest_dataset)
+    except NotFound as exc:
+        raise ValueError(f"destination dataset does not exist: {dest_dataset}") from exc
+
+    existing = {ref.table_id for ref in client.list_tables(dest_dataset)}
+    source_tables = [ref.table_id for ref in client.list_tables(source_dataset)]
+    if tables is not None:
+        wanted = set(tables)
+        source_tables = [t for t in source_tables if t in wanted]
+
+    created: list[str] = []
+    for table_id in source_tables:
+        if table_id in existing:
+            logger.info("skipping %s.%s (already exists)", dest_dataset, table_id)
+            continue
+        src = f"{source_dataset}.{table_id}"
+        dst = f"{dest_dataset}.{table_id}"
+        snapshot_table(
+            src,
+            dst,
+            as_of=as_of,
+            expiration=expiration,
+            project=project,
+        )
+        created.append(dst)
+
+    return created
