@@ -45,6 +45,22 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — Cross-version worker-image gap surfaced; parallel bindings + per-binding override
+
+Two related changes to `cross_version_ais.py` triggered by the first real-world use of the cross-version capability against PIPELINE-1465.
+
+**Worker-image gap.** The first PIPELINE-1465 run reported 0 diff across all 12 output-table pairs (port_visits + port_events × 3 modes × 2 bindings). Investigation: `ais.py` hardcodes `--worker-image=us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4` as the Dataflow `--sdk_container_image`. The `--build-from-source` flag rebuilds only the *submission-side* image; workers always pull v4.6.4. The PIPELINE-1465 fix lives in `pipe_anchorages/transforms/create_in_out_events.py` — a Beam PTransform that runs on workers — so both bindings ran identical worker code. TIC's "identical" verdict was the truthful answer for the data it was given; the test methodology was the failure.
+
+This is an architectural gap in the cross-version capability for any change that lives in worker code (i.e. most pipeline fixes). Phase 2's mode-equivalence test wasn't affected because there only the mode-flags differ, not the underlying code.
+
+Fix shape adopted: per-binding `--worker-image` override. New `--binding-worker-image NAME=IMAGE` flag (repeatable); the orchestrator threads it through `_ais_args_for_binding` so each binding's `ais.py` invocation sees the right image. Per-binding image build + push remains manual for now (target: `gcr.io/world-fishing-827/<image>:<tag>` since we have project-level `uploadArtifacts` there, and the registry is auto-created on first push). An in-orchestrator builder is a follow-up — blocked on the same IAM coordination that gates the proper Option-C ditbox repo (someone with `roles/artifactregistry.admin` on `world-fishing-827` needs to create a shared AR repo).
+
+**Parallel bindings.** Same commit since both touch `cross_version_ais.py` and were independently desired. Bindings now run via `ThreadPoolExecutor` by default; `--sequential-bindings` opts out. Per-binding stdout is line-prefixed `[<binding>] ` via a reader thread. Failure semantics flipped from "abort siblings on first failure" to "let all complete, skip diff pairs touching a failed binding"; overall exit code non-zero iff any binding failed. `_run_binding` switched from `subprocess.run` to `subprocess.Popen` + a daemon reader thread to support per-subprocess stdout streaming.
+
+Hazards considered: concurrent `git worktree add` against the same source repo (safe — git uses per-worktree lockfiles), `--build-from-source` cache races (each binding has its own worktree → own Dockerfile context), Beam temp-dataset table collisions (Beam EXPORT-staging uses UUID-suffixed table names → safe).
+
+Next: rebuild + push the after-binding pipe-anchorages image to `gcr.io/world-fishing-827/pipe-anchorages-1465-after`, re-run cross_version_ais with the override, see what TIC surfaces with actually-differing worker code.
+
 ### 2026-05-15 — Cloud Build ad-hoc runtime + repo pushed public
 
 Three pieces of Runtime & CI work landed together; tracked individually because they were sized as half a day collectively but had three separate review beats.
