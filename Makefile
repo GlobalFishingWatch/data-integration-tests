@@ -25,7 +25,7 @@ DEPS_FLAG = $(if $(FULLDEPS),,--no-deps)
     install-pipe-gaps-ref install-port-visits-ref install-pipe-events-ref \
     snapshot-pipe-gaps snapshot-port-visits snapshot-pipe-events \
     clean-snapshots \
-    publish-ditbox
+    publish-ditbox dit-cloud
 
 # === Framework only ===
 
@@ -90,3 +90,32 @@ publish-ditbox:
 	    --config=docker/ditbox/cloudbuild.yaml \
 	    --substitutions=_GIT_SHA=$$(git rev-parse --short HEAD) \
 	    .
+
+# === Cloud Build: ad-hoc dit run ===
+#
+# Submits a dit workflow run to Cloud Build using cloudbuild-dit.yaml. The
+# pipeline checkout at $(PROJECTS)/$(PIPELINE) flows through as the build
+# source; dit itself is cloned fresh from GitHub at DIT_REF (default main).
+#
+# Required:
+#   WORKFLOW=workflows/<pipeline>/<name>.py
+#   PIPELINE=pipe-gaps | anchorages_pipeline | pipe-events
+# Optional:
+#   ARGS="..."        # appended verbatim to `dit run <workflow>`
+#   REF=<sha-or-tag>  # pipeline ref to install non-editably; empty = editable from source upload
+#   DIT_REF=<ref>     # dit ref to clone (default main)
+#
+# Example:
+#   make dit-cloud \
+#       PIPELINE=anchorages_pipeline \
+#       WORKFLOW=workflows/port_visits/ais.py \
+#       ARGS="--runner dataflow --parallel --build-from-source"
+
+dit-cloud:
+	@test -n "$(WORKFLOW)" || { echo "WORKFLOW required: WORKFLOW=workflows/..." >&2; exit 1; }
+	@test -n "$(PIPELINE)" || { echo "PIPELINE required: anchorages_pipeline | pipe-gaps | pipe-events" >&2; exit 1; }
+	@test -d "$(PROJECTS)/$(PIPELINE)" || { echo "pipeline dir not found: $(PROJECTS)/$(PIPELINE)" >&2; exit 1; }
+	gcloud builds submit \
+	    --config=cloudbuild-dit.yaml \
+	    --source="$(PROJECTS)/$(PIPELINE)" \
+	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)"

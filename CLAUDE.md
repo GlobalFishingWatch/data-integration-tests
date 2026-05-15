@@ -45,6 +45,20 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — Cloud Build ad-hoc runtime + repo pushed public
+
+Three pieces of Runtime & CI work landed together; tracked individually because they were sized as half a day collectively but had three separate review beats.
+
+**GitHub remote.** Created `https://github.com/GlobalFishingWatch/data-integration-tests` (initially private). After a three-agent pre-publication review (credential scan / infra topology / prose-and-docs sensitivity) returned no blockers and two soft prose suggestions, flipped to public. The soft edits landed in `docs/context.md` (Bug 2 "Not yet fixed" -> "Fix proposed"; dropped the "Production VMS gaps continues to run with..." line) — see `5d21045`.
+
+**`table_identical_checks` flipped public.** Prerequisite for clean `pip install` of `table-identical-checks @ git+https://...` from anywhere. The repo had no credentials in tracked files (`sa.json` was already gitignored); flip was a public-shape consistency move with the rest of the GFW pipeline ecosystem. Added the git URL to dit's `requirements.txt` so a fresh `pip install dit` brings `table-check` transitively (it's a real dep of `dit.compare`, was previously installed manually).
+
+**`ditbox` image + `cloudbuild-dit.yaml` + `make dit-cloud`.** Per `docs/plan.md` § Runtime & CI items 1-3. Architecture revision from the original plan: dit itself is NOT baked into ditbox (the original plan said "dit pre-installed"). Now-public dit on GitHub makes `git clone @ _DIT_REF` per-run trivial and gives iteration on dit changes a faster inner loop (no ditbox rebuild required). Pipeline deps also install per-run via the source upload. Net: ditbox is a stable tooling layer that rarely changes; per-run installs are seconds-scale.
+
+`cloudbuild-dit.yaml` runs as `automated-testing@world-fishing-827.iam.gserviceaccount.com` (matches the SA Dataflow already uses; avoids an impersonation hop). 24h timeout; `E2_HIGHCPU_8` machineType for the orchestrator (the actual compute is Dataflow worker-hours; the build VM just orchestrates). `options.logging: CLOUD_LOGGING_ONLY` to avoid the SA needing storage perms for the legacy GCS log bucket.
+
+**Pending (Item 4 of validation, ahead of any cross-version PR-trigger work):** running `make publish-ditbox` for the first time, smoke-testing `make dit-cloud ARGS="--help"`, then a real AIS-staging single-binding run. Likely needs an IAM grant: the build-submitter principal needs `roles/iam.serviceAccountUser` on `automated-testing@`; the SA itself needs `roles/logging.logWriter`. Both surface naturally when the first build is submitted; documented in `docs/plan.md` § Next steps.
+
 ### 2026-05-15 — Synthetic branches for the PIPELINE-1465 cross-version test
 
 To resolve the precondition flagged in the cross-version-glue entry below (every binding must support `--temp_dataset`), created two branches in `/mnt/encrypted_data/git/anchorages_pipeline`:

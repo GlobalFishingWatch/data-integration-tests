@@ -1,0 +1,34 @@
+# Excluded from `gcloud builds submit --source=.` uploads.
+#
+# NOTE: This file applies when the dit repo itself is the build source
+# (e.g. `make publish-ditbox`). When a pipeline checkout is the source
+# (`make dit-cloud`), gcloud falls back to the pipeline repo's own
+# .gcloudignore / .gitignore. Keep this list aligned with the pipeline
+# checkouts' equivalents.
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+
+venv/
+.venv/
+env/
+
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+.vscode/
+.idea/
+.DS_Store
+
+.envrc
+.env
+.env.local
+sa.json
+*.key

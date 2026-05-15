@@ -321,9 +321,9 @@ This lets dit ship and be useful with zero pipeline-repo changes (the ad-hoc pat
 
 **What needs to land** (rough estimate: half a day of plumbing for the ad-hoc path; per-pipeline triggers added afterward as opt-in):
 
-1. **`ditbox` container image** in `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox:<tag>` — Python + gcloud CLI + docker CLI + `dit` pre-installed. Pre-publishes the workflows too so Cloud Build steps don't need to clone `data_integration_tests`.
-2. **`cloudbuild-dit.yaml`** in `data_integration_tests` — parameterised single yaml driven by substitutions; serves cross-version, single-run, and PR-check use cases. **This is the canonical source of truth for the dit build steps.**
-3. **`make dit-cloud-…`** target — wraps `gcloud builds submit --source=$(PIPELINE_DIR)` so the pipeline working tree (including uncommitted changes via `git stash create` + temp tag) flows through as the Cloud Build context. Solves the "python editable emulation" need for on-demand runs.
+1. ✅ **`ditbox` container image** at `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox:<tag>` — Python 3.11 + git + gcloud (incl. `bq`) + docker CLI + `dit`'s runtime deps pre-cached. Built via `docker/ditbox/Dockerfile` + `docker/ditbox/cloudbuild.yaml`; published via `make publish-ditbox`. **Landed 2026-05-15.** Deliberately does NOT bake in dit itself or pipeline deps — both install per-run from the cloudbuild yaml so iteration on either stays fast (revised from the original plan after discussion).
+2. ✅ **`cloudbuild-dit.yaml`** in `data_integration_tests` — parameterised single yaml driven by substitutions (`_WORKFLOW`, `_PIPELINE`, `_ARGS`, `_REF`, `_DIT_REF`); 24h timeout; runs as `automated-testing@`. **Landed 2026-05-15.** Now that dit is public on GitHub, the step `git clone`s dit fresh per run — no source-bundling needed.
+3. ✅ **`make dit-cloud`** target — wraps `gcloud builds submit --source=$(PROJECTS)/$(PIPELINE) --config=cloudbuild-dit.yaml`. The pipeline checkout flows through as the build source (including any uncommitted tracked changes via gcloud's source-upload). **Landed 2026-05-15.** Plus `.gcloudignore` to exclude venvs / pyc / sa.json / .envrc from uploads.
 4. **`scripts/sync-cloud-build-triggers.sh`** — propagates the canonical yaml content into each registered pipeline repo's trigger config when the yaml changes. Optional in the first cut (ad-hoc path doesn't need it).
 5. **Per-pipeline trigger** — added in each pipeline repo's existing Terraform / Cloud Build config (e.g. `anchorages_pipeline/cloudbuild/main.tf`). One trigger per pipeline; references the synced yaml; fires on PR events. Pipeline-team-owned; opt-in.
 6. **Result reporting.** Cloud Build URL on submit; Slack/email on completion; PR comment with diff summary in PR-mode (later).
@@ -363,8 +363,8 @@ This lets dit ship and be useful with zero pipeline-repo changes (the ad-hoc pat
 
 In rough priority order:
 
-1. **Validate the cross-version capability end-to-end.** PIPELINE-1465 cross-version test currently in flight (`before=tests/temp_dataset_for_integration_tests`, `after=tests/pipeline_1465_for_integration_tests`). Result determines confidence in the broader cross-version framing.
-2. **Move runtime to Cloud Build** per § Runtime & CI. Unblocks 12-hour runs from the laptop; sets up the PR-CI surface.
+1. **Validate the Cloud Build ad-hoc path end-to-end.** `make publish-ditbox` → smoke `make dit-cloud ARGS="--help"` → real AIS-staging single-binding run on Cloud Build → `cross_version_ais.py --dry-run` on Cloud Build → real cross-version run. Likely uncovers a couple of small fixups (docker socket access in the custom step, IAM grants on `automated-testing@`).
+2. **Validate the cross-version capability end-to-end.** PIPELINE-1465 cross-version test currently in flight (`before=tests/temp_dataset_for_integration_tests`, `after=tests/pipeline_1465_for_integration_tests`). Result determines confidence in the broader cross-version framing.
 3. **Track 5 cutover** — replace pipe-gaps' `tests/integration/mode_equivalence.py` with a 10-line shim. Blocked on real-BQ verification of Phase 1; can be done opportunistically once you've run the pipe-gaps four-mode test once.
 4. **Pipe-gaps cross-version parity** — apply the same labels + structured job-names + cross-version wrapper pattern to `workflows/pipe_gaps/mode_equivalence.py`. Mostly mechanical; half a day of work.
 5. **VMS port-visits workflow** — `workflows/port_visits/vms.py`. Near-copy of `ais.py` with VMS-shape source datasets and VMS-specific param overrides from `composer-dags-production/dags/core/vms/`.

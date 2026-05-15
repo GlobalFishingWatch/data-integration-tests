@@ -1,0 +1,67 @@
+# Cloud Build config for ad-hoc and PR-triggered runs of dit workflows.
+#
+# This is the canonical "how to run dit" yaml. Per the architecture decision
+# in docs/plan.md § Runtime & CI, pipeline repos own their own triggers
+# (which reference this yaml's content), while dit owns the yaml itself.
+#
+# Ad-hoc usage from a laptop:
+#   make dit-cloud \
+#       PIPELINE=anchorages_pipeline \
+#       WORKFLOW=workflows/port_visits/ais.py \
+#       ARGS="--runner dataflow --parallel --build-from-source"
+#
+# Or directly:
+#   gcloud builds submit \
+#       --config=cloudbuild-dit.yaml \
+#       --source=$PROJECTS/anchorages_pipeline \
+#       --substitutions=_WORKFLOW=workflows/port_visits/ais.py,_PIPELINE=anchorages_pipeline,_ARGS="..."
+#
+# The build context (--source) is the PIPELINE checkout. dit itself is
+# cloned fresh from GitHub at _DIT_REF (default main).
+
+substitutions:
+  # Required:
+  _WORKFLOW: ''       # workflow path inside the dit checkout, e.g. workflows/port_visits/ais.py
+  _PIPELINE: ''       # pipeline name: pipe-gaps | anchorages_pipeline | pipe-events
+  # Optional:
+  _ARGS: ''           # args appended to `dit run <workflow>`
+  _REF: ''            # pipeline ref to install; empty -> editable install from the source upload
+  _DIT_REF: main      # dit ref to clone
+
+steps:
+  - id: dit-run
+    name: us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox:latest
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+
+        echo ">>> Cloning dit @ ${_DIT_REF}"
+        git clone --depth=1 --branch="${_DIT_REF}" \
+            https://github.com/GlobalFishingWatch/data-integration-tests.git \
+            /workspace/.dit
+
+        echo ">>> Installing dit (editable from /workspace/.dit)"
+        pip install --no-deps -e /workspace/.dit
+
+        if [ -n "${_REF}" ]; then
+            echo ">>> Installing ${_PIPELINE} @ ${_REF} (non-editable)"
+            pip install --force-reinstall --no-deps \
+                "git+file:///workspace@${_REF}"
+        else
+            echo ">>> Installing ${_PIPELINE} from /workspace (editable, from source upload)"
+            pip install -e /workspace
+        fi
+
+        echo ">>> Running: dit run ${_WORKFLOW} ${_ARGS}"
+        cd /workspace
+        exec dit run "/workspace/.dit/${_WORKFLOW}" ${_ARGS}
+
+timeout: 86400s
+
+serviceAccount: projects/world-fishing-827/serviceAccounts/automated-testing@world-fishing-827.iam.gserviceaccount.com
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
