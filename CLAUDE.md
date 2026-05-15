@@ -43,6 +43,10 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — Fix `dit.runners.docker` network-teardown defect
+
+Follow-up to the defect flagged in the prior 2026-05-15 entry. `dit.runners.docker.run` (build_from_source path) now wraps the docker invocation in a `try/finally` and calls a new `_teardown_compose_network()` helper that runs `docker network rm <project>_default` after each call. Used `docker network rm` directly rather than `docker compose -p <name> down` so cleanup doesn't depend on a compose file being present in CWD; external volumes (e.g. the `gcp` auth volume) aren't touched. Idempotent — silently no-ops if the network is gone, in use, or never existed. No contract change to `docker.run()`; signature identical.
+
 ### 2026-05-15 — Phase 2 AIS-staging verification: passed; integration findings
 
 First end-to-end run of `workflows/port_visits/ais.py --runner dataflow --parallel --build-from-source` against the staging cohort. Suffix `cb916bf_94dde7`, output in `world-fishing-827.tech_great_expectations.port_visits_..._{1_bf,2_bfd,3_bftruncate}`. All three pairwise comparisons returned `rc=0` on `visit_id` — **port-visits is mode-equivalent across bf / bfd / bftruncate on the 2020 AIS-staging cohort.**

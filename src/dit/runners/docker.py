@@ -6,6 +6,12 @@ invocations under ``--parallel`` do not race on creating the default network.
 (Without uniquification, three parallel ``docker compose run`` calls all try
 to create the same ``<project>_default`` network and the daemon errors with
 "network with name X already exists" for the laggers.)
+
+Each ``build_from_source`` call also tears down its own project network in a
+``finally`` after the container exits -- ``docker compose run --rm`` removes
+containers but leaves the ``<project>_default`` bridge network behind, and the
+default address pool (172.16-172.31, /24 each) exhausts after a few dozen
+unique-named runs.
 """
 
 from __future__ import annotations
@@ -82,5 +88,32 @@ def run(
         proc_env = {**os.environ, **env}
 
     logger.info("docker: %s", " ".join(cmd))
-    result = subprocess.run(cmd, check=False, env=proc_env)
-    return result.returncode
+    try:
+        result = subprocess.run(cmd, check=False, env=proc_env)
+        return result.returncode
+    finally:
+        if build_from_source:
+            _teardown_compose_network(unique_project)
+
+
+def _teardown_compose_network(project_name: str) -> None:
+    """Remove the ``<project>_default`` bridge network left behind by
+    ``docker compose run --rm``. Uses ``docker network rm`` directly (rather
+    than ``docker compose -p <name> down``) so cleanup doesn't depend on a
+    compose file being present in the CWD. External volumes (e.g. the ``gcp``
+    auth volume) are not touched -- they live outside the project namespace.
+
+    Idempotent: silently no-ops if the network is gone, in use, or never
+    existed (e.g., when the run failed before container start).
+    """
+    network = f"{project_name}_default"
+    result = subprocess.run(
+        ["docker", "network", "rm", network],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    logger.debug(
+        "docker network rm %s -> rc=%d %s",
+        network, result.returncode, (result.stderr or "").strip(),
+    )
