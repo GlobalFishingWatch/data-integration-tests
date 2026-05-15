@@ -71,14 +71,24 @@ dit run workflows/port_visits/ais.py --runner dataflow --parallel --build-from-s
 
 Each phase below is a short summary of what's planned and where we are. The canonical detail lives in [`docs/plan.md`](docs/plan.md); this section is the operational dashboard.
 
-| Phase | Scope | Status |
+| Phase / capability | Scope | Status (2026-05-15) |
 |---|---|---|
-| **1 — pipe-gaps port** | Stand up the repo. Lift the four-mode mode-equivalence test from `pipe-gaps/tests/integration/mode_equivalence.py` onto `dit.*` helpers. Drop `--runner=local`. Replace the source file with a shim. | Code complete. **Pending: real-BQ byte-equivalence verification + Track 5 shim swap.** |
-| **2 — port-visits** | Ship AIS-staging, VMS, and AIS-full workflows for `anchorages_pipeline`'s port-visits two-step (`thin_port_messages` → `port_visits`). First real test of the `dit.compare` abstraction on the truncate-shape (`view_suffix=""`, `keys=["visit_id"]`). | **AIS-staging verified 2026-05-15 (3/3 pairwise green).** VMS workflow not started; AIS-full pending VMS. |
+| **1 — pipe-gaps port** | Stand up the repo. Lift the four-mode mode-equivalence test from `pipe-gaps/tests/integration/mode_equivalence.py` onto `dit.*` helpers. Drop `--runner=local`. Replace the source file with a shim. | **Code complete.** Pending: real-BQ verification + Track 5 shim swap. |
+| **2 — port-visits** | Ship AIS-staging, VMS, and AIS-full workflows for `anchorages_pipeline`'s two-step port-visits (`thin_port_messages` → `port_visits`). First real test of the `dit.compare` abstraction on the truncate-shape (`view_suffix=""`, `keys=["visit_id"]`). | **AIS-staging verified 2026-05-15** (3/3 pairwise green). VMS not started; AIS-full not started. |
+| **Cross-version experiments** | BQ snapshot helpers (`dit.bq.snapshot_table`/`snapshot_dataset`), experiment-id linkage (`--experiment-id`/`DIT_EXPERIMENT_ID`), structured Dataflow job names + dynamic labels, and an end-to-end orchestrator (`workflows/port_visits/cross_version_ais.py`) for diffing pipeline outputs across versions against pinned input. | **Landed 2026-05-15.** Validated end-to-end via the PIPELINE-1465 cross-version test. |
+| **Runtime & CI (Cloud Build)** | `ditbox` image + `cloudbuild-dit.yaml` + `make dit-cloud-…` targets. Moves the orchestrator off the laptop; serves both `gcloud builds submit` ad-hoc and GitHub-webhook PR triggers. Tiered triggers (cheap AIS-staging on every PR, heavy AIS-full on label) come on top. | **Designed; implementation pending.** Next-up after PIPELINE-1465 validation. |
 | **3 — pipe-events port** | Port `pipe-events/integration_tests/staging-bf_bfd_bftruncate.sh` (bash, no comparisons) to `workflows/pipe_events/fishing.py`. Add automated comparisons. Then decide whether to extract `Phase`/`Mode`/`Oracle` dataclasses based on three-consumer evidence. | Not started. |
 | **4 — composer-dags param sync** | `dit sync-params --from <composer-dags-checkout>` reads production DAGs and regenerates `params.yaml`. Triggered when a real prod-vs-test param drift bug shows up. | Not started. |
 | **5 — Mutation library** | Promote pipe-gaps' `compute_restricted_ssvids` into `dit.mutations` along with `drop_messages`, `shift_timestamps`, `set_segment_flag`. Cap at ~5 mutations. | Not started; waits for a second consumer. |
 | **6 — Phase sharing** | Hash `(image-tag, phase-config, mutation-set)`; second invocation of an identical phase becomes a `BQ COPY` instead of a re-run. Cuts wall-clock for CI. | Not started; build only when duplicate-run cost matters operationally. |
-| **7 — Golden-table mode** | Per-workflow reference `_1_bf` table keyed by `(image-tag, params-hash, date-range)`; future runs assert byte-equivalence vs. the golden table. Cheap PR-validation regression check. | Not started. |
+| **7 — Golden-table mode** | Per-workflow reference `_1_bf` table keyed by `(image-tag, params-hash, date-range)`; future runs assert byte-equivalence vs. the golden table. Cheap PR-validation regression check. Implementable on top of the cross-version snapshot machinery. | Not started. |
 
-**Cross-version testing** (per-mode pipeline binding, e.g. `pipe-gaps@main` vs `pipe-gaps@pr-NNN` in one workflow) sits on top of the existing install-ref / snapshot machinery; promotable when a real PR-vs-`main` need arises.
+**Operational next steps** (rolling, in priority order):
+
+1. Wait on the PIPELINE-1465 cross-version run to validate the capability end-to-end.
+2. Move the runtime to Cloud Build (see `docs/plan.md` § Runtime & CI).
+3. Track 5 — pipe-gaps repo shim, opportunistically.
+4. Pipe-gaps labels + structured job-name parity in `mode_equivalence.py`.
+5. VMS port-visits workflow, then AIS-full.
+
+The canonical detailed version of this list lives in `docs/plan.md` § Next steps.

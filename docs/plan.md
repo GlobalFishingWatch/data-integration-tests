@@ -13,6 +13,22 @@ User-confirmed decisions:
 - The `--runner=local` Python-import path **is dropped** in the migrated repo. Docker (DirectRunner-in-container) replaces it.
 - Pipeline docker images are **published on a registry**; workflows reference tagged images. Build-from-source is not the Phase 1 default.
 
+## Status at a glance (2026-05-15)
+
+| Phase / capability | Status |
+|---|---|
+| Phase 1 — pipe-gaps port | **Code complete.** Real-BQ verification + Track 5 (pipe-gaps repo shim) pending. |
+| Phase 2 — port-visits | **AIS-staging verified 2026-05-15** (3/3 pairwise green on `visit_id`). VMS not started; AIS-full not started. |
+| Phase 3 — pipe-events port | Not started. |
+| Phase 4 — composer-dags param sync | Not started. |
+| Phase 5 — mutation library | Not started. |
+| Phase 6 — phase sharing / hash-based caching | Not started. |
+| Phase 7 — golden-table regression mode | Not started. |
+| **Cross-version experiments capability** | Landed mid-Phase 2; see § below. Validated end-to-end via the PIPELINE-1465 cross-version test. |
+| **Runtime & CI (Cloud Build)** | Designed; implementation pending. See § below. |
+
+Per-commit history of plan-doc evolution lives in `CLAUDE.md` § Plan changelog. User-facing change log lives in `CHANGELOG.md`. The **Next steps** section near the bottom of this doc is the rolling operational list.
+
 ## Architecture: three-repo split
 
 Integration-test infrastructure is distributed across three repos by ownership. Aligning subagents on this boundary is the single most important alignment step before code lands.
@@ -191,7 +207,9 @@ Lifted from `mode_equivalence._daterange_inclusive`.
 
 A workflow file is a Python module with a `main(argv: Sequence[str] | None = None) -> int` entry point. `dit run <path>` discovers and invokes it; an in-repo workflow can call its own `main()` from a pytest fixture without going through the CLI.
 
-## Phase 1 — Refactor: pipe-gaps moves to the shared repo (target: 1 week)
+## Phase 1 — Refactor: pipe-gaps moves to the shared repo
+
+**Status:** Code complete; Track 5 cutover + real-BQ byte-equivalence verification still pending.
 
 **Scope.** Stand up the new repo. Port `mode_equivalence.py` from `pipe-gaps/tests/integration/` to `data_integration_tests/workflows/pipe_gaps/`. Extract runners (`docker`, `dataflow`), `compare_tables`, and `_daterange_inclusive` into `dit/`. Drop `--runner=local`. Replace pipe-gaps' file with a shim. Verify the four-mode equivalence test produces output identical to a pre-move reference run.
 
@@ -235,7 +253,9 @@ Five tracks. 1–3 are independent and parallelisable; 4 depends on 2+3; 5 depen
 4. **Pipe-gaps workflow port.** `workflows/pipe_gaps/mode_equivalence.py`. Port the four-mode logic (`execute_bf` / `execute_bfd` / `execute_bftruncate` / `execute_mutate_recover`) and the `compute_restricted_ssvids` callsite from the existing 949-line file, calling `dit.runners` and `dit.compare`. Drop `_run_local`. Conforms to the workflow entry-point convention (`def main(argv=None) -> int`).
 5. **Cutover.** Replace `pipe-gaps/tests/integration/mode_equivalence.py` with a 10-line shim that prints "moved to `data_integration_tests`; run `dit run workflows/pipe_gaps/mode_equivalence.py`" and exits 1. Update `pipe-gaps/CLAUDE.md` and any internal docs that reference the old path. Run the verification command above.
 
-## Phase 2 — Port visits (target: ~1 week after Phase 1)
+## Phase 2 — Port visits
+
+**Status:** AIS-staging verified 2026-05-15 (3/3 pairwise green on `visit_id`). VMS workflow not started. AIS-full not started.
 
 **Scope.** Build port-visits workflows for AIS and VMS, exercising the helpers extracted in Phase 1. This is the abstraction-validation step: if `dit.compare`'s `view_suffix=""` path doesn't work, or if `dit.runners.docker` can't accept a different image tag without surprise, Phase 1's design needs adjustment.
 
@@ -262,6 +282,52 @@ Five tracks. 1–3 are independent and parallelisable; 4 depends on 2+3; 5 depen
 
 **Verification.** A teammate clones, follows `README.md`, runs `dit run workflows/port_visits/ais.py --image-tag <published-tag> --start 2024-01-01 --end 2024-02-01`, gets a green result (or surfaces a real bug). Same for VMS workflow. Tables created in `world-fishing-827.tech_great_expectations`.
 
+## Cross-version experiments capability (landed 2026-05-15)
+
+A capability not in the original Phase 1-7 numbering, emerged from the PIPELINE-1465 question: *"validate that a fix changes what we want it to change, and only that."* Sits architecturally between Phase 2 (validates abstractions on one pipeline) and Phases 6-7 (formalizes caching and golden tables).
+
+**What it ships:**
+
+- `dit.bq.snapshot_table` / `snapshot_dataset` — source-data pinning via BQ `CREATE SNAPSHOT TABLE`. Pipeline-agnostic (no source changes needed); persists beyond BQ's 7-day time-travel window; storage is delta-only.
+- `--experiment-id <slug>` / `DIT_EXPERIMENT_ID` flag in workflows. Output-table suffix grows a leftmost slot so N runs cluster under one BQ-prefix-scannable name. Auto-default `solo_<6-hex>` keeps non-experiment runs disjoint.
+- `workflows/port_visits/cross_version_ais.py` — orchestrator. Snapshot source datasets, run `ais.py` per binding inside a git worktree, diff outputs pairwise on `visit_id`. `--dry-run` validates orchestration without Dataflow cost.
+- Structured Dataflow job names (`dit-<repo>-<step>-<exp>-<binding>-<mode>`) and dynamic BQ labels (`dit_repo`, `dit_step`, `dit_experiment_id`, `dit_binding`, `dit_mode`) propagating to both Dataflow jobs and the BQ tables they write.
+
+**Where it goes beyond the original plan:**
+
+- Treats source-data drift as a first-class concern. Phase 7 ("golden-table regression") didn't address how to keep input stable across compared runs; snapshots solve that.
+- Provides the foundation for PR-tier CI (compare against baseline) and reference caching (Phase 7's golden-table becomes implementable on top of this).
+
+**What it explicitly does NOT include yet:**
+
+- **Reference catalog (deferred V2).** Today's cross-version runs both bindings every time. The optimisation that caches main's output as a no-TTL reference and lets PRs run only the candidate side is sketched in the 2026-05-15 Plan changelog and explicitly deferred until the 12-hour-run cost becomes operationally painful.
+- **`--fail-on-diff` mode for PR gating.** Today's wrapper treats diff as information; PR-gating semantics flip this. One-flag addition when needed.
+- **Pipe-gaps parity.** `workflows/pipe_gaps/mode_equivalence.py` doesn't yet use the experiment-id-driven labels or structured job names. A cross-version workflow file for pipe-gaps would mirror `cross_version_ais.py` for the detect-gaps shape.
+- **`--temp_dataset` upstream.** Currently a local patch on `anchorages_pipeline@dit-temp-dataset-support`; the PIPELINE-1465 cross-version test uses synthetic branches that cherry-pick it. Upstream PR pending.
+
+## Runtime & CI (planned)
+
+Today the orchestrator runs on the user's laptop. Babysitting a 12-hour cross-version run is impractical (suspending the laptop kills the run). Design settled on **Cloud Build** for both ad-hoc and PR-triggered runs.
+
+**Why Cloud Build:** GFW already uses it (per `anchorages_pipeline/cloudbuild/`); 24h step timeout covers AIS-full; serverless billing (~$4/day worst case for a 24h run; dominated by Dataflow worker-hours anyway); native docker host; auth via build-step SA; triggerable three ways without code change (`gcloud builds submit` ad-hoc, GitHub webhook for PRs, Cloud Scheduler for nightly).
+
+**What needs to land** (rough estimate: half a day of plumbing):
+
+1. **`ditbox` container image** in `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/ditbox:<tag>` — Python + gcloud CLI + docker CLI + `dit` pre-installed. Pre-publishes the workflows too so Cloud Build steps don't need to clone `data_integration_tests`.
+2. **`cloudbuild-dit.yaml`** in `data_integration_tests` — parameterised single yaml driven by substitutions; serves cross-version, single-run, and PR-check use cases.
+3. **`make dit-cloud-…`** target — wraps `gcloud builds submit --source=$(PIPELINE_DIR)` so the pipeline working tree (including uncommitted changes via `git stash create` + temp tag) flows through as the Cloud Build context. Solves the "python editable emulation" need for on-demand runs.
+4. **Result reporting.** Cloud Build URL on submit; Slack/email on completion; PR comment with diff summary in PR-mode (later).
+
+**Latency budget for on-demand runs:** laptop submit ~15-30 sec; first Dataflow job running 3-5 min from keystroke (cold), 1-2 min (warm).
+
+**Tiered trigger plan** (after Cloud Build is in place):
+
+- Cheap PR tier: AIS-staging cohort on every PR with a `src/**.py` change, paths-filtered. ~30 min wall clock, ~$5.
+- Heavy tier: AIS-full + VMS on `dit:full` label or `/dit run-full` comment. 6-12h.
+- Nightly/scheduled: full-cohort against main; Slack on drift.
+
+**Stretch (Phase 6.5-ish): async orchestration.** Decouple submit-from-wait so the babysitter becomes ephemeral and the runtime question disappears. Substantial refactor; out of scope until Cloud Build runtime is in production and the 24h-job pattern is what's actually hurting.
+
 ## Phase 3 — pipe-events port + framework extraction decision
 
 **Scope.** Port `staging-bf_bfd_bftruncate.sh` to `workflows/pipe_events/fishing.py`. Add the comparisons that the bash never had. Then look at all three consumers and decide whether to extract `Phase`/`Mode`/`Oracle` dataclasses.
@@ -283,14 +349,37 @@ Five tracks. 1–3 are independent and parallelisable; 4 depends on 2+3; 5 depen
 
 **Phase 7 — Golden-table regression mode.** Per-workflow reference `_1_bf` table keyed by `(image-tag, params-hash, date-range)`; future runs assert byte-equivalence vs the golden table. Cheap PR-validation regression check; doesn't replace the four-mode test on `main`.
 
+## Next steps
+
+In rough priority order:
+
+1. **Validate the cross-version capability end-to-end.** PIPELINE-1465 cross-version test currently in flight (`before=tests/temp_dataset_for_integration_tests`, `after=tests/pipeline_1465_for_integration_tests`). Result determines confidence in the broader cross-version framing.
+2. **Move runtime to Cloud Build** per § Runtime & CI. Unblocks 12-hour runs from the laptop; sets up the PR-CI surface.
+3. **Track 5 cutover** — replace pipe-gaps' `tests/integration/mode_equivalence.py` with a 10-line shim. Blocked on real-BQ verification of Phase 1; can be done opportunistically once you've run the pipe-gaps four-mode test once.
+4. **Pipe-gaps cross-version parity** — apply the same labels + structured job-names + cross-version wrapper pattern to `workflows/pipe_gaps/mode_equivalence.py`. Mostly mechanical; half a day of work.
+5. **VMS port-visits workflow** — `workflows/port_visits/vms.py`. Near-copy of `ais.py` with VMS-shape source datasets and VMS-specific param overrides from `composer-dags-production/dags/core/vms/`.
+6. **AIS-full port-visits cohort.** Multi-year data. First real motivation for Cloud Build + reference caching.
+7. **Upstream the `--temp_dataset` pipe-anchorages PR.** Removes the synthetic-branch scaffolding; cross-version bindings collapse to "just use main and the fix branch directly".
+8. **Phase 3 — pipe-events port** + framework-extraction decision based on three-consumer evidence.
+
+Longer-term, no committed timeline:
+
+- Reference catalog (V2 of cross-version) — when full-cohort PR runs become common.
+- PR-tier CI integration — pipeline-repo cloudbuild yaml + webhook trigger.
+- Async orchestration refactor — when 24h Cloud Build jobs become operationally painful.
+- Phases 4, 5, 6, 7 — see original numbering. Each waits for the trigger condition we identified for it.
+
 ## Open items (resolved or accepted as risks)
 
 - ✅ Port-visits scope (Phase 2): AIS + VMS.
 - ✅ Local-Python runner: dropped in Phase 1.
 - ✅ Image-tag convention: published images.
-- ⚠️ **`pipe-gaps` published image availability** (Phase 1 prereq): the existing test does `docker compose build dev` from local source. If `gfw/pipe-gaps:<tag>` isn't reliably published, Phase 1 either (a) makes `--build-from-source` the default for pipe-gaps' workflow specifically or (b) sets up image publishing as a Phase 1 prereq. Recommend (a) for the migration, defer (b) to a Phase 1.5 cleanup.
-- ⚠️ **Port-visits expected-equivalence** (Phase 2 risk): we assume bf/bfd/bftruncate produce identical port-visits tables given the same source data and date range. Untested. If they don't match in the first run, that's itself a bug worth surfacing — but operators should know this isn't pre-proven.
-- ⚠️ **`table-check` distribution**: declare it as a `data-integration-tests` install dependency so `pipx install` works standalone.
+- ✅ **`pipe-gaps` published image availability** (Phase 1 prereq): resolved by making `--build-from-source` the default for pipe-gaps' workflow.
+- ✅ **Port-visits expected-equivalence** (Phase 2 risk): AIS-staging is mode-equivalent on `visit_id` (verified 2026-05-15, 3/3 pairwise green).
+- ⚠️ **`table-check` distribution**: still manual install. Declare as a `data-integration-tests` install dependency when we publish dit.
+- ⚠️ **pipe-anchorages `--temp_dataset` PR**: local-only patch on `dit-temp-dataset-support`. PIPELINE-1465 cross-version test relies on synthetic branches that cherry-pick this; long-term solution is upstream merge.
+- ⚠️ **Runtime is the laptop.** See § Runtime & CI for the Cloud Build plan.
+- ⚠️ **Pipe-gaps labels/job-name parity.** `workflows/pipe_gaps/mode_equivalence.py` doesn't yet have the structured Dataflow job names + `dit_*` labels that `port-visits/ais.py` has. Workflow-level refactor pending (item 4 of Next steps).
 
 ## Critical files referenced
 
