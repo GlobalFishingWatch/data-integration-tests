@@ -62,6 +62,15 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 PROJECT = "world-fishing-827"
+REPO_NAME = "anchorages-pipeline"
+
+# Short step labels for Dataflow job names (which cap at 63 chars). The full
+# step name is used in the dit_step label, which has more room.
+_JOB_STEP_NAMES = {
+    "thin_port_messages": "thin",
+    "port_visits": "visits",
+}
+_MAX_JOB_NAME = 63
 
 # Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
 DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
@@ -169,7 +178,52 @@ def _resolve_suffix(args: argparse.Namespace, repo_dir: str) -> str:
 # Beam pipeline-options assembly
 # --------------------------------------------------------------------------
 
-def _dataflow_pipeline_options(args: argparse.Namespace) -> list[str]:
+def _to_safe_for_job_name(s: str) -> str:
+    """Dataflow job names: lowercase letters, digits, hyphens only."""
+    return s.lower().replace("_", "-").replace(".", "-")
+
+
+def _make_job_name(args: argparse.Namespace, *, step: str, mode: str) -> str:
+    """Build the Dataflow job name as dit-<repo>-<step>-<exp>-<binding>-<mode>.
+
+    Truncates the experiment-id from the right when the composed name would
+    exceed Dataflow's 63-character limit; binding and mode are preserved
+    because they're load-bearing for at-a-glance triage of concurrent jobs.
+    """
+    repo = _to_safe_for_job_name(REPO_NAME)
+    short_step = _to_safe_for_job_name(_JOB_STEP_NAMES.get(step, step))
+    exp = _to_safe_for_job_name(args.experiment_id)
+    binding = _to_safe_for_job_name(args.binding_name) if args.binding_name else ""
+    safe_mode = _to_safe_for_job_name(mode)
+
+    tail = [binding, safe_mode] if binding else [safe_mode]
+    fixed = ["dit", repo, short_step]
+    candidate = "-".join(fixed + [exp] + tail)
+    if len(candidate) <= _MAX_JOB_NAME:
+        return candidate
+
+    fixed_and_tail_len = len("-".join(fixed + [""] + tail))
+    available = _MAX_JOB_NAME - fixed_and_tail_len
+    if available < 4:
+        return candidate[:_MAX_JOB_NAME]
+    return "-".join(fixed + [exp[:available]] + tail)
+
+
+def _dynamic_labels(args: argparse.Namespace, *, step: str, mode: str) -> list[str]:
+    """Per-invocation labels. Propagated by Beam to the Dataflow job and (via
+    pipe-anchorages' BigQueryHelper) to every BQ table written in this run."""
+    labels = [
+        f"--labels=dit_repo={REPO_NAME}",
+        f"--labels=dit_step={step}",
+        f"--labels=dit_experiment_id={args.experiment_id}",
+        f"--labels=dit_mode={mode}",
+    ]
+    if args.binding_name:
+        labels.append(f"--labels=dit_binding={args.binding_name}")
+    return labels
+
+
+def _dataflow_pipeline_options(args: argparse.Namespace, *, step: str, mode: str) -> list[str]:
     return [
         "--runner=DataflowRunner",
         f"--project={PROJECT}",
@@ -179,6 +233,7 @@ def _dataflow_pipeline_options(args: argparse.Namespace) -> list[str]:
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
         f"--sdk_container_image={args.worker_image}",
+        f"--job_name={_make_job_name(args, step=step, mode=mode)}",
         "--wait_for_job",
         # pipe-anchorages requires --labels to be non-None
         # (cloud_to_labels in transforms/sink.py iterates without a None guard).
@@ -188,6 +243,7 @@ def _dataflow_pipeline_options(args: argparse.Namespace) -> list[str]:
         "--labels=project=core_pipeline",
         "--labels=workflow=port_visits_ais",
         "--labels=stage=testing",
+        *_dynamic_labels(args, step=step, mode=mode),
     ]
 
 
@@ -195,9 +251,9 @@ def _directrunner_pipeline_options() -> list[str]:
     return ["--runner=DirectRunner", "--wait_for_job"]
 
 
-def _pipeline_options(args: argparse.Namespace) -> list[str]:
+def _pipeline_options(args: argparse.Namespace, *, step: str, mode: str) -> list[str]:
     return (
-        _dataflow_pipeline_options(args) if args.runner == "dataflow"
+        _dataflow_pipeline_options(args, step=step, mode=mode) if args.runner == "dataflow"
         else _directrunner_pipeline_options()
     )
 
@@ -264,7 +320,7 @@ def _run_slice(
         f"--input_table={_messages_table(args)}",
         f"--output_table={_thinned_table(args, suffix, mode)}",
         f"--temp_dataset={args.bq_temp_dataset}",
-        *_pipeline_options(args),
+        *_pipeline_options(args, step="thin_port_messages", mode=mode),
     ]
     logger.info("thin_port_messages %s [%s, %s]", mode, slice_start, slice_end)
     rc = dit_docker.run(
@@ -286,7 +342,7 @@ def _run_slice(
         f"--output_table={_visits_table(args, suffix, mode)}",
         f"--bad_segs={_bad_segs_sql(args)}",
         f"--temp_dataset={args.bq_temp_dataset}",
-        *_pipeline_options(args),
+        *_pipeline_options(args, step="port_visits", mode=mode),
     ]
     logger.info("port_visits %s [%s, %s]", mode, args.start, slice_end)
     rc = dit_docker.run(
@@ -404,6 +460,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
              "Auto-default solo_<6-hex> when unset. Regex ^[a-z0-9][a-z0-9_-]{0,31}$. "
              "Bypassed entirely when --suffix is set.",
     )
+    p.add_argument("--binding-name", default="",
+                   help="Optional binding label (e.g. 'before', 'after') used by the "
+                        "cross-version wrapper. Surfaces in Dataflow job names and BQ labels "
+                        "(dit_binding=<name>). Empty when running standalone.")
     p.add_argument("--allow-dirty-tree", action="store_true",
                    help="Permit auto-suffix on a dirty working tree.")
     p.add_argument("--skip-pipelines", action="store_true",

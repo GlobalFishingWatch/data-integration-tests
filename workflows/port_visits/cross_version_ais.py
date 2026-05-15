@@ -194,10 +194,19 @@ def _snapshot_source(args: argparse.Namespace) -> str:
 # Per-binding run via git worktree
 # --------------------------------------------------------------------------
 
-def _ais_args_for_binding(extra_args: list[str], *, snap_stem: str, suffix: str) -> list[str]:
-    """Strip user-supplied --source-dataset-stem / --suffix / --experiment-id
-    so the wrapper's overrides win."""
-    drop_kvs = {"--source-dataset-stem", "--suffix", "--experiment-id"}
+def _ais_args_for_binding(
+    extra_args: list[str],
+    *,
+    snap_stem: str,
+    suffix: str,
+    experiment_id: str,
+    binding_name: str,
+) -> list[str]:
+    """Strip user-supplied overrides for fields the wrapper owns, then
+    re-inject the wrapper's values. ``--suffix`` controls table names;
+    ``--experiment-id`` + ``--binding-name`` flow into Dataflow job names
+    and BQ labels."""
+    drop_kvs = {"--source-dataset-stem", "--suffix", "--experiment-id", "--binding-name"}
     out: list[str] = []
     skip_next = False
     for arg in extra_args:
@@ -213,6 +222,8 @@ def _ais_args_for_binding(extra_args: list[str], *, snap_stem: str, suffix: str)
     out.extend([
         "--source-dataset-stem", snap_stem,
         "--suffix", suffix,
+        "--experiment-id", experiment_id,
+        "--binding-name", binding_name,
         "--allow-dirty-tree",  # worktree's git status is clean but ais.py's _git_info still triggers; harmless
     ])
     return out
@@ -222,6 +233,7 @@ def _run_binding(
     *,
     name: str,
     ref: str,
+    experiment_id: str,
     snap_stem: str,
     suffix: str,
     pipeline_dir: str,
@@ -236,7 +248,11 @@ def _run_binding(
         )
         logger.info("binding %s: worktree at %s @ %s", name, worktree_dir, ref)
 
-        argv = _ais_args_for_binding(ais_extra_args, snap_stem=snap_stem, suffix=suffix)
+        argv = _ais_args_for_binding(
+            ais_extra_args,
+            snap_stem=snap_stem, suffix=suffix,
+            experiment_id=experiment_id, binding_name=name,
+        )
         cmd = [sys.executable, str(AIS_WORKFLOW), *argv]
         logger.info("binding %s: invoking %s", name, " ".join(shlex.quote(c) for c in cmd))
 
@@ -331,6 +347,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for name, ref in args.bindings:
         rc = _run_binding(
             name=name, ref=ref,
+            experiment_id=args.experiment_id,
             snap_stem=snap_stem,
             suffix=suffix_by_binding[name],
             pipeline_dir=args.pipeline_dir,
