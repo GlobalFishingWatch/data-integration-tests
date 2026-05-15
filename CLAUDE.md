@@ -43,6 +43,22 @@ Notes:
 
 Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-15 — Cross-version experiment glue (port-visits AIS)
+
+`workflows/port_visits/cross_version_ais.py` ties together the BQ snapshot helpers (`42ef37f`) and experiment-ID linkage (`244521d`) into an end-to-end command. Given `--experiment-id`, `--pin-source-at <iso>`, and N `--binding name=ref` pairs, it:
+
+1. Verifies refs exist in `$PROJECTS/anchorages_pipeline`.
+2. Creates `dit_exp_<sanitized_exp_id>_{internal,published}` snapshot datasets (7-day default expiration).
+3. Snapshots the three port-visits input tables (`messages_positions`, `segment_info`, `segs_activity`) at the pin timestamp into those datasets.
+4. For each binding: `git worktree add` at the ref, runs `ais.py` from the worktree with `--source-dataset-stem=<snap>` and `--suffix=<exp>-<binding-name>` (deterministic so the diff step doesn't need INFORMATION_SCHEMA discovery), tears down the worktree.
+5. For each mode in `--modes`, diffs the corresponding output tables pairwise across bindings on `visit_id`.
+
+Diff outcomes are reported but do not fail the run — non-empty diff is *information* for cross-version testing, not error. Real failures (missing ref, snapshot error, ais.py exits non-zero) exit non-zero.
+
+`--dry-run` runs every step except the ais.py invocations and the diff phase — useful for validating orchestration without Dataflow cost. Validated end-to-end this way against (`v4.6.4`, `fix/PIPELINE-1465_port_visit_start_location`) on 2026-05-15.
+
+**Precondition for actually using this on real bindings.** Every binding's pipe-anchorages source must support the `--temp_dataset` CLI flag — without it, the Dataflow SA hits the BQ EXPORT-staging permission error (see the 2026-05-15 Phase 2 entry below). The flag lives on the local `dit-temp-dataset-support` branch; PR pending. For the immediate PIPELINE-1465 cross-version test we want to motivate, the cleanest path is to cherry-pick the `--temp_dataset` patch onto both comparison refs (or land it upstream first) before invoking `cross_version_ais.py`.
+
 ### 2026-05-15 — `--experiment-id` / `DIT_EXPERIMENT_ID` for cross-version run linkage
 
 - Output-table suffix shape grows a leftmost slot: `<experiment_id>_<commit>[_dirty]_<uuid>`. Leftmost so BQ prefix scans cluster by experiment naturally. `<uuid>` slot preserved so parallel mode-equivalence runs sharing a commit still don't clobber each other. `--suffix` (full manual override) bypasses the experiment-id slot entirely — byte-equivalent backward-compat guarantee.

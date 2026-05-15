@@ -16,6 +16,7 @@ The framework is intentionally thin — a small library plus per-pipeline workfl
 - **Three install modes** per pipeline: editable (fast inner loop), specific-ref (`REF=<sha-or-branch>`), and snapshot (`git stash create` → anchored on a `dit-snapshot-<epoch>` branch). See Usage § Install modes below.
 - **Per-user infra knobs via `DIT_*` env vars**: `DIT_DEST_DATASET`, `DIT_DATAFLOW_SA`, `DIT_DATAFLOW_REGION`, `DIT_DATAFLOW_TEMP_BUCKET`, `DIT_DATAFLOW_SUBNETWORK`, `DIT_BQ_TEMP_DATASET`. Plays cleanly with direnv via `.envrc.example`.
 - **Pipeline integration contract** ([`docs/pipeline-contract.md`](docs/pipeline-contract.md)) — what a pipeline must expose to be cleanly testable by `dit`, with an adoption matrix tracking where each current pipeline stands.
+- **Cross-version experiments** (`workflows/port_visits/cross_version_ais.py`) — pin source data via BQ snapshots at a fixed timestamp, run a workflow at N pipeline-version bindings (git refs in the pipeline checkout), then diff corresponding output tables pairwise. Foundation for PR-validation comparisons (`pipe-anchorages@main` vs `@pr-NNN`).
 
 Pipeline-shape primitives (`Phase`/`Mode`/`Mutation`/`Oracle` dataclasses, mutation library, phase-sharing via BQ COPY, golden-table regression mode) are **deliberately not extracted yet** — see Roadmap below for why and when.
 
