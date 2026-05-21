@@ -229,7 +229,7 @@ def _build_pipeline_for(cfg: SimpleNamespace):
         start, end = cfg.date_range
         parsed.setdefault(
             "job_name",
-            f"three-way-eq-{output_basename}-{start}-{end}".replace("_", "-"),
+            f"dit-pipe-gaps-{output_basename}-{start}-{end}".replace("_", "-"),
         )
 
         runner_only_attrs = {
