@@ -48,6 +48,12 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
         docker-compose-plugin \
  && rm -rf /var/lib/apt/lists/*
 
+# uv is used by cloudbuild-dit.yaml for the per-run pipeline install. It
+# resolves and installs much faster than pip (~10x on cold cache), which is
+# the bottleneck for short Cloud Build runs. Pinned to the system Python via
+# the `--system` flag when invoked.
+RUN pip install --no-cache-dir uv
+
 COPY requirements.txt /tmp/dit-requirements.txt
 RUN pip install -r /tmp/dit-requirements.txt \
  && rm /tmp/dit-requirements.txt

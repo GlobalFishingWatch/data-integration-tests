@@ -44,16 +44,19 @@ steps:
             https://github.com/GlobalFishingWatch/data-integration-tests.git \
             /workspace/.dit
 
+        # uv is baked into ditbox (~10x faster than pip for the per-run
+        # pipeline install where transitive deps dominate). --system installs
+        # into ditbox's system Python rather than requiring a venv.
         echo ">>> Installing dit (editable from /workspace/.dit)"
-        pip install --no-deps -e /workspace/.dit
+        uv pip install --system --no-deps -e /workspace/.dit
 
         if [ -n "${_REF}" ]; then
             echo ">>> Installing ${_PIPELINE} @ ${_REF} (non-editable)"
-            pip install --force-reinstall --no-deps \
+            uv pip install --system --reinstall --no-deps \
                 "git+file:///workspace@${_REF}"
         else
             echo ">>> Installing ${_PIPELINE} from /workspace (editable, from source upload)"
-            pip install -e /workspace
+            uv pip install --system -e /workspace
         fi
 
         echo ">>> Running: dit run ${_WORKFLOW} ${_ARGS}"
