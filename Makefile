@@ -104,12 +104,25 @@ publish-ditbox:
 #   ARGS="..."        # appended verbatim to `dit run <workflow>`
 #   REF=<sha-or-tag>  # pipeline ref to install non-editably; empty = editable from source upload
 #   DIT_REF=<ref>     # dit ref to clone (default main)
+#   BEAM_VERSION=<x.y.z>  # pin apache-beam to match the worker image's beam version
+#                          # (pipe-gaps:v0.9.6 = 2.71.0; pipe-anchorages:v4.6.4 = 2.69.0).
+#                          # Auto-defaulted below by PIPELINE when unset.
 #
 # Example:
 #   make dit-cloud \
 #       PIPELINE=anchorages_pipeline \
 #       WORKFLOW=workflows/port_visits/ais.py \
 #       ARGS="--runner dataflow --parallel --build-from-source"
+
+# Per-pipeline default for BEAM_VERSION. Override by passing BEAM_VERSION=x.y.z.
+# Empty -> no constraint (uv picks newest; expect SDK-version mismatch errors
+# unless the workflow runs locally via --runner docker).
+ifeq ($(PIPELINE),pipe-gaps)
+  BEAM_VERSION ?= 2.71.0
+endif
+ifeq ($(PIPELINE),anchorages_pipeline)
+  BEAM_VERSION ?= 2.69.0
+endif
 
 dit-cloud:
 	@test -n "$(WORKFLOW)" || { echo "WORKFLOW required: WORKFLOW=workflows/..." >&2; exit 1; }
@@ -118,5 +131,5 @@ dit-cloud:
 	gcloud builds submit \
 	    --config=cloudbuild-dit.yaml \
 	    --ignore-file=$(CURDIR)/.gcloudignore \
-	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)" \
+	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)@@_BEAM_VERSION=$(BEAM_VERSION)" \
 	    "$(PROJECTS)/$(PIPELINE)"
