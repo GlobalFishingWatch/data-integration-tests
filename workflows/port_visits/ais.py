@@ -183,20 +183,59 @@ def _to_safe_for_job_name(s: str) -> str:
     return s.lower().replace("_", "-").replace(".", "-")
 
 
-def _make_job_name(args: argparse.Namespace, *, step: str, mode: str) -> str:
-    """Build the Dataflow job name as dit-<repo>-<step>-<exp>-<binding>-<mode>.
+_DIGEST_RE = re.compile(r"@sha\d{3}:[0-9a-f]+$", re.IGNORECASE)
+_UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
+
+
+def _worker_image_tag(image: str) -> str:
+    """Extract the tag portion of a docker image ref.
+
+    Handles both shapes:
+      foo/bar:tag                      -> "tag"
+      foo/bar:tag@sha256:abc...        -> "tag"  (digest stripped first)
+      foo/bar@sha256:abc...            -> "latest"  (digest-only, no tag)
+      foo/bar                          -> "latest"  (no tag, no digest)
+    """
+    # Strip any trailing @<digest> before extracting the tag, otherwise the
+    # final ':' in the digest gets mistaken for a tag separator.
+    image = _DIGEST_RE.sub("", image)
+    return image.rsplit(":", 1)[-1] if ":" in image else "latest"
+
+
+def _safe_label_value(value: str) -> str:
+    """Coerce arbitrary strings into BQ-label-safe form.
+
+    BQ label values are restricted to ASCII ``[a-z0-9_-]`` (max 63 chars).
+    Non-ASCII letters that ``str.isalnum()`` accepts are NOT allowed by BQ,
+    so we use an explicit ASCII-only character-class via regex.
+    """
+    return _UNSAFE_LABEL_CHAR_RE.sub("-", value.lower())[:63]
+
+
+def _make_job_name(
+    args: argparse.Namespace,
+    *,
+    step: str,
+    mode: str,
+    iteration: int,
+    total_iterations: int,
+) -> str:
+    """Build the Dataflow job name as dit-<repo>-<step>-<exp>-<binding>-<mode>-<N>-<M>.
 
     Truncates the experiment-id from the right when the composed name would
-    exceed Dataflow's 63-character limit; binding and mode are preserved
-    because they're load-bearing for at-a-glance triage of concurrent jobs.
+    exceed Dataflow's 63-character limit; binding, mode, and iteration counter
+    are preserved because they're load-bearing for at-a-glance triage of
+    concurrent jobs (and the counter is what disambiguates the N daily
+    iterations within an incremental mode).
     """
     repo = _to_safe_for_job_name(REPO_NAME)
     short_step = _to_safe_for_job_name(_JOB_STEP_NAMES.get(step, step))
     exp = _to_safe_for_job_name(args.experiment_id)
     binding = _to_safe_for_job_name(args.binding_name) if args.binding_name else ""
     safe_mode = _to_safe_for_job_name(mode)
+    iter_suffix = f"{iteration}-{total_iterations}"
 
-    tail = [binding, safe_mode] if binding else [safe_mode]
+    tail = [binding, safe_mode, iter_suffix] if binding else [safe_mode, iter_suffix]
     fixed = ["dit", repo, short_step]
     candidate = "-".join(fixed + [exp] + tail)
     if len(candidate) <= _MAX_JOB_NAME:
@@ -209,21 +248,57 @@ def _make_job_name(args: argparse.Namespace, *, step: str, mode: str) -> str:
     return "-".join(fixed + [exp[:available]] + tail)
 
 
-def _dynamic_labels(args: argparse.Namespace, *, step: str, mode: str) -> list[str]:
+def _dynamic_labels(
+    args: argparse.Namespace,
+    *,
+    step: str,
+    mode: str,
+    iteration: int,
+    total_iterations: int,
+    slice_start: date,
+    slice_end: date,
+) -> list[str]:
     """Per-invocation labels. Propagated by Beam to the Dataflow job and (via
-    pipe-anchorages' BigQueryHelper) to every BQ table written in this run."""
+    pipe-anchorages' BigQueryHelper) to every BQ table written in this run.
+
+    Mix of per-run statics (set once in main(): run_id, commit_sha, worker
+    image tag, launched_by) and per-iteration values (slice dates, iteration
+    counter).
+
+    Free-form-text values (experiment_id, commit_sha, worker_image_tag,
+    launched_by, binding_name) pass through ``_safe_label_value()`` to enforce
+    BQ's ``[a-z0-9_-]{1,63}`` constraint. Values that are statically guaranteed
+    label-safe (``REPO_NAME``, ``step``, ``mode``, integer counters,
+    ISO-date strings, hex ``run_id``) skip the sanitiser for clarity."""
     labels = [
         f"--labels=dit_repo={REPO_NAME}",
         f"--labels=dit_step={step}",
-        f"--labels=dit_experiment_id={args.experiment_id}",
+        f"--labels=dit_experiment_id={_safe_label_value(args.experiment_id)}",
         f"--labels=dit_mode={mode}",
+        f"--labels=dit_iteration={iteration}",
+        f"--labels=dit_total_iterations={total_iterations}",
+        f"--labels=dit_slice_start={slice_start.isoformat()}",
+        f"--labels=dit_slice_end={slice_end.isoformat()}",
+        f"--labels=dit_run_id={args.run_id}",
+        f"--labels=dit_commit_sha={_safe_label_value(args.commit_sha)}",
+        f"--labels=dit_worker_image_tag={_safe_label_value(args.worker_image_tag)}",
+        f"--labels=dit_launched_by={_safe_label_value(args.launched_by)}",
     ]
     if args.binding_name:
-        labels.append(f"--labels=dit_binding={args.binding_name}")
+        labels.append(f"--labels=dit_binding={_safe_label_value(args.binding_name)}")
     return labels
 
 
-def _dataflow_pipeline_options(args: argparse.Namespace, *, step: str, mode: str) -> list[str]:
+def _dataflow_pipeline_options(
+    args: argparse.Namespace,
+    *,
+    step: str,
+    mode: str,
+    iteration: int,
+    total_iterations: int,
+    slice_start: date,
+    slice_end: date,
+) -> list[str]:
     return [
         "--runner=DataflowRunner",
         f"--project={PROJECT}",
@@ -233,7 +308,7 @@ def _dataflow_pipeline_options(args: argparse.Namespace, *, step: str, mode: str
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
         f"--sdk_container_image={args.worker_image}",
-        f"--job_name={_make_job_name(args, step=step, mode=mode)}",
+        f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
         "--wait_for_job",
         # pipe-anchorages requires --labels to be non-None
         # (cloud_to_labels in transforms/sink.py iterates without a None guard).
@@ -243,7 +318,11 @@ def _dataflow_pipeline_options(args: argparse.Namespace, *, step: str, mode: str
         "--labels=project=core_pipeline",
         "--labels=workflow=port_visits_ais",
         "--labels=stage=testing",
-        *_dynamic_labels(args, step=step, mode=mode),
+        *_dynamic_labels(
+            args, step=step, mode=mode,
+            iteration=iteration, total_iterations=total_iterations,
+            slice_start=slice_start, slice_end=slice_end,
+        ),
     ]
 
 
@@ -251,9 +330,22 @@ def _directrunner_pipeline_options() -> list[str]:
     return ["--runner=DirectRunner", "--wait_for_job"]
 
 
-def _pipeline_options(args: argparse.Namespace, *, step: str, mode: str) -> list[str]:
+def _pipeline_options(
+    args: argparse.Namespace,
+    *,
+    step: str,
+    mode: str,
+    iteration: int,
+    total_iterations: int,
+    slice_start: date,
+    slice_end: date,
+) -> list[str]:
     return (
-        _dataflow_pipeline_options(args, step=step, mode=mode) if args.runner == "dataflow"
+        _dataflow_pipeline_options(
+            args, step=step, mode=mode,
+            iteration=iteration, total_iterations=total_iterations,
+            slice_start=slice_start, slice_end=slice_end,
+        ) if args.runner == "dataflow"
         else _directrunner_pipeline_options()
     )
 
@@ -305,12 +397,18 @@ def _run_slice(
     slice_start: date,
     slice_end: date,
     suffix: str,
+    iteration: int,
+    total_iterations: int,
 ) -> None:
     """One slice = one thin_port_messages call + one port_visits call.
 
     port_visits' --start_date is the workflow's --start (pipeline-level
     data_available_from); it does a full recompute over [start, slice_end]
     on every call, matching production semantics.
+
+    ``iteration`` is 1-indexed within the mode; ``total_iterations`` is the
+    number of slices the mode will run. Both flow into the Dataflow job name
+    (as ``-N-M`` suffix) and BQ labels for per-iteration provenance.
     """
     thin_args = [
         "thin_port_messages",
@@ -320,9 +418,14 @@ def _run_slice(
         f"--input_table={_messages_table(args)}",
         f"--output_table={_thinned_table(args, suffix, mode)}",
         f"--temp_dataset={args.bq_temp_dataset}",
-        *_pipeline_options(args, step="thin_port_messages", mode=mode),
+        *_pipeline_options(
+            args, step="thin_port_messages", mode=mode,
+            iteration=iteration, total_iterations=total_iterations,
+            slice_start=slice_start, slice_end=slice_end,
+        ),
     ]
-    logger.info("thin_port_messages %s [%s, %s]", mode, slice_start, slice_end)
+    logger.info("thin_port_messages %s [%s, %s] iter=%d/%d",
+                mode, slice_start, slice_end, iteration, total_iterations)
     rc = dit_docker.run(
         args.image_tag, thin_args,
         entrypoint="pipe-anchorages",
@@ -342,9 +445,14 @@ def _run_slice(
         f"--output_table={_visits_table(args, suffix, mode)}",
         f"--bad_segs={_bad_segs_sql(args)}",
         f"--temp_dataset={args.bq_temp_dataset}",
-        *_pipeline_options(args, step="port_visits", mode=mode),
+        *_pipeline_options(
+            args, step="port_visits", mode=mode,
+            iteration=iteration, total_iterations=total_iterations,
+            slice_start=_parse_date(args.start), slice_end=slice_end,
+        ),
     ]
-    logger.info("port_visits %s [%s, %s]", mode, args.start, slice_end)
+    logger.info("port_visits %s [%s, %s] iter=%d/%d",
+                mode, args.start, slice_end, iteration, total_iterations)
     rc = dit_docker.run(
         args.image_tag, visits_args,
         entrypoint="pipe-anchorages",
@@ -367,30 +475,39 @@ def _parse_date(s: str) -> date:
 def execute_bf(args: argparse.Namespace, suffix: str) -> None:
     start = _parse_date(args.start)
     end = _parse_date(args.end)
-    _run_slice(args, mode="1_bf", slice_start=start, slice_end=end, suffix=suffix)
+    _run_slice(args, mode="1_bf", slice_start=start, slice_end=end, suffix=suffix,
+               iteration=1, total_iterations=1)
 
 
 def execute_bfd(args: argparse.Namespace, suffix: str) -> None:
     start = _parse_date(args.start)
     end = _parse_date(args.end)
     initial_end = end - timedelta(days=args.tail_days)
-    _run_slice(args, mode="2_bfd", slice_start=start, slice_end=initial_end, suffix=suffix)
+    total = 1 + args.tail_days
+    _run_slice(args, mode="2_bfd", slice_start=start, slice_end=initial_end, suffix=suffix,
+               iteration=1, total_iterations=total)
     # daterange_inclusive is half-open per dit.dates contract; +1 day on end
     # to include the final `end` date.
-    for d in dit_dates.daterange_inclusive(
-        initial_end + timedelta(days=1), end + timedelta(days=1)
+    for i, d in enumerate(
+        dit_dates.daterange_inclusive(initial_end + timedelta(days=1), end + timedelta(days=1)),
+        start=2,
     ):
-        _run_slice(args, mode="2_bfd", slice_start=d, slice_end=d, suffix=suffix)
+        _run_slice(args, mode="2_bfd", slice_start=d, slice_end=d, suffix=suffix,
+                   iteration=i, total_iterations=total)
 
 
 def execute_bftruncate(args: argparse.Namespace, suffix: str) -> None:
     start = _parse_date(args.start)
     end = _parse_date(args.end)
-    _run_slice(args, mode="3_bftruncate", slice_start=start, slice_end=end, suffix=suffix)
-    for d in dit_dates.daterange_inclusive(
-        end - timedelta(days=args.tail_days - 1), end + timedelta(days=1)
+    total = 1 + args.tail_days
+    _run_slice(args, mode="3_bftruncate", slice_start=start, slice_end=end, suffix=suffix,
+               iteration=1, total_iterations=total)
+    for i, d in enumerate(
+        dit_dates.daterange_inclusive(end - timedelta(days=args.tail_days - 1), end + timedelta(days=1)),
+        start=2,
     ):
-        _run_slice(args, mode="3_bftruncate", slice_start=d, slice_end=d, suffix=suffix)
+        _run_slice(args, mode="3_bftruncate", slice_start=d, slice_end=d, suffix=suffix,
+                   iteration=i, total_iterations=total)
 
 
 # --------------------------------------------------------------------------
@@ -484,9 +601,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
 
+    if args.tail_days < 0:
+        raise SystemExit(
+            f"--tail-days must be >= 0; got {args.tail_days}. "
+            "Negative values produce nonsensical iteration counts and invert "
+            "the daily-tail date range."
+        )
+
     suffix = _resolve_suffix(args, repo_dir=os.getcwd())
+
+    # Per-invocation lineage attributes, computed once and stashed on args so
+    # every Dataflow job + BQ output table from this run shares them. See
+    # the dit_run_id / dit_commit_sha / dit_worker_image_tag / dit_launched_by
+    # labels in _dynamic_labels.
+    commit_sha, _ = _git_info(os.getcwd())
+    args.run_id = uuid.uuid4().hex[:12]
+    args.commit_sha = commit_sha
+    args.worker_image_tag = _worker_image_tag(args.worker_image)
+    args.launched_by = os.environ.get("USER", "unknown")
+
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("suffix: %s", suffix)
+    logger.info("run_id: %s  commit_sha: %s  worker_image_tag: %s  launched_by: %s",
+                args.run_id, args.commit_sha, args.worker_image_tag, args.launched_by)
     logger.info("source dataset: %s_{internal,published}", args.source_dataset_stem)
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
     logger.info("runner: %s", args.runner)
