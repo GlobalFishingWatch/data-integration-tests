@@ -27,6 +27,14 @@ substitutions:
   _ARGS: ''           # args appended to `dit run <workflow>`
   _REF: ''            # pipeline ref to install; empty -> editable install from the source upload
   _DIT_REF: main      # dit ref to clone
+  # The submission-side apache-beam version must match the published Dataflow
+  # worker image's beam version; otherwise workers fail with "Pipeline
+  # construction environment and pipeline runtime environment are not
+  # compatible". The right value depends on which worker image the workflow
+  # uses (pipe-gaps:v0.9.6 -> 2.71.0; pipe-anchorages:v4.6.4 -> 2.69.0). When
+  # non-empty, this is passed to uv as a --constraint so any fresh resolution
+  # is held to the right version; empty disables the constraint.
+  _BEAM_VERSION: ''
 
 steps:
   - id: dit-run
@@ -50,13 +58,31 @@ steps:
         echo ">>> Installing dit (editable from /workspace/.dit)"
         uv pip install --system --no-deps -e /workspace/.dit
 
+        # When _BEAM_VERSION is set, write a constraint file so the pipeline
+        # install below honours it. Otherwise uv freely picks the newest
+        # apache-beam matching the pipeline's ~= constraint, which drifts
+        # past whatever the published worker image was built with.
+        CONSTRAINT_FLAGS=()
+        if [ -n "${_BEAM_VERSION}" ]; then
+            echo "apache-beam==${_BEAM_VERSION}" > /tmp/dit-constraints.txt
+            CONSTRAINT_FLAGS+=(--constraint /tmp/dit-constraints.txt)
+            echo ">>> Pinning apache-beam==${_BEAM_VERSION} via uv --constraint"
+        fi
+
+        # --no-deps is deliberately NOT used in either branch: pipelines like
+        # pipe-gaps need apache-beam (and dozens of transitives) on the
+        # submission side too, since the Dataflow runner is in-process here.
+        # The _BEAM_VERSION constraint (when set) holds beam to the version
+        # baked into the published worker image; everything else resolves
+        # freely.
         if [ -n "${_REF}" ]; then
             echo ">>> Installing ${_PIPELINE} @ ${_REF} (non-editable)"
-            uv pip install --system --reinstall --no-deps \
+            uv pip install --system --reinstall \
+                "${CONSTRAINT_FLAGS[@]}" \
                 "git+file:///workspace@${_REF}"
         else
             echo ">>> Installing ${_PIPELINE} from /workspace (editable, from source upload)"
-            uv pip install --system -e /workspace
+            uv pip install --system "${CONSTRAINT_FLAGS[@]}" -e /workspace
         fi
 
         echo ">>> Running: dit run ${_WORKFLOW} ${_ARGS}"
