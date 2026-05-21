@@ -29,7 +29,12 @@ substitutions:
   _CACHE_REPO: gcr.io/world-fishing-827/github.com/globalfishingwatch/kaniko-cache
 
 steps:
-  - name: gcr.io/kaniko-project/executor:latest
+  # Pinned by digest: gcr.io/kaniko-project/executor doesn't publish versioned
+  # tags (only :latest and :debug live there), so digest pinning is the only
+  # reproducible option. Refresh by running:
+  #   gcloud container images describe gcr.io/kaniko-project/executor:latest \
+  #       --format='value(image_summary.digest)'
+  - name: gcr.io/kaniko-project/executor@sha256:4e7a52dd1f14872430652bb3b027405b8dfd17c4538751c620ac005741ef9698
     args:
       - --destination=${_IMAGE}:latest
       - --destination=${_IMAGE}:${_GIT_SHA}

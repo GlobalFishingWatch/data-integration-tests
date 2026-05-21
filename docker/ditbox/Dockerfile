@@ -52,7 +52,9 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
 # resolves and installs much faster than pip (~10x on cold cache), which is
 # the bottleneck for short Cloud Build runs. Pinned to the system Python via
 # the `--system` flag when invoked.
-RUN pip install --no-cache-dir uv
+# Version-pinned for reproducibility; bump intentionally when a new uv brings
+# a desired change.
+RUN pip install --no-cache-dir uv==0.11.15
 
 COPY requirements.txt /tmp/dit-requirements.txt
 RUN pip install -r /tmp/dit-requirements.txt \
