@@ -623,7 +623,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # labels in _dynamic_labels.
     commit_sha, dirty = _git_info(os.getcwd())
     warn_if_worker_image_misses_dirty_tree(
-        dirty=dirty,
+        dirty_fn=lambda: dirty,
         repo_dir=os.getcwd(),
         runner=args.runner,
         worker_image=args.worker_image,

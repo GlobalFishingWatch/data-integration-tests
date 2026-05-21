@@ -539,7 +539,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("Run suffix: %s", suffix)
 
     warn_if_worker_image_misses_dirty_tree(
-        dirty=_git_info(repo_dir)[1],
+        dirty_fn=lambda: _git_info(repo_dir)[1],
         repo_dir=repo_dir,
         runner=args.runner,
         worker_image=args.worker_image,

@@ -8,13 +8,14 @@ The per-workflow ``_git_info()`` helpers stay duplicated for now (per the
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
 
 def warn_if_worker_image_misses_dirty_tree(
     *,
-    dirty: bool,
+    dirty_fn: Callable[[], bool],
     repo_dir: str,
     runner: str,
     worker_image: str,
@@ -29,7 +30,11 @@ def warn_if_worker_image_misses_dirty_tree(
     * ``runner == "dataflow"`` (the docker runner builds the image from
       source, so there is no submitter/worker split).
     * ``worker_image == default_worker_image`` (the caller did not override).
-    * ``dirty`` is True (submitter has uncommitted changes).
+    * ``dirty_fn()`` returns True (submitter has uncommitted changes).
+
+    ``dirty_fn`` is invoked lazily, after the cheap early-returns, so callers
+    that pass ``--suffix`` (or otherwise avoid touching git) are not forced
+    into a ``git status`` shell-out they don't need.
 
     The check is intentionally lenient (warning, not block) because legitimate
     cases exist -- dirty test harness code, docs, workflow-side tweaks, etc.
@@ -42,7 +47,7 @@ def warn_if_worker_image_misses_dirty_tree(
         return
     if worker_image != default_worker_image:
         return
-    if not dirty:
+    if not dirty_fn():
         return
 
     banner = "!" * 80
