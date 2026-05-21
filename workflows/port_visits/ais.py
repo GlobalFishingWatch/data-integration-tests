@@ -52,6 +52,7 @@ from typing import Optional, Sequence
 
 from dit import compare as dit_compare
 from dit import dates as dit_dates
+from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 
 logger = logging.getLogger(__name__)
@@ -64,13 +65,13 @@ logger = logging.getLogger(__name__)
 PROJECT = "world-fishing-827"
 REPO_NAME = "anchorages-pipeline"
 
-# Short step labels for Dataflow job names (which cap at 63 chars). The full
-# step name is used in the dit_step label, which has more room.
+# Short step labels for Dataflow job names (the cap at 63 chars constrains
+# composition). The full step name is used in the dit_step label, which has
+# more room.
 _JOB_STEP_NAMES = {
     "thin_port_messages": "thin",
     "port_visits": "visits",
 }
-_MAX_JOB_NAME = 63
 
 # Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
 DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
@@ -178,11 +179,6 @@ def _resolve_suffix(args: argparse.Namespace, repo_dir: str) -> str:
 # Beam pipeline-options assembly
 # --------------------------------------------------------------------------
 
-def _to_safe_for_job_name(s: str) -> str:
-    """Dataflow job names: lowercase letters, digits, hyphens only."""
-    return s.lower().replace("_", "-").replace(".", "-")
-
-
 _DIGEST_RE = re.compile(r"@sha\d{3}:[0-9a-f]+$", re.IGNORECASE)
 _UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
 
@@ -220,32 +216,18 @@ def _make_job_name(
     iteration: int,
     total_iterations: int,
 ) -> str:
-    """Build the Dataflow job name as dit-<repo>-<step>-<exp>-<binding>-<mode>-<N>-<M>.
-
-    Truncates the experiment-id from the right when the composed name would
-    exceed Dataflow's 63-character limit; binding, mode, and iteration counter
-    are preserved because they're load-bearing for at-a-glance triage of
-    concurrent jobs (and the counter is what disambiguates the N daily
-    iterations within an incremental mode).
-    """
-    repo = _to_safe_for_job_name(REPO_NAME)
-    short_step = _to_safe_for_job_name(_JOB_STEP_NAMES.get(step, step))
-    exp = _to_safe_for_job_name(args.experiment_id)
-    binding = _to_safe_for_job_name(args.binding_name) if args.binding_name else ""
-    safe_mode = _to_safe_for_job_name(mode)
-    iter_suffix = f"{iteration}-{total_iterations}"
-
-    tail = [binding, safe_mode, iter_suffix] if binding else [safe_mode, iter_suffix]
-    fixed = ["dit", repo, short_step]
-    candidate = "-".join(fixed + [exp] + tail)
-    if len(candidate) <= _MAX_JOB_NAME:
-        return candidate
-
-    fixed_and_tail_len = len("-".join(fixed + [""] + tail))
-    available = _MAX_JOB_NAME - fixed_and_tail_len
-    if available < 4:
-        return candidate[:_MAX_JOB_NAME]
-    return "-".join(fixed + [exp[:available]] + tail)
+    """Thin adapter over ``dit.job_names.make_job_name`` that pulls the
+    workflow-specific repo + step abbreviation from local constants and
+    threads the ``args`` namespace's experiment_id/binding_name through."""
+    return make_job_name(
+        repo=REPO_NAME,
+        step=_JOB_STEP_NAMES.get(step, step),
+        experiment_id=args.experiment_id,
+        mode=mode,
+        binding=args.binding_name or None,
+        iteration=iteration,
+        total_iterations=total_iterations,
+    )
 
 
 def _dynamic_labels(

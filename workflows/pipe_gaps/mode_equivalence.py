@@ -24,6 +24,7 @@ from typing import Any, Optional
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit.dates import daterange_inclusive
+from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
 
@@ -31,6 +32,19 @@ logger = logging.getLogger(__name__)
 
 
 PROJECT = "world-fishing-827"
+REPO_NAME = "pipe-gaps"
+
+# Step label for Dataflow job names. Pipe-gaps' detect pipeline is a single
+# step, but the dit-shaped naming keeps the slot for symmetry with multi-step
+# workflows like port_visits/ais.py (which has thin + visits).
+STEP_NAME = "detect"
+
+# Mode labels embedded in Dataflow job names + the bq_output_gaps table
+# suffix. Single source of truth; execute_* helpers thread them through.
+MODE_BF = "1_bf"
+MODE_BFD = "2_bfd"
+MODE_BFTRUNCATE = "3_bftruncate"
+MODE_MUTATE_RECOVER = "4_mutate_recover"
 
 # Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
 DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
@@ -156,6 +170,7 @@ def _make_config(
     dataflow_temp_bucket: Optional[str] = None,
     dataflow_subnetwork: Optional[str] = None,
     worker_image: Optional[str] = None,
+    job_name: Optional[str] = None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         date_range=(start.isoformat(), end.isoformat()),
@@ -177,6 +192,7 @@ def _make_config(
     cfg.dataflow_temp_bucket = dataflow_temp_bucket
     cfg.dataflow_subnetwork = dataflow_subnetwork
     cfg.worker_image = worker_image
+    cfg.job_name = job_name
     return cfg
 
 
@@ -236,12 +252,8 @@ def _build_pipeline_for(cfg: SimpleNamespace):
         for key, value in opts.items():
             parsed.setdefault(key, value)
 
-        output_basename = cfg.bq_output_gaps.rsplit(".", 1)[-1]
-        start, end = cfg.date_range
-        parsed.setdefault(
-            "job_name",
-            f"dit-pipe-gaps-{output_basename}-{start}-{end}".replace("_", "-"),
-        )
+        if cfg.job_name:
+            parsed.setdefault("job_name", cfg.job_name)
 
         runner_only_attrs = {
             "service_account",
@@ -250,6 +262,7 @@ def _build_pipeline_for(cfg: SimpleNamespace):
             "dataflow_temp_bucket",
             "dataflow_subnetwork",
             "worker_image",
+            "job_name",
         }
         cfg_attrs = {k: v for k, v in vars(cfg).items() if k not in runner_only_attrs}
         df_cfg = SimpleNamespace(**cfg_attrs)
@@ -309,10 +322,27 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
     raise ValueError(f"unknown runner: {runner}")
 
 
+def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
+    """Workflow-local shorthand for the dit-shaped Dataflow job name."""
+    return make_job_name(
+        repo=REPO_NAME,
+        step=STEP_NAME,
+        experiment_id=experiment_id,
+        mode=mode,
+        iteration=iteration,
+        total_iterations=total,
+    )
+
+
 def execute_bf(
-    runner: str, *, base_cfg: dict, start: date, end: date, output: str, image_tag: str,
+    runner: str, *, base_cfg: dict, start: date, end: date, output: str,
+    experiment_id: str, image_tag: str,
 ) -> None:
-    cfg = _make_config(start=start, end=end, bq_output_gaps=output, **base_cfg)
+    cfg = _make_config(
+        start=start, end=end, bq_output_gaps=output,
+        job_name=_job_name(experiment_id, MODE_BF, 1, 1),
+        **base_cfg,
+    )
     _run_pipeline(runner, cfg, image_tag)
 
 
@@ -325,15 +355,27 @@ def execute_bfd(
     tail_days: int,
     backfill_days_w: int,
     output: str,
+    experiment_id: str,
     image_tag: str,
 ) -> None:
     mid = end - timedelta(days=tail_days)
-    cfg = _make_config(start=start, end=mid, bq_output_gaps=output, **base_cfg)
+    daily_ends = list(daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1)))
+    total = 1 + len(daily_ends)  # initial big slice + N dailies
+
+    cfg = _make_config(
+        start=start, end=mid, bq_output_gaps=output,
+        job_name=_job_name(experiment_id, MODE_BFD, 1, total),
+        **base_cfg,
+    )
     _run_pipeline(runner, cfg, image_tag)
 
-    for day_end in daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1)):
+    for i, day_end in enumerate(daily_ends, start=2):
         day_start = day_end - timedelta(days=backfill_days_w)
-        cfg = _make_config(start=day_start, end=day_end, bq_output_gaps=output, **base_cfg)
+        cfg = _make_config(
+            start=day_start, end=day_end, bq_output_gaps=output,
+            job_name=_job_name(experiment_id, MODE_BFD, i, total),
+            **base_cfg,
+        )
         _run_pipeline(runner, cfg, image_tag)
 
 
@@ -346,15 +388,27 @@ def execute_bftruncate(
     tail_days: int,
     backfill_days_w: int,
     output: str,
+    experiment_id: str,
     image_tag: str,
 ) -> None:
-    cfg = _make_config(start=start, end=end, bq_output_gaps=output, **base_cfg)
+    tail_start = end - timedelta(days=tail_days)
+    daily_ends = list(daterange_inclusive(tail_start + timedelta(days=1), end + timedelta(days=1)))
+    total = 1 + len(daily_ends)  # initial full slice + N tail-day re-runs
+
+    cfg = _make_config(
+        start=start, end=end, bq_output_gaps=output,
+        job_name=_job_name(experiment_id, MODE_BFTRUNCATE, 1, total),
+        **base_cfg,
+    )
     _run_pipeline(runner, cfg, image_tag)
 
-    tail_start = end - timedelta(days=tail_days)
-    for day_end in daterange_inclusive(tail_start + timedelta(days=1), end + timedelta(days=1)):
+    for i, day_end in enumerate(daily_ends, start=2):
         day_start = day_end - timedelta(days=backfill_days_w)
-        cfg = _make_config(start=day_start, end=day_end, bq_output_gaps=output, **base_cfg)
+        cfg = _make_config(
+            start=day_start, end=day_end, bq_output_gaps=output,
+            job_name=_job_name(experiment_id, MODE_BFTRUNCATE, i, total),
+            **base_cfg,
+        )
         _run_pipeline(runner, cfg, image_tag)
 
 
@@ -368,6 +422,7 @@ def execute_mutate_recover(
     backfill_days_w: int,
     output: str,
     restricted_ssvids: tuple[str, ...],
+    experiment_id: str,
     image_tag: str,
 ) -> None:
     if not restricted_ssvids:
@@ -376,24 +431,38 @@ def execute_mutate_recover(
         )
 
     mid = end - timedelta(days=tail_days)
+    daily_ends = list(daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1)))
+    # 1 initial slice + N restricted dailies + N recovery dailies.
+    total = 1 + 2 * len(daily_ends)
 
-    cfg = _make_config(start=start, end=mid, bq_output_gaps=output, **base_cfg)
+    cfg = _make_config(
+        start=start, end=mid, bq_output_gaps=output,
+        job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, 1, total),
+        **base_cfg,
+    )
     _run_pipeline(runner, cfg, image_tag)
 
     restricted_cfg = {**base_cfg, "ssvids": restricted_ssvids}
-    for day_end in daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1)):
+    iteration = 2
+    for day_end in daily_ends:
         day_start = day_end - timedelta(days=backfill_days_w)
         cfg = _make_config(
-            start=day_start, end=day_end, bq_output_gaps=output, **restricted_cfg,
+            start=day_start, end=day_end, bq_output_gaps=output,
+            job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, iteration, total),
+            **restricted_cfg,
         )
         _run_pipeline(runner, cfg, image_tag)
+        iteration += 1
 
-    for day_end in daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1)):
+    for day_end in daily_ends:
         day_start = day_end - timedelta(days=backfill_days_w)
         cfg = _make_config(
-            start=day_start, end=day_end, bq_output_gaps=output, **base_cfg,
+            start=day_start, end=day_end, bq_output_gaps=output,
+            job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, iteration, total),
+            **base_cfg,
         )
         _run_pipeline(runner, cfg, image_tag)
+        iteration += 1
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -513,19 +582,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     if not args.skip_pipelines:
-        bf_kwargs = dict(
-            runner=args.runner, base_cfg=base_cfg, start=start, end=end, output=bf_table,
-            image_tag=args.image_tag,
-        )
-        bfd_kwargs = dict(
+        common = dict(
             runner=args.runner, base_cfg=base_cfg, start=start, end=end,
+            experiment_id=args.experiment_id, image_tag=args.image_tag,
+        )
+        bf_kwargs = dict(common, output=bf_table)
+        bfd_kwargs = dict(
+            common, output=bfd_table,
             tail_days=args.tail_days, backfill_days_w=args.backfill_days,
-            output=bfd_table, image_tag=args.image_tag,
         )
         bft_kwargs = dict(
-            runner=args.runner, base_cfg=base_cfg, start=start, end=end,
+            common, output=bft_table,
             tail_days=args.tail_days, backfill_days_w=args.backfill_days,
-            output=bft_table, image_tag=args.image_tag,
         )
 
         mr_restricted: Optional[tuple[str, ...]] = (
@@ -550,6 +618,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         tail_days=args.tail_days, backfill_days_w=args.backfill_days,
                         output=mr_table,
                         restricted_ssvids=mr_restricted,
+                        experiment_id=args.experiment_id,
                         image_tag=args.image_tag,
                     ))
                 for f in futures:
@@ -574,6 +643,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tail_days=args.tail_days, backfill_days_w=args.backfill_days,
                 output=mr_table,
                 restricted_ssvids=mr_restricted,
+                experiment_id=args.experiment_id,
                 image_tag=args.image_tag,
             )
         elif args.enable_pipeline_4 and not args.parallel:
@@ -583,6 +653,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tail_days=args.tail_days, backfill_days_w=args.backfill_days,
                 output=mr_table,
                 restricted_ssvids=mr_restricted,
+                experiment_id=args.experiment_id,
                 image_tag=args.image_tag,
             )
 

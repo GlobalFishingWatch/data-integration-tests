@@ -8,6 +8,10 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ### 2026-05-21
 
+#### Changed
+- **Dataflow job-name builder centralised in `dit.job_names`.** Extracted `to_safe_for_job_name` + `make_job_name` from `workflows/port_visits/ais.py` into a shared module so both workflows compose names through the same logic instead of each maintaining its own. `make_job_name(*, repo, step, experiment_id, mode=None, binding=None, iteration=None, total_iterations=None, max_len=63)` produces `dit-<repo>-<step>-<exp>-<binding?>-<mode?>-<N?>-<M?>` and truncates `experiment_id` from the right to fit the 63-char cap. Port-visits is unchanged behaviourally; pipe-gaps now uses the same shape — its job name is built from explicit semantic parts (`repo=pipe-gaps`, `step=detect`, mode constant, iteration counter) rather than synthesised from the output table's `three_way_<suffix>` name. The stale `three-way-eq` / `three_way` strings no longer appear in Dataflow job names. The BQ output-table prefix (`three_way_<suffix>`) is intentionally still unchanged so existing diff tables and ad-hoc queries against them keep working.
+- The `execute_*` helpers in `workflows/pipe_gaps/mode_equivalence.py` now take an explicit `experiment_id` kwarg (threaded into the per-slice `cfg.job_name`). Internal API; the only callers are inside the same file's `main()`.
+
 #### Fixed
 - **Pin apache-beam at install time via `_BEAM_VERSION` in `cloudbuild-dit.yaml`.** Without this, `uv pip install` resolves apache-beam to the newest version satisfying the pipeline's `~=2.71` (or similar) constraint, which drifts past whatever the published worker image was built with — Dataflow then rejects the submission with `Pipeline construction environment and pipeline runtime environment are not compatible`. New `_BEAM_VERSION` substitution writes a constraint file consumed by uv. Per-pipeline defaults wired into the `Makefile`: `pipe-gaps -> 2.71.0` (matching `pipe-gaps:v0.9.6`); `anchorages_pipeline -> 2.69.0` (matching `pipe-anchorages:v4.6.4`). Override via `BEAM_VERSION=<x.y.z>` on the `make dit-cloud` command line.
 
