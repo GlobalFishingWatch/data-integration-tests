@@ -14,12 +14,26 @@ at-a-glance triage of concurrent jobs.
 
 from __future__ import annotations
 
+import re
+
 MAX_JOB_NAME = 63
+
+_UNSAFE_CHARS_RE = re.compile(r"[^a-z0-9-]+")
+_REPEATED_HYPHEN_RE = re.compile(r"-+")
 
 
 def to_safe_for_job_name(s: str) -> str:
-    """Coerce to the lowercase / digit / hyphen alphabet Dataflow expects."""
-    return s.lower().replace("_", "-").replace(".", "-")
+    """Coerce to the lowercase / digit / hyphen alphabet Dataflow expects.
+
+    Lowercases, replaces runs of any non ``[a-z0-9-]`` character with a single
+    hyphen, collapses repeated hyphens, and strips leading/trailing hyphens.
+    Guarantees the output is a non-empty Dataflow-name-segment when the input
+    contains at least one alphanumeric character; returns ``""`` otherwise
+    (caller's responsibility to handle that degenerate case).
+    """
+    s = _UNSAFE_CHARS_RE.sub("-", s.lower())
+    s = _REPEATED_HYPHEN_RE.sub("-", s)
+    return s.strip("-")
 
 
 def make_job_name(
@@ -56,6 +70,15 @@ def make_job_name(
 
     fixed_and_tail_len = len("-".join(fixed + [""] + tail))
     available = max_len - fixed_and_tail_len
-    if available < 4:
-        return candidate[:max_len]
+    if available < 1:
+        # Slicing the whole candidate would chop the load-bearing tail
+        # (binding / mode / iteration counter) and could leave a trailing
+        # hyphen, which Dataflow rejects. Surface a clear caller error
+        # instead.
+        raise ValueError(
+            f"cannot fit job name within {max_len} chars: the fixed parts "
+            f"(repo/step) plus the tail (binding/mode/iteration) already "
+            f"occupy {fixed_and_tail_len - 1} chars, leaving no room for the "
+            f"experiment id. Shorten one of them or raise max_len."
+        )
     return "-".join(fixed + [exp[:available]] + tail)

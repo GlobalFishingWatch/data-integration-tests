@@ -1,8 +1,26 @@
+import pytest
+
 from dit.job_names import MAX_JOB_NAME, make_job_name, to_safe_for_job_name
 
 
 def test_to_safe_lowercases_and_replaces():
     assert to_safe_for_job_name("Foo_Bar.Baz") == "foo-bar-baz"
+
+
+def test_to_safe_replaces_arbitrary_unsafe_chars():
+    assert to_safe_for_job_name("foo bar/baz@qux") == "foo-bar-baz-qux"
+
+
+def test_to_safe_collapses_repeated_hyphens():
+    assert to_safe_for_job_name("foo___bar...baz") == "foo-bar-baz"
+
+
+def test_to_safe_strips_edges():
+    assert to_safe_for_job_name("_foo_") == "foo"
+
+
+def test_to_safe_empty_on_all_unsafe():
+    assert to_safe_for_job_name("___") == ""
 
 
 def test_make_job_name_minimal_shape():
@@ -54,3 +72,19 @@ def test_make_job_name_respects_custom_max_len():
         max_len=20,
     )
     assert len(name) == 20
+
+
+def test_make_job_name_raises_when_fixed_parts_already_overflow():
+    # The fixed+tail parts alone exceed max_len -> we can't fit any
+    # experiment_id, so the function raises rather than truncating the
+    # load-bearing tail (which would also risk a trailing hyphen).
+    with pytest.raises(ValueError, match="cannot fit job name"):
+        make_job_name(
+            repo="very-long-repo-name",
+            step="very-long-step-name",
+            experiment_id="anything",
+            mode="m",
+            iteration=1,
+            total_iterations=1,
+            max_len=20,
+        )

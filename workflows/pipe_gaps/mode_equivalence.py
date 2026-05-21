@@ -558,10 +558,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     base = f"{PROJECT}.{args.dest_dataset}.three_way_{suffix}"
-    bf_table = f"{base}_1_bf"
-    bfd_table = f"{base}_2_bfd"
-    bft_table = f"{base}_3_bftruncate"
-    mr_table = f"{base}_4_mutate_recover"
+    bf_table = f"{base}_{MODE_BF}"
+    bfd_table = f"{base}_{MODE_BFD}"
+    bft_table = f"{base}_{MODE_BFTRUNCATE}"
+    mr_table = f"{base}_{MODE_MUTATE_RECOVER}"
 
     logger.info("output tables:")
     logger.info("  %s", bf_table)
@@ -661,12 +661,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     pairs = [
-        ("1_bf vs 2_bfd",         bf_table, bfd_table),
-        ("1_bf vs 3_bftruncate",  bf_table, bft_table),
-        ("2_bfd vs 3_bftruncate", bfd_table, bft_table),
+        (f"{MODE_BF} vs {MODE_BFD}",         bf_table, bfd_table),
+        (f"{MODE_BF} vs {MODE_BFTRUNCATE}",  bf_table, bft_table),
+        (f"{MODE_BFD} vs {MODE_BFTRUNCATE}", bfd_table, bft_table),
     ]
     if args.enable_pipeline_4:
-        pairs.append(("1_bf vs 4_mutate_recover", bf_table, mr_table))
+        pairs.append((f"{MODE_BF} vs {MODE_MUTATE_RECOVER}", bf_table, mr_table))
 
     rcs = []
     for label, a, b in pairs:
