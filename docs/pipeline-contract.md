@@ -88,7 +88,7 @@ Multiple invocations of the pipeline running concurrently must not collide on in
 
 Multi-step BQ-SQL pipelines often have intermediate tables (pipe-events has `incremental_fishing_events_merged`, `incremental_fishing_events_filtered`, `fishing_events_v`, etc.). Each step's source and destination tables must be overridable.
 
-*Why:* the workflow assigns each mode its own per-suffix output tables. Any hardcoded intermediate causes modes to collide on it.
+*Why:* the workflow assigns each mode its own per-suffix output tables. Any hardcoded intermediate causes modes to collide on it. **Also enables step-skipping**: when the change under test lives only in step N, dit can point step N's input at an externally-supplied table (typically a snapshot of prod's step N-1 output) and skip running step N-1 entirely. Pipe-anchorages port-visits exercises this today via `--thinned-message-table` on `workflows/port_visits/ais.py`; pipelines that want the same optimisation must expose each step's input as a CLI flag.
 
 ## Strongly recommended for every pipeline
 
