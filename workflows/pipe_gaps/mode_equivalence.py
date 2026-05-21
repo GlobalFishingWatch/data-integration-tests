@@ -47,7 +47,17 @@ DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
 )
 
 # Workflow-specific defaults (no env var; one-off overrides via CLI flag).
-DEFAULT_SOURCE_DATASET = "pipe_ais_test_202408290000_published"
+# Pipe-gaps reads two input tables. They happen to live in different halves of
+# the AIS-staging cohort (messages in _internal, segs_activity in _published);
+# rather than parameterise by dataset (which would need separate stems per
+# half), each input is its own fully-qualified flag. Override one or both
+# directly when running against a non-staging cohort.
+DEFAULT_SOURCE_MESSAGES = (
+    f"{PROJECT}.pipe_ais_test_202408290000_internal.messages_positions"
+)
+DEFAULT_SOURCE_SEGMENTS = (
+    f"{PROJECT}.pipe_ais_test_202408290000_published.segs_activity"
+)
 
 DEFAULT_MIN_GAP_LENGTH = 1.0
 DEFAULT_N_HOURS_BEFORE = 12
@@ -367,9 +377,12 @@ def execute_mutate_recover(
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n", 1)[0])
     p.add_argument("--runner", choices=list(RUNNERS), default="dataflow")
-    p.add_argument("--source-dataset", default=DEFAULT_SOURCE_DATASET)
-    p.add_argument("--source-messages", default=None)
-    p.add_argument("--source-segments", default=None)
+    p.add_argument("--source-messages", default=DEFAULT_SOURCE_MESSAGES,
+                   help=f"Fully-qualified BQ table of input AIS messages. "
+                        f"Default: {DEFAULT_SOURCE_MESSAGES}")
+    p.add_argument("--source-segments", default=DEFAULT_SOURCE_SEGMENTS,
+                   help=f"Fully-qualified BQ table of segs_activity. "
+                        f"Default: {DEFAULT_SOURCE_SEGMENTS}")
     p.add_argument("--start", default=DEFAULT_START)
     p.add_argument("--end", default=DEFAULT_END)
     p.add_argument("--tail-days", type=int, default=DEFAULT_TAIL_DAYS)
@@ -429,8 +442,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
 
-    source_messages = args.source_messages or f"{args.source_dataset}.messages"
-    source_segments = args.source_segments or f"{args.source_dataset}.segs_activity"
+    source_messages = args.source_messages
+    source_segments = args.source_segments
 
     base_cfg = dict(
         bq_input_messages=source_messages,
