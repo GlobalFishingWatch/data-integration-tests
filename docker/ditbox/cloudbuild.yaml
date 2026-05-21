@@ -10,6 +10,12 @@
 #       .
 #
 # The build context is the repo root so the Dockerfile can `COPY requirements.txt`.
+#
+# Uses kaniko with a registry-backed layer cache (shared with the rest of the
+# GFW org's GitHub-built images — see e.g. monitoring/cloudbuild/main.tf which
+# uses the same _CACHE_REPO). Unchanged Dockerfile layers (apt packages,
+# gcloud install, python base) get reused across rebuilds; only the bottom
+# of the file rebuilds on dep bumps.
 
 substitutions:
   # dit images live under gcr.io/world-fishing-827/dit/* (see docs/conventions.md
@@ -18,19 +24,29 @@ substitutions:
   # repositories.create.
   _IMAGE: gcr.io/world-fishing-827/dit/ditbox
   _GIT_SHA: dev
+  # Shared org-wide kaniko cache repo. We have project-level uploadArtifacts
+  # on world-fishing-827, so writes here work without a per-repo grant.
+  _CACHE_REPO: gcr.io/world-fishing-827/github.com/globalfishingwatch/kaniko-cache
 
 steps:
-  - name: gcr.io/cloud-builders/docker
+  # Pinned by digest: gcr.io/kaniko-project/executor doesn't publish versioned
+  # tags (only :latest and :debug live there), so digest pinning is the only
+  # reproducible option. Refresh by running:
+  #   gcloud container images describe gcr.io/kaniko-project/executor:latest \
+  #       --format='value(image_summary.digest)'
+  - name: gcr.io/kaniko-project/executor@sha256:4e7a52dd1f14872430652bb3b027405b8dfd17c4538751c620ac005741ef9698
     args:
-      - build
-      - --tag=${_IMAGE}:latest
-      - --tag=${_IMAGE}:${_GIT_SHA}
-      - --file=docker/ditbox/Dockerfile
-      - .
+      - --destination=${_IMAGE}:latest
+      - --destination=${_IMAGE}:${_GIT_SHA}
+      - --cache=true
+      - --cache-ttl=8760h
+      - --cache-repo=${_CACHE_REPO}
+      - --dockerfile=docker/ditbox/Dockerfile
+      - --context=dir:///workspace
+      - --log-format=text
 
-images:
-  - ${_IMAGE}:latest
-  - ${_IMAGE}:${_GIT_SHA}
+# kaniko pushes via its --destination flags; no `images:` field needed
+# (that's for the docker builder and would cause a redundant push attempt).
 
 options:
   logging: CLOUD_LOGGING_ONLY
