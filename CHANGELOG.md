@@ -2,7 +2,7 @@
 
 User-facing changes to `dit` (the framework, CLI, and workflows). For the internal record of plan-doc evolution, see the **Plan changelog** in [`CLAUDE.md`](CLAUDE.md).
 
-The project is pre-1.0; entries are grouped chronologically under `[Unreleased]` rather than semver releases. Format inspired by [Keep a Changelog](https://keepachangelog.com/).
+The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful set of features has landed, `main` is tagged as `v0.X.Y` and the accumulated content moves under a `## [v0.X.Y] — YYYY-MM-DD` heading (pre-1.0 — minor increments freely). Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
@@ -13,6 +13,9 @@ The project is pre-1.0; entries are grouped chronologically under `[Unreleased]`
 - **`--source-dataset` flag removed.** Per-table FQN flags are the override unit going forward: `--source-messages` and `--source-segments` (which already existed) now carry **fully-qualified defaults** that point at the populated AIS-staging tables. Breaking change for explicit callers of `--source-dataset`; migrate to passing the two `--source-*` flags directly. Aligns with the user-stated principle that dataset-shaped flags are only useful for pipelines with many input tables or steps; for pipe-gaps' two-input case, FQNs are simpler.
 
 ### 2026-05-15
+
+#### Changed
+- **Git workflow shifted to feature-branch + squash-merge.** Non-trivial changes now live on short-lived `<type>/<short-slug>` branches (types: feat / fix / docs / refactor / test / chore). PRs request Copilot as reviewer; squash-merge to `main` after sign-off so `main` gets one clean commit per feature. Releases will be tagged as `v0.X.Y` (pre-1.0 — increment minor freely). Recorded in CLAUDE.md § Working agreements. Trivial one-line fixes still go straight to `main`.
 
 #### Added
 - **[`docs/architecture.md`](docs/architecture.md)** — visual reference for the project: system-context diagram (three-repo split + TIC integration), run-mode table (ad-hoc / Cloud Build / PR-triggered / scheduled), mode-equivalence + cross-version workflow sequences, Cloud Build runtime flow, and the image-namespace tree. Mermaid + ASCII; renders natively on GitHub. Pointed at from README + CLAUDE.md "Read first" lists.
