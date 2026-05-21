@@ -282,13 +282,18 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
         from pipe_gaps.pipelines.detect.factory import DetectGapsLinearDagFactory
 
         # Workers pull from a registry; the local docker tag (image_tag) is
-        # for the in-process submission image only. Fall back to image_tag
-        # if no worker image is set, preserving the prior (broken on Dataflow)
-        # behaviour for callers that explicitly opt out.
-        worker_image = cfg.worker_image or image_tag
+        # for the in-process submission image only. Require an explicit
+        # worker image -- silently falling back to image_tag reproduces the
+        # original ImagePullBackOff this split was meant to fix.
+        if not cfg.worker_image:
+            raise RuntimeError(
+                "dataflow runner requires --worker-image (or a non-empty "
+                "DEFAULT_WORKER_IMAGE). The docker runner's --image-tag "
+                "is local-only and cannot be pulled by Dataflow workers."
+            )
         rc = dit_dataflow.run(
             args=[],
-            image_tag=worker_image,
+            image_tag=cfg.worker_image,
             service_account=cfg.service_account,
             region=cfg.dataflow_region,
             temp_bucket=cfg.dataflow_temp_bucket,
