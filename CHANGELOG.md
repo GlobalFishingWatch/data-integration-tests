@@ -12,6 +12,19 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 - **`workflows/pipe_gaps/mode_equivalence.py` source-table defaults.** The previous defaults derived both messages and segments FQNs from a single `--source-dataset` flag, which assumed both tables lived in the same half of the dataset. They don't — in the AIS-staging cohort, `messages_positions` lives in the `_internal` half and `segs_activity` lives in `_published`. The old `--source-dataset=pipe_ais_test_202408290000_published` default produced `pipe_ais_test_202408290000_published.messages` for messages, which **points at an empty table**. A Cloud Build run against this default ran for ~60 minutes reading nothing before the BQ Read step failed.
 - **`--source-dataset` flag removed.** Per-table FQN flags are the override unit going forward: `--source-messages` and `--source-segments` (which already existed) now carry **fully-qualified defaults** that point at the populated AIS-staging tables. Breaking change for explicit callers of `--source-dataset`; migrate to passing the two `--source-*` flags directly. Aligns with the user-stated principle that dataset-shaped flags are only useful for pipelines with many input tables or steps; for pipe-gaps' two-input case, FQNs are simpler.
 
+### 2026-05-18
+
+#### Added
+- **Per-iteration job-name suffix + lineage labels in `workflows/port_visits/ais.py`.** Dataflow job names now end with `-<N>-<M>` (1-indexed iteration / total) so the N daily jobs within `2_bfd` / `3_bftruncate` are distinguishable in the Dataflow UI without parsing logs. New BQ labels (eight in total; propagate to written tables via pipe-anchorages' `BigQueryHelper`):
+  - **`dit_iteration`** and **`dit_total_iterations`** — `N` and `M` (1-indexed; `1/1` for `1_bf`).
+  - **`dit_slice_start`** and **`dit_slice_end`** — per-iteration date range in `YYYY-MM-DD`.
+  - **`dit_run_id`** — a 12-char hex UUID generated once per `main()` call; stamped on every Dataflow job + BQ table from one `dit run` invocation. Lets you find "all jobs from that one cross-version invocation" with a single label filter.
+  - **`dit_commit_sha`** — short SHA of the workflow's `cwd` repo at run time (the binding's worktree commit in cross-version runs).
+  - **`dit_worker_image_tag`** — tag portion of `--worker-image` (`gcr.io/.../pipe-anchorages:pipeline-1465-after` → `pipeline-1465-after`). Surfaces "which built image variant" without parsing the image URL — useful for cross-version where bindings deliberately differ.
+  - **`dit_launched_by`** — `$USER` env var (or `unknown`). Best-effort attribution for shared-cohort runs.
+
+  No change to the existing `dit_repo` / `dit_step` / `dit_experiment_id` / `dit_mode` / `dit_binding` labels or the 5 static labels. Follow-up: bring `workflows/pipe_gaps/mode_equivalence.py` to the same shape (cross-version parity work, already on the next-steps list).
+
 ### 2026-05-15
 
 #### Changed
