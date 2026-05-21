@@ -52,6 +52,7 @@ from typing import Optional, Sequence
 
 from dit import compare as dit_compare
 from dit import dates as dit_dates
+from dit.git_info import warn_if_worker_image_misses_dirty_tree
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 
@@ -620,7 +621,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # every Dataflow job + BQ output table from this run shares them. See
     # the dit_run_id / dit_commit_sha / dit_worker_image_tag / dit_launched_by
     # labels in _dynamic_labels.
-    commit_sha, _ = _git_info(os.getcwd())
+    commit_sha, dirty = _git_info(os.getcwd())
+    warn_if_worker_image_misses_dirty_tree(
+        dirty=dirty,
+        repo_dir=os.getcwd(),
+        runner=args.runner,
+        worker_image=args.worker_image,
+        default_worker_image=DEFAULT_WORKER_IMAGE,
+    )
     args.run_id = uuid.uuid4().hex[:12]
     args.commit_sha = commit_sha
     args.worker_image_tag = _worker_image_tag(args.worker_image)
