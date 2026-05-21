@@ -6,6 +6,12 @@ The project is pre-1.0; entries are grouped chronologically under `[Unreleased]`
 
 ## [Unreleased]
 
+### 2026-05-21
+
+#### Fixed
+- **`workflows/pipe_gaps/mode_equivalence.py` source-table defaults.** The previous defaults derived both messages and segments FQNs from a single `--source-dataset` flag, which assumed both tables lived in the same half of the dataset. They don't — in the AIS-staging cohort, `messages_positions` lives in the `_internal` half and `segs_activity` lives in `_published`. The old `--source-dataset=pipe_ais_test_202408290000_published` default produced `pipe_ais_test_202408290000_published.messages` for messages, which **points at an empty table**. A Cloud Build run against this default ran for ~60 minutes reading nothing before the BQ Read step failed.
+- **`--source-dataset` flag removed.** Per-table FQN flags are the override unit going forward: `--source-messages` and `--source-segments` (which already existed) now carry **fully-qualified defaults** that point at the populated AIS-staging tables. Breaking change for explicit callers of `--source-dataset`; migrate to passing the two `--source-*` flags directly. Aligns with the user-stated principle that dataset-shaped flags are only useful for pipelines with many input tables or steps; for pipe-gaps' two-input case, FQNs are simpler.
+
 ### 2026-05-15
 
 #### Added
