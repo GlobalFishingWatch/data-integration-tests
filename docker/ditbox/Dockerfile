@@ -1,7 +1,8 @@
 # ditbox -- tooling layer for dit Cloud Build runs.
 #
 # Contents:
-#   - Python 3.11
+#   - Python 3.12 (matches pipe-anchorages' requires-python>=3.12; pipe-gaps
+#     and pipe-events install fine on the same base)
 #   - git, make, curl, gnupg
 #   - gcloud CLI (incl. bq) for BigQuery operations in workflows
 #   - docker CLI (talks to the host /var/run/docker.sock mounted by cloudbuild-dit.yaml)
@@ -13,7 +14,7 @@
 #   - pipeline deps (pipe-gaps / anchorages_pipeline / pipe-events) -- installed per-run by
 #     the workflow's --binding ref.
 
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
