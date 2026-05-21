@@ -69,9 +69,15 @@ steps:
             echo ">>> Pinning apache-beam==${_BEAM_VERSION} via uv --constraint"
         fi
 
+        # --no-deps is deliberately NOT used in either branch: pipelines like
+        # pipe-gaps need apache-beam (and dozens of transitives) on the
+        # submission side too, since the Dataflow runner is in-process here.
+        # The _BEAM_VERSION constraint (when set) holds beam to the version
+        # baked into the published worker image; everything else resolves
+        # freely.
         if [ -n "${_REF}" ]; then
             echo ">>> Installing ${_PIPELINE} @ ${_REF} (non-editable)"
-            uv pip install --system --reinstall --no-deps \
+            uv pip install --system --reinstall \
                 "${CONSTRAINT_FLAGS[@]}" \
                 "git+file:///workspace@${_REF}"
         else
