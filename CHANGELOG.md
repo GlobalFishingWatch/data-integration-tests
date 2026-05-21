@@ -25,6 +25,9 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
   No change to the existing `dit_repo` / `dit_step` / `dit_experiment_id` / `dit_mode` / `dit_binding` labels or the 5 static labels. Follow-up: bring `workflows/pipe_gaps/mode_equivalence.py` to the same shape (cross-version parity work, already on the next-steps list).
 
+#### Fixed
+- **`dit.compare.compare_tables` return value now reflects real table differences.** Previously the shim returned `subprocess.run().returncode`, but `table-check summary` always exits `0` regardless of whether differences were found (it's informational, not assertional). Every successful comparison reported `rc=0`, which `cross_version_ais.py` mapped to verdict `IDENTICAL` — silently hiding all real diffs in cross-version runs. New implementation passes `--output-json` to `table-check`, parses the resulting summary, and returns **`0` if tables are identical (post-tolerance), `1` if any difference is detected**. The exact differing-row count is logged at INFO level; the full per-column delta lives in the JSON `table-check` writes. Backward-compatible for `rc == 0` / `rc != 0` callers (mode-equivalence in `ais.py` and `pipe_gaps/mode_equivalence.py`); cross-version verdict lines now reflect reality. Falls back to the subprocess exit code only when no JSON is written (real subprocess failure). Clamping to `0`/`1` (vs returning the raw count) avoids a subtle bug where `sys.exit(diff_rows)` would have been truncated to 0–255 by the OS — a 256-row diff would have exited with status 0 and incorrectly signalled success.
+
 ### 2026-05-15
 
 #### Changed
