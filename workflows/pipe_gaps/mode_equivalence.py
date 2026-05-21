@@ -24,6 +24,7 @@ from typing import Any, Optional
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit.dates import daterange_inclusive
+from dit.git_info import warn_if_worker_image_misses_dirty_tree
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
@@ -536,6 +537,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     suffix = _resolve_suffix(args, repo_dir)
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
+
+    warn_if_worker_image_misses_dirty_tree(
+        dirty_fn=lambda: _git_info(repo_dir)[1],
+        repo_dir=repo_dir,
+        runner=args.runner,
+        worker_image=args.worker_image,
+        default_worker_image=DEFAULT_WORKER_IMAGE,
+    )
 
     source_messages = args.source_messages
     source_segments = args.source_segments
