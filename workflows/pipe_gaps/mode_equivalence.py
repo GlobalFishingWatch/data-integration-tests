@@ -71,6 +71,15 @@ DEFAULT_TAIL_DAYS = 4
 
 DEFAULT_IMAGE_TAG = "gfw/pipe-gaps:dev"
 
+# Dataflow worker container image -- needs pipe_gaps installed (workers
+# unpickle DoFns from pipe_gaps.*). Published path in GFW's Artifact Registry.
+# Distinct from DEFAULT_IMAGE_TAG (which names the local image the docker
+# runner builds + runs for the submission process). Override via --worker-image
+# when you've published a custom build (e.g. cross-version testing).
+DEFAULT_WORKER_IMAGE = (
+    "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.9.6"
+)
+
 RUNNERS = ("docker", "dataflow")
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
@@ -146,6 +155,7 @@ def _make_config(
     dataflow_region: Optional[str] = None,
     dataflow_temp_bucket: Optional[str] = None,
     dataflow_subnetwork: Optional[str] = None,
+    worker_image: Optional[str] = None,
 ) -> SimpleNamespace:
     cfg = SimpleNamespace(
         date_range=(start.isoformat(), end.isoformat()),
@@ -166,6 +176,7 @@ def _make_config(
     cfg.dataflow_region = dataflow_region
     cfg.dataflow_temp_bucket = dataflow_temp_bucket
     cfg.dataflow_subnetwork = dataflow_subnetwork
+    cfg.worker_image = worker_image
     return cfg
 
 
@@ -238,6 +249,7 @@ def _build_pipeline_for(cfg: SimpleNamespace):
             "dataflow_region",
             "dataflow_temp_bucket",
             "dataflow_subnetwork",
+            "worker_image",
         }
         cfg_attrs = {k: v for k, v in vars(cfg).items() if k not in runner_only_attrs}
         df_cfg = SimpleNamespace(**cfg_attrs)
@@ -269,9 +281,14 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
     if runner == "dataflow":
         from pipe_gaps.pipelines.detect.factory import DetectGapsLinearDagFactory
 
+        # Workers pull from a registry; the local docker tag (image_tag) is
+        # for the in-process submission image only. Fall back to image_tag
+        # if no worker image is set, preserving the prior (broken on Dataflow)
+        # behaviour for callers that explicitly opt out.
+        worker_image = cfg.worker_image or image_tag
         rc = dit_dataflow.run(
             args=[],
-            image_tag=image_tag,
+            image_tag=worker_image,
             service_account=cfg.service_account,
             region=cfg.dataflow_region,
             temp_bucket=cfg.dataflow_temp_bucket,
@@ -421,9 +438,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--dataflow-temp-bucket", default=DEFAULT_DATAFLOW_TEMP_BUCKET)
     p.add_argument("--dataflow-subnetwork", default=DEFAULT_DATAFLOW_SUBNETWORK)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
-                   help=f"Pipeline image tag (default: {DEFAULT_IMAGE_TAG}). "
-                        "Docker uses build-from-source so this is informational; "
-                        "Dataflow forwards it as sdk_container_image.")
+                   help=f"Local image tag for the docker runner (default: "
+                        f"{DEFAULT_IMAGE_TAG}). Built from source; not used "
+                        f"by the dataflow runner -- see --worker-image.")
+    p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
+                   help=f"Dataflow worker container image (registry-published) "
+                        f"forwarded as sdk_container_image. Default: "
+                        f"{DEFAULT_WORKER_IMAGE}.")
     p.add_argument("--enable-pipeline-4", action="store_true")
     p.add_argument("--restricted-ssvids", default="")
     p.add_argument("--auto-restrict", action="store_true")
@@ -459,6 +480,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dataflow_region=args.dataflow_region or None,
         dataflow_temp_bucket=args.dataflow_temp_bucket or None,
         dataflow_subnetwork=args.dataflow_subnetwork or None,
+        worker_image=args.worker_image or None,
     )
 
     base = f"{PROJECT}.{args.dest_dataset}.three_way_{suffix}"
