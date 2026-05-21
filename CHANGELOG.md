@@ -2,7 +2,7 @@
 
 User-facing changes to `dit` (the framework, CLI, and workflows). For the internal record of plan-doc evolution, see the **Plan changelog** in [`CLAUDE.md`](CLAUDE.md).
 
-The project is pre-1.0; entries are grouped chronologically under `[Unreleased]` rather than semver releases. Format inspired by [Keep a Changelog](https://keepachangelog.com/).
+The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful set of features has landed, `main` is tagged as `v0.X.Y` and the accumulated content moves under a `## [v0.X.Y] — YYYY-MM-DD` heading (pre-1.0 — minor increments freely). Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
