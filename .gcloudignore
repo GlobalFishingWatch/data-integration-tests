@@ -1,10 +1,15 @@
-# Excluded from `gcloud builds submit --source=.` uploads.
+# Excluded from `gcloud builds submit` uploads.
 #
-# NOTE: This file applies when the dit repo itself is the build source
-# (e.g. `make publish-ditbox`). When a pipeline checkout is the source
-# (`make dit-cloud`), gcloud falls back to the pipeline repo's own
-# .gcloudignore / .gitignore. Keep this list aligned with the pipeline
-# checkouts' equivalents.
+# Used in two places:
+#   1. `make publish-ditbox` — submits with the dit repo as source.
+#   2. `make dit-cloud`      — submits with a PIPELINE checkout as source,
+#                              pointed here explicitly via --ignore-file=...
+#                              so .git is preserved in the upload (the
+#                              auto-generated default excludes .git, which
+#                              breaks workflows that call `git rev-parse`
+#                              to compute commit suffixes).
+#
+# Therefore this file MUST NOT exclude .git/.
 
 __pycache__/
 *.py[cod]

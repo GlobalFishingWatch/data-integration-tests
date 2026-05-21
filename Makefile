@@ -117,5 +117,6 @@ dit-cloud:
 	@test -d "$(PROJECTS)/$(PIPELINE)" || { echo "pipeline dir not found: $(PROJECTS)/$(PIPELINE)" >&2; exit 1; }
 	gcloud builds submit \
 	    --config=cloudbuild-dit.yaml \
+	    --ignore-file=$(CURDIR)/.gcloudignore \
 	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)" \
 	    "$(PROJECTS)/$(PIPELINE)"
