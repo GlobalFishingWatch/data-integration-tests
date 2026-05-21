@@ -409,38 +409,53 @@ def _run_slice(
     ``iteration`` is 1-indexed within the mode; ``total_iterations`` is the
     number of slices the mode will run. Both flow into the Dataflow job name
     (as ``-N-M`` suffix) and BQ labels for per-iteration provenance.
+
+    When ``args.thinned_message_table`` is set, step 1 is SKIPPED and step 2
+    reads from that table instead of the per-mode ``port_events_<suffix>_<mode>``
+    table the workflow would normally produce. This is the supported way to
+    run dit against a change that lives only in step 2 -- avoids re-thinning
+    AIS data that step 1 has already produced upstream (e.g. in prod).
     """
-    thin_args = [
-        "thin_port_messages",
-        f"--start_date={slice_start.isoformat()}",
-        f"--end_date={slice_end.isoformat()}",
-        f"--anchorage_table={args.named_anchorages}",
-        f"--input_table={_messages_table(args)}",
-        f"--output_table={_thinned_table(args, suffix, mode)}",
-        f"--temp_dataset={args.bq_temp_dataset}",
-        *_pipeline_options(
-            args, step="thin_port_messages", mode=mode,
-            iteration=iteration, total_iterations=total_iterations,
-            slice_start=slice_start, slice_end=slice_end,
-        ),
-    ]
-    logger.info("thin_port_messages %s [%s, %s] iter=%d/%d",
-                mode, slice_start, slice_end, iteration, total_iterations)
-    rc = dit_docker.run(
-        args.image_tag, thin_args,
-        entrypoint="pipe-anchorages",
-        build_from_source=args.build_from_source,
-    )
-    if rc != 0:
-        raise SystemExit(
-            f"thin_port_messages failed (rc={rc}, mode={mode}, slice=[{slice_start}, {slice_end}])"
+    if args.thinned_message_table:
+        logger.info(
+            "thin_port_messages SKIPPED for mode=%s slice=[%s, %s] iter=%d/%d -- using external table %s",
+            mode, slice_start, slice_end, iteration, total_iterations,
+            args.thinned_message_table,
         )
+        thinned_input = args.thinned_message_table
+    else:
+        thin_args = [
+            "thin_port_messages",
+            f"--start_date={slice_start.isoformat()}",
+            f"--end_date={slice_end.isoformat()}",
+            f"--anchorage_table={args.named_anchorages}",
+            f"--input_table={_messages_table(args)}",
+            f"--output_table={_thinned_table(args, suffix, mode)}",
+            f"--temp_dataset={args.bq_temp_dataset}",
+            *_pipeline_options(
+                args, step="thin_port_messages", mode=mode,
+                iteration=iteration, total_iterations=total_iterations,
+                slice_start=slice_start, slice_end=slice_end,
+            ),
+        ]
+        logger.info("thin_port_messages %s [%s, %s] iter=%d/%d",
+                    mode, slice_start, slice_end, iteration, total_iterations)
+        rc = dit_docker.run(
+            args.image_tag, thin_args,
+            entrypoint="pipe-anchorages",
+            build_from_source=args.build_from_source,
+        )
+        if rc != 0:
+            raise SystemExit(
+                f"thin_port_messages failed (rc={rc}, mode={mode}, slice=[{slice_start}, {slice_end}])"
+            )
+        thinned_input = _thinned_table(args, suffix, mode)
 
     visits_args = [
         "port_visits",
         f"--start_date={args.start}",
         f"--end_date={slice_end.isoformat()}",
-        f"--thinned_message_table={_thinned_table(args, suffix, mode)}",
+        f"--thinned_message_table={thinned_input}",
         f"--vessel_id_table={_segment_info_table(args)}",
         f"--output_table={_visits_table(args, suffix, mode)}",
         f"--bad_segs={_bad_segs_sql(args)}",
@@ -581,6 +596,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Optional binding label (e.g. 'before', 'after') used by the "
                         "cross-version wrapper. Surfaces in Dataflow job names and BQ labels "
                         "(dit_binding=<name>). Empty when running standalone.")
+    p.add_argument("--thinned-message-table", default=None,
+                   help="Fully-qualified BQ table holding pre-thinned port messages. When set, "
+                        "step 1 (thin_port_messages) is SKIPPED and step 2 (port_visits) reads "
+                        "directly from this table instead of the per-mode port_events_<suffix>_<mode> "
+                        "the workflow would otherwise produce. Useful when the change under test "
+                        "is in step 2 only (e.g. PORT_GAP_BEGIN anchorage fixes) -- saves the "
+                        "dominant cost of running the thin step on full AIS data. Cross-version "
+                        "runs should provide a snapshotted FQN (cross_version_ais.py pins this "
+                        "automatically when given a prod-side FQN).")
     p.add_argument("--allow-dirty-tree", action="store_true",
                    help="Permit auto-suffix on a dirty working tree.")
     p.add_argument("--skip-pipelines", action="store_true",

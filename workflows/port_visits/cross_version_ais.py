@@ -127,6 +127,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                    help="`name=image` pair, repeatable. Overrides --worker-image (passed to ais.py) for that one binding. "
                         "Lets cross-version actually exercise per-binding worker code, which the default static --worker-image does not. "
                         "Bindings without an override use ais.py's default.")
+    p.add_argument("--thinned-message-table", default=None,
+                   help="Fully-qualified BQ table holding pre-thinned port messages. When set, "
+                        "the wrapper snapshots it into the experiment's snapshot dataset at "
+                        "--pin-source-at (mirroring how source datasets are pinned), then passes "
+                        "the snapshot FQN to every binding's ais.py as --thinned-message-table. "
+                        "Each binding's step 1 (thin_port_messages) is then SKIPPED -- saves the "
+                        "dominant cost when the change under test is in step 2 only. The wrapper "
+                        "exclusively owns this knob in cross-version runs: any user-supplied "
+                        "--thinned-message-table in extras is ALWAYS dropped (even when this "
+                        "wrapper flag is unset), so the user can't inject an unpinned table "
+                        "and bypass the snapshot. To skip step 1 in a cross-version run, set "
+                        "this wrapper flag.")
     args, ais_extra_args = p.parse_known_args(argv)
     args.bindings = [_parse_binding(b) for b in args.bindings]
     args.modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -226,6 +238,34 @@ def _snapshot_source(args: argparse.Namespace) -> str:
     return snap_stem
 
 
+# Fixed table name we snapshot the external thinned-messages source into.
+# Lives in the same _internal half as messages_positions (it's intermediate,
+# not published downstream data).
+_THINNED_SNAPSHOT_TABLE = "port_events_external"
+
+
+def _snapshot_thinned_table(args: argparse.Namespace, snap_stem: str) -> str:
+    """Snapshot the user-supplied --thinned-message-table into the experiment's
+    snapshot dataset at --pin-source-at, return the snapshot FQN. The snapshot
+    dataset is created by ``_snapshot_source`` first.
+
+    Deliberately NOT idempotent: ``snapshot_table`` is called without
+    ``if_not_exists=True``, so a re-run of the same experiment-id with a
+    different ``--thinned-message-table`` (or a different ``--pin-source-at``)
+    fails fast with a BQ Conflict rather than silently keeping the prior
+    snapshot. Re-running cleanly requires either a fresh experiment-id or
+    explicit deletion of the existing snapshot table."""
+    dst_fqn = f"{PROJECT}.{snap_stem}_internal.{_THINNED_SNAPSHOT_TABLE}"
+    dit_bq.snapshot_table(
+        args.thinned_message_table, dst_fqn,
+        as_of=args.pin_source_at,
+        project=PROJECT,
+    )
+    logger.info("snapshotted external thinned table %s -> %s (as_of=%s)",
+                args.thinned_message_table, dst_fqn, args.pin_source_at.isoformat())
+    return dst_fqn
+
+
 # --------------------------------------------------------------------------
 # Per-binding run via git worktree
 # --------------------------------------------------------------------------
@@ -238,13 +278,19 @@ def _ais_args_for_binding(
     experiment_id: str,
     binding_name: str,
     worker_image: Optional[str] = None,
+    thinned_message_table: Optional[str] = None,
 ) -> list[str]:
     """Strip user-supplied overrides for fields the wrapper owns, then
     re-inject the wrapper's values. ``--suffix`` controls table names;
     ``--experiment-id`` + ``--binding-name`` flow into Dataflow job names
-    and BQ labels. ``--worker-image`` is dropped from extra_args only when
-    a per-binding override is provided -- otherwise ais.py's default wins."""
-    drop_kvs = {"--source-dataset-stem", "--suffix", "--experiment-id", "--binding-name"}
+    and BQ labels. ``--worker-image`` and ``--thinned-message-table`` are
+    dropped from extra_args only when a wrapper-supplied value is present
+    -- otherwise ais.py's default wins (no override, no drop)."""
+    # --thinned-message-table is always dropped in cross-version runs (whether or
+    # not the wrapper supplies its own snapshot FQN). The wrapper exclusively owns
+    # this knob -- user-supplied extras can never inject an unpinned table.
+    drop_kvs = {"--source-dataset-stem", "--suffix", "--experiment-id", "--binding-name",
+                "--thinned-message-table"}
     if worker_image is not None:
         drop_kvs = drop_kvs | {"--worker-image"}
     out: list[str] = []
@@ -268,6 +314,8 @@ def _ais_args_for_binding(
     ])
     if worker_image is not None:
         out.extend(["--worker-image", worker_image])
+    if thinned_message_table is not None:
+        out.extend(["--thinned-message-table", thinned_message_table])
     return out
 
 
@@ -295,6 +343,7 @@ def _run_binding(
     ais_extra_args: list[str],
     dry_run: bool,
     worker_image: Optional[str] = None,
+    thinned_message_table: Optional[str] = None,
 ) -> int:
     worktree_dir = tempfile.mkdtemp(prefix=f"dit-xv-{name}-")
     try:
@@ -309,6 +358,7 @@ def _run_binding(
             snap_stem=snap_stem, suffix=suffix,
             experiment_id=experiment_id, binding_name=name,
             worker_image=worker_image,
+            thinned_message_table=thinned_message_table,
         )
         cmd = [sys.executable, str(AIS_WORKFLOW), *argv]
         logger.info("binding %s: invoking %s", name, " ".join(shlex.quote(c) for c in cmd))
@@ -432,6 +482,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _verify_refs(args.pipeline_dir, args.bindings)
     snap_stem = _snapshot_source(args)
 
+    # Optional: snapshot an externally-supplied thinned-messages table so that
+    # step 1 (thin_port_messages) can be skipped on every binding. Done after
+    # _snapshot_source so the _internal snapshot dataset already exists.
+    thinned_snapshot_fqn = (
+        _snapshot_thinned_table(args, snap_stem)
+        if args.thinned_message_table else None
+    )
+
     # Each binding gets a deterministic suffix the diff step can address.
     suffix_by_binding = {
         name: f"{args.experiment_id}-{name}" for name, _ in args.bindings
@@ -447,6 +505,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ais_extra_args=ais_extra_args,
             dry_run=args.dry_run,
             worker_image=args.binding_worker_images.get(name),
+            thinned_message_table=thinned_snapshot_fqn,
         )
         return name, rc
 

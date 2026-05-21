@@ -265,6 +265,8 @@ Five tracks. 1–3 are independent and parallelisable; 4 depends on 2+3; 5 depen
 3. Compares all three pairs with `dit.compare.compare_tables(..., keys=["visit_id"], view_suffix="")`.
 4. Returns 0 if all three match.
 
+Optional: `--thinned-message-table=<FQN>` skips step 1 (`thin_port_messages`) entirely and points step 2 (`port_visits`) at the supplied table. Used when the change under test lives only in step 2 — saves the dominant cost of running the thin step over full AIS data. `cross_version_ais.py` exposes the same flag at the wrapper level and snapshots the source table at `--pin-source-at` so both bindings see byte-identical input.
+
 `workflows/port_visits/vms.py` does the same with VMS-shape orchestration: 4-day window `[d-W, d)`, VMS-flavored param values from `params.yaml`. The two scripts share `params.yaml` and a local `_make_phase_call()` helper inside `workflows/port_visits/`. Code duplication between `ais.py` and `vms.py` is **deliberate** — two copies are not a framework; framework decisions wait for the third consumer (pipe-events in Phase 3).
 
 **Deliverables.**
