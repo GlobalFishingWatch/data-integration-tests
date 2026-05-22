@@ -15,19 +15,34 @@ import re
 import subprocess
 import sys
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Optional
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
+from dit.cache import (
+    STATUS_SUCCEEDED,
+    CachedRun,
+    CacheKey,
+    compute_cache_key,
+    expires_at_for,
+    read_cache,
+    resolve_worker_image_to_digest,
+    sha1_of_workflow_file,
+    verify_tables_exist,
+    write_cache,
+)
 from dit.dates import daterange_inclusive
 from dit.git_info import warn_if_worker_image_misses_dirty_tree
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
+
+# Compute once at import time; the dit-side cache buster.
+WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +481,179 @@ def execute_mutate_recover(
         iteration += 1
 
 
+# --------------------------------------------------------------------------
+# Run cache integration (M4 of dit.cache rollout; see docs/run-cache-impl.md)
+# --------------------------------------------------------------------------
+
+#: The workflow name recorded on every CachedRun row.
+WORKFLOW_NAME = "workflows/pipe_gaps/mode_equivalence.py"
+
+
+#: Modes that consume ``tail_days`` + ``backfill_days``. ``MODE_BF`` is the
+#: single big-range run -- those fields are wired through ``execute_*`` for
+#: it but never read, so they must NOT contribute to its cache key (otherwise
+#: changing ``--tail-days`` would invalidate BF's cache for no behavioural
+#: reason, dropping the hit rate).
+_MODES_USING_TAIL = frozenset({MODE_BFD, MODE_BFTRUNCATE, MODE_MUTATE_RECOVER})
+
+
+def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]:
+    """Output-affecting params for a pipe-gaps mode-equivalence run.
+
+    Mode-aware: only the params each mode actually consumes contribute
+    to its cache key. ``MODE_BF`` runs a single big range and ignores
+    ``tail_days`` / ``backfill_days``; the other modes use them for
+    their daily slices. Including irrelevant fields in BF's key would
+    invalidate its cache on every ``--tail-days`` change, even though
+    BF's output doesn't depend on it.
+
+    Excludes plumbing (service accounts, regions, datasets), naming
+    (experiment_id, suffix), and runner-only knobs (image_tag, parallel,
+    skip_pipelines) — none of which affect the output content.
+    """
+    params: dict[str, Any] = {
+        "mode": mode,
+        "start": args.start,
+        "end": args.end,
+        "min_gap_length": args.min_gap_length,
+        "n_hours_before": args.n_hours_before,
+        "window_period_d": args.window_period_d,
+        "filter_good_seg": (args.filter_good_seg == "True"),
+        "skip_open_gaps": bool(args.skip_open_gaps),
+        "ssvids": sorted(
+            s.strip() for s in args.ssvids.split(",") if s.strip()
+        ),
+        "source_messages": args.source_messages,
+        "source_segments": args.source_segments,
+    }
+    if mode in _MODES_USING_TAIL:
+        params["tail_days"] = args.tail_days
+        params["backfill_days"] = args.backfill_days
+    return params
+
+
+def _build_cache_key(args: argparse.Namespace, mode: str, **extra_params: Any) -> CacheKey:
+    """Compose a :class:`CacheKey` for the given mode.
+
+    ``extra_params`` are merged into the params dict for modes whose
+    output depends on additional inputs (e.g. ``mutate_recover``'s
+    ``restricted_ssvids``).
+    """
+    params = canonical_params_dict(args, mode)
+    params.update(extra_params)
+    return CacheKey(
+        pipeline_commit=args.pipeline_commit,
+        worker_image_digest=args.worker_image_digest,
+        workflow_file_sha1=WORKFLOW_FILE_SHA1,
+        params=params,
+    )
+
+
+def _dit_commit() -> str:
+    """Short git SHA of the dit checkout the workflow was loaded from.
+
+    Best-effort — returns ``"unknown"`` outside a git repo (e.g. when
+    dit is pip-installed from a tarball). The value is recorded for
+    provenance only; it does NOT feed into the cache key (dit
+    refactors shouldn't invalidate cache entries).
+    """
+    try:
+        import dit
+        # dit/__init__.py -> dit/ -> src/ -> repo root
+        dit_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(dit.__file__))))
+        return subprocess.check_output(
+            ["git", "-C", dit_root, "rev-parse", "--short", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, ImportError):
+        return "unknown"
+
+
+def _run_with_cache(
+    execute_fn: Callable[..., None],
+    *,
+    args: argparse.Namespace,
+    mode: str,
+    output_fqn: str,
+    execute_kwargs: dict[str, Any],
+    cache_key_extras: Optional[dict[str, Any]] = None,
+) -> str:
+    """Wrap an ``execute_*`` call with cache lookup + record-on-miss.
+
+    Returns the FQN of the output table to use for downstream
+    comparisons:
+
+    * On cache **hit** (matching key + output tables verified to still
+      exist): skip ``execute_fn`` entirely; return the cached row's
+      ``output_tables[0]`` (the cached FQN, which differs from the
+      current run's ``output_fqn`` because of the per-run UUID suffix).
+    * On cache **miss** or **stale** (row exists but tables expired):
+      call ``execute_fn(**execute_kwargs)``; write a :class:`CachedRun`
+      row with the current run's metadata; return ``output_fqn``.
+
+    The cache row is written for **every** completed run including
+    dirty-tree ones (registry purpose). ``read_cache`` filters
+    ``pipeline_dirty = TRUE`` rows out of lookups so dirty runs don't
+    poison future caches.
+    """
+    cache_key_obj = _build_cache_key(args, mode, **(cache_key_extras or {}))
+    cache_key = compute_cache_key(cache_key_obj)
+    key_short = cache_key[:12]
+
+    cached = read_cache(cache_key)
+    if cached is not None:
+        # Empty output_tables on a "succeeded" row is a degenerate state
+        # (shouldn't happen given our write path, but guard against it
+        # in case future runs / manual seeds write malformed rows -- the
+        # vacuous `all([]) == True` would otherwise step into an
+        # IndexError on `cached.output_tables[0]`).
+        if cached.output_tables and all(verify_tables_exist(cached.output_tables)):
+            logger.info(
+                "cache HIT  mode=%-16s key=%s -> %s",
+                mode, key_short, cached.output_tables[0],
+            )
+            return cached.output_tables[0]
+        reason = "empty output_tables" if not cached.output_tables else "tables expired"
+        logger.info(
+            "cache STALE mode=%-16s key=%s (%s); recomputing",
+            mode, key_short, reason,
+        )
+
+    started_at = datetime.now(timezone.utc)
+    execute_fn(**execute_kwargs)
+    finished_at = datetime.now(timezone.utc)
+
+    output_tables = [output_fqn]
+    row = CachedRun(
+        run_id=args.run_id,
+        cache_key=cache_key,
+        workflow=WORKFLOW_NAME,
+        pipeline="pipe-gaps",
+        experiment_id=args.experiment_id,
+        pipeline_commit=args.pipeline_commit,
+        pipeline_dirty=args.pipeline_dirty,
+        dit_commit=args.dit_commit,
+        workflow_file_sha1=WORKFLOW_FILE_SHA1,
+        worker_image=args.worker_image,
+        params=cache_key_obj.params,
+        output_tables=output_tables,
+        # TODO(M5): runner doesn't return Dataflow job IDs yet; cancel_run
+        # will need to find them via the dit_run_id label until then.
+        dataflow_job_ids=[],
+        cloud_build_id=os.environ.get("BUILD_ID"),
+        started_at=started_at,
+        finished_at=finished_at,
+        status=STATUS_SUCCEEDED,
+        expires_at=expires_at_for(output_tables),
+    )
+    write_cache(row)
+    logger.info(
+        "cache MISS mode=%-16s key=%s -> wrote run %s",
+        mode, key_short, args.run_id,
+    )
+    return output_fqn
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n", 1)[0])
     p.add_argument("--runner", choices=list(RUNNERS), default="dataflow")
@@ -538,8 +726,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
 
+    # Per-`main()` context used by the run cache (see dit.cache /
+    # docs/run-cache.md). Stashed on args so downstream code can read
+    # without recomputing.
+    pipeline_commit, pipeline_dirty = _git_info(repo_dir)
+    args.run_id = uuid.uuid4().hex[:12]
+    args.pipeline_commit = pipeline_commit
+    args.pipeline_dirty = pipeline_dirty
+    args.dit_commit = _dit_commit()
+    # resolve_worker_image_to_digest is a one-off ~1-2s gcloud call;
+    # fall back to the tag form if it fails (no cache hits then, but
+    # the run still produces output).
+    try:
+        args.worker_image_digest = resolve_worker_image_to_digest(args.worker_image)
+    except RuntimeError as e:
+        logger.warning(
+            "could not resolve %s to a digest (%s); falling back to tag form. "
+            "Cache lookups will likely miss.",
+            args.worker_image, e,
+        )
+        args.worker_image_digest = args.worker_image
+    logger.info(
+        "run_id=%s pipeline_commit=%s%s dit_commit=%s",
+        args.run_id, args.pipeline_commit,
+        " (DIRTY)" if args.pipeline_dirty else "",
+        args.dit_commit,
+    )
+
     warn_if_worker_image_misses_dirty_tree(
-        dirty_fn=lambda: _git_info(repo_dir)[1],
+        dirty_fn=lambda: pipeline_dirty,
         repo_dir=repo_dir,
         runner=args.runner,
         worker_image=args.worker_image,
@@ -609,19 +824,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             explicit_restricted if (args.enable_pipeline_4 and explicit_restricted) else None
         )
 
+        # Wrap each mode's execute_* through the run cache so identical
+        # (commit, image, params, workflow_file) tuples reuse prior
+        # output tables instead of re-running Dataflow. Returns the
+        # FQN to use for downstream comparisons (cached or fresh).
+        def _wrap_bf() -> str:
+            return _run_with_cache(
+                execute_bf, args=args, mode=MODE_BF,
+                output_fqn=bf_table, execute_kwargs=bf_kwargs,
+            )
+
+        def _wrap_bfd() -> str:
+            return _run_with_cache(
+                execute_bfd, args=args, mode=MODE_BFD,
+                output_fqn=bfd_table, execute_kwargs=bfd_kwargs,
+            )
+
+        def _wrap_bft() -> str:
+            return _run_with_cache(
+                execute_bftruncate, args=args, mode=MODE_BFTRUNCATE,
+                output_fqn=bft_table, execute_kwargs=bft_kwargs,
+            )
+
         if args.parallel:
             can_parallel_p4 = args.enable_pipeline_4 and mr_restricted is not None
             max_workers = 4 if can_parallel_p4 else 3
 
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = [
-                    ex.submit(execute_bf, **bf_kwargs),
-                    ex.submit(execute_bfd, **bfd_kwargs),
-                    ex.submit(execute_bftruncate, **bft_kwargs),
-                ]
+                f_bf = ex.submit(_wrap_bf)
+                f_bfd = ex.submit(_wrap_bfd)
+                f_bft = ex.submit(_wrap_bft)
+                f_mr = None
                 if can_parallel_p4:
-                    futures.append(ex.submit(
-                        execute_mutate_recover,
+                    assert mr_restricted is not None  # narrowed by can_parallel_p4
+                    mr_kwargs = dict(
                         runner=args.runner, base_cfg=base_cfg,
                         start=start, end=end,
                         tail_days=args.tail_days, backfill_days_w=args.backfill_days,
@@ -629,13 +865,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         restricted_ssvids=mr_restricted,
                         experiment_id=args.experiment_id,
                         image_tag=args.image_tag,
-                    ))
-                for f in futures:
-                    f.result()
+                    )
+                    f_mr = ex.submit(
+                        _run_with_cache,
+                        execute_mutate_recover,
+                        args=args, mode=MODE_MUTATE_RECOVER,
+                        output_fqn=mr_table, execute_kwargs=mr_kwargs,
+                        cache_key_extras={"restricted_ssvids": sorted(mr_restricted)},
+                    )
+                bf_table = f_bf.result()
+                bfd_table = f_bfd.result()
+                bft_table = f_bft.result()
+                if f_mr is not None:
+                    mr_table = f_mr.result()
         else:
-            execute_bf(**bf_kwargs)
-            execute_bfd(**bfd_kwargs)
-            execute_bftruncate(**bft_kwargs)
+            bf_table = _wrap_bf()
+            bfd_table = _wrap_bfd()
+            bft_table = _wrap_bft()
 
         if args.enable_pipeline_4 and args.auto_restrict:
             mid = end - timedelta(days=args.tail_days)
@@ -646,7 +892,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 seed=args.auto_restrict_seed,
             )
             mr_restricted = tuple(restricted_list)
-            execute_mutate_recover(
+            mr_kwargs = dict(
                 runner=args.runner, base_cfg=base_cfg,
                 start=start, end=end,
                 tail_days=args.tail_days, backfill_days_w=args.backfill_days,
@@ -655,8 +901,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 experiment_id=args.experiment_id,
                 image_tag=args.image_tag,
             )
+            mr_table = _run_with_cache(
+                execute_mutate_recover,
+                args=args, mode=MODE_MUTATE_RECOVER,
+                output_fqn=mr_table, execute_kwargs=mr_kwargs,
+                cache_key_extras={"restricted_ssvids": sorted(mr_restricted)},
+            )
         elif args.enable_pipeline_4 and not args.parallel:
-            execute_mutate_recover(
+            assert mr_restricted is not None  # validated above when enable_pipeline_4
+            mr_kwargs = dict(
                 runner=args.runner, base_cfg=base_cfg,
                 start=start, end=end,
                 tail_days=args.tail_days, backfill_days_w=args.backfill_days,
@@ -664,6 +917,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 restricted_ssvids=mr_restricted,
                 experiment_id=args.experiment_id,
                 image_tag=args.image_tag,
+            )
+            mr_table = _run_with_cache(
+                execute_mutate_recover,
+                args=args, mode=MODE_MUTATE_RECOVER,
+                output_fqn=mr_table, execute_kwargs=mr_kwargs,
+                cache_key_extras={"restricted_ssvids": sorted(mr_restricted)},
             )
 
     if args.skip_comparisons:

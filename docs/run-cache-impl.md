@@ -43,7 +43,7 @@ Implement `CachedRun.to_bq_row` + `write_cache`.
 - 8 new unit tests: shape, ISO timestamps, JSON-string params, nullable passthrough, round-trip via `from_bq_row`, `insert_rows_json` call shape, error-raising, dirty rows still written.
 - Real-BQ smoke: write a row → `read_cache` it back → assert match. Passes.
 
-### Milestone 4 — Workflow integration (pipe-gaps)
+### Milestone 4 — Workflow integration (pipe-gaps) ✓ (`feat/dit-cache-workflow-pipe-gaps`)
 
 Wire `dit.cache` into `workflows/pipe_gaps/mode_equivalence.py`.
 
