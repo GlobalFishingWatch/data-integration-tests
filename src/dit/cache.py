@@ -374,16 +374,19 @@ def expires_at_for(table_fqns: list[str], *, client: Any = None) -> datetime:
     if not table_fqns:
         return datetime.now(timezone.utc) + timedelta(days=1)
     client = client or _make_client()
+    from google.api_core import exceptions as gax_exceptions
 
     expirations: list[datetime] = []
     for fqn in table_fqns:
         try:
             table = client.get_table(fqn)
-        except Exception:
-            # Caller will verify table existence separately via
-            # verify_tables_exist; if a table is missing here, ignoring
-            # it is correct -- it doesn't gate the cache entry's TTL.
-            logger.debug("expires_at_for: get_table(%s) raised; skipping", fqn)
+        except gax_exceptions.NotFound:
+            # Missing tables are fine: verify_tables_exist handles
+            # existence separately, and a missing table doesn't gate
+            # the cache entry's TTL. Other errors (permission, rate
+            # limit, transient network) propagate -- silently swallowing
+            # them would mask real ops problems.
+            logger.debug("expires_at_for: %s not found; skipping", fqn)
             continue
         if table.expires is not None:
             expirations.append(table.expires)

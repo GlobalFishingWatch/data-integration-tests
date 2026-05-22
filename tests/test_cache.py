@@ -8,15 +8,24 @@ plumbing for the scaffold milestone.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
 
 from dit.cache import (
     CacheKey,
+    CachedRun,
     canonicalise_params,
     compute_cache_key,
+    expires_at_for,
+    read_cache,
     resolve_worker_image_to_digest,
     sha1_of_workflow_file,
+    verify_tables_exist,
 )
 
 
@@ -152,20 +161,6 @@ def test_resolve_worker_image_to_digest_passes_digest_form_through():
 # BQ-touching paths (M2): read_cache / verify_tables_exist /
 # expires_at_for / CachedRun.from_bq_row. Tests use a mocked client.
 # --------------------------------------------------------------------------
-
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-from unittest.mock import MagicMock
-
-import pytest
-
-from dit.cache import (
-    CachedRun,
-    expires_at_for,
-    read_cache,
-    verify_tables_exist,
-)
-
 
 def _bq_row(**overrides: Any) -> Any:
     """SimpleNamespace stand-in for a `google.cloud.bigquery.Row`."""
@@ -312,16 +307,26 @@ def test_expires_at_for_falls_back_when_no_expirations():
 
 
 def test_expires_at_for_skips_missing_tables():
-    # A table that get_table() can't find shouldn't crash the call;
-    # verify_tables_exist handles the existence check separately.
+    # A missing table shouldn't crash the call; verify_tables_exist
+    # handles the existence check separately. Only NotFound is swallowed
+    # -- other exceptions (permission, rate limit, etc.) propagate.
+    from google.api_core import exceptions as gax_exceptions
     a = datetime(2026, 6, 1, tzinfo=timezone.utc)
     client = MagicMock()
     client.get_table.side_effect = [
         SimpleNamespace(expires=a),
-        Exception("404 Not Found"),
+        gax_exceptions.NotFound("proj.ds.gone"),
     ]
     result = expires_at_for(["proj.ds.a", "proj.ds.gone"], client=client)
     assert result == a
+
+
+def test_expires_at_for_propagates_non_notfound_errors():
+    from google.api_core import exceptions as gax_exceptions
+    client = MagicMock()
+    client.get_table.side_effect = gax_exceptions.Forbidden("nope")
+    with pytest.raises(gax_exceptions.Forbidden):
+        expires_at_for(["proj.ds.a"], client=client)
 
 
 def test_expires_at_for_empty_input():
