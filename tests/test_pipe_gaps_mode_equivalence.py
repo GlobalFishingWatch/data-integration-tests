@@ -9,11 +9,8 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 # This import works even without pipe_gaps; the workflow's pipe_gaps imports
 # are inside function bodies, not at module level.
@@ -61,8 +58,32 @@ def test_canonical_params_dict_changes_with_mode():
     a = mod.canonical_params_dict(_args(), mod.MODE_BF)
     b = mod.canonical_params_dict(_args(), mod.MODE_BFD)
     assert a != b
-    # Only the mode field differs.
-    assert {k: v for k, v in a.items() if k != "mode"} == {k: v for k, v in b.items() if k != "mode"}
+
+
+def test_canonical_params_dict_bf_excludes_tail_and_backfill():
+    # MODE_BF runs a single big-range slice; tail_days / backfill_days
+    # are wired through execute_* for symmetry but BF doesn't read
+    # them. They must not contribute to BF's cache key or changing
+    # --tail-days would invalidate BF for no behavioural reason.
+    p = mod.canonical_params_dict(_args(), mod.MODE_BF)
+    assert "tail_days" not in p
+    assert "backfill_days" not in p
+
+
+def test_canonical_params_dict_bfd_includes_tail_and_backfill():
+    # MODE_BFD does multiple daily slices controlled by tail_days +
+    # backfill_days, so these DO affect its output.
+    p = mod.canonical_params_dict(_args(), mod.MODE_BFD)
+    assert p["tail_days"] == 4
+    assert p["backfill_days"] == 4
+
+
+def test_canonical_params_dict_bf_invariant_to_tail_change():
+    # Concrete consequence: changing --tail-days alone should produce
+    # the same BF cache key.
+    a = mod.canonical_params_dict(_args(tail_days=4), mod.MODE_BF)
+    b = mod.canonical_params_dict(_args(tail_days=10), mod.MODE_BF)
+    assert a == b
 
 
 def test_canonical_params_dict_excludes_plumbing():
@@ -186,6 +207,31 @@ def test_run_with_cache_miss_runs_and_writes():
     assert written_row.status == mod.STATUS_SUCCEEDED
     assert written_row.pipeline == "pipe-gaps"
     # Returns the FRESH FQN (we just computed it).
+    assert result == "proj.ds.fresh_bf_table"
+
+
+def test_run_with_cache_empty_output_tables_treats_as_miss():
+    # Degenerate state: a "succeeded" row with no output_tables. Without
+    # the guard, all([]) -> True and indexing [0] would IndexError.
+    execute_fn = MagicMock()
+    with (
+        patch.object(mod, "read_cache", return_value=_cached_row(output_tables=[])),
+        patch.object(mod, "verify_tables_exist", return_value=[]),
+        patch.object(mod, "write_cache") as mock_write,
+        patch.object(
+            mod, "expires_at_for",
+            return_value=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        ),
+    ):
+        result = mod._run_with_cache(
+            execute_fn,
+            args=_args(),
+            mode=mod.MODE_BF,
+            output_fqn="proj.ds.fresh_bf_table",
+            execute_kwargs={},
+        )
+    execute_fn.assert_called_once()
+    mock_write.assert_called_once()
     assert result == "proj.ds.fresh_bf_table"
 
 

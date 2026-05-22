@@ -489,21 +489,32 @@ def execute_mutate_recover(
 WORKFLOW_NAME = "workflows/pipe_gaps/mode_equivalence.py"
 
 
+#: Modes that consume ``tail_days`` + ``backfill_days``. ``MODE_BF`` is the
+#: single big-range run -- those fields are wired through ``execute_*`` for
+#: it but never read, so they must NOT contribute to its cache key (otherwise
+#: changing ``--tail-days`` would invalidate BF's cache for no behavioural
+#: reason, dropping the hit rate).
+_MODES_USING_TAIL = frozenset({MODE_BFD, MODE_BFTRUNCATE, MODE_MUTATE_RECOVER})
+
+
 def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     """Output-affecting params for a pipe-gaps mode-equivalence run.
 
-    Includes the mode constant so different modes within the same dit
-    invocation get different cache keys. Excludes plumbing (service
-    accounts, regions, datasets), naming (experiment_id, suffix), and
-    runner-only knobs (image_tag, parallel, skip_pipelines) — none of
-    which affect the output content.
+    Mode-aware: only the params each mode actually consumes contribute
+    to its cache key. ``MODE_BF`` runs a single big range and ignores
+    ``tail_days`` / ``backfill_days``; the other modes use them for
+    their daily slices. Including irrelevant fields in BF's key would
+    invalidate its cache on every ``--tail-days`` change, even though
+    BF's output doesn't depend on it.
+
+    Excludes plumbing (service accounts, regions, datasets), naming
+    (experiment_id, suffix), and runner-only knobs (image_tag, parallel,
+    skip_pipelines) — none of which affect the output content.
     """
-    return {
+    params: dict[str, Any] = {
         "mode": mode,
         "start": args.start,
         "end": args.end,
-        "tail_days": args.tail_days,
-        "backfill_days": args.backfill_days,
         "min_gap_length": args.min_gap_length,
         "n_hours_before": args.n_hours_before,
         "window_period_d": args.window_period_d,
@@ -515,6 +526,10 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
         "source_messages": args.source_messages,
         "source_segments": args.source_segments,
     }
+    if mode in _MODES_USING_TAIL:
+        params["tail_days"] = args.tail_days
+        params["backfill_days"] = args.backfill_days
+    return params
 
 
 def _build_cache_key(args: argparse.Namespace, mode: str, **extra_params: Any) -> CacheKey:
@@ -587,15 +602,21 @@ def _run_with_cache(
 
     cached = read_cache(cache_key)
     if cached is not None:
-        if all(verify_tables_exist(cached.output_tables)):
+        # Empty output_tables on a "succeeded" row is a degenerate state
+        # (shouldn't happen given our write path, but guard against it
+        # in case future runs / manual seeds write malformed rows -- the
+        # vacuous `all([]) == True` would otherwise step into an
+        # IndexError on `cached.output_tables[0]`).
+        if cached.output_tables and all(verify_tables_exist(cached.output_tables)):
             logger.info(
                 "cache HIT  mode=%-16s key=%s -> %s",
                 mode, key_short, cached.output_tables[0],
             )
             return cached.output_tables[0]
+        reason = "empty output_tables" if not cached.output_tables else "tables expired"
         logger.info(
-            "cache STALE mode=%-16s key=%s (tables expired); recomputing",
-            mode, key_short,
+            "cache STALE mode=%-16s key=%s (%s); recomputing",
+            mode, key_short, reason,
         )
 
     started_at = datetime.now(timezone.utc)
