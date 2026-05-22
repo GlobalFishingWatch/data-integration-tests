@@ -36,23 +36,45 @@ After this pivot:
 
 `git stash create` writes a new commit every invocation: the tree may be identical, but the committer timestamp changes, so the commit SHA changes. Under the run-cache key `sha256(pipeline_commit + worker_image_digest + workflow_file_sha1 + canonical_params_json)`, two stash commits of an unchanged working tree would hash to different keys → MISS → byte-identical recompute. That defeats the motivating "two identical dirty builds" scenario from § Why.
 
-Fix: snapshot creation in M-pivot-1 / M-pivot-2 derives a **deterministic commit** from the working-tree content:
+Fix: snapshot creation in M-pivot-1 / M-pivot-2 derives a **deterministic commit** from the working-tree content. The trickiest part is capturing the dirty working tree into a tree SHA *without polluting the user's index*. The reference implementation:
 
-1. `git update-index --refresh && TREE_SHA=$(git write-tree)` — captures the index's tree SHA; deterministic for an unchanged tree.
-2. Build a commit with frozen author/committer dates so the commit SHA is purely a function of the tree:
-   ```bash
-   GIT_AUTHOR_DATE="1970-01-01T00:00:00Z" \
-   GIT_COMMITTER_DATE="1970-01-01T00:00:00Z" \
-   GIT_AUTHOR_NAME=dit GIT_AUTHOR_EMAIL=dit@local \
-   GIT_COMMITTER_NAME=dit GIT_COMMITTER_EMAIL=dit@local \
-   COMMIT_SHA=$(git commit-tree -m "dit snapshot" -p HEAD "$TREE_SHA")
-   ```
-3. Snapshot ref name uses the commit's short SHA: `refs/dit-snapshots/<pipeline>/<commit-short-sha>`. Identical tree → identical commit SHA → identical ref → push is a no-op (or skipped entirely if `git rev-parse refs/dit-snapshots/<pipeline>/<sha>` already resolves on origin).
-4. Install from `<commit-sha>`. The cache key sees the same `pipeline_commit` for repeat runs of unchanged uncommitted code.
+```bash
+# 1. Build a temp index seeded from HEAD, stage tracked-file modifications
+#    against it (same logic `git stash create` uses internally; isolating
+#    via GIT_INDEX_FILE keeps the user's real index untouched).
+TMP_INDEX=$(mktemp)
+trap 'rm -f "$TMP_INDEX"' EXIT
+GIT_INDEX_FILE="$TMP_INDEX" git read-tree HEAD
+GIT_INDEX_FILE="$TMP_INDEX" git add -u
+TREE_SHA=$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)
+
+# 2. Build a commit with frozen author/committer identities so the commit
+#    SHA is purely a function of the tree (+ parent HEAD).
+SHA=$(GIT_AUTHOR_DATE="1970-01-01T00:00:00Z" \
+      GIT_COMMITTER_DATE="1970-01-01T00:00:00Z" \
+      GIT_AUTHOR_NAME=dit GIT_AUTHOR_EMAIL=dit@local \
+      GIT_COMMITTER_NAME=dit GIT_COMMITTER_EMAIL=dit@local \
+      git commit-tree -m "dit snapshot" -p HEAD "$TREE_SHA")
+
+# 3. Idempotency: skip the push if the ref already resolves on origin.
+REF="refs/dit-snapshots/<pipeline>/${SHA:0:12}"  # 12 chars > git default 7
+if git ls-remote --exit-code origin "$REF" >/dev/null 2>&1; then
+    echo "snapshot already present on origin: $REF"
+else
+    git update-ref "$REF" "$SHA"
+    git push origin "$REF:$REF"
+fi
+```
+
+Why each piece matters:
+- **Temp index** (`GIT_INDEX_FILE=$(mktemp) + git read-tree HEAD + git add -u`): this is the equivalent of what `git stash create` does internally. A naïve `git write-tree` against the user's real index would either pollute it or write HEAD's tree (depending on whether the user had pre-staged changes). The temp index lets us capture the dirty working tree without side-effects on the user's repo state.
+- **Frozen author/committer dates AND identities** (epoch 0; `dit` / `dit@local`): commits include author *and* committer (name, email, date) in their SHA. Both must be deterministic. Without freezing the identity too, two different users' snapshots of the same tree would have different SHAs.
+- **Parent = HEAD**: ties the snapshot to its starting point (good for reproduce instructions). Side effect: pushing the snapshot ref also propagates any unpushed HEAD ancestors. Acceptable trade-off — the user is already on a branch they intend to push eventually, and `refs/dit-snapshots/*` is a hidden namespace.
+- **12-char SHA prefix**: collision-resistant for our scale (millions of snapshots needed before birthday-paradox concern) while keeping ref names readable. Bumping later is a one-line change in M-pivot-1.
 
 The `<epoch>-<hex>` ref-naming scheme in earlier drafts of this doc / the policy memory is superseded by `<commit-short-sha>` for the content-addressable property. Epoch was an attempt to ensure uniqueness; tree-content hashing achieves uniqueness AND idempotency, which is what M-pivot-2 actually needs.
 
-Untracked files are still not captured (`git write-tree` only sees the index). Same caveat as today's `make snapshot-<pipeline>` — `git add -A` first if you need them.
+Untracked files are still not captured (`git add -u` only stages tracked modifications). Same caveat as today's `make snapshot-<pipeline>` — `git add -A` first if you need them.
 
 ## Migration plan
 
@@ -79,7 +101,7 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 ### M-pivot-3 — `unreviewed_code` column replaces `pipeline_dirty`
 
 - Migration: `ALTER TABLE tech_great_expectations.dit_runs ADD COLUMN unreviewed_code BOOL`.
-- `_run_with_cache` writes `unreviewed_code=TRUE` when `pipeline_commit` resolves under `refs/dit-snapshots/*` (or — heuristic — fails `git merge-base --is-ancestor <commit> origin/main`). `FALSE` for commits on or merged into `origin/main`.
+- `_run_with_cache` writes `unreviewed_code=TRUE` when `pipeline_commit` resolves under `refs/dit-snapshots/*` (or — heuristic — fails `git merge-base --is-ancestor <commit> origin/main` after a `git fetch origin main`). `FALSE` for commits on or merged into `origin/main`. The pre-check `git fetch` is needed because a stale local `origin/main` would mark recently-merged commits as `unreviewed_code=TRUE` until the next fetch; one round-trip per `_run_with_cache` invocation is acceptable cost.
 - `read_cache` default behaviour: returns all rows (`unreviewed_code` is informational). PR-validation queries that want strict provenance filter `WHERE unreviewed_code = FALSE` explicitly.
 - Drop the `pipeline_dirty = FALSE` filter from `read_cache`.
 - Backfill existing rows: `UPDATE ... SET unreviewed_code = pipeline_dirty` (semantically equivalent for the existing data).
@@ -120,6 +142,7 @@ No drops requiring a destructive migration. The rename is additive (ADD + UPDATE
 | **`make snapshot-<pipeline>` now requires git-push permission to the pipeline repo.** | Same scope of users who already need GCP AR push; no new permission class. Document the requirement in README. |
 | **CI scripts that pass `--allow-dirty-tree` break.** | Deprecation cycle: M-pivot-2 keeps the flag as a no-op with a warning; M-pivot-4 removes it. One release of grace. |
 | **Snapshot push + branch-protection rules.** | `refs/dit-snapshots/*` is outside `refs/heads/`; branch protection patterns typically don't apply. Confirm with whoever set up the pipeline-repo's protections. |
+| **Pushing the snapshot ref propagates any unpushed HEAD ancestors** (git's reachability rules). A user with N local-only commits on their feature branch effectively pushes those commits when the snapshot ref pins HEAD as its parent. | Acceptable — the user is on a branch they intend to push eventually; the dit-snapshots namespace is hidden from the GitHub UI; and this matches the existing implicit assumption that "anything you put in dit-cloud you're OK with on origin". Worth one line in the snapshot banner so the behaviour isn't surprising. |
 | **A user without push access (e.g. read-only viewer) tries to run dit-cloud against uncommitted code.** | Auto-snapshot will fail at push time with a clear error pointing at `make install-<pipeline>-ref REF=<committed-ref>` or to committing the changes first. Acceptable failure mode. |
 
 ## Open questions
