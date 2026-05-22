@@ -17,7 +17,7 @@ A single table serves all three. Naming is intentionally generic — this is not
 ```sql
 CREATE TABLE dit_meta.runs (
   -- identity
-  run_id           STRING    NOT NULL,  -- dit_run_id label (12-hex from ais.py / mode_equivalence.py)
+  run_id           STRING    NOT NULL,  -- 12-hex; matches the `dit_run_id` BQ label that ais.py already emits (port_visits). mode_equivalence.py does NOT emit `dit_run_id` today (it generates a 6-hex experiment-id suffix instead) -- adding the label to pipe-gaps is part of the run-cache implementation work, not preexisting.
   cache_key        STRING    NOT NULL,  -- sha256, see below
 
   -- context (what produced this run)
@@ -42,7 +42,7 @@ CREATE TABLE dit_meta.runs (
   started_at       TIMESTAMP NOT NULL,
   finished_at      TIMESTAMP,
   status           STRING    NOT NULL,  -- "running" / "succeeded" / "failed" / "cancelled"
-  expires_at       TIMESTAMP NOT NULL,  -- mirrors the dest dataset's default_table_expiration_ms
+  expires_at       TIMESTAMP NOT NULL   -- moment the output_tables are no longer guaranteed to exist; see § expires_at below
 )
 PARTITION BY DATE(started_at)
 CLUSTER BY pipeline, cache_key;
@@ -106,6 +106,19 @@ def maybe_cached_run(workflow_fn, args) -> RunReport:
 
 **Concurrency.** Two PRs hitting `main`'s 1_bf at the same time both miss the cache (no prior row), both compute, both insert. Idempotent: same key, different `run_id`s. Next PR hits cache. Worth-the-waste; alternative (advisory locks) is heavier than the duplication cost.
 
+## `expires_at` — single rule
+
+`expires_at` reflects when the **physical `output_tables` are no longer guaranteed to exist** — not the dataset-level TTL.
+
+The two values aren't always the same. In the common case (output tables live in `scratch_*_ttl120d` or `tech_great_expectations` with a uniform `default_table_expiration_ms`), they coincide and `expires_at = started_at + default_table_expiration_ms`. But:
+
+- A workflow can write outputs to a dataset with a different (or no) default expiration, in which case the rule is whatever TTL the workflow set explicitly on its `CREATE TABLE`.
+- Cross-version runs write to `dit_exp_*` datasets with a 7-day default; the cache row mirrors that 7-day window for those outputs, not the dest dataset's 120-day default.
+
+Implementation: when writing a cache row, query `INFORMATION_SCHEMA.TABLES` for `expiration_time` on each `output_table` and take the **minimum** — any earlier-expiring output invalidates the whole cache entry. Stored as an absolute `TIMESTAMP` (not a duration) so the lookup query is a simple `WHERE expires_at > CURRENT_TIMESTAMP()`.
+
+The `INFORMATION_SCHEMA.TABLES` lookup on the read path is the second-line guard: even if `expires_at` is wrong (TTL got changed after write), the cache hit still verifies physical existence before reusing.
+
 ## Cleanup flow (`make dit-cancel RUN_ID=<id>`)
 
 ```
@@ -123,7 +136,6 @@ A separate **SIGTERM trap inside `dit run`'s `main()`** handles the live case (C
 
 - **Cross-version comparison semantics with cache hits.** When the PR's 1_bf is freshly computed but main's 1_bf is a cache hit, the `experiment_id` of the cached row doesn't match the PR run's `experiment_id`. The comparison logic must join on `cache_key` (or its components), not on `experiment_id`. Easy to get wrong; needs a clear API on the report side.
 - **Workflow file changes that produce identical outputs.** A docstring edit invalidates the cache for no reason. Tolerable for now; can refine with a hand-bumped `BEHAVIOUR_VERSION` constant later if it becomes painful.
-- **TTL behaviour with shared `dit_exp_*` datasets.** Cross-version source-snapshot datasets carry a 7-day `default_table_expiration_ms`. Output tables in the dest dataset (`scratch_*_ttl120d` or `tech_great_expectations`) have their own TTL. The `expires_at` column on the cache row must reflect the *output table's* TTL, not the dataset's — a row's cache entry is stale the moment its output tables would have expired.
 - **dit_meta dataset creation + IAM.** Dataset needs to exist with `dataEditor` for `automated-testing@`. One-time terraform + an idempotent `CREATE TABLE IF NOT EXISTS` migration. Worth a small `make dit-bootstrap` target.
 - **Multi-pipeline lookups.** `cache_key` is globally unique (sha256 over all inputs), but partition + cluster keys (`pipeline`, `started_at`) optimise the common per-pipeline scan. If we ever need cross-pipeline reuse (unlikely), the schema supports it.
 
