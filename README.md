@@ -91,10 +91,10 @@ Each phase below is a short summary of what's planned and where we are. The cano
 
 **Operational next steps** (rolling, in priority order):
 
-1. **Run cache M5 — port-visits integration + `make dit-cancel`.** Wire `dit.cache._run_with_cache` into `workflows/port_visits/ais.py` (structurally identical to the pipe-gaps M4 work that just landed). Add `make dit-cancel RUN_ID=<id>` reading the cache table to cancel Dataflow + drop output tables. Implement `cancel_run` in `dit.cache`.
+1. **Run cache M5 — port-visits integration + `make dit-cancel`.** Wire `dit.cache` into `workflows/port_visits/ais.py` via a `_run_with_cache`-style wrapper (structurally identical to the pipe-gaps M4 work that just landed in `workflows/pipe_gaps/mode_equivalence.py`). Add `make dit-cancel RUN_ID=<id>` reading the cache table to cancel Dataflow + drop output tables. Implement `cancel_run` in `dit.cache`.
 2. **Run cache M6 — SIGTERM trap inside `dit run`** so Cloud Build cancellations cleanly tear down their own Dataflow + BQ artefacts via `cancel_run`.
 3. **Per-pipeline PR triggers.** Wire `pipe-gaps` (most-verified) → `anchorages_pipeline` → `pipe-events` to fire dit on PRs. Trigger config lives in each pipeline repo; references `cloudbuild-dit.yaml` from the dit checkout. Path-filter on pipeline-relevant files; `dit:run` label as the escape-hatch override.
-4. **PR comment integration via Check Runs.** `dit.report` module + GitHub Check Run API call from inside `dit run`. Typed contract end-to-end (no log parsing). Design: [`docs/llm-pr-gating.md`](docs/llm-pr-gating.md) (companion design also covers the negative-signal-only LLM pre-filter).
+4. **PR comment integration via Check Runs.** `dit.report` module + GitHub Check Run API call from inside `dit run`. Typed contract end-to-end (no log parsing). Design doc TBD; separately, [`docs/llm-pr-gating.md`](docs/llm-pr-gating.md) covers the negative-signal-only LLM pre-filter that gates *whether* a PR triggers dit (orthogonal concern from how the verdict is posted).
 5. **Track 5** — pipe-gaps repo shim, opportunistically (replace `pipe-gaps/tests/integration/mode_equivalence.py` with a thin re-export from `dit/workflows/pipe_gaps/...`).
 6. VMS port-visits workflow, then AIS-full (the latter is what motivates Cloud Run jobs hardest once concurrent runs scale up).
 7. PIPELINE-1465 cross-version full validation against newly-built pipe-anchorages images (parallel to the pipe-gaps validation just completed).

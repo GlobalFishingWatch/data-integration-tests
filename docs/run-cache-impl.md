@@ -38,10 +38,10 @@ Implement `CachedRun.to_bq_row` + `write_cache`.
 **Reconciled with the design doc**: dirty-tree handling lives at the **read** side, not the write side. `read_cache` already filters `pipeline_dirty = FALSE`, so dirty rows never satisfy a cache lookup; but we still INSERT them for registry / cleanup purposes (`make dit-cancel` finds them via the run_id). No `record_run` wrapper needed — the earlier plan's "skip write when dirty" framing was inconsistent with the design.
 
 **Tasks (done)**:
-- `CachedRun.to_bq_row()` — datetime → ISO-8601 string; params dict → JSON string; nullables pass through.
-- `write_cache(row, *, client=None)` — `insert_rows_json`; raises on streaming-insert errors.
-- 8 new unit tests: shape, ISO timestamps, JSON-string params, nullable passthrough, round-trip via `from_bq_row`, `insert_rows_json` call shape, error-raising, dirty rows still written.
-- Real-BQ smoke: write a row → `read_cache` it back → assert match. Passes.
+- `CachedRun.to_bq_row()` — datetime → ISO-8601 string; params dict → JSON string; nullables pass through. Kept as a "render as dict" helper for debug/log/serialisation; not on the write hot path.
+- `write_cache(row, *, client=None)` — **parameterised DML INSERT** (`client.query("INSERT INTO ... VALUES (@a, ...)").result()`), with `PARSE_JSON(@params_json)` server-side over a STRING-typed parameter for the JSON column. Chosen over `insert_rows_json` because streaming inserts (a) sit in a 90-minute buffer that blocks UPDATE/DELETE — would break M5's `cancel_run` UPDATE — and (b) are at-least-once (retries can duplicate rows without explicit `row_ids=`). DML INSERT lands in permanent storage immediately, exactly-once, at the same cost (INSERT scans zero bytes). Raises whatever exception the BQ query job raises on failure.
+- 9 unit tests: `to_bq_row` shape (all 18 columns), ISO timestamps, JSON-string params, nullable passthrough, `from_bq_row` round-trip; `write_cache` calls `client.query` with the right SQL + parameter bindings, raises on DML errors, dirty rows still written, NULL params bind correctly.
+- Real-BQ smoke: write a row → `read_cache` it back → DELETE immediately. Affected rows: 1. (No streaming buffer = rows are immediately mutable.)
 
 ### Milestone 4 — Workflow integration (pipe-gaps) ✓ (`feat/dit-cache-workflow-pipe-gaps`)
 
