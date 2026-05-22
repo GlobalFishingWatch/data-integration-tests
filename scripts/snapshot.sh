@@ -36,19 +36,24 @@ cd "$PROJECT_DIR"
 PARENT_SHA=$(git rev-parse HEAD)
 
 # Clean tree -> nothing to snapshot; return HEAD directly.
-if git diff --quiet && git diff --cached --quiet; then
+# `git status --porcelain` emits one line per modified, staged, OR untracked
+# (non-gitignored) path. Empty output = nothing the snapshot would capture.
+# Plain `git diff` would miss untracked files and produce the wrong answer
+# now that we use `git add -A` in the temp-index dance below.
+if [ -z "$(git status --porcelain)" ]; then
     echo "$PARENT_SHA"
     exit 0
 fi
 
-# Build a temp index seeded from HEAD; stage tracked-file modifications
-# against it (same dance `git stash create` does internally). Keeps the
-# user's real index untouched.
-TMP_INDEX=$(mktemp)
+# Build a temp index seeded from HEAD; stage all working-tree changes
+# (modifications, deletions, AND new files honouring .gitignore) against
+# it. Keeps the user's real index untouched. `mktemp -t <template>` is
+# the portable form (works on macOS where bare `mktemp` errors).
+TMP_INDEX=$(mktemp -t dit-snapshot-index.XXXXXXXX)
 trap 'rm -f "$TMP_INDEX"' EXIT
 
 GIT_INDEX_FILE="$TMP_INDEX" git read-tree HEAD
-GIT_INDEX_FILE="$TMP_INDEX" git add -u
+GIT_INDEX_FILE="$TMP_INDEX" git add -A
 TREE_SHA=$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)
 
 # Frozen author/committer dates AND identities + --no-gpg-sign:
@@ -73,16 +78,27 @@ REF="refs/dit-snapshots/$PIPELINE/${SNAPSHOT_SHA:0:12}"
     echo "  snapshot:  $SNAPSHOT_SHA"
     echo "  parent:    $PARENT_SHA"
     echo "  caveats:"
-    echo "    - tracked files only; 'git add -A' first if untracked files matter"
-    echo "    - this run writes unreviewed_code=TRUE to dit_runs"
+    echo "    - working-tree changes captured automatically (.gitignore'd files excluded)"
     echo "    - if your changes touch worker code, also build+push a custom --worker-image"
     echo "    - auto-push requires git-push permission on $PIPELINE's origin"
 } >&2
 
 git update-ref "$REF" "$SNAPSHOT_SHA"
 
-if git ls-remote --exit-code origin "$REF" >/dev/null 2>&1; then
-    echo "  (ref already present on origin -- skipping push)" >&2
+# If the remote already has the ref, it must point at the same SHA we just
+# computed (the ref is content-addressable). A divergence means either a
+# 12-char prefix collision (astronomically rare) or a manual overwrite —
+# either way, refusing to silently install from a local-only ref that
+# disagrees with origin is the safer failure mode.
+REMOTE_SHA=$(git ls-remote origin "$REF" 2>/dev/null | awk '{print $1}')
+if [ -n "$REMOTE_SHA" ]; then
+    if [ "$REMOTE_SHA" != "$SNAPSHOT_SHA" ]; then
+        echo "error: $REF exists on origin at $REMOTE_SHA but local snapshot is $SNAPSHOT_SHA" >&2
+        echo "       refusing to install from a local-only ref that disagrees with origin." >&2
+        echo "       delete the divergent ref (scripts/clean-snapshot.sh) or use a longer prefix." >&2
+        exit 1
+    fi
+    echo "  (ref already present on origin at the same SHA -- skipping push)" >&2
 else
     git push origin "$REF:$REF" >&2
 fi

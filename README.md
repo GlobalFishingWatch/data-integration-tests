@@ -57,7 +57,7 @@ For the framework only (no workflow deps), `make install` works — but the data
 | Pipeline's transitive deps changed in target ref | add `FULLDEPS=1` | Drops `--no-deps`, lets pip reinstall the full dep tree (slower; only needed when the target ref bumped or added a dep). |
 | Remove a specific snapshot ref (secret-leak remediation only) | `make clean-snapshot PIPELINE=<name> REF=<sha-or-full-ref>` | Deletes the ref locally and on origin in one step. Snapshots otherwise live forever by design (bytes-scale, hidden namespace). |
 
-Notes on snapshot mode: only **tracked** modifications are captured. Run `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot. Requires `git push` permission on the pipeline's origin.
+Notes on snapshot mode: working-tree changes (modifications, deletions, AND new files) are captured automatically; `.gitignore`'d files are excluded (so `.env` or credentials in standard ignored paths won't be pushed). Requires `git push` permission on the pipeline's origin.
 
 ### Run a workflow
 

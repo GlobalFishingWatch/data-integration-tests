@@ -41,7 +41,7 @@ Read these in order before coding:
 Notes:
 
 - The framework-only `make install` works without any pipeline; the dataflow runner won't load until a workflow install brings `apache-beam[gcp]` transitively.
-- `make snapshot-<pipeline>` produces a **deterministic orphan commit** from the dirty tracked-files state (`git write-tree` against a temp index + `git commit-tree` with frozen author/committer dates+identity → identical tree → identical SHA). Parent SHA recorded in the commit message as `dit snapshot of <40-char-sha>`. Requires `git push` permission on the pipeline's origin. Only tracked modifications are captured — `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot.
+- `make snapshot-<pipeline>` produces a **deterministic orphan commit** from the dirty working tree (`git write-tree` against a temp index seeded from HEAD + `git add -A` against the temp index → tree captures modifications, deletions, AND new files honouring `.gitignore`; then `git commit-tree` with frozen author/committer dates+identity → identical tree → identical SHA). Parent SHA recorded in the commit message as `dit snapshot of <40-char-sha>`. Requires `git push` permission on the pipeline's origin.
 - Snapshots live forever by design (bytes-scale, hidden namespace under `refs/dit-snapshots/*`). No periodic cleanup. `make clean-snapshot` exists only for accidental-secret remediation; the previous broad-sweep `make clean-snapshots` was removed in M-pivot-1.
 - The non-editable install modes (`-ref`, snapshot) point the debugger at the installed copy under `venv/lib/python3.x/site-packages/<pipeline>/`, not your dev tree. If you're stepping through pipeline source, use the editable target instead.
 

@@ -99,6 +99,18 @@ def test_snapshot_dirty_tree_creates_orphan_ref(pipeline_repo: Path) -> None:
     subject = _git("show", "-s", "--format=%s", sha, cwd=pipeline_repo).stdout.strip()
     assert subject == f"dit snapshot of {head}"
 
+    # Commit metadata is frozen to epoch 0 / dit identity — required for the
+    # "two snapshots of the same tree at different wall-clock times resolve
+    # to the same SHA" property. A regression here would re-introduce
+    # non-determinism via committer/author timestamp drift.
+    fmt = "%at|%ct|%an|%ae|%cn|%ce"
+    meta = _git("show", "-s", f"--format={fmt}", sha, cwd=pipeline_repo).stdout.strip()
+    author_ts, committer_ts, an, ae, cn, ce = meta.split("|")
+    assert author_ts == "0", f"author timestamp must be epoch 0, got {author_ts!r}"
+    assert committer_ts == "0", f"committer timestamp must be epoch 0, got {committer_ts!r}"
+    assert an == "dit" and ae == "dit@local"
+    assert cn == "dit" and ce == "dit@local"
+
     # Banner reaches stderr.
     assert "dit snapshot for pipe-gaps" in stderr
 
@@ -185,3 +197,68 @@ def test_clean_snapshot_accepts_short_sha(pipeline_repo: Path) -> None:
     proc = _run_clean(pipeline_repo, short)
     assert "removed-local=1" in proc.stdout
     assert "removed-remote=1" in proc.stdout
+
+
+def test_clean_snapshot_rejects_invalid_short_ref(pipeline_repo: Path) -> None:
+    """Destructive: reject anything that isn't 12 hex chars or a full ref."""
+    proc = subprocess.run(
+        [str(CLEAN_SCRIPT), str(pipeline_repo), "not-a-sha"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "must be exactly 12 hex chars" in proc.stderr
+
+
+def test_snapshot_captures_untracked_files(pipeline_repo: Path) -> None:
+    """With `git add -A` in the temp index, brand-new files land in the tree."""
+    new_file = pipeline_repo / "src" / "new_module.py"
+    new_file.parent.mkdir(parents=True)
+    new_file.write_text("def f(): pass\n")
+
+    ref, _ = _run_snapshot(pipeline_repo)
+    sha = _git("rev-parse", ref, cwd=pipeline_repo).stdout.strip()
+
+    # `git ls-tree -r` should list the new path.
+    tree_listing = _git("ls-tree", "-r", "--name-only", sha, cwd=pipeline_repo).stdout
+    assert "src/new_module.py" in tree_listing.split()
+
+
+def test_snapshot_excludes_gitignored_files(pipeline_repo: Path) -> None:
+    """`.gitignore`'d paths must not enter the snapshot tree — guards against
+    accidental secret/credential leakage via auto-snapshot."""
+    (pipeline_repo / ".gitignore").write_text(".env\n")
+    _git("add", ".gitignore", cwd=pipeline_repo)
+    _git("commit", "-q", "-m", "gitignore", cwd=pipeline_repo)
+
+    (pipeline_repo / ".env").write_text("SECRET=hunter2\n")
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+
+    ref, _ = _run_snapshot(pipeline_repo)
+    sha = _git("rev-parse", ref, cwd=pipeline_repo).stdout.strip()
+
+    tree_listing = _git("ls-tree", "-r", "--name-only", sha, cwd=pipeline_repo).stdout
+    assert ".env" not in tree_listing.split()
+
+
+def test_snapshot_fails_on_ref_divergence(pipeline_repo: Path) -> None:
+    """If the remote already has the snapshot ref pointing at a different SHA,
+    snapshot.sh must refuse to install from a divergent local-only ref."""
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+    ref, _ = _run_snapshot(pipeline_repo)
+
+    # Simulate divergence: overwrite the remote ref to point at HEAD instead.
+    head = _git("rev-parse", "HEAD", cwd=pipeline_repo).stdout.strip()
+    _git("push", "origin", f"{head}:{ref}", "--force", cwd=pipeline_repo)
+    # Also drop the local ref so update-ref re-creates it cleanly on the next
+    # run; this isolates the test to the "remote disagrees" path.
+    _git("update-ref", "-d", ref, cwd=pipeline_repo)
+
+    proc = subprocess.run(
+        [str(SNAPSHOT_SCRIPT), "pipe-gaps", str(pipeline_repo)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "exists on origin at" in proc.stderr
+    assert "refusing to install" in proc.stderr

@@ -2,15 +2,20 @@
 # Surgical removal of a single snapshot ref locally and on origin.
 #
 # Intended only for secret-leak remediation -- snapshots normally live forever
-# by design (bytes-scale storage in a hidden namespace). The reproduce context
-# survives in dit_runs.pipeline_commit_parent even after the ref is gone.
+# by design (bytes-scale storage in a hidden namespace).
+#
+# Each snapshot commit's message records the parent SHA as
+#   "dit snapshot of <40-char-sha>"
+# so `git show <snapshot>` preserves the reproduce context even before the
+# `dit_runs.pipeline_commit_parent` column (M-pivot-3) lands.
 #
 # Usage: scripts/clean-snapshot.sh <pipeline-dir> <ref>
 #
 # <ref> may be:
 #   - full:  refs/dit-snapshots/<pipeline>/<sha>
-#   - short: just the <sha> portion (script deduces the pipeline from the
-#            pipeline-dir's basename)
+#   - short: exactly 12 hex chars (the script deduces the pipeline from the
+#            pipeline-dir's basename; any other shape is rejected to guard
+#            against accidental deletion).
 
 set -euo pipefail
 
@@ -30,8 +35,20 @@ fi
 cd "$PROJECT_DIR"
 
 case "$REF" in
-    refs/dit-snapshots/*) FULL_REF="$REF" ;;
-    *) FULL_REF="refs/dit-snapshots/$(basename "$PROJECT_DIR")/$REF" ;;
+    refs/dit-snapshots/*)
+        FULL_REF="$REF"
+        ;;
+    *)
+        # Short form must be exactly 12 hex chars -- this is what snapshot.sh
+        # emits. Reject anything else to make accidental deletion via typo or
+        # branch-name harder.
+        if ! [[ "$REF" =~ ^[0-9a-f]{12}$ ]]; then
+            echo "error: short REF must be exactly 12 hex chars (got: $REF)" >&2
+            echo "       or pass the full ref: refs/dit-snapshots/<pipeline>/<sha>" >&2
+            exit 2
+        fi
+        FULL_REF="refs/dit-snapshots/$(basename "$PROJECT_DIR")/$REF"
+        ;;
 esac
 
 REMOVED_LOCAL=0
