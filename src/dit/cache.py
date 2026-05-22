@@ -252,9 +252,40 @@ class CachedRun:
         )
 
     def to_bq_row(self) -> dict[str, Any]:
-        """Render as a dict suitable for `bigquery.Client.insert_rows_json`."""
-        # TODO: implement when write path lands.
-        raise NotImplementedError("CachedRun.to_bq_row — implement with write_cache()")
+        """Render as a dict suitable for ``bigquery.Client.insert_rows_json``.
+
+        Conversions vs the in-memory dataclass shape:
+
+        * ``datetime`` -> ISO-8601 string (BQ TIMESTAMP).
+        * ``params`` (dict) -> JSON-encoded string (BQ JSON column). The
+          ``insert_rows_json`` streaming API accepts a string for JSON
+          columns and parses it server-side.
+        * ``None`` for the nullable fields (``params``, ``cloud_build_id``,
+          ``finished_at``) passes through.
+        """
+        def _iso(dt: datetime | None) -> str | None:
+            return dt.isoformat() if dt is not None else None
+
+        return {
+            "run_id": self.run_id,
+            "cache_key": self.cache_key,
+            "workflow": self.workflow,
+            "pipeline": self.pipeline,
+            "experiment_id": self.experiment_id,
+            "pipeline_commit": self.pipeline_commit,
+            "pipeline_dirty": self.pipeline_dirty,
+            "dit_commit": self.dit_commit,
+            "workflow_file_sha1": self.workflow_file_sha1,
+            "worker_image": self.worker_image,
+            "params_json": json.dumps(self.params) if self.params is not None else None,
+            "output_tables": list(self.output_tables),
+            "dataflow_job_ids": list(self.dataflow_job_ids),
+            "cloud_build_id": self.cloud_build_id,
+            "started_at": _iso(self.started_at),
+            "finished_at": _iso(self.finished_at),
+            "status": self.status,
+            "expires_at": _iso(self.expires_at),
+        }
 
 
 # --------------------------------------------------------------------------
@@ -396,14 +427,77 @@ def expires_at_for(table_fqns: list[str], *, client: Any = None) -> datetime:
     return min(expirations)
 
 
-def write_cache(row: CachedRun) -> None:
-    """Insert a row into ``tech_great_expectations.dit_runs``.
+def write_cache(row: CachedRun, *, client: Any = None) -> None:
+    """Insert a row into ``tech_great_expectations.dit_runs`` via a
+    parameterised DML INSERT.
 
-    The caller decides whether to write (dirty trees should not, per
-    the design's reproducibility rule). This function records anything
-    given to it.
+    **Why DML INSERT, not streaming inserts (``insert_rows_json``)**:
+    streaming-inserted rows sit in a 90-minute buffer during which
+    UPDATE/DELETE against them is rejected. Our cancel path
+    (``cancel_run`` / ``make dit-cancel`` in M5) needs to UPDATE
+    ``status='cancelled'`` mid-flight, which is by definition within
+    the buffer window. Streaming is also at-least-once: retries can
+    create duplicate rows unless an explicit ``row_ids=`` is passed.
+    DML INSERT sidesteps both: rows land in permanent storage
+    immediately + every submission is exactly-once. Cost is the same
+    (INSERT VALUES scans zero bytes); latency is a few seconds vs
+    streaming's sub-second — invisible inside multi-minute Dataflow
+    workflows.
+
+    **Dirty-tree handling** lives at the read side, not here: every row
+    is recorded for registry + cleanup purposes regardless of
+    ``pipeline_dirty``. The :func:`read_cache` query filters out
+    ``pipeline_dirty = TRUE`` rows so dirty runs never satisfy a cache
+    lookup, but they remain visible to :func:`cancel_run` for cleanup.
+
+    Exceptions from the BQ query job propagate. ``.result()`` blocks
+    until the INSERT commits.
     """
-    raise NotImplementedError("write_cache — see docs/run-cache-impl.md § Milestone 3")
+    client = client or _make_client()
+    from google.cloud import bigquery
+
+    params_json_str = (
+        json.dumps(row.params) if row.params is not None else None
+    )
+
+    query = f"""
+        INSERT INTO `{TABLE_FQN}` (
+            run_id, cache_key, workflow, pipeline, experiment_id,
+            pipeline_commit, pipeline_dirty, dit_commit, workflow_file_sha1,
+            worker_image, params_json, output_tables, dataflow_job_ids,
+            cloud_build_id, started_at, finished_at, status, expires_at
+        ) VALUES (
+            @run_id, @cache_key, @workflow, @pipeline, @experiment_id,
+            @pipeline_commit, @pipeline_dirty, @dit_commit, @workflow_file_sha1,
+            @worker_image, PARSE_JSON(@params_json), @output_tables, @dataflow_job_ids,
+            @cloud_build_id, @started_at, @finished_at, @status, @expires_at
+        )
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("run_id", "STRING", row.run_id),
+        bigquery.ScalarQueryParameter("cache_key", "STRING", row.cache_key),
+        bigquery.ScalarQueryParameter("workflow", "STRING", row.workflow),
+        bigquery.ScalarQueryParameter("pipeline", "STRING", row.pipeline),
+        bigquery.ScalarQueryParameter("experiment_id", "STRING", row.experiment_id),
+        bigquery.ScalarQueryParameter("pipeline_commit", "STRING", row.pipeline_commit),
+        bigquery.ScalarQueryParameter("pipeline_dirty", "BOOL", row.pipeline_dirty),
+        bigquery.ScalarQueryParameter("dit_commit", "STRING", row.dit_commit),
+        bigquery.ScalarQueryParameter("workflow_file_sha1", "STRING", row.workflow_file_sha1),
+        bigquery.ScalarQueryParameter("worker_image", "STRING", row.worker_image),
+        # JSON column gets a STRING-typed parameter + server-side PARSE_JSON;
+        # documented BQ pattern for parameterised JSON inserts. NULL passes
+        # through because PARSE_JSON(NULL) returns NULL.
+        bigquery.ScalarQueryParameter("params_json", "STRING", params_json_str),
+        bigquery.ArrayQueryParameter("output_tables", "STRING", list(row.output_tables)),
+        bigquery.ArrayQueryParameter("dataflow_job_ids", "STRING", list(row.dataflow_job_ids)),
+        bigquery.ScalarQueryParameter("cloud_build_id", "STRING", row.cloud_build_id),
+        bigquery.ScalarQueryParameter("started_at", "TIMESTAMP", row.started_at),
+        bigquery.ScalarQueryParameter("finished_at", "TIMESTAMP", row.finished_at),
+        bigquery.ScalarQueryParameter("status", "STRING", row.status),
+        bigquery.ScalarQueryParameter("expires_at", "TIMESTAMP", row.expires_at),
+    ])
+
+    client.query(query, job_config=job_config).result()
 
 
 # --------------------------------------------------------------------------

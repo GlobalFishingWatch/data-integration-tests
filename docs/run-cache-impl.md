@@ -31,17 +31,17 @@ Implement `read_cache`, `verify_tables_exist`, `expires_at_for`.
 
 **Estimated effort**: ~half-day including the table creation.
 
-### Milestone 3 — BQ write path + dirty-tree skip
+### Milestone 3 — BQ write path ✓ (`feat/dit-cache-bq-write`)
 
-Implement `write_cache`. Add the `pipeline_dirty` gate at the public API level.
+Implement `CachedRun.to_bq_row` + `write_cache`.
 
-**Tasks**:
-- Implement `CachedRun.to_bq_row()` (inverse of `from_bq_row`).
-- Implement `write_cache(row)` via `bigquery.Client.insert_rows_json`.
-- Add a `record_run(row)` thin wrapper that calls `write_cache` only when `row.pipeline_dirty == False`; logs the skip otherwise. This is what workflows call — they don't think about the dirty gate themselves.
-- **Tests**: ~4 new tests covering the round-trip (to_bq_row + from_bq_row), the dirty-skip behaviour, and the insert-error path (logged + raised, never silently swallowed).
+**Reconciled with the design doc**: dirty-tree handling lives at the **read** side, not the write side. `read_cache` already filters `pipeline_dirty = FALSE`, so dirty rows never satisfy a cache lookup; but we still INSERT them for registry / cleanup purposes (`make dit-cancel` finds them via the run_id). No `record_run` wrapper needed — the earlier plan's "skip write when dirty" framing was inconsistent with the design.
 
-**Estimated effort**: half-day.
+**Tasks (done)**:
+- `CachedRun.to_bq_row()` — datetime → ISO-8601 string; params dict → JSON string; nullables pass through.
+- `write_cache(row, *, client=None)` — `insert_rows_json`; raises on streaming-insert errors.
+- 8 new unit tests: shape, ISO timestamps, JSON-string params, nullable passthrough, round-trip via `from_bq_row`, `insert_rows_json` call shape, error-raising, dirty rows still written.
+- Real-BQ smoke: write a row → `read_cache` it back → assert match. Passes.
 
 ### Milestone 4 — Workflow integration (pipe-gaps)
 

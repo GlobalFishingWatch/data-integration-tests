@@ -26,6 +26,7 @@ from dit.cache import (
     resolve_worker_image_to_digest,
     sha1_of_workflow_file,
     verify_tables_exist,
+    write_cache,
 )
 
 
@@ -334,3 +335,163 @@ def test_expires_at_for_empty_input():
     result = expires_at_for([])
     # No client used; pure fallback.
     assert timedelta(hours=23) < result - before < timedelta(hours=25)
+
+
+# --------------------------------------------------------------------------
+# Write path (M3): to_bq_row + write_cache.
+# --------------------------------------------------------------------------
+
+def _cached_run(**overrides: Any) -> CachedRun:
+    base = dict(
+        run_id="rid01",
+        cache_key="key01",
+        workflow="workflows/pipe_gaps/mode_equivalence.py",
+        pipeline="pipe-gaps",
+        experiment_id="exp01",
+        pipeline_commit="abc1234",
+        pipeline_dirty=False,
+        dit_commit="def5678",
+        workflow_file_sha1="aa" * 20,
+        worker_image="gcr.io/foo/pipe-gaps@sha256:0011",
+        params={"start": "2020-01-01", "end": "2020-12-31"},
+        output_tables=["world-fishing-827.tech_great_expectations.bf_table"],
+        dataflow_job_ids=["2026-05-22_00_00_00-1"],
+        cloud_build_id="build-01",
+        started_at=datetime(2026, 5, 22, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 5, 22, 0, 30, tzinfo=timezone.utc),
+        status="succeeded",
+        expires_at=datetime(2026, 9, 22, tzinfo=timezone.utc),
+    )
+    base.update(overrides)
+    return CachedRun(**base)
+
+
+def test_to_bq_row_shape():
+    row = _cached_run().to_bq_row()
+    # All 18 columns are present.
+    assert set(row.keys()) == {
+        "run_id", "cache_key", "workflow", "pipeline", "experiment_id",
+        "pipeline_commit", "pipeline_dirty", "dit_commit", "workflow_file_sha1",
+        "worker_image", "params_json", "output_tables", "dataflow_job_ids",
+        "cloud_build_id", "started_at", "finished_at", "status", "expires_at",
+    }
+
+
+def test_to_bq_row_timestamps_are_iso_strings():
+    row = _cached_run().to_bq_row()
+    assert row["started_at"] == "2026-05-22T00:00:00+00:00"
+    assert row["finished_at"] == "2026-05-22T00:30:00+00:00"
+    assert row["expires_at"] == "2026-09-22T00:00:00+00:00"
+
+
+def test_to_bq_row_params_json_is_serialised():
+    row = _cached_run().to_bq_row()
+    # Streaming inserts accept JSON columns as JSON-string literals; the
+    # server parses them back. Round-trip should yield the original dict.
+    import json as _json
+    assert _json.loads(row["params_json"]) == {"start": "2020-01-01", "end": "2020-12-31"}
+
+
+def test_to_bq_row_nullable_fields_pass_through():
+    row = _cached_run(
+        params=None,
+        cloud_build_id=None,
+        finished_at=None,
+    ).to_bq_row()
+    assert row["params_json"] is None
+    assert row["cloud_build_id"] is None
+    assert row["finished_at"] is None
+
+
+def test_to_bq_row_from_bq_row_round_trip():
+    # Symmetric: to_bq_row -> simulate BQ deserialisation -> from_bq_row
+    # should reproduce the same fields the round-trip preserves.
+    original = _cached_run()
+    bq_dict = original.to_bq_row()
+    # Simulate the BQ read coming back:
+    #   * TIMESTAMP -> datetime (parsing the ISO string)
+    #   * JSON -> dict (parsed by the BQ client)
+    import json as _json
+    row_obj = SimpleNamespace(
+        **{k: v for k, v in bq_dict.items() if k != "params_json"},
+        params_json=_json.loads(bq_dict["params_json"]) if bq_dict["params_json"] else None,
+    )
+    # Re-parse the TIMESTAMP fields back into datetime (BQ client does this).
+    for field in ("started_at", "finished_at", "expires_at"):
+        v = getattr(row_obj, field)
+        if v is not None:
+            setattr(row_obj, field, datetime.fromisoformat(v))
+
+    restored = CachedRun.from_bq_row(row_obj)
+    assert restored == original
+
+
+def test_write_cache_calls_dml_insert():
+    client = MagicMock()
+    run = _cached_run()
+    write_cache(run, client=client)
+    client.query.assert_called_once()
+    args, kwargs = client.query.call_args
+    sql = args[0]
+    assert "INSERT INTO" in sql
+    assert "world-fishing-827.tech_great_expectations.dit_runs" in sql
+    # JSON column uses the documented PARSE_JSON(STRING_param) pattern.
+    assert "PARSE_JSON(@params_json)" in sql
+    # All 18 columns appear as @parameters in the VALUES clause.
+    expected = {
+        "run_id", "cache_key", "workflow", "pipeline", "experiment_id",
+        "pipeline_commit", "pipeline_dirty", "dit_commit", "workflow_file_sha1",
+        "worker_image", "params_json", "output_tables", "dataflow_job_ids",
+        "cloud_build_id", "started_at", "finished_at", "status", "expires_at",
+    }
+    job_config = kwargs["job_config"]
+    actual = {p.name for p in job_config.query_parameters}
+    assert actual == expected
+    # .result() must be called so we block until the INSERT commits.
+    client.query.return_value.result.assert_called_once()
+
+
+def test_write_cache_binds_params_with_correct_values():
+    client = MagicMock()
+    run = _cached_run(run_id="rid-x", cache_key="ck-x", pipeline_dirty=True)
+    write_cache(run, client=client)
+    job_config = client.query.call_args.kwargs["job_config"]
+    by_name = {p.name: p for p in job_config.query_parameters}
+    assert by_name["run_id"].value == "rid-x"
+    assert by_name["cache_key"].value == "ck-x"
+    assert by_name["pipeline_dirty"].value is True
+    # params_json is the JSON-STRING form, server-side PARSE_JSON converts.
+    import json as _json
+    assert _json.loads(by_name["params_json"].value) == run.params
+    # Arrays bind via ArrayQueryParameter (`.values`, not `.value`).
+    assert by_name["output_tables"].values == list(run.output_tables)
+
+
+def test_write_cache_propagates_query_errors():
+    # DML errors come back via client.query(...).result(), not as a
+    # returned list (which is what insert_rows_json does).
+    client = MagicMock()
+    client.query.return_value.result.side_effect = RuntimeError("bad SQL")
+    with pytest.raises(RuntimeError, match="bad SQL"):
+        write_cache(_cached_run(), client=client)
+
+
+def test_write_cache_writes_dirty_rows_too():
+    # Design invariant: dirty rows ARE inserted (registry purpose); read
+    # path filters them out. Don't suppress writes here.
+    client = MagicMock()
+    write_cache(_cached_run(pipeline_dirty=True), client=client)
+    job_config = client.query.call_args.kwargs["job_config"]
+    dirty = next(p for p in job_config.query_parameters if p.name == "pipeline_dirty")
+    assert dirty.value is True
+
+
+def test_write_cache_handles_null_params():
+    # PARSE_JSON(NULL) returns NULL; the params_json binding must pass None.
+    client = MagicMock()
+    write_cache(_cached_run(params=None), client=client)
+    job_config = client.query.call_args.kwargs["job_config"]
+    params_json_param = next(
+        p for p in job_config.query_parameters if p.name == "params_json"
+    )
+    assert params_json_param.value is None
