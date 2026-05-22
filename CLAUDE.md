@@ -47,7 +47,39 @@ Notes:
 
 ## Plan changelog
 
-Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
+Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
+
+### 2026-05-22 — First end-to-end validation: framework caught a real bug, custom worker image proved the fix
+
+dit's first complete proof-of-value run, against the 2020 AIS-staging cohort:
+
+1. `make dit-cloud PIPELINE=pipe-gaps WORKFLOW=workflows/pipe_gaps/mode_equivalence.py ARGS="--runner dataflow --parallel --allow-dirty-tree"` against the registry's `pipe-gaps:v0.9.6` worker image produced **320 / 307 / 331 differing rows** across the three pairwise mode comparisons (1_bf vs 2_bfd, 1_bf vs 3_bftruncate, 2_bfd vs 3_bftruncate). Diff pattern (identical `end_timestamp`, divergent `end_msgid` / `end_lat` / `end_lon`) matched the textbook signature of non-deterministic message-sort tie-breaking at boundary handoffs.
+2. Diagnosis: workers ran v0.9.6's `_sort_messages` (SHA-1 `4c4d2de9941e` — just `operator.itemgetter(KEY_TIMESTAMP)`); the user's local tree on `PIPELINE-3974/source_table_time_travel` (committed `dfe662d` + uncommitted Boundaries extension) had the 5-tuple tiebreaker (SHA-1 `9a06bdb5659b`). The submitter's dirty changes never reached workers.
+3. Built `gcr.io/world-fishing-827/dit/pipe-gaps:dit-fix-msg-sort-dfe662d-dirty-6720a4` from the dirty tree (`docker build --target=prod`, ~5 min) → pushed to the dit-namespace. Re-ran with `--worker-image=<that-image> --experiment-id=fix-tiebreaker`. **All three pairwise comparisons collapsed to 0 differing rows** in 41 minutes (build `df159e3f-042d-474c-9bb7-b1fef6069f67`, exit 0).
+
+This validates: (a) the Cloud Build path end-to-end (`make publish-ditbox` → kaniko ditbox build → `make dit-cloud` → uv per-run install → Dataflow submission → BQ output → `dit.compare` verdict → exit-code propagation); (b) the mode-equivalence test surfaces real bugs rather than noise; (c) `dit.compare` returns the real diff count (PR #3 fix from 2026-05-18 actually working in production); (d) the recommended "custom worker image → `--worker-image` override" pattern works for testing pipeline-code changes.
+
+Plan-doc impact: no architectural changes needed; `docs/plan.md` Phase 2 verification path stands. Memory entries [[dit-first-real-catch]] and [[submitter-vs-worker-split]] persist this across sessions.
+
+### 2026-05-21 — Cloud Build runtime hardening (six PRs: #6–#11)
+
+Six PRs land together as the Cloud Build runtime moves from "submitted; let's see what happens" to "production-shaped tooling". Listed in the order they hit `main`:
+
+**PR #7 (`fix: pipe-gaps Dataflow job-name prefix dit-pipe-gaps`)**: `workflows/pipe_gaps/mode_equivalence.py` was still hardcoding `three-way-eq-...` as the Dataflow job_name prefix; only `port_visits/ais.py` had been migrated to `dit-<repo>-...` during the per-iteration labels work. One-line rename. BQ output-table prefix (`three_way_<suffix>`) intentionally left untouched so existing diff tables / ad-hoc queries against them keep working.
+
+**PR #8 (`fix: split DEFAULT_WORKER_IMAGE from local image tag in pipe-gaps workflow`)**: pipe-gaps' workflow was passing `DEFAULT_IMAGE_TAG = "gfw/pipe-gaps:dev"` (unqualified local tag) as `sdk_container_image`, putting Dataflow workers into permanent `ImagePullBackOff`. Split the local-docker tag from the registry-published worker image (`us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.9.6`), added `--worker-image` CLI flag, threaded it via `cfg.worker_image`. Dataflow branch in `_run_pipeline` now raises a clear `RuntimeError` if worker image is unset (no silent fallback to the local tag — that's what produced the original bug).
+
+**PR #6 (`feat: kaniko-cached ditbox build + uv per-run pipeline installs`)**: `docker/ditbox/cloudbuild.yaml` switched from `gcr.io/cloud-builders/docker` to `gcr.io/kaniko-project/executor` (pinned by digest, since that registry doesn't publish versioned tags) with a registry-backed layer cache at `gcr.io/world-fishing-827/github.com/globalfishingwatch/kaniko-cache` (shared with `monitoring/cloudbuild`). `cloudbuild-dit.yaml` uses `uv pip install --system` for per-run pipeline installs; uv is baked into ditbox at `0.11.15`. Ditbox rebuilds drop from ~3 min to seconds on cache-hits; per-run installs drop from ~30–90s to ~5–10s.
+
+**PR #9 (`fix: pin apache-beam at install time to match Dataflow worker image`)**: without an explicit constraint, the per-run uv install picked the newest apache-beam matching the pipeline's `~=` requirement; that drifted past whatever the published worker image was built with, and Dataflow rejected the submission with `Pipeline construction environment and pipeline runtime environment are not compatible`. New `_BEAM_VERSION` substitution in `cloudbuild-dit.yaml` writes a uv `--constraint` file; per-pipeline defaults wired into the `Makefile` (pipe-gaps → 2.71.0; anchorages_pipeline → 2.69.0). `--no-deps` dropped from both install paths (Copilot caught that it made the constraint a no-op).
+
+**PR #10 (`refactor: centralise Dataflow job-name builder in dit.job_names`)**: new module `src/dit/job_names.py` with `to_safe_for_job_name` + `make_job_name(*, repo, step, experiment_id, mode=None, binding=None, iteration=None, total_iterations=None, max_len=63)`. Pipe-gaps now builds the job name from explicit semantic parts (`repo=pipe-gaps`, `step=detect`, mode constant, iteration counter) instead of synthesising from the output table's `three_way_<suffix>` name — the stale `three-way-eq` / `three_way` strings no longer leak into Dataflow job names. Port-visits' local `_make_job_name` now delegates. `execute_bfd` / `execute_bftruncate` / `execute_mutate_recover` count iterations explicitly (matching the `N-of-M` suffix port-visits already had). Sanitizer strengthened to a real `[a-z0-9-]` regex; overflow raises rather than slicing the load-bearing tail. 7 unit tests in `tests/test_job_names.py`.
+
+**PR #11 (`feat: warn when submitter tree is dirty but worker image is the default`)**: new `src/dit/git_info.py` with `warn_if_worker_image_misses_dirty_tree(...)`. Logs a prominent banner when `runner == "dataflow"`, `worker_image == default_worker_image`, and the submitter's tree is dirty. Warning-only (legitimate cases exist — dirty workflow harness / docs / tests). Takes a `dirty_fn: Callable[[], bool]` (Copilot caught that an eager `dirty` parameter would force a `git status` shell-out even on the `--suffix` path). Both workflows call it from `main()`. 4 unit tests.
+
+**Why all at once.** The 2026-05-22 validation run exercises everything in this PR train end-to-end. Without #7/#8 the run wouldn't start; without #9 the SDK versions wouldn't match; without #11 the failure mode of "submitter dirty, workers don't see it" would only surface during result analysis. The Cloud Build runtime is now load-bearing, not aspirational.
+
+Memory entry [[submitter-vs-worker-split]] persists the cross-cutting lesson across sessions.
 
 ### 2026-05-15 — Image-namespace convention codified: `gcr.io/world-fishing-827/dit/*`
 
