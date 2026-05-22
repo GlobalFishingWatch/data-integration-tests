@@ -30,7 +30,29 @@ After this pivot:
 - **`_dirty` suffix gone from output table names.** Output suffix becomes `<experiment_id>_<commit>_<uuid>` — every byte traceable to a real git ref.
 - **`make snapshot-<pipeline>` auto-pushes** to the `refs/dit-snapshots/*` namespace.
 - **`make clean-snapshots` extended** to also delete the remote refs. User-invoked, same shape as today.
-- **The User experiences zero extra ceremony** for the iterative-development path (today's two-command friction goes away because dit handles the snapshot automatically). They gain reproducibility and cache hits on repeat runs of the same uncommitted code.
+- **The User experiences zero extra ceremony** for the iterative-development path (today's two-command friction goes away because dit handles the snapshot automatically). They gain reproducibility and cache hits on repeat runs of the same uncommitted code — see § "Deterministic snapshots" below for why this requires more than `git stash create`.
+
+## Deterministic snapshots (required for the cache-hit story)
+
+`git stash create` writes a new commit every invocation: the tree may be identical, but the committer timestamp changes, so the commit SHA changes. Under the run-cache key `sha256(pipeline_commit + worker_image_digest + workflow_file_sha1 + canonical_params_json)`, two stash commits of an unchanged working tree would hash to different keys → MISS → byte-identical recompute. That defeats the motivating "two identical dirty builds" scenario from § Why.
+
+Fix: snapshot creation in M-pivot-1 / M-pivot-2 derives a **deterministic commit** from the working-tree content:
+
+1. `git update-index --refresh && TREE_SHA=$(git write-tree)` — captures the index's tree SHA; deterministic for an unchanged tree.
+2. Build a commit with frozen author/committer dates so the commit SHA is purely a function of the tree:
+   ```bash
+   GIT_AUTHOR_DATE="1970-01-01T00:00:00Z" \
+   GIT_COMMITTER_DATE="1970-01-01T00:00:00Z" \
+   GIT_AUTHOR_NAME=dit GIT_AUTHOR_EMAIL=dit@local \
+   GIT_COMMITTER_NAME=dit GIT_COMMITTER_EMAIL=dit@local \
+   COMMIT_SHA=$(git commit-tree -m "dit snapshot" -p HEAD "$TREE_SHA")
+   ```
+3. Snapshot ref name uses the commit's short SHA: `refs/dit-snapshots/<pipeline>/<commit-short-sha>`. Identical tree → identical commit SHA → identical ref → push is a no-op (or skipped entirely if `git rev-parse refs/dit-snapshots/<pipeline>/<sha>` already resolves on origin).
+4. Install from `<commit-sha>`. The cache key sees the same `pipeline_commit` for repeat runs of unchanged uncommitted code.
+
+The `<epoch>-<hex>` ref-naming scheme in earlier drafts of this doc / the policy memory is superseded by `<commit-short-sha>` for the content-addressable property. Epoch was an attempt to ensure uniqueness; tree-content hashing achieves uniqueness AND idempotency, which is what M-pivot-2 actually needs.
+
+Untracked files are still not captured (`git write-tree` only sees the index). Same caveat as today's `make snapshot-<pipeline>` — `git add -A` first if you need them.
 
 ## Migration plan
 
@@ -39,11 +61,13 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 ### M-pivot-1 — `refs/dit-snapshots/*` namespace + auto-push in `make snapshot-<pipeline>`
 
 - Update `scripts/snapshot-install.sh` (and `make snapshot-<pipeline>`) to:
-  - Create the snapshot ref under `refs/dit-snapshots/<pipeline>/<epoch>-<hex>` instead of `refs/heads/dit-snapshot-<epoch>`.
-  - `git push origin refs/dit-snapshots/<pipeline>/<epoch>-<hex>:refs/dit-snapshots/<pipeline>/<epoch>-<hex>` after creating the ref.
-  - Print a one-liner banner with the four caveats: first-run-MISS, untracked-files-not-captured, unreviewed-code, worker-image-may-not-match.
+  - Build a **deterministic** snapshot commit from the working tree (`git write-tree` + `git commit-tree` with frozen dates — see § "Deterministic snapshots" above). Identical tree → identical commit SHA → idempotent.
+  - Create the snapshot ref under `refs/dit-snapshots/<pipeline>/<commit-short-sha>` instead of `refs/heads/dit-snapshot-<epoch>`.
+  - Skip the push if `git ls-remote origin refs/dit-snapshots/<pipeline>/<sha>` already resolves (the ref is content-addressable, so a re-push would be a no-op).
+  - Otherwise `git push origin refs/dit-snapshots/<pipeline>/<sha>:refs/dit-snapshots/<pipeline>/<sha>`.
+  - Print a one-liner banner with the caveats: untracked-files-not-captured, unreviewed-code, worker-image-may-not-match, requires-push-permission-on-pipeline-repo.
 - Update `make clean-snapshots` to also `git push --delete origin refs/dit-snapshots/...` for each cleaned local ref.
-- Tests: smoke that the snapshot ref ends up at the right place locally + remotely; banner appears.
+- Tests: smoke that (a) the snapshot ref ends up at the right place locally + remotely, (b) two invocations against an unchanged tree produce the same SHA / skip the second push, (c) banner appears.
 
 ### M-pivot-2 — auto-snapshot inside `make dit-cloud` + `dit run`
 
@@ -115,7 +139,7 @@ The total cost of these two runs was ~60 min × E2_HIGHCPU_8 + ~$10 of Dataflow,
 
 ## Related
 
-- [[no-dirty-tree-policy]] memory — pinned in the same PR as this plan.
 - [`docs/run-cache.md`](run-cache.md) — design that will get the `unreviewed_code` rename in M-pivot-3.
 - [`docs/run-cache-impl.md`](run-cache-impl.md) — milestone tracker; same.
-- The post-pivot README **§ Usage scenarios** section lives in `README.md` alongside this PR.
+- The post-pivot README **§ Usage scenarios** section lives in [`README.md`](../README.md) alongside this plan.
+- A Claude Code session memory pin (`no-dirty-tree-policy`, in `.claude/.../memory/`) carries the policy across assistant sessions; not user-facing — the canonical sources are this doc + the README sections referenced above.
