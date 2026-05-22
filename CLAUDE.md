@@ -49,6 +49,26 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-22 — No-dirty-tree pivot (planning); deprecate `--allow-dirty-tree`, auto-snapshot+push
+
+After the M1-M4 cache rollout we ran two `make dit-cloud` builds against the same dirty pipe-gaps tree to demo cache hits — both produced cache MISSes because the cache's `pipeline_dirty=TRUE` filter (correctly) skipped both rows. Wasted ~60 min of Dataflow + ~$10 on byte-identical recomputes. The demo dead-ended on exactly the feature we'd designed to defend against, which surfaces a real cost: eight discrete pieces of dirty-tree-aware logic across `--allow-dirty-tree`, the `_dirty` table-suffix, the `pipeline_dirty` cache column, the `read_cache` filter, the `warn_if_worker_image_misses_dirty_tree` helper, the per-mode-write-but-don't-read pattern, the dirty-row tests, and the relevant memories.
+
+The original plan never called for this. `make snapshot-<pipeline>` has existed since 2026-05-08 as the "test uncommitted changes reproducibly" pattern (git stash → temp branch → install from there). `--allow-dirty-tree` was a 2026-05-14 convenience shortcut that grew the surrounding scaffolding.
+
+**Decision**: deprecate `--allow-dirty-tree`; under the pivot, every dit run executes a committed git ref. Dirty trees → auto-snapshot+push to `refs/dit-snapshots/<pipeline>/<commit-short-sha>` as an **orphan, content-addressable** commit (no `-p HEAD` parent — that would propagate unpushed ancestors and tie the snapshot SHA to the branch history; instead the parent SHA is recorded in the commit message `dit snapshot of <parent-sha>` and mirrored in a new nullable `pipeline_commit_parent` column on `dit_runs`). `git write-tree` against a temp index + `git commit-tree` with frozen author/committer dates and identities, so identical tree state always resolves to the same SHA — repeat runs of unchanged uncommitted code hit the cache; hidden ref namespace, invisible to GitHub UI, fetchable by anyone with repo read access. `pipeline_dirty` column renamed to `unreviewed_code` (sharper semantic — distinguishes "snapshot or ad-hoc branch" from "merged to main", which is what the dirty flag was a proxy for). The broad `make clean-snapshots` is dropped in favour of a surgical `make clean-snapshot REF=<sha>` aimed at secret-leak remediation (snapshots live forever by design otherwise). Five-PR migration spelled out in [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md).
+
+**User-facing impact** at the end of the pivot:
+- Zero new ceremony for the common case (auto-snapshot is transparent — `make dit-cloud` works the same way for a dirty tree, just routes through a real ref).
+- Every cache row is reproducible by anyone with repo read access.
+- Cross-version + PR-validation queries can filter on `unreviewed_code = FALSE` for strict provenance, but cache hits still work for the user's own iteration loop.
+- ~30 sec extra at first snapshot creation per new uncommitted state (snapshot + push); subsequent runs against same snapshot hit cache instantly.
+
+**Trade-off accepted**: the auto-push pattern requires git-push permission on the pipeline repos. Same scope of users as the existing GCP Artifact Registry push permission (everyone who already runs `make publish-ditbox` or builds custom worker images). No new permission class.
+
+**Cleanup**: `make clean-snapshots` (existing user-invoked target) extended to also delete the remote refs. No cron, no inline cleanup. Bytes-scale storage on origin makes "never clean up" acceptable too; cleanup target is for UX hygiene.
+
+New memory [[no-dirty-tree-policy]] persists the policy across sessions. README § Usage scenarios concretises the end-state user flows. Plan-doc impact: `docs/run-cache.md` / `docs/run-cache-impl.md` will get the `unreviewed_code` rename in M-pivot-3; CHANGELOG gets Removed entries when each PR lands.
+
 ### 2026-05-22 — Run cache landed (M1–M4); content-addressable cache + registry + provenance in one table
 
 `dit.cache` ships in four PRs landed in sequence (#16 → #17 → #18 → #19), implementing the design sketched in [`docs/run-cache.md`](docs/run-cache.md) and tracked in [`docs/run-cache-impl.md`](docs/run-cache-impl.md).
