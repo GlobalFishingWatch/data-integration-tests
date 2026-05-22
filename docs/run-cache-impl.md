@@ -12,7 +12,7 @@ Each milestone is one PR's worth of work. Each ships on its own branch + PR, squ
 
 - **`src/dit/cache.py`**: module + dataclasses (`CacheKey`, `CachedRun`) + implemented pure functions (`compute_cache_key`, `sha1_of_workflow_file`, `canonicalise_params`, `resolve_worker_image_to_digest`). BQ-touching functions raise `NotImplementedError` with TODO markers.
 - **`tests/test_cache.py`**: 15 tests covering the pure functions: key determinism, sensitivity to each input, sha1 stability + edit-detection, params canonicalisation rules.
-- **`migrations/001_dit_meta_runs.sql`**: `CREATE TABLE IF NOT EXISTS` for `world-fishing-827.dit_meta.runs`. Partitioned by `DATE(started_at)`, clustered on `pipeline, cache_key`.
+- **`migrations/001_dit_meta_runs.sql`**: `CREATE TABLE IF NOT EXISTS` for `world-fishing-827.tech_great_expectations.dit_runs`. Partitioned by `DATE(started_at)`, clustered on `pipeline, cache_key`. (Filename keeps `001_dit_meta_runs.sql` for migration-history stability; the table inside is `dit_runs`.)
 - **`docs/run-cache-impl.md`** (this doc).
 
 **Why scaffold-first**: the BQ-touching code is one third of the surface area but is hard to test without infra; the pure parts (hash key, file sha1, params canonicalisation) are 80% of the correctness-relevant logic and 100% testable in milliseconds. Land them first, then add the BQ shell around them. Workflow integration doesn't go in until M4 — wiring half-implemented cache into workflows risks subtle bugs that would land before they were verifiable.
@@ -22,8 +22,7 @@ Each milestone is one PR's worth of work. Each ships on its own branch + PR, squ
 Implement `read_cache`, `verify_tables_exist`, `expires_at_for`.
 
 **Tasks**:
-- `bq mk dit_meta` (one-off, may need IAM coordination — see Open infra below).
-- Apply `migrations/001_dit_meta_runs.sql` via `bq query`.
+- Apply `migrations/001_dit_meta_runs.sql` via `bq query --use_legacy_sql=false < migrations/001_dit_meta_runs.sql`. No dataset creation or IAM grant needed — `tech_great_expectations` already exists and `automated-testing@` has `dataEditor` on it.
 - Implement `read_cache(cache_key) -> CachedRun | None` using `google.cloud.bigquery.Client.query` with a parameterised `cache_key`. Returns `None` on no match.
 - Implement `verify_tables_exist(table_fqns) -> list[bool]`. Group FQNs by dataset; one `INFORMATION_SCHEMA.TABLES` query per dataset.
 - Implement `expires_at_for(table_fqns) -> datetime`. Same INFORMATION_SCHEMA join; `MIN(expiration_time)` across the supplied tables.
@@ -54,7 +53,7 @@ Wire `dit.cache` into `workflows/pipe_gaps/mode_equivalence.py`.
 - Add the `dit_run_id` label to pipe-gaps' Dataflow job options (currently only port-visits has it). 12-hex UUID generated once per `main()`, stamped on every Dataflow job + BQ table for cleanup-by-label.
 - Wire `cfg` to carry `run_id`, `experiment_id`, `pipeline_dirty`, `worker_image_digest` so `record_run` can fill the `CachedRun` row at exit.
 - **Tests**: integration test against a stub `dit.cache` (mock `read_cache` returning Some/None) — confirms `execute_*` skips computation on hit, runs on miss. No real BQ.
-- **Smoke**: one Cloud Build run against the AIS-staging cohort with `dit_meta.runs` empty (expect: miss, compute, write); a second run with the cache populated (expect: hit, skip, no Dataflow jobs).
+- **Smoke**: one Cloud Build run against the AIS-staging cohort with `tech_great_expectations.dit_runs` empty (expect: miss, compute, write); a second run with the cache populated (expect: hit, skip, no Dataflow jobs).
 
 **Estimated effort**: 1 day. The threading work (cfg attributes, label addition) is the bulk; the cache-call sites are 4 lines each.
 
@@ -84,8 +83,7 @@ When Cloud Build cancels a build mid-flight, the orchestrator process gets SIGTE
 
 ## Open infra prerequisites
 
-- **`dit_meta` dataset.** Needs to exist in `world-fishing-827` with `dataEditor` for `automated-testing@`. One-time. Two paths: (a) terraform PR against the GFW cloud-platform-terraform repo (canonical; ~1-week turnaround); (b) `bq mk` + manual IAM grant via the console (immediate; not version-controlled). Recommendation: do (b) for the M2 implementation work, follow up with (a) for permanence.
-- **`bigquery.Client` for read.** `read_cache` runs from inside the Cloud Build step (the dit orchestrator). The build's service account (`automated-testing@`) already has `dataViewer` on most datasets; needs explicit `dataViewer` on `dit_meta` (covered by the same dataEditor grant).
+- **Cache table creation.** One-shot `bq query --use_legacy_sql=false < migrations/001_dit_meta_runs.sql`. No new dataset / IAM grant — uses the existing `tech_great_expectations` dataset that dit already writes outputs to. If/when retention separation or per-table IAM is needed, the table moves with a one-line `TABLE_FQN` change in `src/dit/cache.py`.
 - **`gcloud dataflow jobs cancel` permission.** For `cancel_run`. `automated-testing@` likely already has `dataflow.jobs.cancel` (it can submit; cancel is the symmetric operation). Verify before M5.
 
 ## Decision points still open
@@ -108,4 +106,4 @@ After this PR, the next branch is `feat/dit-cache-bq-read` for M2.
 
 - [`docs/run-cache.md`](run-cache.md) — design.
 - [`docs/plan.md`](plan.md) § Next steps item 1 — roadmap placement.
-- [`docs/llm-pr-gating.md`](llm-pr-gating.md) — sibling design; the LLM pre-filter's audit query (`docs/llm-pr-gating.md` § Audit) joins against `dit_meta.runs`.
+- [`docs/llm-pr-gating.md`](llm-pr-gating.md) — sibling design; the LLM pre-filter's audit query (`docs/llm-pr-gating.md` § Audit) joins against `tech_great_expectations.dit_runs`.

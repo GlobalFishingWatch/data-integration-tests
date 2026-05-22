@@ -1,4 +1,4 @@
-# Run cache (`dit_meta.runs`)
+# Run cache (`tech_great_expectations.dit_runs`)
 
 **Status:** design sketch, not implemented. Owner: dit. Drafted 2026-05-22.
 
@@ -15,7 +15,7 @@ A single table serves all three. Naming is intentionally generic — this is not
 ## Schema
 
 ```sql
-CREATE TABLE dit_meta.runs (
+CREATE TABLE `world-fishing-827.tech_great_expectations.dit_runs` (
   -- identity
   run_id           STRING    NOT NULL,  -- 12-hex; matches the `dit_run_id` BQ label that ais.py already emits (port_visits). mode_equivalence.py does NOT emit `dit_run_id` today (it generates a 6-hex experiment-id suffix instead) -- adding the label to pipe-gaps is part of the run-cache implementation work, not preexisting.
   cache_key        STRING    NOT NULL,  -- sha256, see below
@@ -48,7 +48,7 @@ PARTITION BY DATE(started_at)
 CLUSTER BY pipeline, cache_key;
 ```
 
-The table itself lives in `world-fishing-827.dit_meta.runs` — a dit-owned dataset with no TTL (rows expire by `expires_at` filter at query time, not by BQ table-level TTL, because we need cancelled/failed-run rows around long enough for forensics).
+The table lives in `world-fishing-827.tech_great_expectations.dit_runs` — same dataset dit already writes workflow outputs to, no new dataset / IAM grant needed. The `dit_` prefix scopes the table within the shared dataset. Rows have no BQ-level TTL — they expire by the `expires_at` column at query time, because we need cancelled/failed-run rows around long enough for forensics. If/when retention separation or per-table IAM justifies a dedicated dataset, the table moves with a single `TABLE_FQN` change in `src/dit/cache.py`.
 
 ## Cache key
 
@@ -80,7 +80,7 @@ cache_key = sha256(json.dumps({
 def maybe_cached_run(workflow_fn, args) -> RunReport:
     key = compute_cache_key(args)
     row = bq_query(
-        "SELECT * FROM dit_meta.runs "
+        "SELECT * FROM tech_great_expectations.dit_runs "
         "WHERE cache_key = @k AND status='succeeded' "
         "  AND expires_at > CURRENT_TIMESTAMP() "
         "  AND NOT pipeline_dirty "
@@ -98,7 +98,7 @@ def maybe_cached_run(workflow_fn, args) -> RunReport:
     # cache miss -- run the workflow
     report = workflow_fn(args)
     if not args.pipeline_dirty and report.status == "succeeded":
-        bq_insert("dit_meta.runs", row_from(report, cache_key=key))
+        bq_insert("tech_great_expectations.dit_runs", row_from(report, cache_key=key))
     return report
 ```
 
@@ -122,10 +122,10 @@ The `INFORMATION_SCHEMA.TABLES` lookup on the read path is the second-line guard
 ## Cleanup flow (`make dit-cancel RUN_ID=<id>`)
 
 ```
-1. SELECT output_tables, dataflow_job_ids FROM dit_meta.runs WHERE run_id = <id>
+1. SELECT output_tables, dataflow_job_ids FROM tech_great_expectations.dit_runs WHERE run_id = <id>
 2. For each dataflow_job_id: gcloud dataflow jobs cancel
 3. For each output_table: bq rm -f
-4. UPDATE dit_meta.runs SET status='cancelled', finished_at=CURRENT_TIMESTAMP() WHERE run_id=<id>
+4. UPDATE tech_great_expectations.dit_runs SET status='cancelled', finished_at=CURRENT_TIMESTAMP() WHERE run_id=<id>
 ```
 
 Idempotent: re-running on an already-cancelled run is a no-op (cancel-already-cancelled-jobs returns silently; `bq rm -f` on non-existent tables likewise).
@@ -136,7 +136,7 @@ A separate **SIGTERM trap inside `dit run`'s `main()`** handles the live case (C
 
 - **Cross-version comparison semantics with cache hits.** When the PR's 1_bf is freshly computed but main's 1_bf is a cache hit, the `experiment_id` of the cached row doesn't match the PR run's `experiment_id`. The comparison logic must join on `cache_key` (or its components), not on `experiment_id`. Easy to get wrong; needs a clear API on the report side.
 - **Workflow file changes that produce identical outputs.** A docstring edit invalidates the cache for no reason. Tolerable for now; can refine with a hand-bumped `BEHAVIOUR_VERSION` constant later if it becomes painful.
-- **dit_meta dataset creation + IAM.** Dataset needs to exist with `dataEditor` for `automated-testing@`. One-time terraform + an idempotent `CREATE TABLE IF NOT EXISTS` migration. Worth a small `make dit-bootstrap` target.
+- ~~**`dit_meta` dataset creation + IAM.**~~ Resolved 2026-05-22 — the cache table lives in the existing `tech_great_expectations` dataset that dit already writes outputs to. No new dataset / IAM grant needed; bootstrap is a one-shot `bq query --use_legacy_sql=false < migrations/001_dit_meta_runs.sql`.
 - **Multi-pipeline lookups.** `cache_key` is globally unique (sha256 over all inputs), but partition + cluster keys (`pipeline`, `started_at`) optimise the common per-pipeline scan. If we ever need cross-pipeline reuse (unlikely), the schema supports it.
 
 ## Implementation plan
@@ -145,7 +145,7 @@ A separate **SIGTERM trap inside `dit run`'s `main()`** handles the live case (C
 2. **Hook into workflows** — `mode_equivalence.py` and `ais.py` wrap their per-mode computations with `maybe_cached_run`. Per-mode (not per-workflow), so individual modes can be cached independently.
 3. **`make dit-cancel`** — shell wrapper around `bq query` + `gcloud dataflow jobs cancel` + `bq rm`.
 4. **SIGTERM trap in `dit run`** — best-effort; cancellation is rare.
-5. **Tests** — `tests/test_cache.py` covering key computation determinism, cache hit/miss/stale logic, dirty-tree write-skip. Real-BQ smoke via a throwaway `dit_meta.runs_test` table.
+5. **Tests** — `tests/test_cache.py` covering key computation determinism, cache hit/miss/stale logic, dirty-tree write-skip. Real-BQ smoke via a throwaway `tech_great_expectations.dit_runs_test` table.
 
 Likely ~3 days of work for items 1-3; item 4 is small; item 5 is the verifier.
 

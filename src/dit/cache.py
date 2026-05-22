@@ -1,4 +1,4 @@
-"""``dit_meta.runs`` — content-addressable run cache + cleanup registry.
+"""``tech_great_expectations.dit_runs`` — content-addressable run cache + cleanup registry.
 
 Single BQ table serves three jobs (see `docs/run-cache.md` for the full
 design):
@@ -38,8 +38,10 @@ logger = logging.getLogger(__name__)
 # Constants
 # --------------------------------------------------------------------------
 
-#: Fully-qualified name of the cache table.
-TABLE_FQN = "world-fishing-827.dit_meta.runs"
+#: Fully-qualified name of the cache table. Lives in the same dataset dit
+#: already writes workflow outputs to, so no new dataset / IAM grant is
+#: required. The ``dit_`` prefix scopes it within the shared dataset.
+TABLE_FQN = "world-fishing-827.tech_great_expectations.dit_runs"
 
 #: ``status`` column values.
 STATUS_RUNNING = "running"
@@ -182,7 +184,7 @@ def resolve_worker_image_to_digest(image_ref: str) -> str:
 
 @dataclass
 class CachedRun:
-    """A row of ``dit_meta.runs``.
+    """A row of ``tech_great_expectations.dit_runs``.
 
     Mirrors the BQ schema in ``docs/run-cache.md`` § Schema. ``params_json``
     is the *serialised* form (matches BQ's JSON-as-STRING storage); the
@@ -233,7 +235,7 @@ def read_cache(cache_key: str) -> CachedRun | None:
     Query shape::
 
         SELECT *
-        FROM dit_meta.runs
+        FROM `world-fishing-827.tech_great_expectations.dit_runs`
         WHERE cache_key = @key
           AND status = 'succeeded'
           AND pipeline_dirty = FALSE
@@ -268,7 +270,7 @@ def expires_at_for(table_fqns: list[str]) -> datetime:
 
 
 def write_cache(row: CachedRun) -> None:
-    """Insert a row into ``dit_meta.runs``.
+    """Insert a row into ``tech_great_expectations.dit_runs``.
 
     The caller decides whether to write (dirty trees should not, per
     the design's reproducibility rule). This function records anything
