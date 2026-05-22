@@ -1,8 +1,25 @@
 #!/usr/bin/env bash
 # Build a deterministic, orphan snapshot commit of the pipeline checkout's
-# current tracked-files state, push it to origin under
+# current TRACKED-FILES state, push it to origin under
 # refs/dit-snapshots/<pipeline>/<commit-short-sha>, and print the resulting
 # ref (or HEAD SHA, if the working tree is clean) to stdout.
+#
+# SECURITY: this script PUSHES TO ORIGIN AUTOMATICALLY. The pipeline repo's
+# origin may be a public GitHub repository. Treat every snapshot as if it
+# will be publicly visible:
+#
+#   - Only TRACKED files (modifications + deletions against HEAD) are
+#     captured. Files you haven't `git add`-ed are NOT captured. If you
+#     keep credentials / .env / one-off datasets as untracked files in the
+#     pipeline checkout, they stay out of the snapshot.
+#   - If you have already tracked a file that contains secrets (e.g. you
+#     once `git commit`-ed a credentials file by mistake), the snapshot
+#     WILL include any modification to it. Untrack the file first.
+#   - If you've added a NEW file you want included in the snapshot, you
+#     must `git commit` it first (no `git add` shortcut — see the docstring
+#     below on why). This is the deliberate safety default; the
+#     alternative (`git add -A` in the temp index) would automatically
+#     push any rogue file in the working tree.
 #
 # Properties:
 #   - Identical tree state -> identical commit SHA -> idempotent push.
@@ -45,15 +62,22 @@ if [ -z "$(git status --porcelain)" ]; then
     exit 0
 fi
 
-# Build a temp index seeded from HEAD; stage all working-tree changes
-# (modifications, deletions, AND new files honouring .gitignore) against
-# it. Keeps the user's real index untouched. `mktemp -t <template>` is
-# the portable form (works on macOS where bare `mktemp` errors).
+# Build a temp index seeded from HEAD; stage tracked-file modifications +
+# deletions against it. Keeps the user's real index untouched. `mktemp -t`
+# is the portable form (works on macOS where bare `mktemp` errors).
+#
+# WHY `git add -u` (NOT `-A`): security default. `-A` would push every
+# non-gitignored file in the working tree to origin, including any rogue
+# `.env`, `sa.json`, downloaded test dataset, or one-off artifact the user
+# happens to have lying around. `-u` confines the snapshot to files the
+# user has explicitly chosen to track. The cost — silent drop of brand-new
+# files — surfaces immediately as a failed/wrong Dataflow run; credential
+# leaks may not surface for weeks. We take the louder failure mode.
 TMP_INDEX=$(mktemp -t dit-snapshot-index.XXXXXXXX)
 trap 'rm -f "$TMP_INDEX"' EXIT
 
 GIT_INDEX_FILE="$TMP_INDEX" git read-tree HEAD
-GIT_INDEX_FILE="$TMP_INDEX" git add -A
+GIT_INDEX_FILE="$TMP_INDEX" git add -u
 TREE_SHA=$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)
 
 # Frozen author/committer dates AND identities + --no-gpg-sign:
@@ -72,13 +96,27 @@ SNAPSHOT_SHA=$(
 
 REF="refs/dit-snapshots/$PIPELINE/${SNAPSHOT_SHA:0:12}"
 
+# Show the user exactly which tracked paths will be in the snapshot.
+# Last-chance visual review before the auto-push goes out — a `.env`
+# accidentally promoted to tracked status, or a credentials file added in
+# error, surfaces here rather than after the fact on origin.
+CHANGED_PATHS=$(git diff --name-only HEAD || true)
+
 {
     echo "dit snapshot for $PIPELINE:"
     echo "  ref:       $REF"
     echo "  snapshot:  $SNAPSHOT_SHA"
     echo "  parent:    $PARENT_SHA"
-    echo "  caveats:"
-    echo "    - working-tree changes captured automatically (.gitignore'd files excluded)"
+    echo "  pushing tracked-file changes:"
+    if [ -n "$CHANGED_PATHS" ]; then
+        echo "$CHANGED_PATHS" | sed 's/^/    /'
+    else
+        echo "    (no tracked-file changes — snapshot tree is identical to HEAD)"
+    fi
+    echo "  safety notes:"
+    echo "    - tracked files only; untracked files NEVER snapshotted (commit first to include)"
+    echo "    - SNAPSHOT IS PUSHED TO origin AUTOMATICALLY; origin may be a public repo"
+    echo "    - if a path above contains secrets, ABORT (Ctrl-C now) and untrack it"
     echo "    - if your changes touch worker code, also build+push a custom --worker-image"
     echo "    - auto-push requires git-push permission on $PIPELINE's origin"
 } >&2

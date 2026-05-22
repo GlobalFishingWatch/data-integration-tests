@@ -124,10 +124,17 @@ When to use: **iterating on a fix that isn't PR-ready** (e.g. making a pipeline 
 
 Caveats printed at snapshot time:
 - First run against each new tree-state is a cache MISS; **repeat runs of an unchanged tree are a HIT** (snapshot SHA is content-addressable — derived from `git write-tree` with frozen author/committer dates, so identical tree → identical SHA → identical cache key).
-- Only **tracked** modifications are captured — `git add -A` first if you have new files.
+- Only **tracked modifications + deletions** are captured. Untracked files (and files you `git add`-ed but haven't `git commit`-ed yet) are **never** in the snapshot — see § "Safety: auto-push and credential leakage" below for why this is the deliberate default. Commit a new file before running dit if you want it included.
 - The cache row is tagged `unreviewed_code=TRUE` so PR-validation queries skip it.
 - If your changes touch worker code, build+push a custom worker image too (`--worker-image=…`).
 - **Requires `git push` permission on the pipeline repo.** If you're a read-only viewer, dit will fail at push time with a clear error pointing at `make install-<pipeline>-ref REF=<committed-ref>` or asking you to commit + push the changes via a normal branch first.
+
+> **⚠ Safety: auto-push and credential leakage.** `make dit-cloud` pushes the snapshot to the pipeline repo's origin automatically. The pipeline repo may be a **public GitHub repository**. Treat every snapshot as potentially publicly visible:
+>
+> - Only **tracked files** (modifications + deletions to files already in HEAD) are captured. This is intentional — it confines the snapshot to files you've explicitly chosen to track via `git add` + `git commit`. Anything else (rogue `.env`, downloaded `sa.json`, one-off `query_results.csv`, etc.) stays out.
+> - **If you have already tracked a file containing secrets** (e.g. a credentials file was committed at some point), modifications to it WILL go into the snapshot. Untrack it first: `git rm --cached <file>` + commit the removal + add to `.gitignore`.
+> - **The snapshot banner shows you which paths are about to be pushed** before the push happens. Review it; if anything surprises you, Ctrl-C immediately.
+> - **If you've already pushed a snapshot containing secrets**, treat it as a compromised credential (rotate it) and run `make clean-snapshot PIPELINE=<name> REF=<sha>` to delete the ref locally + on origin. Cleanup alone doesn't undo a leak; rotation is the load-bearing step.
 
 #### Scenario C — Running against any committed ref (testing main, a colleague's branch, an old commit)
 

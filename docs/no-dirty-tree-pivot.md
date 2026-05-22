@@ -79,7 +79,18 @@ Why each piece matters:
 
 The `<epoch>-<hex>` ref-naming scheme in earlier drafts of this doc / the policy memory is superseded by `<commit-short-sha>` for the content-addressable property. Epoch was an attempt to ensure uniqueness; tree-content hashing achieves uniqueness AND idempotency, which is what M-pivot-2 actually needs.
 
-Untracked files are still not captured (`git add -u` only stages tracked modifications). Same caveat as today's `make snapshot-<pipeline>` — `git add -A` first if you need them.
+Only tracked files are captured (`git add -u` against the temp index only updates entries already in HEAD). This is **the deliberate safety default** — see § Safety below.
+
+## Safety: auto-push, public origins, and credential leakage
+
+The snapshot mechanism pushes to the pipeline repo's `origin` **automatically and unprompted**. Pipeline repos may be — or may become — public GitHub repositories. The safety story is built around that assumption:
+
+- **Default capture is `add -u` (tracked files only).** Modifications + deletions to files already in HEAD go into the snapshot. Untracked files do NOT, even if the user has `git add`-ed them into their real index (the temp index is seeded from HEAD, so `add -u` only touches what's already tracked). This confines the snapshot's content to files the user has explicitly chosen to track + commit at least once.
+- **The convenience alternative `add -A` was explicitly rejected.** It would silently capture any rogue `.env`, `sa.json`, downloaded test dataset, `.envrc`, debug log, or one-off artifact in the working tree and push it to origin. The cost of the chosen default (silent drop of new files the user might have wanted included) surfaces immediately as a wrong/failed Dataflow run; credential leaks may not surface for weeks or never. Louder failure mode wins.
+- **The snapshot banner shows the user which paths are about to be pushed** before the push happens (a `git diff --name-only HEAD` listing). Visual review is the last-line-of-defence safety check: a tracked credential file or a surprise modification surfaces here, with Ctrl-C still available.
+- **Already-tracked secrets must be untracked first.** If a credentials file was once committed by mistake, `git add -u` will include any subsequent modification. Remediation: `git rm --cached <file>` + add to `.gitignore` + commit the removal.
+- **Post-leak remediation is `make clean-snapshot REF=<sha>` + rotate the credential.** The former removes the ref locally and on origin; the latter is the load-bearing step (anything ever pushed to a public repo must be treated as compromised even after the ref is gone — git history snapshots, forks, mirrors, indexers, etc. all make "untoward push to public origin" effectively permanent).
+- **Planned: pre-push secret scanner** (see "Open questions" / follow-up PR). A pattern-based scanner (gitleaks or similar) running against the snapshot tree before push gives defense-in-depth against the case where a tracked file contains a newly-introduced credential the user didn't notice. Override via env var for false positives. M-pivot-1 ships without this; M-pivot-1b adds it.
 
 ## Cache schema: parent SHA
 

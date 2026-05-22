@@ -210,35 +210,89 @@ def test_clean_snapshot_rejects_invalid_short_ref(pipeline_repo: Path) -> None:
     assert "must be exactly 12 hex chars" in proc.stderr
 
 
-def test_snapshot_captures_untracked_files(pipeline_repo: Path) -> None:
-    """With `git add -A` in the temp index, brand-new files land in the tree."""
+def test_snapshot_excludes_untracked_files(pipeline_repo: Path) -> None:
+    """SECURITY default: untracked files MUST NOT enter the snapshot tree.
+
+    With `git add -u` in the temp-index dance, brand-new files (untracked OR
+    `git add`-ed-but-uncommitted in the user's real index) stay out of the
+    snapshot. This is the deliberate safety default — auto-push means
+    untracked must mean unseen, otherwise a stray `.env` / `sa.json` /
+    one-off dataset could land on origin without the user noticing.
+
+    The cost (silent drop of new files the user wanted in the snapshot)
+    surfaces immediately as a wrong/failed Dataflow run; the alternative
+    failure mode (credentials on origin) may not surface for weeks.
+    """
+    # An untracked file that the user would expect to be part of the test.
     new_file = pipeline_repo / "src" / "new_module.py"
     new_file.parent.mkdir(parents=True)
     new_file.write_text("def f(): pass\n")
 
-    ref, _ = _run_snapshot(pipeline_repo)
-    sha = _git("rev-parse", ref, cwd=pipeline_repo).stdout.strip()
-
-    # `git ls-tree -r` should list the new path.
-    tree_listing = _git("ls-tree", "-r", "--name-only", sha, cwd=pipeline_repo).stdout
-    assert "src/new_module.py" in tree_listing.split()
-
-
-def test_snapshot_excludes_gitignored_files(pipeline_repo: Path) -> None:
-    """`.gitignore`'d paths must not enter the snapshot tree — guards against
-    accidental secret/credential leakage via auto-snapshot."""
-    (pipeline_repo / ".gitignore").write_text(".env\n")
-    _git("add", ".gitignore", cwd=pipeline_repo)
-    _git("commit", "-q", "-m", "gitignore", cwd=pipeline_repo)
-
-    (pipeline_repo / ".env").write_text("SECRET=hunter2\n")
+    # Some tracked-file modifications to ensure the snapshot path is taken.
     (pipeline_repo / "README.md").write_text("hello dirty\n")
 
     ref, _ = _run_snapshot(pipeline_repo)
     sha = _git("rev-parse", ref, cwd=pipeline_repo).stdout.strip()
 
-    tree_listing = _git("ls-tree", "-r", "--name-only", sha, cwd=pipeline_repo).stdout
-    assert ".env" not in tree_listing.split()
+    tree_paths = (
+        _git("ls-tree", "-r", "--name-only", sha, cwd=pipeline_repo)
+        .stdout.split()
+    )
+    assert "src/new_module.py" not in tree_paths
+
+
+def test_snapshot_excludes_staged_but_uncommitted_files(pipeline_repo: Path) -> None:
+    """SECURITY: even files the user has `git add`-ed (staged in the real
+    index) must NOT enter the snapshot if they aren't yet in HEAD.
+
+    The temp index is seeded from HEAD, so `git add -u` against it only
+    updates entries that exist in HEAD. A staged-but-uncommitted new file
+    isn't in HEAD -> not in temp index -> not in snapshot tree.
+    """
+    new_file = pipeline_repo / "src" / "staged_new.py"
+    new_file.parent.mkdir(parents=True)
+    new_file.write_text("# staged but not committed\n")
+    _git("add", "src/staged_new.py", cwd=pipeline_repo)
+
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+
+    ref, _ = _run_snapshot(pipeline_repo)
+    sha = _git("rev-parse", ref, cwd=pipeline_repo).stdout.strip()
+
+    tree_paths = (
+        _git("ls-tree", "-r", "--name-only", sha, cwd=pipeline_repo)
+        .stdout.split()
+    )
+    assert "src/staged_new.py" not in tree_paths
+
+
+def test_snapshot_excludes_credential_shaped_untracked_file(pipeline_repo: Path) -> None:
+    """A representative credential-shaped untracked file (.env in the
+    pipeline root) must not be captured even if .gitignore doesn't mention
+    it. With `git add -u`, gitignore status is irrelevant — anything not
+    tracked stays out.
+    """
+    (pipeline_repo / ".env").write_text("GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json\n")
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+
+    ref, _ = _run_snapshot(pipeline_repo)
+    sha = _git("rev-parse", ref, cwd=pipeline_repo).stdout.strip()
+
+    tree_paths = (
+        _git("ls-tree", "-r", "--name-only", sha, cwd=pipeline_repo)
+        .stdout.split()
+    )
+    assert ".env" not in tree_paths
+
+
+def test_snapshot_banner_lists_changed_paths(pipeline_repo: Path) -> None:
+    """Banner shows the user exactly which tracked paths are about to be
+    pushed, so a tracked credential file (or any surprise) can be spotted
+    before the snapshot lands on origin."""
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+    _, stderr = _run_snapshot(pipeline_repo)
+    assert "pushing tracked-file changes:" in stderr
+    assert "README.md" in stderr
 
 
 def test_snapshot_fails_on_ref_divergence(pipeline_repo: Path) -> None:
