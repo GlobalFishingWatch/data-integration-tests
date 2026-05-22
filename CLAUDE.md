@@ -34,15 +34,15 @@ Read these in order before coding:
 |---|---|
 | Active dev on a pipeline (fast inner loop, edits picked up live) | `make install-<pipeline>` |
 | Reproducible install of a specific committed ref (~5-10s; non-editable) | `make install-<pipeline>-ref REF=<sha-or-branch>` |
-| Snapshot the current working tree onto a temp branch and install from it | `make snapshot-<pipeline>` |
+| Snapshot the current dirty working tree to `refs/dit-snapshots/<pipeline>/<sha>` on origin and install from it | `make snapshot-<pipeline>` |
 | Target ref's transitive deps drifted (rare) — drop `--no-deps` | append `FULLDEPS=1` |
-| GC the `dit-snapshot-*` branches across all pipeline checkouts | `make clean-snapshots` |
+| Remove a single snapshot ref locally + on origin (secret-leak remediation only) | `make clean-snapshot PIPELINE=<name> REF=<sha-or-full-ref>` |
 
 Notes:
 
 - The framework-only `make install` works without any pipeline; the dataflow runner won't load until a workflow install brings `apache-beam[gcp]` transitively.
-- `make snapshot-<pipeline>` uses `git stash create` which captures **tracked** changes only — `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot.
-- Snapshot branches stick around for traceability (recoverable via `git checkout dit-snapshot-<epoch>` in the pipeline repo) until `make clean-snapshots`.
+- `make snapshot-<pipeline>` produces a **deterministic orphan commit** from the dirty tracked-files state (`git write-tree` against a temp index + `git commit-tree` with frozen author/committer dates+identity → identical tree → identical SHA). Parent SHA recorded in the commit message as `dit snapshot of <40-char-sha>`. Requires `git push` permission on the pipeline's origin. Only tracked modifications are captured — `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot.
+- Snapshots live forever by design (bytes-scale, hidden namespace under `refs/dit-snapshots/*`). No periodic cleanup. `make clean-snapshot` exists only for accidental-secret remediation; the previous broad-sweep `make clean-snapshots` was removed in M-pivot-1.
 - The non-editable install modes (`-ref`, snapshot) point the debugger at the installed copy under `venv/lib/python3.x/site-packages/<pipeline>/`, not your dev tree. If you're stepping through pipeline source, use the editable target instead.
 
 ## Plan changelog

@@ -53,11 +53,11 @@ For the framework only (no workflow deps), `make install` works — but the data
 |---|---|---|
 | Active dev on a pipeline (fast inner loop) | `make install-<pipeline>` | `pip install -e <pipeline-dir>` — working-tree edits picked up immediately. |
 | Reproducible run against a specific committed ref | `make install-<pipeline>-ref REF=<sha-or-branch>` | `pip install --force-reinstall --no-deps git+file://...@<ref>` — non-editable, exactly that commit, ~5-10s per ref. |
-| Test what's currently in the working tree, reproducibly | `make snapshot-<pipeline>` | `git stash create` captures tracked changes (working tree untouched), anchors on a `dit-snapshot-<epoch>` branch, installs from that ref. |
+| Test what's currently in the working tree, reproducibly | `make snapshot-<pipeline>` | Builds a deterministic orphan commit from the dirty tracked-files (temp-index `git write-tree` + `git commit-tree` with frozen dates/identity) → pushes to `refs/dit-snapshots/<pipeline>/<commit-short-sha>` on origin → installs from that ref. Identical tree → identical SHA → cache hits on repeat invocations. Parent SHA recorded in the commit message. |
 | Pipeline's transitive deps changed in target ref | add `FULLDEPS=1` | Drops `--no-deps`, lets pip reinstall the full dep tree (slower; only needed when the target ref bumped or added a dep). |
-| GC the temp snapshot branches | `make clean-snapshots` | Removes `dit-snapshot-*` branches from all three pipeline checkouts. |
+| Remove a specific snapshot ref (secret-leak remediation only) | `make clean-snapshot PIPELINE=<name> REF=<sha-or-full-ref>` | Deletes the ref locally and on origin in one step. Snapshots otherwise live forever by design (bytes-scale, hidden namespace). |
 
-Notes on snapshot mode: `git stash create` captures **tracked** modifications only. Run `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot. The snapshot branch persists for traceability until `make clean-snapshots`.
+Notes on snapshot mode: only **tracked** modifications are captured. Run `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot. Requires `git push` permission on the pipeline's origin.
 
 ### Run a workflow
 
