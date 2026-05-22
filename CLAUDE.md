@@ -47,7 +47,7 @@ Notes:
 
 ## Plan changelog
 
-Appended chronologically. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
+Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
 ### 2026-05-22 — First end-to-end validation: framework caught a real bug, custom worker image proved the fix
 
