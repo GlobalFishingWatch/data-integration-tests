@@ -252,9 +252,40 @@ class CachedRun:
         )
 
     def to_bq_row(self) -> dict[str, Any]:
-        """Render as a dict suitable for `bigquery.Client.insert_rows_json`."""
-        # TODO: implement when write path lands.
-        raise NotImplementedError("CachedRun.to_bq_row — implement with write_cache()")
+        """Render as a dict suitable for ``bigquery.Client.insert_rows_json``.
+
+        Conversions vs the in-memory dataclass shape:
+
+        * ``datetime`` -> ISO-8601 string (BQ TIMESTAMP).
+        * ``params`` (dict) -> JSON-encoded string (BQ JSON column). The
+          ``insert_rows_json`` streaming API accepts a string for JSON
+          columns and parses it server-side.
+        * ``None`` for the nullable fields (``params``, ``cloud_build_id``,
+          ``finished_at``) passes through.
+        """
+        def _iso(dt: datetime | None) -> str | None:
+            return dt.isoformat() if dt is not None else None
+
+        return {
+            "run_id": self.run_id,
+            "cache_key": self.cache_key,
+            "workflow": self.workflow,
+            "pipeline": self.pipeline,
+            "experiment_id": self.experiment_id,
+            "pipeline_commit": self.pipeline_commit,
+            "pipeline_dirty": self.pipeline_dirty,
+            "dit_commit": self.dit_commit,
+            "workflow_file_sha1": self.workflow_file_sha1,
+            "worker_image": self.worker_image,
+            "params_json": json.dumps(self.params) if self.params is not None else None,
+            "output_tables": list(self.output_tables),
+            "dataflow_job_ids": list(self.dataflow_job_ids),
+            "cloud_build_id": self.cloud_build_id,
+            "started_at": _iso(self.started_at),
+            "finished_at": _iso(self.finished_at),
+            "status": self.status,
+            "expires_at": _iso(self.expires_at),
+        }
 
 
 # --------------------------------------------------------------------------
@@ -396,14 +427,29 @@ def expires_at_for(table_fqns: list[str], *, client: Any = None) -> datetime:
     return min(expirations)
 
 
-def write_cache(row: CachedRun) -> None:
-    """Insert a row into ``tech_great_expectations.dit_runs``.
+def write_cache(row: CachedRun, *, client: Any = None) -> None:
+    """Insert a row into ``tech_great_expectations.dit_runs`` via the
+    streaming-inserts API (``insert_rows_json``).
 
-    The caller decides whether to write (dirty trees should not, per
-    the design's reproducibility rule). This function records anything
-    given to it.
+    **Dirty-tree handling** is at the read side, not here: every row is
+    recorded for registry + cleanup purposes regardless of
+    ``pipeline_dirty``. The :func:`read_cache` query filters out
+    ``pipeline_dirty = TRUE`` rows so dirty runs never satisfy a cache
+    lookup, but they remain visible to :func:`cancel_run` /
+    ``make dit-cancel`` so their Dataflow jobs + BQ tables can be
+    cleaned up after the fact.
+
+    Raises ``RuntimeError`` if the streaming insert returns any errors.
+    Streaming inserts are queryable via SELECT within seconds (the
+    90-minute "streaming buffer" caveat only affects DML against
+    freshly-inserted rows, which we don't do).
     """
-    raise NotImplementedError("write_cache — see docs/run-cache-impl.md § Milestone 3")
+    client = client or _make_client()
+    errors = client.insert_rows_json(TABLE_FQN, [row.to_bq_row()])
+    if errors:
+        raise RuntimeError(
+            f"insert_rows_json into {TABLE_FQN} returned errors: {errors}"
+        )
 
 
 # --------------------------------------------------------------------------

@@ -334,3 +334,128 @@ def test_expires_at_for_empty_input():
     result = expires_at_for([])
     # No client used; pure fallback.
     assert timedelta(hours=23) < result - before < timedelta(hours=25)
+
+
+# --------------------------------------------------------------------------
+# Write path (M3): to_bq_row + write_cache.
+# --------------------------------------------------------------------------
+
+from dit.cache import write_cache
+
+
+def _cached_run(**overrides: Any) -> CachedRun:
+    base = dict(
+        run_id="rid01",
+        cache_key="key01",
+        workflow="workflows/pipe_gaps/mode_equivalence.py",
+        pipeline="pipe-gaps",
+        experiment_id="exp01",
+        pipeline_commit="abc1234",
+        pipeline_dirty=False,
+        dit_commit="def5678",
+        workflow_file_sha1="aa" * 20,
+        worker_image="gcr.io/foo/pipe-gaps@sha256:0011",
+        params={"start": "2020-01-01", "end": "2020-12-31"},
+        output_tables=["world-fishing-827.tech_great_expectations.bf_table"],
+        dataflow_job_ids=["2026-05-22_00_00_00-1"],
+        cloud_build_id="build-01",
+        started_at=datetime(2026, 5, 22, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 5, 22, 0, 30, tzinfo=timezone.utc),
+        status="succeeded",
+        expires_at=datetime(2026, 9, 22, tzinfo=timezone.utc),
+    )
+    base.update(overrides)
+    return CachedRun(**base)
+
+
+def test_to_bq_row_shape():
+    row = _cached_run().to_bq_row()
+    # All 18 columns are present.
+    assert set(row.keys()) == {
+        "run_id", "cache_key", "workflow", "pipeline", "experiment_id",
+        "pipeline_commit", "pipeline_dirty", "dit_commit", "workflow_file_sha1",
+        "worker_image", "params_json", "output_tables", "dataflow_job_ids",
+        "cloud_build_id", "started_at", "finished_at", "status", "expires_at",
+    }
+
+
+def test_to_bq_row_timestamps_are_iso_strings():
+    row = _cached_run().to_bq_row()
+    assert row["started_at"] == "2026-05-22T00:00:00+00:00"
+    assert row["finished_at"] == "2026-05-22T00:30:00+00:00"
+    assert row["expires_at"] == "2026-09-22T00:00:00+00:00"
+
+
+def test_to_bq_row_params_json_is_serialised():
+    row = _cached_run().to_bq_row()
+    # Streaming inserts accept JSON columns as JSON-string literals; the
+    # server parses them back. Round-trip should yield the original dict.
+    import json as _json
+    assert _json.loads(row["params_json"]) == {"start": "2020-01-01", "end": "2020-12-31"}
+
+
+def test_to_bq_row_nullable_fields_pass_through():
+    row = _cached_run(
+        params=None,
+        cloud_build_id=None,
+        finished_at=None,
+    ).to_bq_row()
+    assert row["params_json"] is None
+    assert row["cloud_build_id"] is None
+    assert row["finished_at"] is None
+
+
+def test_to_bq_row_from_bq_row_round_trip():
+    # Symmetric: to_bq_row -> simulate BQ deserialisation -> from_bq_row
+    # should reproduce the same fields the round-trip preserves.
+    original = _cached_run()
+    bq_dict = original.to_bq_row()
+    # Simulate the BQ read coming back:
+    #   * TIMESTAMP -> datetime (parsing the ISO string)
+    #   * JSON -> dict (parsed by the BQ client)
+    import json as _json
+    row_obj = SimpleNamespace(
+        **{k: v for k, v in bq_dict.items() if k != "params_json"},
+        params_json=_json.loads(bq_dict["params_json"]) if bq_dict["params_json"] else None,
+    )
+    # Re-parse the TIMESTAMP fields back into datetime (BQ client does this).
+    for field in ("started_at", "finished_at", "expires_at"):
+        v = getattr(row_obj, field)
+        if v is not None:
+            setattr(row_obj, field, datetime.fromisoformat(v))
+
+    restored = CachedRun.from_bq_row(row_obj)
+    assert restored == original
+
+
+def test_write_cache_calls_insert_rows_json():
+    client = MagicMock()
+    client.insert_rows_json.return_value = []  # no errors
+    run = _cached_run()
+    write_cache(run, client=client)
+    client.insert_rows_json.assert_called_once()
+    args, _ = client.insert_rows_json.call_args
+    table_arg, rows_arg = args
+    assert table_arg == "world-fishing-827.tech_great_expectations.dit_runs"
+    assert isinstance(rows_arg, list)
+    assert len(rows_arg) == 1
+    assert rows_arg[0]["run_id"] == run.run_id
+
+
+def test_write_cache_raises_on_streaming_errors():
+    client = MagicMock()
+    client.insert_rows_json.return_value = [
+        {"index": 0, "errors": [{"reason": "invalid", "message": "bad field"}]}
+    ]
+    with pytest.raises(RuntimeError, match="insert_rows_json"):
+        write_cache(_cached_run(), client=client)
+
+
+def test_write_cache_writes_dirty_rows_too():
+    # Design invariant: dirty rows ARE inserted (registry purpose); read
+    # path filters them out. Don't suppress writes here.
+    client = MagicMock()
+    client.insert_rows_json.return_value = []
+    write_cache(_cached_run(pipeline_dirty=True), client=client)
+    args, _ = client.insert_rows_json.call_args
+    assert args[1][0]["pipeline_dirty"] is True
