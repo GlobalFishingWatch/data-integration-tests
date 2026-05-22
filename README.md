@@ -12,14 +12,14 @@ The framework is intentionally thin — a small library plus per-pipeline workfl
 - **Comparison shim** (`dit.compare.compare_tables`) — thin wrapper over `table-check summary` from the [`table_identical_checks`](https://github.com/GlobalFishingWatch/table_identical_checks) repo. Per-column tolerances, `view_suffix` for SCD-2 last-versions vs. truncate-shape, `keys` for the comparison join.
 - **BQ + date utilities** (`dit.bq`, `dit.dates`) — drop tables by prefix, query for restricted ssvids, snapshot a table or whole dataset for source-data pinning across cross-version runs, half-open date iteration. Used by workflows that need pre/post-run setup or computed inputs.
 - **Library-first**: anything you can do via `dit run …` you can also do by importing `dit.*` from a pytest target or another Python script. The CLI is one consumer of the library, not the only one.
-- **Workflow file conventions**: per-pipeline workflows live in `workflows/<pipeline>/<name>.py` and expose `main(argv) -> int`. Output tables tagged with `<experiment_id>_<commit>_<uuid>` for provenance; `--experiment-id` / `DIT_EXPERIMENT_ID` clusters N runs (e.g. `pipe-gaps@main` vs `@pr-NNN`) under one BQ-prefix-scannable slug, defaulting to `solo_<6-hex>` when unset; `--allow-dirty-tree` opt-in for dirty-tree runs.
+- **Workflow file conventions**: per-pipeline workflows live in `workflows/<pipeline>/<name>.py` and expose `main(argv) -> int`. Output tables tagged with `<experiment_id>_<commit>_<uuid>` for provenance; `--experiment-id` / `DIT_EXPERIMENT_ID` clusters N runs (e.g. `pipe-gaps@main` vs `@pr-NNN`) under one BQ-prefix-scannable slug, defaulting to `solo_<6-hex>` when unset. (`--allow-dirty-tree` exists today as a transition aid but is **scheduled for removal** — see [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md). Going forward, dit auto-snapshots dirty trees to a pushed ref and runs reproducibly.)
 - **Three install modes** per pipeline: editable (fast inner loop), specific-ref (`REF=<sha-or-branch>`), and snapshot (`git stash create` → anchored on a `dit-snapshot-<epoch>` branch). See Usage § Install modes below.
 - **Per-user infra knobs via `DIT_*` env vars**: `DIT_DEST_DATASET`, `DIT_DATAFLOW_SA`, `DIT_DATAFLOW_REGION`, `DIT_DATAFLOW_TEMP_BUCKET`, `DIT_DATAFLOW_SUBNETWORK`, `DIT_BQ_TEMP_DATASET`. Plays cleanly with direnv via `.envrc.example`.
 - **Pipeline integration contract** ([`docs/pipeline-contract.md`](docs/pipeline-contract.md)) — what a pipeline must expose to be cleanly testable by `dit`, with an adoption matrix tracking where each current pipeline stands.
 - **Cross-version experiments** (`workflows/port_visits/cross_version_ais.py`) — pin source data via BQ snapshots at a fixed timestamp, run a workflow at N pipeline-version bindings (git refs in the pipeline checkout), then diff corresponding output tables pairwise. Foundation for PR-validation comparisons (`pipe-anchorages@main` vs `@pr-NNN`).
 - **Content-addressable run cache** (`dit.cache` + `world-fishing-827.tech_great_expectations.dit_runs`) — every `execute_*` mode hashes `(pipeline_commit, worker_image_digest, workflow_file_sha1, params)` and looks up the run-cache table. On hit (output tables still present), the workflow skips Dataflow entirely and uses the cached FQN for downstream comparisons; on miss, it runs and inserts a row with output tables + provenance. The same table also serves as registry + cleanup source for `make dit-cancel` (M5, in flight). Pipe-gaps wired in 2026-05-22; port-visits next. Design: [`docs/run-cache.md`](docs/run-cache.md); milestone tracker: [`docs/run-cache-impl.md`](docs/run-cache-impl.md).
 - **Centralised Dataflow job-name builder** (`dit.job_names.make_job_name`) — single source of truth for the `dit-<repo>-<step>-<exp>-<binding?>-<mode?>-<N?>-<M?>` shape, with 63-char truncation that preserves the load-bearing tail. Both workflows use it; the prefix lets a single label-filter find every dit-launched Dataflow job in the UI.
-- **Submitter-vs-worker guardrail** (`dit.git_info.warn_if_worker_image_misses_dirty_tree`) — Dataflow runs install pipeline code from two different sources (submitter from `/workspace`, workers from the registry). When the submitter's tree is dirty but `--worker-image` is unchanged from the workflow's default, the workers won't see the changes; the helper logs a prominent banner pointing at the build+push fix.
+- **Submitter-vs-worker guardrail** (`dit.git_info.warn_if_worker_image_misses_dirty_tree`) — Dataflow runs install pipeline code from two different sources (submitter from `/workspace`, workers from the registry). When the submitter's tree is dirty but `--worker-image` is unchanged from the workflow's default, the workers won't see the changes; the helper logs a prominent banner pointing at the build+push fix. (Scheduled for removal in the no-dirty-tree pivot — the warn-helper exists only because dirty submitters exist. The underlying submitter-vs-worker concept itself stays relevant — see memory `[[submitter-vs-worker-split]]` — but with all submitters running committed code post-pivot, the warning is no longer the right vehicle.)
 - **Cloud Build ad-hoc runtime** (`cloudbuild-dit.yaml`, `make dit-cloud`, `make publish-ditbox`) — submit a workflow run to Cloud Build with one command. The pipeline checkout flows through as the build source; dit is cloned fresh per run at a configurable ref. ditbox builds via kaniko with a registry-backed layer cache; per-run pipeline installs use `uv` (~10× faster than pip). The `_BEAM_VERSION` substitution pins apache-beam to match the worker image's SDK (per-pipeline defaults in the Makefile: `pipe-gaps=2.71.0`, `anchorages_pipeline=2.69.0`). Validated end-to-end 2026-05-22 — caught a real `pipe-gaps:v0.9.6` mode-equivalence bug and verified the fix against a custom-published worker image. PR-trigger integration in each pipeline repo comes as a follow-up.
 
 Pipeline-shape primitives (`Phase`/`Mode`/`Mutation`/`Oracle` dataclasses, mutation library, phase-sharing via BQ COPY, golden-table regression mode) are **deliberately not extracted yet** — see Roadmap below for why and when.
@@ -73,6 +73,144 @@ Example (Phase 2 AIS-staging, the verified mode-equivalence test for port-visits
 dit run workflows/port_visits/ais.py --runner dataflow --parallel --build-from-source
 ```
 
+## Usage scenarios
+
+dit covers a small set of orthogonal axes, summarised first, then walked through as concrete scenarios. **Best-practice paths are flagged ⭐.**
+
+### The orthogonal axes
+
+| Axis | Choices |
+|---|---|
+| **Where** | local (`dit run …`) / Cloud Build (`make dit-cloud …`) |
+| **Pipeline ref** | clean HEAD of pipeline checkout / `dit-snapshot-*` (auto-created from uncommitted changes) / a specific committed ref (`make install-<pipeline>-ref REF=…` or `make dit-cloud REF=…`) / a PR head SHA (automated, future) |
+| **Worker image** | published default (e.g. `pipe-gaps:v0.9.6`) / custom-built from a ref (for changes that touch worker code) |
+| **Single vs cross-version** | one ref / N refs compared (`workflows/port_visits/cross_version_ais.py`) |
+| **Trigger** | manual CLI / PR event (automated, future) / scheduled (future) |
+
+> **Future-state note** (see [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md)): under the in-flight pivot, **every dit run executes a committed git ref**. If your working tree is dirty when you invoke dit, the workflow auto-snapshots to `refs/dit-snapshots/<pipeline>/<epoch>-<hex>`, auto-pushes, and uses that ref — no `--allow-dirty-tree` flag, no special-case logic, every cache row reproducible. The scenarios below describe the end state.
+
+### Scenarios
+
+#### ⭐ Scenario A — PR validation (the canonical automated path)
+
+You're working on a pipeline change; you commit it; push to a branch; open a PR. dit fires automatically and compares the PR against `main`'s cached output.
+
+```
+$ cd $PROJECTS/pipe-gaps
+$ git checkout -b fix/PIPELINE-1465-tiebreaker
+$ git commit -am "Add deterministic tiebreaker to message sort"
+$ git push -u origin fix/PIPELINE-1465-tiebreaker
+$ gh pr create --title "Fix PIPELINE-1465 tiebreaker" --body "..."
+                          # ← dit triggers here, automatically
+                          # ← Check Run appears on the PR with the verdict
+```
+
+When to use: **default for any pipeline change you intend to land.** No commands beyond your normal git workflow. dit hits the cache for main's side (it's already been computed), runs the PR side fresh, posts the diff as a Check Run.
+
+#### Scenario B — Iterating on uncommitted code (auto-snapshot)
+
+You're mid-development; you want feedback before opening a PR. dit detects the dirty tree, auto-snapshots, auto-pushes, runs against the snapshot. Your working tree is untouched.
+
+```
+$ cd $PROJECTS/pipe-gaps && vim src/...   # edits, not committed
+$ cd $PROJECTS/data_integration_tests
+$ make dit-cloud PIPELINE=pipe-gaps WORKFLOW=workflows/pipe_gaps/mode_equivalence.py
+                          # auto-snapshots → refs/dit-snapshots/pipe-gaps/<epoch>-<hex>
+                          # auto-pushes
+                          # runs against the snapshot
+```
+
+When to use: **iterating on a fix that isn't PR-ready** (e.g. making a pipeline idempotent across modes). Each edit produces a fresh snapshot (new cache key, new MISS, full Dataflow workload). Once you're happy, commit + push the same code to a real branch + open a PR (Scenario A).
+
+Caveats printed at snapshot time:
+- First run against each snapshot is a cache MISS (new ref = new key).
+- `git stash create` captures **tracked** modifications only — `git add -A` first if you have new files.
+- The cache row is tagged `unreviewed_code=TRUE` so PR-validation queries skip it.
+- If your changes touch worker code, build+push a custom worker image too (`--worker-image=…`).
+
+#### Scenario C — Running against any committed ref (testing main, a colleague's branch, an old commit)
+
+You want to test a specific committed ref without changing what's installed.
+
+```
+$ make dit-cloud PIPELINE=pipe-gaps REF=main WORKFLOW=workflows/pipe_gaps/mode_equivalence.py
+# or:
+$ make dit-cloud PIPELINE=pipe-gaps REF=fix/PIPELINE-1465-tiebreaker WORKFLOW=...
+# or to install locally for inspection / DirectRunner:
+$ make install-pipe-gaps-ref REF=fix/PIPELINE-1465-tiebreaker
+$ dit run workflows/pipe_gaps/mode_equivalence.py --runner dataflow ...
+```
+
+When to use: testing main as a regression baseline; reviewing a teammate's PR locally; reproducing a historical run from a `dit_runs` row's `pipeline_commit`.
+
+#### Scenario D — Cross-version testing (you want to compare two refs)
+
+You have a fix and want to verify it doesn't regress anywhere it shouldn't.
+
+```
+$ dit run workflows/port_visits/cross_version_ais.py \
+    --experiment-id pipeline-1465 \
+    --pin-source-at 2026-05-15T10:00:00Z \
+    --binding before=main \
+    --binding after=fix/PIPELINE-1465-tiebreaker \
+    --binding-worker-image after=gcr.io/world-fishing-827/dit/pipe-anchorages:fix-tiebreaker \
+    --runner dataflow --parallel --build-from-source
+```
+
+When to use: **fix-verification before PR** (or as a separate verification run alongside Scenario A). Each binding runs against a frozen source snapshot at `--pin-source-at`; outputs are diffed pairwise.
+
+Per-binding `--worker-image` is important when the change touches worker code — see memory `[[submitter-vs-worker-split]]`.
+
+#### Scenario E — Reproducing a past run
+
+A previous cache row says `pipeline_commit=<sha>`. You want to rerun against that exact code.
+
+```
+$ bq query --use_legacy_sql=false --project_id=world-fishing-827 \
+    'SELECT pipeline_commit, params_json FROM `world-fishing-827.tech_great_expectations.dit_runs`
+     WHERE run_id = "<rid>"'
+$ make dit-cloud PIPELINE=pipe-gaps REF=<sha> WORKFLOW=workflows/pipe_gaps/mode_equivalence.py ARGS="..."
+```
+
+When to use: investigating a past diff; auditing a result; sanity-checking that a snapshot ref is still fetchable. Because every dit run executes a pushed ref, this works for anyone with read access to the pipeline repo — the row is genuinely portable.
+
+#### Scenario F — Cancelling a stuck or unwanted run (M5)
+
+```
+$ make dit-cancel RUN_ID=<rid>
+```
+
+Looks up the run's Dataflow job IDs + output table FQNs in `dit_runs`, cancels the jobs, drops the tables, marks the row `cancelled`. Reads the same `dit_run_id` label dit stamps on every Dataflow job + BQ table from a run.
+
+#### Scenario G — `make snapshot-<pipeline>` explicitly (advanced)
+
+You can manually invoke the snapshot step before running dit. Equivalent to letting `make dit-cloud` auto-snapshot, but useful when you want to inspect the snapshot ref before the run, or when running multiple dit invocations against the same uncommitted code base (the second run hits cache against the first).
+
+```
+$ make snapshot-pipe-gaps
+# Prints: Created refs/dit-snapshots/pipe-gaps/<epoch>-<hex>; pushed to origin.
+$ make dit-cloud PIPELINE=pipe-gaps REF=refs/dit-snapshots/pipe-gaps/<that> ...
+```
+
+#### Cleanup
+
+```
+$ make clean-snapshots
+```
+
+Walks the configured pipeline checkouts, deletes any `dit-snapshot-*` local refs (and their remote counterparts under `refs/dit-snapshots/<pipeline>/*`). User-invoked, no cron. Snapshot accumulation is bytes-scale on the remote (hidden namespace, invisible to GitHub's UI) so this is hygiene-when-you-feel-like-it, not a hard requirement.
+
+### Decision tree
+
+| Question | Answer | Scenario |
+|---|---|---|
+| Are you opening a PR? | Yes | **A** (best) |
+| | Not yet — iterating | **B** (auto-snapshot) |
+| | Testing an existing ref | **C** |
+| Are you comparing two refs against pinned source? | Yes | **D** |
+| Are you reproducing or auditing a past run? | Yes | **E** |
+| Need to clean up a stuck run? | Yes | **F** (M5) |
+
 ## Roadmap
 
 Each phase below is a short summary of what's planned and where we are. The canonical detail lives in [`docs/plan.md`](docs/plan.md); this section is the operational dashboard.
@@ -91,6 +229,7 @@ Each phase below is a short summary of what's planned and where we are. The cano
 
 **Operational next steps** (rolling, in priority order):
 
+0. **No-dirty-tree pivot** ([`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md)). Deprecate `--allow-dirty-tree`; auto-snapshot+push dirty trees; rename `pipeline_dirty` → `unreviewed_code`; collapse the accumulated special-case logic before M5 inherits any of it into port-visits.
 1. **Run cache M5 — port-visits integration + `make dit-cancel`.** Wire `dit.cache` into `workflows/port_visits/ais.py` via a `_run_with_cache`-style wrapper (structurally identical to the pipe-gaps M4 work that just landed in `workflows/pipe_gaps/mode_equivalence.py`). Add `make dit-cancel RUN_ID=<id>` reading the cache table to cancel Dataflow + drop output tables. Implement `cancel_run` in `dit.cache`.
 2. **Run cache M6 — SIGTERM trap inside `dit run`** so Cloud Build cancellations cleanly tear down their own Dataflow + BQ artefacts via `cancel_run`.
 3. **Per-pipeline PR triggers.** Wire `pipe-gaps` (most-verified) → `anchorages_pipeline` → `pipe-events` to fire dit on PRs. Trigger config lives in each pipeline repo; references `cloudbuild-dit.yaml` from the dit checkout. Path-filter on pipeline-relevant files; `dit:run` label as the escape-hatch override.
