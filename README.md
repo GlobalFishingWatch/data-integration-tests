@@ -82,12 +82,12 @@ dit covers a small set of orthogonal axes, summarised first, then walked through
 | Axis | Choices |
 |---|---|
 | **Where** | local (`dit run …`) / Cloud Build (`make dit-cloud …`) |
-| **Pipeline ref** | clean HEAD of pipeline checkout / `dit-snapshot-*` (auto-created from uncommitted changes) / a specific committed ref (`make install-<pipeline>-ref REF=…` or `make dit-cloud REF=…`) / a PR head SHA (automated, future) |
+| **Pipeline ref** | clean HEAD of pipeline checkout / auto-created snapshot under `refs/dit-snapshots/<pipeline>/<commit-short-sha>` (content-addressable; one ref per distinct working-tree state) / a specific committed ref (`make install-<pipeline>-ref REF=…` or `make dit-cloud REF=…`) / a PR head SHA (automated, future) |
 | **Worker image** | published default (e.g. `pipe-gaps:v0.9.6`) / custom-built from a ref (for changes that touch worker code) |
 | **Single vs cross-version** | one ref / N refs compared (`workflows/port_visits/cross_version_ais.py`) |
 | **Trigger** | manual CLI / PR event (automated, future) / scheduled (future) |
 
-> **Future-state note** (see [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md)): under the in-flight pivot, **every dit run executes a committed git ref**. If your working tree is dirty when you invoke dit, the workflow auto-snapshots to `refs/dit-snapshots/<pipeline>/<epoch>-<hex>`, auto-pushes, and uses that ref — no `--allow-dirty-tree` flag, no special-case logic, every cache row reproducible. The scenarios below describe the end state.
+> **Future-state note** (see [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md)): under the in-flight pivot, **every dit run executes a committed git ref**. If your working tree is dirty when you invoke dit, the workflow auto-snapshots to `refs/dit-snapshots/<pipeline>/<commit-short-sha>` (content-addressable — identical tree state always produces the same SHA, so repeat runs of unchanged uncommitted code hit the cache), auto-pushes, and uses that ref — no `--allow-dirty-tree` flag, no special-case logic, every cache row reproducible. The scenarios below describe the end state.
 
 ### Scenarios
 
@@ -115,7 +115,7 @@ You're mid-development; you want feedback before opening a PR. dit detects the d
 $ cd $PROJECTS/pipe-gaps && vim src/...   # edits, not committed
 $ cd $PROJECTS/data_integration_tests
 $ make dit-cloud PIPELINE=pipe-gaps WORKFLOW=workflows/pipe_gaps/mode_equivalence.py
-                          # auto-snapshots → refs/dit-snapshots/pipe-gaps/<epoch>-<hex>
+                          # auto-snapshots → refs/dit-snapshots/pipe-gaps/<commit-short-sha>
                           # auto-pushes
                           # runs against the snapshot
 ```
@@ -137,7 +137,7 @@ You want to test a specific committed ref without changing what's installed.
 $ make dit-cloud PIPELINE=pipe-gaps REF=main WORKFLOW=workflows/pipe_gaps/mode_equivalence.py
 # or:
 $ make dit-cloud PIPELINE=pipe-gaps REF=fix/PIPELINE-1465-tiebreaker WORKFLOW=...
-# or to install locally for inspection / DirectRunner:
+# or to install locally and run from your venv (e.g. for ad-hoc inspection, or to drive Dataflow without Cloud Build):
 $ make install-pipe-gaps-ref REF=fix/PIPELINE-1465-tiebreaker
 $ dit run workflows/pipe_gaps/mode_equivalence.py --runner dataflow ...
 ```
@@ -189,7 +189,8 @@ You can manually invoke the snapshot step before running dit. Equivalent to lett
 
 ```
 $ make snapshot-pipe-gaps
-# Prints: Created refs/dit-snapshots/pipe-gaps/<epoch>-<hex>; pushed to origin.
+# Prints: Created refs/dit-snapshots/pipe-gaps/<commit-short-sha>; pushed to origin
+#         (or: ref already exists on origin, skipping push — content-addressable).
 $ make dit-cloud PIPELINE=pipe-gaps REF=refs/dit-snapshots/pipe-gaps/<that> ...
 ```
 
@@ -199,7 +200,7 @@ $ make dit-cloud PIPELINE=pipe-gaps REF=refs/dit-snapshots/pipe-gaps/<that> ...
 $ make clean-snapshots
 ```
 
-Walks the configured pipeline checkouts, deletes any `dit-snapshot-*` local refs (and their remote counterparts under `refs/dit-snapshots/<pipeline>/*`). User-invoked, no cron. Snapshot accumulation is bytes-scale on the remote (hidden namespace, invisible to GitHub's UI) so this is hygiene-when-you-feel-like-it, not a hard requirement.
+Walks the configured pipeline checkouts and deletes any local refs under `refs/dit-snapshots/<pipeline>/*` along with their remote counterparts (and, transitionally during the migration, any pre-pivot `refs/heads/dit-snapshot-*` branches still hanging around). User-invoked, no cron. Snapshot accumulation is bytes-scale on the remote (hidden namespace, invisible to GitHub's UI) so this is hygiene-when-you-feel-like-it, not a hard requirement.
 
 ### Decision tree
 

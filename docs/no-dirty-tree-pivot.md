@@ -24,7 +24,7 @@ The original plan never called for this. `make snapshot-<pipeline>` has existed 
 After this pivot:
 
 - **Every cache row references a committed, fetchable git ref.** Pure reproducibility.
-- **`--allow-dirty-tree` is removed.** A dirty tree at submit time → dit auto-snapshots, auto-pushes to `refs/dit-snapshots/<pipeline>/<epoch>-<hex>`, and uses that ref. The user doesn't need to think about snapshots; the workflow handles it.
+- **`--allow-dirty-tree` is removed.** A dirty tree at submit time → dit auto-snapshots, auto-pushes to `refs/dit-snapshots/<pipeline>/<commit-short-sha>` (content-addressable — see § "Deterministic snapshots" below), and uses that ref. The user doesn't need to think about snapshots; the workflow handles it.
 - **`pipeline_dirty` column drops from the cache.** Replaced by a sharper-semantic `unreviewed_code` BOOL: `TRUE` for snapshot refs and ad-hoc branches, `FALSE` for merged-into-main commits. This carries the actual semantic the dirty-tree filter was a proxy for ("don't trust this row for cross-pipeline / PR-validation purposes") without conflating it with git state.
 - **`dit.git_info.warn_if_worker_image_misses_dirty_tree` is removed.** No dirty trees possible; no warning needed. The submitter-vs-worker memory's content stays relevant (it's about worker-image staleness, not git state) but the warn helper is gone.
 - **`_dirty` suffix gone from output table names.** Output suffix becomes `<experiment_id>_<commit>_<uuid>` — every byte traceable to a real git ref.
@@ -73,13 +73,13 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 
 - `make dit-cloud` detects a dirty pipeline checkout and runs the snapshot+push automatically before the Cloud Build submit. No user-visible flag for the "happy path" (dirty → just snapshot). Add a `--require-clean` opt-out for users who want the run to error rather than auto-snapshot (CI scripts, etc.).
 - Same for local `dit run --runner=dataflow`: detect dirty tree, auto-snapshot, install from the snapshot, proceed.
-- Local `dit run --runner=docker` (DirectRunner) keeps working against the working tree as today — it's the inner-loop fast iteration mode, and the snapshot isn't needed (no Cloud Build / no remote workers).
+- Local `dit run --runner=docker` (runs the pipeline image inside a local container via `dit.runners.docker`) keeps working against the working tree as today — it's the inner-loop fast iteration mode, and the snapshot isn't needed (no Cloud Build / no remote workers; the container reads from the locally-mounted source).
 - `--allow-dirty-tree` becomes a no-op with a deprecation warning, then removed in a follow-up PR.
 
 ### M-pivot-3 — `unreviewed_code` column replaces `pipeline_dirty`
 
 - Migration: `ALTER TABLE tech_great_expectations.dit_runs ADD COLUMN unreviewed_code BOOL`.
-- `_run_with_cache` writes `unreviewed_code=TRUE` when `pipeline_commit` is a snapshot ref (matches `dit-snapshot-` prefix or lives under `refs/dit-snapshots/*`). `FALSE` otherwise.
+- `_run_with_cache` writes `unreviewed_code=TRUE` when `pipeline_commit` resolves under `refs/dit-snapshots/*` (or — heuristic — fails `git merge-base --is-ancestor <commit> origin/main`). `FALSE` for commits on or merged into `origin/main`.
 - `read_cache` default behaviour: returns all rows (`unreviewed_code` is informational). PR-validation queries that want strict provenance filter `WHERE unreviewed_code = FALSE` explicitly.
 - Drop the `pipeline_dirty = FALSE` filter from `read_cache`.
 - Backfill existing rows: `UPDATE ... SET unreviewed_code = pipeline_dirty` (semantically equivalent for the existing data).
@@ -116,7 +116,7 @@ No drops requiring a destructive migration. The rename is additive (ADD + UPDATE
 |---|---|
 | **Existing dirty rows in `dit_runs` reference unreviewable code.** | Migration `UPDATE ... SET unreviewed_code = pipeline_dirty` preserves the semantic. PR-validation queries explicitly filter `unreviewed_code = FALSE`. |
 | **`refs/dit-snapshots/*` accumulates on origin** if nobody runs `make clean-snapshots`. | Bytes-scale storage; UX is fine (hidden ref namespace). Optional weekly user habit. |
-| **Auto-snapshot might surprise users who didn't realise their code is being pushed.** | Loud banner at snapshot time. Auto-snapshot is restricted to `--runner=dataflow` paths (the ones that need Cloud Build / remote workers). DirectRunner stays local-only as today. |
+| **Auto-snapshot might surprise users who didn't realise their code is being pushed.** | Loud banner at snapshot time. Auto-snapshot is restricted to `--runner=dataflow` paths (the ones that need Cloud Build / remote workers). The docker runner (`--runner=docker`) stays local-only as today — its container reads from the locally-mounted source, no remote ref needed. |
 | **`make snapshot-<pipeline>` now requires git-push permission to the pipeline repo.** | Same scope of users who already need GCP AR push; no new permission class. Document the requirement in README. |
 | **CI scripts that pass `--allow-dirty-tree` break.** | Deprecation cycle: M-pivot-2 keeps the flag as a no-op with a warning; M-pivot-4 removes it. One release of grace. |
 | **Snapshot push + branch-protection rules.** | `refs/dit-snapshots/*` is outside `refs/heads/`; branch protection patterns typically don't apply. Confirm with whoever set up the pipeline-repo's protections. |
@@ -125,7 +125,7 @@ No drops requiring a destructive migration. The rename is additive (ADD + UPDATE
 ## Open questions
 
 1. **Auto-snapshot opt-out shape.** `--require-clean` (error if dirty) vs `--no-auto-snapshot` (proceed somehow else) — pick at M-pivot-2 implementation time. I'd argue `--require-clean` is the right name; the failure mode is clearer.
-2. **Should `dit run --runner=docker` also auto-snapshot?** No — DirectRunner runs locally against the working tree directly; the snapshot adds zero value. Worth confirming.
+2. **Should `dit run --runner=docker` also auto-snapshot?** No — the docker runner executes the pipeline image locally inside a container reading from the mounted source; no remote workers, no remote ref needed; the snapshot adds zero value. Worth confirming.
 3. **Snapshot ref retention policy.** Default = "keep forever, user runs `make clean-snapshots` when they want". Worth revisiting if we discover real friction.
 4. **`unreviewed_code` semantics for `make install-<pipeline>-ref REF=<branch>`.** A branch that's a PR head is `unreviewed_code=TRUE`; a merged-to-main commit is `unreviewed_code=FALSE`. How do we tell? Cheap heuristic: `git merge-base --is-ancestor <ref> origin/main`. Implementation detail for M-pivot-3.
 
