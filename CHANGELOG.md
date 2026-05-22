@@ -9,7 +9,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 ### 2026-05-22
 
 #### Added
-- **`dit.cache` module — scaffolding for the content-addressable run cache** (`dit_meta.runs`). Pure functions implemented (`compute_cache_key`, `sha1_of_workflow_file`, `canonicalise_params`, `resolve_worker_image_to_digest`); BQ-touching functions (`read_cache`, `verify_tables_exist`, `expires_at_for`, `write_cache`, `cancel_run`) raise `NotImplementedError` with TODO markers pointing at the per-milestone PRs that follow. 15 unit tests for the pure surface. BQ schema lives in `migrations/001_dit_meta_runs.sql`; implementation plan in `docs/run-cache-impl.md`. Workflow integration lands in subsequent milestones (M4 = pipe-gaps; M5 = port-visits + `make dit-cancel`).
+- **`dit.cache` module — scaffolding for the content-addressable run cache** (BQ table: `world-fishing-827.tech_great_expectations.dit_runs`). Pure functions implemented (`compute_cache_key`, `sha1_of_workflow_file`, `canonicalise_params`, `resolve_worker_image_to_digest`); BQ-touching functions (`read_cache`, `verify_tables_exist`, `expires_at_for`, `write_cache`, `cancel_run`) raise `NotImplementedError` with TODO markers pointing at the per-milestone PRs that follow. 15 unit tests for the pure surface. BQ schema lives in `migrations/001_dit_meta_runs.sql`; implementation plan in `docs/run-cache-impl.md`. Workflow integration lands in subsequent milestones (M4 = pipe-gaps; M5 = port-visits + `make dit-cancel`).
 
 ### 2026-05-21
 

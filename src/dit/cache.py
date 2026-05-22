@@ -90,13 +90,18 @@ def compute_cache_key(key: CacheKey) -> str:
     will silently shift every existing hash; if that happens
     intentionally, all in-flight cache entries are invalidated (which is
     usually what you want).
+
+    ``key.params`` is passed through :func:`canonicalise_params` defensively
+    so callers can't accidentally end up with different cache keys for
+    semantically identical params (e.g. ``ssvids`` in different orders).
+    Calling canonicalise on already-canonical params is a cheap no-op.
     """
     payload = json.dumps(
         {
             "pipeline_commit": key.pipeline_commit,
             "worker_image_digest": key.worker_image_digest,
             "workflow_file_sha1": key.workflow_file_sha1,
-            "params": dict(key.params),
+            "params": canonicalise_params(key.params),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -116,24 +121,27 @@ def sha1_of_workflow_file(workflow_path: str | Path) -> str:
 def canonicalise_params(params: Mapping[str, Any]) -> dict[str, Any]:
     """Sort + normalise a params mapping for inclusion in the cache key.
 
-    Sequences (tuples, lists) are normalised to sorted tuples-as-lists where
-    ordering shouldn't affect output (e.g. ``ssvids``); leave other fields
-    alone. Strings, ints, bools, None pass through unchanged.
+    **Contract**: ``list`` values are treated as unordered and always
+    sorted (e.g. ``ssvids``). ``tuple`` values are treated as ordered and
+    preserved (e.g. ``modes``). Callers choose the container that matches
+    the semantics of each field. Everything else (str / int / bool / None
+    / dict) passes through unchanged.
 
     Callers (workflow-side ``canonical_params_dict``) are responsible for
-    excluding plumbing-only fields (service_account, region, etc.) BEFORE
-    handing the dict to this function. This function just normalises what
-    it's given.
+    excluding plumbing-only fields (``service_account``, ``region``, etc.)
+    BEFORE handing the dict to this function. This function just
+    normalises what it's given; it does not know which fields affect
+    pipeline output.
     """
     out: dict[str, Any] = {}
     for k in sorted(params):
         v = params[k]
-        if isinstance(v, (list, tuple)):
-            # Lists where order doesn't matter (ssvids, modes) get sorted.
-            # If a workflow ever needs to cache an ordered list, pass a
-            # tuple; this helper preserves a tuple's position but converts
-            # to list for JSON.
-            out[k] = list(sorted(v) if isinstance(v, list) else v)
+        if isinstance(v, list):
+            # Unordered: sort for cache-key stability.
+            out[k] = sorted(v)
+        elif isinstance(v, tuple):
+            # Ordered: preserve, but render as list for JSON.
+            out[k] = list(v)
         else:
             out[k] = v
     return out
@@ -186,9 +194,10 @@ def resolve_worker_image_to_digest(image_ref: str) -> str:
 class CachedRun:
     """A row of ``tech_great_expectations.dit_runs``.
 
-    Mirrors the BQ schema in ``docs/run-cache.md`` § Schema. ``params_json``
-    is the *serialised* form (matches BQ's JSON-as-STRING storage); the
-    in-memory dict lives in :class:`CacheKey`.
+    Mirrors the BQ schema in ``docs/run-cache.md`` § Schema. The
+    ``params`` field maps to the BQ ``JSON`` column (NULLABLE) and round-
+    trips as a Python dict via the bigquery client — no manual
+    ``json.loads`` / ``json.dumps`` on the application side.
     """
 
     run_id: str
@@ -201,7 +210,7 @@ class CachedRun:
     dit_commit: str
     workflow_file_sha1: str
     worker_image: str
-    params_json: str
+    params: Mapping[str, Any] | None
     output_tables: list[str]
     dataflow_job_ids: list[str]
     cloud_build_id: str | None

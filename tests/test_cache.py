@@ -142,6 +142,7 @@ def test_resolve_worker_image_to_digest_passes_digest_form_through():
     assert resolve_worker_image_to_digest(digest_form) == digest_form
 
 
-# Tag-form resolution makes a real gcloud call; skipped by default. To
-# exercise it manually: `pytest tests/test_cache.py -k digest_tag --no-skip`
-# (requires a real image ref + gcloud auth).
+# Tag-form resolution would require a real gcloud call; no test for it
+# here. Manual verification at M2 / first real workflow integration:
+#   resolve_worker_image_to_digest("us-central1-docker.pkg.dev/.../pipe-gaps:v0.9.6")
+# should return the same image ref with @sha256:... appended.

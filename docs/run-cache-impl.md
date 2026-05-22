@@ -139,7 +139,7 @@ dit_compare.compare_tables(bf_fqn, bfd_fqn, keys=COMPARE_KEYS, view_suffix=COMPA
 - [x] `tests/test_cache.py` — 15 tests; all passing.
 - [x] `migrations/001_dit_meta_runs.sql` — DDL.
 - [x] `docs/run-cache-impl.md` — this doc.
-- [ ] `CHANGELOG.md` — `[Unreleased]` entry under `#### Added`.
+- [x] `CHANGELOG.md` — `[Unreleased]` entry under `#### Added`.
 
 After this PR, the next branch is `feat/dit-cache-bq-read` for M2.
 
