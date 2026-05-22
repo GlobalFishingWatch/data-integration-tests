@@ -86,11 +86,52 @@ When Cloud Build cancels a build mid-flight, the orchestrator process gets SIGTE
 - **Cache table creation.** One-shot `bq query --use_legacy_sql=false < migrations/001_dit_meta_runs.sql`. No new dataset / IAM grant — uses the existing `tech_great_expectations` dataset that dit already writes outputs to. If/when retention separation or per-table IAM is needed, the table moves with a one-line `TABLE_FQN` change in `src/dit/cache.py`.
 - **`gcloud dataflow jobs cancel` permission.** For `cancel_run`. `automated-testing@` likely already has `dataflow.jobs.cancel` (it can submit; cancel is the symmetric operation). Verify before M5.
 
-## Decision points still open
+## Decisions for M4 (resolved 2026-05-22)
 
-- **`dit_run_id` for pipe-gaps**: scope of M4 confirms the label addition, but where the UUID is generated is open. Options: (a) inside `main()`, stamped onto each cfg; (b) per-execute helper, separate per mode. (a) is simpler and matches port_visits; (b) would let the user cancel one mode without cancelling the others. Going with (a) unless someone calls for (b).
-- **Cache wrapper API**: design has been "wrap each `execute_*`". Could also be "wrap `_run_pipeline`" (more granular but higher per-call cost; less semantic). M4 will pick when the workflow code is in front of us.
-- **Mode-equivalence on cache hits.** If 1_bf hits cache but 2_bfd misses, the comparison between them is still valid (the cached 1_bf was produced by the same pipeline_commit + worker_image as the fresh 2_bfd). But if the user passes `--experiment-id`, the cached row's `experiment_id` won't match — the comparison logic needs to look up output FQNs by `cache_key` (or by traversing the cache table) rather than by string-concatenating the experiment_id. The right shape is for `dit.compare` (the `dit.report` work in roadmap item 3) to take a `CachedRun | None` per side and use the cached row's `output_tables` field.
+### Decision A — `dit_run_id` is per-`main()`, asset traceability is per-`execute_*`
+
+`dit_run_id` is generated once in `main()` (12-hex UUID) and stamped on every Dataflow job + BQ output from that invocation, matching the port-visits pattern. **It's the control-plane identifier**: "all jobs/tables from one `dit run`". `make dit-cancel RUN_ID=<id>` operates at this scope — cancels all sibling modes together.
+
+**Asset traceability remains per-mode** without a separate identifier:
+
+- One row in `tech_great_expectations.dit_runs` per `execute_*` call — `cache_key` distinguishes modes within an invocation. The row's `output_tables` + `dataflow_job_ids` columns are the per-mode asset list.
+- BQ labels on each individual Dataflow job + output table carry `dit_mode` / `dit_step` / `dit_iteration` (from the per-iteration-labels work in PR #2 on port_visits, to be replicated for pipe-gaps in M4).
+- So "what assets came from mode 2_bfd of run X" is one BQ filter: `WHERE dit_run_id = X AND dit_mode = "2_bfd"` — or equivalently `WHERE run_id = X AND cache_key = ...` on the cache table.
+
+If we later discover that *cancelling one mode without cancelling siblings* is a real workflow (it isn't today), the right answer is a new `--mode <name>` flag on `make dit-cancel` that filters within a `run_id`, NOT splitting `run_id` itself. That keeps the run/mode hierarchy clean.
+
+### Decision B — Cache wrap unit is `execute_*` (whole mode)
+
+Wrap each `execute_bf` / `execute_bfd` / `execute_bftruncate` / `execute_mutate_recover` as the cache unit. **Not** per-`_run_pipeline` (individual Dataflow job).
+
+Rationale: the storage boundary is at the mode level — bfd's 5 daily iterations all append to the *same* output table. A per-Dataflow-job cache would produce incoherent "half-cached half-fresh mode" states (iteration 3 has rows from a previous run; iterations 1-2 are re-run and truncate-overwrite them; arbitrary mismatch). Per-mode keeps the cache unit aligned with the storage unit: one cache_key = one BQ output table.
+
+Loses: resume-from-failed-iteration semantics (a partial-failed bfd retries from scratch). Doesn't matter at AIS-staging scale; revisit if/when AIS-full makes a single mode's wall-clock painful.
+
+### Decision C — Workflow resolves output FQN; `dit.compare` stays dumb
+
+The cache wrapper returns the output FQN (either from `cached_row.output_tables[0]` on a hit, or the workflow's just-computed `bf_table` variable on a miss). The workflow then passes that FQN to `dit.compare.compare_tables(a, b, keys=..., view_suffix=...)` exactly as today.
+
+**`dit.compare`'s signature does not change.** The working-agreement "`dit.compare` is a thin shim over `table-check`" is the deciding consideration — adding cache-row awareness contradicts it. The workflow has both the `CachedRun` and the local FQN in scope; the swap is a two-line conditional at the call site.
+
+Sketch:
+
+```python
+def run_with_cache(workflow_fn, *, cache_key, output_fqn, **kwargs) -> str:
+    """Return the FQN of the output table — from cache on hit, freshly computed on miss."""
+    if cached := dit_cache.read_cache(cache_key):
+        if all(dit_cache.verify_tables_exist(cached.output_tables)):
+            logger.info("cache HIT: reusing %s", cached.output_tables[0])
+            return cached.output_tables[0]
+    workflow_fn(**kwargs)
+    if not args.allow_dirty_tree:  # equivalently: not pipeline_dirty
+        dit_cache.record_run(...)
+    return output_fqn
+
+bf_fqn  = run_with_cache(execute_bf,         cache_key=bf_key,  output_fqn=bf_table,  ...)
+bfd_fqn = run_with_cache(execute_bfd,        cache_key=bfd_key, output_fqn=bfd_table, ...)
+dit_compare.compare_tables(bf_fqn, bfd_fqn, keys=COMPARE_KEYS, view_suffix=COMPARE_VIEW_SUFFIX)
+```
 
 ## What lands in this PR (M1) — checklist
 
