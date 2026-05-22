@@ -424,3 +424,14 @@ def test_snapshot_fails_on_ref_divergence(pipeline_repo: Path) -> None:
     assert proc.returncode != 0
     assert "exists on origin at" in proc.stderr
     assert "refusing to install" in proc.stderr
+
+    # No partial local-ref left behind — the divergence check must fail
+    # BEFORE `git update-ref` runs. Otherwise the next invocation finds a
+    # local ref pointing at a SHA disagreeing with origin and the user has
+    # to clean it up manually.
+    assert (
+        _git(
+            "rev-parse", "--verify", "--quiet", ref, cwd=pipeline_repo, check=False
+        ).returncode
+        != 0
+    ), "divergence failure must NOT leave behind a local ref"

@@ -122,8 +122,11 @@ else
     echo "  gitleaks scan passed" >&2
 fi
 
-# Frozen author/committer dates AND identities + --no-gpg-sign:
+# Frozen author/committer dates AND identities + disabled GPG signing:
 # commit SHA must be a pure function of the tree for content-addressability.
+# `-c commit.gpgsign=false` is the portable disable (works on any git
+# version with config-override support); `--no-gpg-sign` would be belt-
+# and-suspenders but isn't supported by all git versions.
 SNAPSHOT_SHA=$(
     GIT_AUTHOR_DATE="1970-01-01T00:00:00Z" \
     GIT_COMMITTER_DATE="1970-01-01T00:00:00Z" \
@@ -131,7 +134,7 @@ SNAPSHOT_SHA=$(
     GIT_AUTHOR_EMAIL=dit@local \
     GIT_COMMITTER_NAME=dit \
     GIT_COMMITTER_EMAIL=dit@local \
-    git -c commit.gpgsign=false commit-tree --no-gpg-sign \
+    git -c commit.gpgsign=false commit-tree \
         -m "dit snapshot of $PARENT_SHA" \
         "$TREE_SHA"
 )
@@ -163,21 +166,26 @@ CHANGED_PATHS=$(git diff --name-only HEAD || true)
     echo "    - auto-push requires git-push permission on $PIPELINE's origin"
 } >&2
 
-git update-ref "$REF" "$SNAPSHOT_SHA"
-
 # If the remote already has the ref, it must point at the same SHA we just
 # computed (the ref is content-addressable). A divergence means either a
 # 12-char prefix collision (astronomically rare) or a manual overwrite —
 # either way, refusing to silently install from a local-only ref that
 # disagrees with origin is the safer failure mode.
+#
+# Check BEFORE `git update-ref` so a divergent-remote run doesn't leave
+# behind a local-only ref pointing at the divergent SHA (undermines the
+# "refusing to install" message and creates cleanup work for the user).
 REMOTE_SHA=$(git ls-remote origin "$REF" 2>/dev/null | awk '{print $1}')
+if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$SNAPSHOT_SHA" ]; then
+    echo "error: $REF exists on origin at $REMOTE_SHA but local snapshot is $SNAPSHOT_SHA" >&2
+    echo "       refusing to install from a local-only ref that disagrees with origin." >&2
+    echo "       delete the divergent ref (scripts/clean-snapshot.sh) or use a longer prefix." >&2
+    exit 1
+fi
+
+git update-ref "$REF" "$SNAPSHOT_SHA"
+
 if [ -n "$REMOTE_SHA" ]; then
-    if [ "$REMOTE_SHA" != "$SNAPSHOT_SHA" ]; then
-        echo "error: $REF exists on origin at $REMOTE_SHA but local snapshot is $SNAPSHOT_SHA" >&2
-        echo "       refusing to install from a local-only ref that disagrees with origin." >&2
-        echo "       delete the divergent ref (scripts/clean-snapshot.sh) or use a longer prefix." >&2
-        exit 1
-    fi
     echo "  (ref already present on origin at the same SHA -- skipping push)" >&2
 else
     git push origin "$REF:$REF" >&2
