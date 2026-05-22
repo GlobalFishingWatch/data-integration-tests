@@ -26,6 +26,7 @@ from dit.cache import (
     resolve_worker_image_to_digest,
     sha1_of_workflow_file,
     verify_tables_exist,
+    write_cache,
 )
 
 
@@ -340,9 +341,6 @@ def test_expires_at_for_empty_input():
 # Write path (M3): to_bq_row + write_cache.
 # --------------------------------------------------------------------------
 
-from dit.cache import write_cache
-
-
 def _cached_run(**overrides: Any) -> CachedRun:
     base = dict(
         run_id="rid01",
@@ -428,26 +426,53 @@ def test_to_bq_row_from_bq_row_round_trip():
     assert restored == original
 
 
-def test_write_cache_calls_insert_rows_json():
+def test_write_cache_calls_dml_insert():
     client = MagicMock()
-    client.insert_rows_json.return_value = []  # no errors
     run = _cached_run()
     write_cache(run, client=client)
-    client.insert_rows_json.assert_called_once()
-    args, _ = client.insert_rows_json.call_args
-    table_arg, rows_arg = args
-    assert table_arg == "world-fishing-827.tech_great_expectations.dit_runs"
-    assert isinstance(rows_arg, list)
-    assert len(rows_arg) == 1
-    assert rows_arg[0]["run_id"] == run.run_id
+    client.query.assert_called_once()
+    args, kwargs = client.query.call_args
+    sql = args[0]
+    assert "INSERT INTO" in sql
+    assert "world-fishing-827.tech_great_expectations.dit_runs" in sql
+    # JSON column uses the documented PARSE_JSON(STRING_param) pattern.
+    assert "PARSE_JSON(@params_json)" in sql
+    # All 18 columns appear as @parameters in the VALUES clause.
+    expected = {
+        "run_id", "cache_key", "workflow", "pipeline", "experiment_id",
+        "pipeline_commit", "pipeline_dirty", "dit_commit", "workflow_file_sha1",
+        "worker_image", "params_json", "output_tables", "dataflow_job_ids",
+        "cloud_build_id", "started_at", "finished_at", "status", "expires_at",
+    }
+    job_config = kwargs["job_config"]
+    actual = {p.name for p in job_config.query_parameters}
+    assert actual == expected
+    # .result() must be called so we block until the INSERT commits.
+    client.query.return_value.result.assert_called_once()
 
 
-def test_write_cache_raises_on_streaming_errors():
+def test_write_cache_binds_params_with_correct_values():
     client = MagicMock()
-    client.insert_rows_json.return_value = [
-        {"index": 0, "errors": [{"reason": "invalid", "message": "bad field"}]}
-    ]
-    with pytest.raises(RuntimeError, match="insert_rows_json"):
+    run = _cached_run(run_id="rid-x", cache_key="ck-x", pipeline_dirty=True)
+    write_cache(run, client=client)
+    job_config = client.query.call_args.kwargs["job_config"]
+    by_name = {p.name: p for p in job_config.query_parameters}
+    assert by_name["run_id"].value == "rid-x"
+    assert by_name["cache_key"].value == "ck-x"
+    assert by_name["pipeline_dirty"].value is True
+    # params_json is the JSON-STRING form, server-side PARSE_JSON converts.
+    import json as _json
+    assert _json.loads(by_name["params_json"].value) == run.params
+    # Arrays bind via ArrayQueryParameter (`.values`, not `.value`).
+    assert by_name["output_tables"].values == list(run.output_tables)
+
+
+def test_write_cache_propagates_query_errors():
+    # DML errors come back via client.query(...).result(), not as a
+    # returned list (which is what insert_rows_json does).
+    client = MagicMock()
+    client.query.return_value.result.side_effect = RuntimeError("bad SQL")
+    with pytest.raises(RuntimeError, match="bad SQL"):
         write_cache(_cached_run(), client=client)
 
 
@@ -455,7 +480,18 @@ def test_write_cache_writes_dirty_rows_too():
     # Design invariant: dirty rows ARE inserted (registry purpose); read
     # path filters them out. Don't suppress writes here.
     client = MagicMock()
-    client.insert_rows_json.return_value = []
     write_cache(_cached_run(pipeline_dirty=True), client=client)
-    args, _ = client.insert_rows_json.call_args
-    assert args[1][0]["pipeline_dirty"] is True
+    job_config = client.query.call_args.kwargs["job_config"]
+    dirty = next(p for p in job_config.query_parameters if p.name == "pipeline_dirty")
+    assert dirty.value is True
+
+
+def test_write_cache_handles_null_params():
+    # PARSE_JSON(NULL) returns NULL; the params_json binding must pass None.
+    client = MagicMock()
+    write_cache(_cached_run(params=None), client=client)
+    job_config = client.query.call_args.kwargs["job_config"]
+    params_json_param = next(
+        p for p in job_config.query_parameters if p.name == "params_json"
+    )
+    assert params_json_param.value is None

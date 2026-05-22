@@ -428,28 +428,76 @@ def expires_at_for(table_fqns: list[str], *, client: Any = None) -> datetime:
 
 
 def write_cache(row: CachedRun, *, client: Any = None) -> None:
-    """Insert a row into ``tech_great_expectations.dit_runs`` via the
-    streaming-inserts API (``insert_rows_json``).
+    """Insert a row into ``tech_great_expectations.dit_runs`` via a
+    parameterised DML INSERT.
 
-    **Dirty-tree handling** is at the read side, not here: every row is
-    recorded for registry + cleanup purposes regardless of
+    **Why DML INSERT, not streaming inserts (``insert_rows_json``)**:
+    streaming-inserted rows sit in a 90-minute buffer during which
+    UPDATE/DELETE against them is rejected. Our cancel path
+    (``cancel_run`` / ``make dit-cancel`` in M5) needs to UPDATE
+    ``status='cancelled'`` mid-flight, which is by definition within
+    the buffer window. Streaming is also at-least-once: retries can
+    create duplicate rows unless an explicit ``row_ids=`` is passed.
+    DML INSERT sidesteps both: rows land in permanent storage
+    immediately + every submission is exactly-once. Cost is the same
+    (INSERT VALUES scans zero bytes); latency is a few seconds vs
+    streaming's sub-second — invisible inside multi-minute Dataflow
+    workflows.
+
+    **Dirty-tree handling** lives at the read side, not here: every row
+    is recorded for registry + cleanup purposes regardless of
     ``pipeline_dirty``. The :func:`read_cache` query filters out
     ``pipeline_dirty = TRUE`` rows so dirty runs never satisfy a cache
-    lookup, but they remain visible to :func:`cancel_run` /
-    ``make dit-cancel`` so their Dataflow jobs + BQ tables can be
-    cleaned up after the fact.
+    lookup, but they remain visible to :func:`cancel_run` for cleanup.
 
-    Raises ``RuntimeError`` if the streaming insert returns any errors.
-    Streaming inserts are queryable via SELECT within seconds (the
-    90-minute "streaming buffer" caveat only affects DML against
-    freshly-inserted rows, which we don't do).
+    Exceptions from the BQ query job propagate. ``.result()`` blocks
+    until the INSERT commits.
     """
     client = client or _make_client()
-    errors = client.insert_rows_json(TABLE_FQN, [row.to_bq_row()])
-    if errors:
-        raise RuntimeError(
-            f"insert_rows_json into {TABLE_FQN} returned errors: {errors}"
+    from google.cloud import bigquery
+
+    params_json_str = (
+        json.dumps(row.params) if row.params is not None else None
+    )
+
+    query = f"""
+        INSERT INTO `{TABLE_FQN}` (
+            run_id, cache_key, workflow, pipeline, experiment_id,
+            pipeline_commit, pipeline_dirty, dit_commit, workflow_file_sha1,
+            worker_image, params_json, output_tables, dataflow_job_ids,
+            cloud_build_id, started_at, finished_at, status, expires_at
+        ) VALUES (
+            @run_id, @cache_key, @workflow, @pipeline, @experiment_id,
+            @pipeline_commit, @pipeline_dirty, @dit_commit, @workflow_file_sha1,
+            @worker_image, PARSE_JSON(@params_json), @output_tables, @dataflow_job_ids,
+            @cloud_build_id, @started_at, @finished_at, @status, @expires_at
         )
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("run_id", "STRING", row.run_id),
+        bigquery.ScalarQueryParameter("cache_key", "STRING", row.cache_key),
+        bigquery.ScalarQueryParameter("workflow", "STRING", row.workflow),
+        bigquery.ScalarQueryParameter("pipeline", "STRING", row.pipeline),
+        bigquery.ScalarQueryParameter("experiment_id", "STRING", row.experiment_id),
+        bigquery.ScalarQueryParameter("pipeline_commit", "STRING", row.pipeline_commit),
+        bigquery.ScalarQueryParameter("pipeline_dirty", "BOOL", row.pipeline_dirty),
+        bigquery.ScalarQueryParameter("dit_commit", "STRING", row.dit_commit),
+        bigquery.ScalarQueryParameter("workflow_file_sha1", "STRING", row.workflow_file_sha1),
+        bigquery.ScalarQueryParameter("worker_image", "STRING", row.worker_image),
+        # JSON column gets a STRING-typed parameter + server-side PARSE_JSON;
+        # documented BQ pattern for parameterised JSON inserts. NULL passes
+        # through because PARSE_JSON(NULL) returns NULL.
+        bigquery.ScalarQueryParameter("params_json", "STRING", params_json_str),
+        bigquery.ArrayQueryParameter("output_tables", "STRING", list(row.output_tables)),
+        bigquery.ArrayQueryParameter("dataflow_job_ids", "STRING", list(row.dataflow_job_ids)),
+        bigquery.ScalarQueryParameter("cloud_build_id", "STRING", row.cloud_build_id),
+        bigquery.ScalarQueryParameter("started_at", "TIMESTAMP", row.started_at),
+        bigquery.ScalarQueryParameter("finished_at", "TIMESTAMP", row.finished_at),
+        bigquery.ScalarQueryParameter("status", "STRING", row.status),
+        bigquery.ScalarQueryParameter("expires_at", "TIMESTAMP", row.expires_at),
+    ])
+
+    client.query(query, job_config=job_config).result()
 
 
 # --------------------------------------------------------------------------
