@@ -361,25 +361,26 @@ This lets dit ship and be useful with zero pipeline-repo changes (the ad-hoc pat
 
 **Phase 7 — Golden-table regression mode.** Per-workflow reference `_1_bf` table keyed by `(image-tag, params-hash, date-range)`; future runs assert byte-equivalence vs the golden table. Cheap PR-validation regression check; doesn't replace the four-mode test on `main`.
 
-## Next steps
+## Next steps (rewritten 2026-05-22)
 
-In rough priority order:
+The 2026-05-22 validation of the Cloud Build path end-to-end + the framework's first real catch (`pipe-gaps:v0.9.6` mode-equivalence bug, fix verified via custom worker image) closed out the prior list's items 1, 2, and 4. The work in flight now centres on PR-integration as the natural next milestone. Rough priority order:
 
-1. **Validate the Cloud Build ad-hoc path end-to-end.** `make publish-ditbox` → smoke `make dit-cloud ARGS="--help"` → real AIS-staging single-binding run on Cloud Build → `cross_version_ais.py --dry-run` on Cloud Build → real cross-version run. Likely uncovers a couple of small fixups (docker socket access in the custom step, IAM grants on `automated-testing@`).
-2. **Validate the cross-version capability end-to-end.** PIPELINE-1465 cross-version test currently in flight (`before=tests/temp_dataset_for_integration_tests`, `after=tests/pipeline_1465_for_integration_tests`). Result determines confidence in the broader cross-version framing.
-3. **Track 5 cutover** — replace pipe-gaps' `tests/integration/mode_equivalence.py` with a 10-line shim. Blocked on real-BQ verification of Phase 1; can be done opportunistically once you've run the pipe-gaps four-mode test once.
-4. **Pipe-gaps cross-version parity** — apply the same labels + structured job-names + cross-version wrapper pattern to `workflows/pipe_gaps/mode_equivalence.py`. Mostly mechanical; half a day of work.
-5. **VMS port-visits workflow** — `workflows/port_visits/vms.py`. Near-copy of `ais.py` with VMS-shape source datasets and VMS-specific param overrides from `composer-dags-production/dags/core/vms/`.
-6. **AIS-full port-visits cohort.** Multi-year data. First real motivation for Cloud Build + reference caching.
+1. **Content-addressable run cache (`dit_meta.runs`).** New BQ table acting as registry + cache + cleanup source. Cache key: `sha256(pipeline_commit + worker_image_digest + workflow_file_sha1 + canonical_params_json)`. On run start: look up the key, verify output tables physically exist (TTL might have eaten them), reuse or recompute. On run success: insert a new row. Dirty pipeline trees skip the cache write. See [`docs/run-cache.md`](run-cache.md) for the design sketch. Underpins items 2, 3, and 4. Replaces the previously-aspirational Phase 7 "golden table" concept — the cache is the generalisation; "main's 1_bf" becomes just another cache key.
+2. **`make dit-cancel RUN_ID=<id>`** reading `dit_meta.runs`. Looks up the run's Dataflow job IDs + output table FQNs, cancels the jobs, drops the tables. Solves the orphan-resource problem when the user cancels a Cloud Build mid-flight. ~50 LOC bash.
+3. **`dit.report` module + GitHub Check Run integration.** New `dit.report.VerdictReport` dataclass (hoisted out of `dit.compare`'s return value), `dit.report.github.post_check_run(report, repo, sha, token)`. Posts a typed Check Run from inside the same Python process that ran the comparisons — no log parsing, no Cloud Function, no second CI system. Cloud Build env vars supply the PR head SHA; Secret Manager supplies a GitHub App token. Markdown-rendering `output.summary` carries the results table + run context.
+4. **Per-pipeline PR triggers.** Pipe-gaps first (most-verified), then anchorages, then events. Trigger config lives in each pipeline repo; references `cloudbuild-dit.yaml` from the dit checkout. Path filters (`src/**`, `transforms/**`) gate cheap PRs; `dit:run` label is the manual escape-hatch override. `ready_for_review` event handling so draft PRs don't fire. PR run composes items 1 + 3: cache-lookup main's 1_bf, run the PR's 1_bf, diff, post Check Run.
+5. **Track 5 cutover** — replace `pipe-gaps/tests/integration/mode_equivalence.py` with a thin shim importing from dit. Opportunistic; verification done.
+6. **`dit v0.1.0` release tag.** First versioned release; precondition for the long-term "pipeline repos own their own workflow files; import dit as a library" shape. The release commits dit to a semver-versioned public API surface.
 7. **Upstream the `--temp_dataset` pipe-anchorages PR.** Removes the synthetic-branch scaffolding; cross-version bindings collapse to "just use main and the fix branch directly".
-8. **Phase 3 — pipe-events port** + framework-extraction decision based on three-consumer evidence.
+8. **VMS port-visits workflow** — `workflows/port_visits/vms.py`. Near-copy of `ais.py` with VMS-shape source datasets and VMS-specific param overrides from `composer-dags-production/dags/core/vms/`.
+9. **AIS-full port-visits cohort.** Multi-year data. First real motivation for Cloud Run jobs migration (Cloud Build's 30-concurrent-build slot ceiling becomes a real constraint once full-cohort PR runs are routine).
+10. **Phase 3 — pipe-events port** + framework-extraction decision based on three-consumer evidence.
 
 Longer-term, no committed timeline:
 
-- Reference catalog (V2 of cross-version) — when full-cohort PR runs become common.
-- PR-tier CI integration — pipeline-repo cloudbuild yaml + webhook trigger.
-- Async orchestration refactor — when 24h Cloud Build jobs become operationally painful.
-- Phases 4, 5, 6, 7 — see original numbering. Each waits for the trigger condition we identified for it.
+- **Workflow-location transition** — once `dit v0.1+` ships and the API surface is stable, pipeline repos start hosting their own `integration_tests/<workflow>.py` that imports dit; the dit-side files become shims or get dropped. Tracks decision 6 (library-first) to its conclusion.
+- **Cloud Run jobs migration** — when sustained per-PR concurrent runs exceed Cloud Build's 30-build quota. Same containerised Python; ~no code rewrite. Cloud Build kept for ad-hoc + PR-triggered runs at lower concurrency.
+- **Phases 4, 5, 6, 7** — each waits for the trigger condition we identified for it. Note: Phase 6 (phase sharing) and Phase 7 (golden-table mode) are largely subsumed by item 1's run cache; the residual scope is per-phase granularity (smaller than the full workflow run as the cache unit) and is opt-in if the cost ratio becomes painful.
 
 ## Open items (resolved or accepted as risks)
 
