@@ -49,6 +49,26 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-05-22 — Run cache landed (M1–M4); content-addressable cache + registry + provenance in one table
+
+`dit.cache` ships in four PRs landed in sequence (#16 → #17 → #18 → #19), implementing the design sketched in [`docs/run-cache.md`](docs/run-cache.md) and tracked in [`docs/run-cache-impl.md`](docs/run-cache-impl.md).
+
+**Single table serves three jobs**: cache (skip recomputing main's 1_bf on every PR), registry (find Dataflow jobs + output tables a run produced — for cleanup), provenance ("which commit produced this table?"). Lives at `world-fishing-827.tech_great_expectations.dit_runs` (same dataset dit already writes to, so no new dataset / IAM grant — replaced the original `dit_meta` proposal which would have needed a terraform PR).
+
+**Cache key** is `sha256(pipeline_commit + worker_image_digest + workflow_file_sha1 + canonical_params_json)`. The `workflow_file_sha1` makes it dit-side cache-buster: pure dit-library refactors don't invalidate (good — PR #10's `dit.job_names` extraction shouldn't have); workflow-file edits do. `worker_image_digest` is resolved from the tag at submit time so `:main` retags invalidate cleanly. `params` is mode-aware: `MODE_BF` doesn't include `tail_days`/`backfill_days` because that mode doesn't read them (Copilot catch on PR #19; including them would have dropped BF's hit rate for no behavioural reason).
+
+**M3 pivot away from streaming inserts.** Initial write path used `bigquery.Client.insert_rows_json`; the first M3 smoke-test cleanup hit the 90-minute streaming-buffer rule that blocks UPDATE/DELETE against freshly-inserted rows. That would have broken M5's `cancel_run` UPDATE entirely (cancellations are by definition close to the write). Switched to parameterised DML INSERT (`client.query("INSERT INTO ... VALUES (@a, ...)").result()`), with `PARSE_JSON(@params_json)` server-side for the JSON column. Same cost (INSERT scans zero bytes), few-seconds latency invisible inside multi-minute Dataflow workflows, exactly-once per submission, rows immediately mutable. Documented under "Why DML INSERT" in `src/dit/cache.py` and the M3 CHANGELOG entry.
+
+**Workflow integration (M4) in `workflows/pipe_gaps/mode_equivalence.py`.** Each mode's `execute_*` now flows through a `_run_with_cache(...)` wrapper that returns the FQN to use for downstream comparisons (cached or fresh). `dit.compare` is untouched — the cache-or-fresh swap happens at the workflow level, matching decision C from the M4 design discussion. Per-`main()` context (`run_id`, `pipeline_commit`, `pipeline_dirty`, `dit_commit`, `worker_image_digest`) is stamped on `args` early so all downstream code reads from one place. Dirty-tree runs still write rows (registry purpose); `read_cache` filters them out of lookups so they can't poison future caches.
+
+**Still-stubbed in M5 + M6**:
+- `cancel_run(run_id)` — looks up the row, cancels Dataflow jobs, drops output tables. Needs the runner to surface Dataflow job IDs (currently `dataflow_job_ids` is `[]` in every written row — TODO M5).
+- `make dit-cancel RUN_ID=<id>` — the user-facing cleanup target.
+- SIGTERM trap inside `dit run` — best-effort cleanup when Cloud Build cancels mid-flight.
+- Port-visits cache integration (M5; structurally similar to pipe-gaps' M4, runs against `workflows/port_visits/ais.py`).
+
+Six PRs total when M5/M6 land; the four merged today take 290 LOC of `dit.cache` + 295 LOC of workflow integration + 184 LOC of tests + a 40-line BQ migration. New memory [[dit-runs-cache]] persists the table location + cache-key shape across sessions.
+
 ### 2026-05-22 — First end-to-end validation: framework caught a real bug, custom worker image proved the fix
 
 dit's first complete proof-of-value run, against the 2020 AIS-staging cohort:

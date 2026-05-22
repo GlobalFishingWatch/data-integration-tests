@@ -220,7 +220,7 @@ Rollout exit criteria: **zero false negatives over N PRs** (suggest N=50, or 14 
 
 Two queries the operator should be able to run any day:
 
-1. **False-negative scan** — `WHERE pr_relevance.should_run = 'false' AND dit.diff_rows > 0`. Returns the cases where the LLM said skip but dit found diffs. Should always be empty in Phase B+. Implemented as a saved BQ query joining `dit_meta.runs` (see [`run-cache.md`](run-cache.md)) with a new `dit_meta.pr_gate_decisions` table or with GHA Check Run history pulled via the API.
+1. **False-negative scan** — `WHERE pr_relevance.should_run = 'false' AND dit.diff_rows > 0`. Returns the cases where the LLM said skip but dit found diffs. Should always be empty in Phase B+. Implemented as a saved BQ query joining `tech_great_expectations.dit_runs` (see [`run-cache.md`](run-cache.md)) with a sibling `tech_great_expectations.dit_pr_gate_decisions` table (or with GHA Check Run history pulled via the API). The pr-gate-decisions table is hypothetical at this point — would land alongside the gate's Phase A scaffolding.
 2. **Skip rate over time** — how often did the LLM say "safe to skip"? Should track PR-content drift; sudden spike or drop is worth investigating.
 
 Both queries belong in a `scripts/dit-pr-gate-audit.sh` (or a small Looker dashboard) that anyone can run.
@@ -251,7 +251,7 @@ Slots into [`docs/plan.md`](plan.md) § Next steps as **item 4.5 — LLM PR-rele
 
 | Step | What it depends on |
 |---|---|
-| Phase A (log-only) | Item 4 (PR triggers exist), item 3 (`dit.report` JSON to compare against), item 1 (`dit_meta.runs` to audit against) |
+| Phase A (log-only) | Item 4 (PR triggers exist), item 3 (`dit.report` JSON to compare against), item 1 (`tech_great_expectations.dit_runs` to audit against) |
 | Phase B (enforce) | Phase A's audit passes |
 | Phase C (escalate model) | Only if Phase B reveals quality gaps |
 
@@ -262,7 +262,7 @@ Future related work (separate docs):
 ## Implementation plan
 
 1. **Phase A scaffolding** (~half-day): add `.github/workflows/dit-pr-gate.yml` to one pipeline repo (pipe-gaps first), with `should_run` writing to a Check Run but the dit-cloud job unconditionally running.
-2. **Audit query** (~half-day): saved BQ query joining Check Run history with `dit_meta.runs.status` and diff counts.
+2. **Audit query** (~half-day): saved BQ query joining Check Run history with `tech_great_expectations.dit_runs.status` and diff counts.
 3. **Two-week soak.**
 4. **Flip to enforce** (~5 minutes): single `if:` change in the workflow file.
 5. **Replicate to anchorages_pipeline + pipe-events** (~half-day each): same workflow file, different path filters and trigger names.
@@ -272,5 +272,5 @@ Total: ~2 days of glue work spread over ~3 weeks of soak time.
 ## Related
 
 - [`docs/plan.md`](plan.md) § Next steps item 4.5.
-- [`docs/run-cache.md`](run-cache.md) — `dit_meta.runs` is what the audit query joins against.
+- [`docs/run-cache.md`](run-cache.md) — `tech_great_expectations.dit_runs` is what the audit query joins against.
 - [`docs/architecture.md`](architecture.md) § Cloud Build runtime — the trigger this filter precedes.
