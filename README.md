@@ -196,11 +196,15 @@ $ make dit-cloud PIPELINE=pipe-gaps REF=refs/dit-snapshots/pipe-gaps/<that> ...
 
 #### Cleanup
 
+Snapshots live forever by design — bytes-scale storage on origin in a hidden ref namespace, no measurable cost. There's no periodic-cleanup target.
+
+The one exception:
+
 ```
-$ make clean-snapshots
+$ make clean-snapshot REF=refs/dit-snapshots/pipe-gaps/<sha>
 ```
 
-Walks the configured pipeline checkouts and deletes any local refs under `refs/dit-snapshots/<pipeline>/*` along with their remote counterparts (and, transitionally during the migration, any pre-pivot `refs/heads/dit-snapshot-*` branches still hanging around). User-invoked, no cron. Snapshot accumulation is bytes-scale on the remote (hidden namespace, invisible to GitHub's UI) so this is hygiene-when-you-feel-like-it, not a hard requirement.
+Deletes the specified snapshot ref locally and on origin in one step. Intended for **secret-leak remediation** — e.g. you noticed a `.env` file or a credential was tracked in the working tree when you ran `make dit-cloud`. Surgical, user-invoked. The cache row in `dit_runs` retains `pipeline_commit_parent`, so removing the snapshot ref doesn't lose reproduce context for the rest of the row's lifetime.
 
 ### Decision tree
 
