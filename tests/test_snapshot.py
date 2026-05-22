@@ -15,6 +15,8 @@ mechanism. These tests exercise the high-value invariants:
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -23,6 +25,17 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT_SCRIPT = REPO_ROOT / "scripts" / "snapshot.sh"
 CLEAN_SCRIPT = REPO_ROOT / "scripts" / "clean-snapshot.sh"
+
+# Most tests bypass the pre-push secret scanner so they don't require
+# gitleaks installed on the test runner. A focused test below exercises the
+# scan path explicitly (skipped if gitleaks isn't available).
+SKIP_SCAN_ENV = {**os.environ, "DIT_SKIP_SECRET_SCAN": "1"}
+
+_GITLEAKS_AVAILABLE = shutil.which("gitleaks") is not None
+requires_gitleaks = pytest.mark.skipif(
+    not _GITLEAKS_AVAILABLE,
+    reason="gitleaks not installed on test runner",
+)
 
 
 def _git(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -49,12 +62,15 @@ def pipeline_repo(tmp_path: Path) -> Path:
     return work
 
 
-def _run_snapshot(repo: Path, pipeline: str = "pipe-gaps") -> tuple[str, str]:
+def _run_snapshot(
+    repo: Path, pipeline: str = "pipe-gaps", env: dict[str, str] | None = None
+) -> tuple[str, str]:
     proc = subprocess.run(
         [str(SNAPSHOT_SCRIPT), pipeline, str(repo)],
         check=True,
         capture_output=True,
         text=True,
+        env=env if env is not None else SKIP_SCAN_ENV,
     )
     return proc.stdout.strip(), proc.stderr
 
@@ -295,6 +311,97 @@ def test_snapshot_banner_lists_changed_paths(pipeline_repo: Path) -> None:
     assert "README.md" in stderr
 
 
+def test_snapshot_refuses_without_gitleaks_or_bypass(
+    pipeline_repo: Path,
+) -> None:
+    """When gitleaks isn't on PATH and no bypass env var is set, the
+    snapshot must refuse to push. Defense-in-depth invariant: the auto-push
+    can't happen without either a scanner or an explicit opt-out."""
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+    env_no_scan = {k: v for k, v in os.environ.items() if k != "DIT_SKIP_SECRET_SCAN"}
+    env_no_scan["PATH"] = "/usr/bin:/bin"  # strip any user-local gitleaks
+
+    proc = subprocess.run(
+        [str(SNAPSHOT_SCRIPT), "pipe-gaps", str(pipeline_repo)],
+        capture_output=True,
+        text=True,
+        env=env_no_scan,
+    )
+    assert proc.returncode != 0
+    assert "gitleaks not installed" in proc.stderr
+    assert "refusing to auto-push without a secret scan" in proc.stderr
+
+
+def test_snapshot_bypass_env_var_logs_loud_banner(pipeline_repo: Path) -> None:
+    """The DIT_SKIP_SECRET_SCAN bypass must emit a loud WARNING banner so
+    the user (and anyone reading CI logs) can spot it. Quiet bypass would
+    let the scanner be silently disabled, defeating the safety story."""
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+    _, stderr = _run_snapshot(pipeline_repo)
+    assert "secret scan BYPASSED via DIT_SKIP_SECRET_SCAN" in stderr
+    assert "personally vouching" in stderr
+
+
+@requires_gitleaks
+def test_snapshot_blocks_when_scanner_finds_credential(pipeline_repo: Path) -> None:
+    """End-to-end: a recognisable credential-shaped string in a TRACKED
+    file makes the scan fail, the push gets blocked, and the user sees a
+    clear remediation pointer."""
+    # Commit a config file first so the credential modification lands in
+    # a tracked file (the `add -u` path actually captures it).
+    cfg = pipeline_repo / "config.py"
+    cfg.write_text("# config\n")
+    _git("add", "config.py", cwd=pipeline_repo)
+    _git("commit", "-q", "-m", "add config", cwd=pipeline_repo)
+    _git("push", "-q", "origin", "main", cwd=pipeline_repo)
+
+    # Introduce a GitHub-PAT-shaped string. AWS dummy keys like
+    # AKIAIOSFODNN7EXAMPLE are on gitleaks' built-in allowlist (they're
+    # the canonical example keys in AWS docs); `ghp_<40-chars>` is not
+    # allowlisted and triggers the GitHub personal access token rule.
+    cfg.write_text(
+        'GITHUB_TOKEN = "ghp_1234567890abcdef1234567890abcdef123456"\n'
+    )
+
+    env_with_scan = {k: v for k, v in os.environ.items() if k != "DIT_SKIP_SECRET_SCAN"}
+    proc = subprocess.run(
+        [str(SNAPSHOT_SCRIPT), "pipe-gaps", str(pipeline_repo)],
+        capture_output=True,
+        text=True,
+        env=env_with_scan,
+    )
+    assert proc.returncode != 0
+    assert "gitleaks detected" in proc.stderr or "leaks found" in proc.stderr.lower()
+
+    # Ref must NOT have been created locally — the scan happens before
+    # the snapshot commit is built.
+    refs = _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/dit-snapshots/",
+        cwd=pipeline_repo,
+    ).stdout
+    assert refs == ""
+
+
+@requires_gitleaks
+def test_snapshot_allows_clean_tree_through_scanner(pipeline_repo: Path) -> None:
+    """The scan path is enabled but the change is benign — push proceeds."""
+    (pipeline_repo / "README.md").write_text("hello dirty (no secrets here)\n")
+
+    env_with_scan = {k: v for k, v in os.environ.items() if k != "DIT_SKIP_SECRET_SCAN"}
+    proc = subprocess.run(
+        [str(SNAPSHOT_SCRIPT), "pipe-gaps", str(pipeline_repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env_with_scan,
+    )
+    ref = proc.stdout.strip()
+    assert ref.startswith("refs/dit-snapshots/pipe-gaps/")
+    assert "gitleaks scan passed" in proc.stderr
+
+
 def test_snapshot_fails_on_ref_divergence(pipeline_repo: Path) -> None:
     """If the remote already has the snapshot ref pointing at a different SHA,
     snapshot.sh must refuse to install from a divergent local-only ref."""
@@ -312,6 +419,7 @@ def test_snapshot_fails_on_ref_divergence(pipeline_repo: Path) -> None:
         [str(SNAPSHOT_SCRIPT), "pipe-gaps", str(pipeline_repo)],
         capture_output=True,
         text=True,
+        env=SKIP_SCAN_ENV,
     )
     assert proc.returncode != 0
     assert "exists on origin at" in proc.stderr

@@ -80,6 +80,48 @@ GIT_INDEX_FILE="$TMP_INDEX" git read-tree HEAD
 GIT_INDEX_FILE="$TMP_INDEX" git add -u
 TREE_SHA=$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)
 
+# Pre-push secret scanner. Defense-in-depth on top of the `add -u`
+# tracked-only default: catches newly-introduced credential-shaped
+# content in a tracked file before it lands on origin (e.g. a developer
+# pasted an API key into a config.py mid-debug). Gitleaks is the
+# de-facto standard pattern-based scanner (and is pre-baked into ditbox).
+#
+# Override only with deliberate intent — secrets in a tracked file are
+# a credential rotation event, not a flag-bypass event.
+#
+#   DIT_SKIP_SECRET_SCAN=1   skip the scan entirely (logs a loud bypass
+#                            banner; intended for known false positives
+#                            and for environments where installing
+#                            gitleaks isn't an option)
+if [ -n "${DIT_SKIP_SECRET_SCAN:-}" ]; then
+    echo "  WARNING: secret scan BYPASSED via DIT_SKIP_SECRET_SCAN" >&2
+    echo "  WARNING: you are personally vouching that no credential-shaped" >&2
+    echo "  WARNING: content is about to land on $PIPELINE's origin." >&2
+elif ! command -v gitleaks >/dev/null 2>&1; then
+    echo "error: gitleaks not installed; refusing to auto-push without a secret scan" >&2
+    echo "       (the snapshot push is a known credential-leak surface area;" >&2
+    echo "       defense-in-depth requires this scanner)" >&2
+    echo "" >&2
+    echo "       install: https://github.com/gitleaks/gitleaks/releases" >&2
+    echo "       or override (NOT recommended; rotate any leaked credential afterwards):" >&2
+    echo "         export DIT_SKIP_SECRET_SCAN=1" >&2
+    exit 1
+else
+    SCAN_DIR=$(mktemp -d -t dit-snapshot-scan.XXXXXXXX)
+    # Extend the EXIT trap so SCAN_DIR is cleaned up too.
+    trap 'rm -f "$TMP_INDEX"; rm -rf "$SCAN_DIR"' EXIT
+    GIT_INDEX_FILE="$TMP_INDEX" git checkout-index --prefix="$SCAN_DIR/" -a
+    if ! gitleaks detect --source "$SCAN_DIR" --no-git --no-banner --redact --exit-code 1 >&2; then
+        echo "" >&2
+        echo "error: gitleaks detected credential-shaped content in the snapshot tree." >&2
+        echo "       review the findings above, untrack the offending file(s), and re-run." >&2
+        echo "       to override after careful review (rotate any flagged secret afterwards):" >&2
+        echo "         export DIT_SKIP_SECRET_SCAN=1" >&2
+        exit 1
+    fi
+    echo "  gitleaks scan passed" >&2
+fi
+
 # Frozen author/committer dates AND identities + --no-gpg-sign:
 # commit SHA must be a pure function of the tree for content-addressability.
 SNAPSHOT_SHA=$(

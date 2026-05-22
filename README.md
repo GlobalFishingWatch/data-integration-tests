@@ -129,12 +129,20 @@ Caveats printed at snapshot time:
 - If your changes touch worker code, build+push a custom worker image too (`--worker-image=…`).
 - **Requires `git push` permission on the pipeline repo.** If you're a read-only viewer, dit will fail at push time with a clear error pointing at `make install-<pipeline>-ref REF=<committed-ref>` or asking you to commit + push the changes via a normal branch first.
 
-> **⚠ Safety: auto-push and credential leakage.** `make dit-cloud` pushes the snapshot to the pipeline repo's origin automatically. The pipeline repo may be a **public GitHub repository**. Treat every snapshot as potentially publicly visible:
+> **⚠ Safety: auto-push and credential leakage.** `make dit-cloud` pushes the snapshot to the pipeline repo's origin automatically. The pipeline repo may be a **public GitHub repository**. Treat every snapshot as potentially publicly visible.
 >
-> - Only **tracked files** (modifications + deletions to files already in HEAD) are captured. This is intentional — it confines the snapshot to files you've explicitly chosen to track via `git add` + `git commit`. Anything else (rogue `.env`, downloaded `sa.json`, one-off `query_results.csv`, etc.) stays out.
-> - **If you have already tracked a file containing secrets** (e.g. a credentials file was committed at some point), modifications to it WILL go into the snapshot. Untrack it first: `git rm --cached <file>` + commit the removal + add to `.gitignore`.
-> - **The snapshot banner shows you which paths are about to be pushed** before the push happens. Review it; if anything surprises you, Ctrl-C immediately.
-> - **If you've already pushed a snapshot containing secrets**, treat it as a compromised credential (rotate it) and run `make clean-snapshot PIPELINE=<name> REF=<sha>` to delete the ref locally + on origin. Cleanup alone doesn't undo a leak; rotation is the load-bearing step.
+> Three defense layers, smallest blast radius first:
+>
+> 1. **`git add -u` (tracked-only) is the default.** Only modifications + deletions to files already in HEAD enter the snapshot. Untracked files (and files you `git add`-ed but haven't `git commit`-ed yet) stay out. Rogue `.env`, downloaded `sa.json`, one-off `query_results.csv`, etc. are not captured.
+> 2. **Pre-push banner shows you the changed paths** before the push happens. Visual review is the last-line-of-defence; if anything surprises you, Ctrl-C immediately.
+> 3. **Pre-push secret scanner (gitleaks).** Before each push, the script extracts the snapshot tree to a temp dir and runs `gitleaks detect`. A finding aborts the snapshot. Required by default: if gitleaks isn't installed and no bypass env var is set, the snapshot refuses to proceed (`brew install gitleaks` / one-line install instructions in the error). Override is `export DIT_SKIP_SECRET_SCAN=1` and emits a loud `WARNING: secret scan BYPASSED` banner — for false positives only, never as a "make this work" shortcut. Ditbox has gitleaks pre-baked.
+>
+> Remediation if a snapshot containing secrets has already landed on origin:
+>
+> 1. **Rotate the credential.** Load-bearing step. Anything ever pushed to a public-shaped repo must be treated as compromised (history snapshots, forks, mirrors, indexers all make untoward pushes effectively permanent).
+> 2. **`make clean-snapshot PIPELINE=<name> REF=<sha>`** — deletes the ref locally + on origin. Necessary but **not** sufficient on its own.
+>
+> If a tracked file contains a secret (the scanner caught one, or you noticed in the banner), the structural fix is `git rm --cached <file>` + add to `.gitignore` + commit the removal — then the next snapshot won't include it.
 
 #### Scenario C — Running against any committed ref (testing main, a colleague's branch, an old commit)
 
