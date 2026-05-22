@@ -17,7 +17,7 @@ Each milestone is one PR's worth of work. Each ships on its own branch + PR, squ
 
 **Why scaffold-first**: the BQ-touching code is one third of the surface area but is hard to test without infra; the pure parts (hash key, file sha1, params canonicalisation) are 80% of the correctness-relevant logic and 100% testable in milliseconds. Land them first, then add the BQ shell around them. Workflow integration doesn't go in until M4 — wiring half-implemented cache into workflows risks subtle bugs that would land before they were verifiable.
 
-### Milestone 2 — BQ read path
+### Milestone 2 — BQ read path ✓ (`feat/dit-cache-bq-read`)
 
 Implement `read_cache`, `verify_tables_exist`, `expires_at_for`.
 

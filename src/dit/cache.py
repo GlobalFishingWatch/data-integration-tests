@@ -27,7 +27,7 @@ import json
 import logging
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -220,12 +220,36 @@ class CachedRun:
     expires_at: datetime
 
     @classmethod
-    def from_bq_row(cls, row: Mapping[str, Any]) -> "CachedRun":
-        """Construct from a BQ row mapping. Out-of-band coercion for the
-        types BQ surfaces differently (TIMESTAMP -> datetime, ARRAY -> list).
+    def from_bq_row(cls, row: Any) -> "CachedRun":
+        """Construct from a ``google.cloud.bigquery.Row`` (or anything with
+        the same attribute-access shape).
+
+        The BQ Python client coerces TIMESTAMP → ``datetime``, ARRAY → list,
+        and JSON → ``dict`` natively; we just pull each column off the row.
+        The dataclass field ``params`` reads from the BQ column
+        ``params_json`` (the rename keeps the dataclass field pythonic
+        while the BQ column name stays self-documenting).
         """
-        # TODO: implement when read path lands.
-        raise NotImplementedError("CachedRun.from_bq_row — implement with read_cache()")
+        return cls(
+            run_id=row.run_id,
+            cache_key=row.cache_key,
+            workflow=row.workflow,
+            pipeline=row.pipeline,
+            experiment_id=row.experiment_id,
+            pipeline_commit=row.pipeline_commit,
+            pipeline_dirty=bool(row.pipeline_dirty),
+            dit_commit=row.dit_commit,
+            workflow_file_sha1=row.workflow_file_sha1,
+            worker_image=row.worker_image,
+            params=row.params_json,
+            output_tables=list(row.output_tables or []),
+            dataflow_job_ids=list(row.dataflow_job_ids or []),
+            cloud_build_id=row.cloud_build_id,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+            status=row.status,
+            expires_at=row.expires_at,
+        )
 
     def to_bq_row(self) -> dict[str, Any]:
         """Render as a dict suitable for `bigquery.Client.insert_rows_json`."""
@@ -234,48 +258,139 @@ class CachedRun:
 
 
 # --------------------------------------------------------------------------
-# BQ-touching operations (stubs; see docs/run-cache-impl.md)
+# BQ client factory (lazy; tests can pass their own ``client``)
 # --------------------------------------------------------------------------
 
-def read_cache(cache_key: str) -> CachedRun | None:
+def _make_client() -> Any:
+    """Construct a default ``google.cloud.bigquery.Client``.
+
+    Lazy-import so ``import dit.cache`` doesn't require ``google-cloud-bigquery``
+    to be installed for the pure-function surface (e.g. for downstream
+    callers that only use :func:`compute_cache_key`).
+    """
+    from google.cloud import bigquery
+    return bigquery.Client(project="world-fishing-827")
+
+
+def _group_by_dataset(table_fqns: list[str]) -> dict[tuple[str, str], list[str]]:
+    """Partition fully-qualified table refs by ``(project, dataset)``.
+
+    Both INFORMATION_SCHEMA.TABLES and INFORMATION_SCHEMA.TABLE_OPTIONS
+    are dataset-scoped views, so one query per distinct ``(project, dataset)``
+    serves any number of tables within it.
+    """
+    by_dataset: dict[tuple[str, str], list[str]] = {}
+    for fqn in table_fqns:
+        parts = fqn.split(".")
+        if len(parts) != 3:
+            raise ValueError(
+                f"expected fully-qualified `project.dataset.table` form, got {fqn!r}"
+            )
+        project, dataset, table = parts
+        by_dataset.setdefault((project, dataset), []).append(table)
+    return by_dataset
+
+
+# --------------------------------------------------------------------------
+# BQ-touching operations
+# --------------------------------------------------------------------------
+
+def read_cache(cache_key: str, *, client: Any = None) -> CachedRun | None:
     """Return the most-recent successful, non-dirty, non-expired
     :class:`CachedRun` with the given ``cache_key``, or None.
+    """
+    client = client or _make_client()
+    from google.cloud import bigquery
 
-    Query shape::
-
+    query = f"""
         SELECT *
-        FROM `world-fishing-827.tech_great_expectations.dit_runs`
-        WHERE cache_key = @key
-          AND status = 'succeeded'
+        FROM `{TABLE_FQN}`
+        WHERE cache_key = @cache_key
+          AND status = '{STATUS_SUCCEEDED}'
           AND pipeline_dirty = FALSE
           AND expires_at > CURRENT_TIMESTAMP()
         ORDER BY started_at DESC
         LIMIT 1
     """
-    raise NotImplementedError("read_cache — see docs/run-cache-impl.md § Milestone 2")
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("cache_key", "STRING", cache_key),
+        ]
+    )
+    rows = list(client.query(query, job_config=job_config).result())
+    if not rows:
+        return None
+    return CachedRun.from_bq_row(rows[0])
 
 
-def verify_tables_exist(table_fqns: list[str]) -> list[bool]:
+def verify_tables_exist(table_fqns: list[str], *, client: Any = None) -> list[bool]:
     """For each FQN, return True iff the table currently exists in BQ.
 
     Cache hits must verify physical existence before returning — TTL may
-    have removed the tables since the row was written. Single
-    INFORMATION_SCHEMA.TABLES query per dataset is more efficient than
-    one ``Client.get_table`` per FQN.
+    have removed the tables since the cache row was written. One
+    ``INFORMATION_SCHEMA.TABLES`` query per distinct dataset; output
+    preserves input order.
     """
-    raise NotImplementedError("verify_tables_exist — see docs/run-cache-impl.md § Milestone 2")
+    if not table_fqns:
+        return []
+    client = client or _make_client()
+    from google.cloud import bigquery
+
+    by_dataset = _group_by_dataset(table_fqns)
+    found: set[str] = set()
+    for (project, dataset), tables in by_dataset.items():
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("tables", "STRING", tables),
+            ]
+        )
+        # `INFORMATION_SCHEMA.TABLES` lives at the dataset level in BQ;
+        # the project/dataset are part of the *view* reference, not query
+        # parameters (BQ doesn't accept parameterised identifiers).
+        query = f"""
+            SELECT table_name
+            FROM `{project}.{dataset}.INFORMATION_SCHEMA.TABLES`
+            WHERE table_name IN UNNEST(@tables)
+        """
+        for row in client.query(query, job_config=job_config).result():
+            found.add(f"{project}.{dataset}.{row.table_name}")
+    return [fqn in found for fqn in table_fqns]
 
 
-def expires_at_for(table_fqns: list[str]) -> datetime:
-    """``min(expiration_time)`` across the supplied tables.
+def expires_at_for(table_fqns: list[str], *, client: Any = None) -> datetime:
+    """``min(table.expires)`` across the supplied tables.
 
-    Computed from INFORMATION_SCHEMA.TABLES. Any earlier-expiring output
-    invalidates the whole cache entry — the row is unusable the moment
-    any of its outputs expire. Returns ``now + 1 day`` if none of the
-    tables have an explicit expiration (effectively a short caching
-    window for caller awareness).
+    Any earlier-expiring output invalidates the whole cache entry — the
+    row is unusable the moment any of its outputs expire. Returns
+    ``now + 1 day`` (UTC) if no input tables have an explicit expiration
+    (rare; means we'd cache for at most a day without a TTL handshake).
+
+    Uses ``Client.get_table`` per table rather than INFORMATION_SCHEMA
+    because table-level expiration is exposed cleanly on the SDK side
+    (combines explicit table TTL + dataset default_table_expiration_ms
+    into a single resolved ``expires`` field). One get-table per table
+    is fine at our scale (a cache row typically has 1-3 outputs).
     """
-    raise NotImplementedError("expires_at_for — see docs/run-cache-impl.md § Milestone 2")
+    if not table_fqns:
+        return datetime.now(timezone.utc) + timedelta(days=1)
+    client = client or _make_client()
+
+    expirations: list[datetime] = []
+    for fqn in table_fqns:
+        try:
+            table = client.get_table(fqn)
+        except Exception:
+            # Caller will verify table existence separately via
+            # verify_tables_exist; if a table is missing here, ignoring
+            # it is correct -- it doesn't gate the cache entry's TTL.
+            logger.debug("expires_at_for: get_table(%s) raised; skipping", fqn)
+            continue
+        if table.expires is not None:
+            expirations.append(table.expires)
+
+    if not expirations:
+        return datetime.now(timezone.utc) + timedelta(days=1)
+    return min(expirations)
 
 
 def write_cache(row: CachedRun) -> None:
