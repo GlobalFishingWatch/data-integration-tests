@@ -8,18 +8,24 @@
 # origin may be a public GitHub repository. Treat every snapshot as if it
 # will be publicly visible:
 #
-#   - Only TRACKED files (modifications + deletions against HEAD) are
-#     captured. Files you haven't `git add`-ed are NOT captured. If you
-#     keep credentials / .env / one-off datasets as untracked files in the
-#     pipeline checkout, they stay out of the snapshot.
+#   - The capture boundary is "files already tracked in HEAD". The temp
+#     index is seeded from HEAD; `git add -u` against that index updates
+#     entries that exist in HEAD with their current working-tree content
+#     (or removes them if deleted). New files are NOT in HEAD, so they
+#     don't enter the temp index, so they don't enter the snapshot —
+#     regardless of whether they're `git add`-ed in the user's real index.
+#   - Practical consequence: credentials/.env/one-off datasets you keep
+#     untracked stay out of the snapshot. To include a new file, you must
+#     `git commit` it first — the staging step alone isn't enough.
 #   - If you have already tracked a file that contains secrets (e.g. you
 #     once `git commit`-ed a credentials file by mistake), the snapshot
-#     WILL include any modification to it. Untrack the file first.
-#   - If you've added a NEW file you want included in the snapshot, you
-#     must `git commit` it first (no `git add` shortcut — see the docstring
-#     below on why). This is the deliberate safety default; the
-#     alternative (`git add -A` in the temp index) would automatically
-#     push any rogue file in the working tree.
+#     WILL include any subsequent modification. Untrack it via
+#     `git rm --cached <file>` + `.gitignore` + commit the removal.
+#   - This is the deliberate safety default. The alternative (`git add -A`
+#     in the temp index) would automatically push any non-gitignored file
+#     in the working tree — rejected because the convenience win is
+#     dwarfed by the credential-leak surface area against a potentially-
+#     public origin.
 #
 # Properties:
 #   - Identical tree state -> identical commit SHA -> idempotent push.
@@ -51,16 +57,7 @@ fi
 cd "$PROJECT_DIR"
 
 PARENT_SHA=$(git rev-parse HEAD)
-
-# Clean tree -> nothing to snapshot; return HEAD directly.
-# `git status --porcelain` emits one line per modified, staged, OR untracked
-# (non-gitignored) path. Empty output = nothing the snapshot would capture.
-# Plain `git diff` would miss untracked files and produce the wrong answer
-# now that we use `git add -A` in the temp-index dance below.
-if [ -z "$(git status --porcelain)" ]; then
-    echo "$PARENT_SHA"
-    exit 0
-fi
+HEAD_TREE=$(git rev-parse "HEAD^{tree}")
 
 # Build a temp index seeded from HEAD; stage tracked-file modifications +
 # deletions against it. Keeps the user's real index untouched. `mktemp -t`
@@ -79,6 +76,18 @@ trap 'rm -f "$TMP_INDEX"' EXIT
 GIT_INDEX_FILE="$TMP_INDEX" git read-tree HEAD
 GIT_INDEX_FILE="$TMP_INDEX" git add -u
 TREE_SHA=$(GIT_INDEX_FILE="$TMP_INDEX" git write-tree)
+
+# If the computed tree is identical to HEAD's tree, nothing the snapshot
+# would capture has changed -- return HEAD directly. This catches BOTH
+# (a) a truly clean working tree and (b) a working tree with only
+# untracked files (those don't enter the temp index, so the resulting
+# tree equals HEAD's). Either way: no need to run the scanner or push.
+# Using the tree comparison rather than `git status --porcelain` keeps
+# the early-exit aligned with the actual `add -u` capture boundary.
+if [ "$TREE_SHA" = "$HEAD_TREE" ]; then
+    echo "$PARENT_SHA"
+    exit 0
+fi
 
 # Pre-push secret scanner. Defense-in-depth on top of the `add -u`
 # tracked-only default: catches newly-introduced credential-shaped
@@ -179,7 +188,8 @@ REMOTE_SHA=$(git ls-remote origin "$REF" 2>/dev/null | awk '{print $1}')
 if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$SNAPSHOT_SHA" ]; then
     echo "error: $REF exists on origin at $REMOTE_SHA but local snapshot is $SNAPSHOT_SHA" >&2
     echo "       refusing to install from a local-only ref that disagrees with origin." >&2
-    echo "       delete the divergent ref (scripts/clean-snapshot.sh) or use a longer prefix." >&2
+    echo "       investigate the manual overwrite (or 12-char collision) and remove" >&2
+    echo "       the divergent ref with: make clean-snapshot PIPELINE=<name> REF=$REF" >&2
     exit 1
 fi
 

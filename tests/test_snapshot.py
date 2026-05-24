@@ -90,6 +90,22 @@ def test_snapshot_clean_tree_returns_head(pipeline_repo: Path) -> None:
     assert out == head
 
 
+def test_snapshot_only_untracked_files_treated_as_clean(pipeline_repo: Path) -> None:
+    """A working tree with ONLY untracked changes produces a tree identical
+    to HEAD (because `add -u` doesn't pick them up). The early-exit must
+    detect this and return HEAD without scanning or pushing — otherwise a
+    user with leftover scratch files would auto-push pointless snapshot
+    refs and trigger the gitleaks scanner on content the snapshot won't
+    contain anyway."""
+    (pipeline_repo / "scratch.txt").write_text("temp working notes\n")
+    head = _git("rev-parse", "HEAD", cwd=pipeline_repo).stdout.strip()
+
+    out, stderr = _run_snapshot(pipeline_repo)
+    assert out == head, "only-untracked-changes should early-exit to HEAD"
+    # No snapshot banner should appear (we exited before reaching it).
+    assert "dit snapshot for" not in stderr
+
+
 def test_snapshot_dirty_tree_creates_orphan_ref(pipeline_repo: Path) -> None:
     (pipeline_repo / "README.md").write_text("hello dirty\n")
     head = _git("rev-parse", "HEAD", cwd=pipeline_repo).stdout.strip()
@@ -312,14 +328,31 @@ def test_snapshot_banner_lists_changed_paths(pipeline_repo: Path) -> None:
 
 
 def test_snapshot_refuses_without_gitleaks_or_bypass(
-    pipeline_repo: Path,
+    pipeline_repo: Path, tmp_path: Path
 ) -> None:
     """When gitleaks isn't on PATH and no bypass env var is set, the
     snapshot must refuse to push. Defense-in-depth invariant: the auto-push
-    can't happen without either a scanner or an explicit opt-out."""
+    can't happen without either a scanner or an explicit opt-out.
+
+    Determinism: we build a tightly-scoped PATH directory containing only
+    the executables the script needs (`git`, `mktemp`, `awk`, `sed`,
+    `basename`, `dirname`) symlinked from their real locations. A system-
+    installed `gitleaks` somewhere on the default PATH (e.g. /usr/bin) can't
+    influence the outcome — only what's in this temp dir is visible.
+    """
+    # Tracked-file modification so the script proceeds past the
+    # tree-identical-to-HEAD early-exit and reaches the scanner check.
     (pipeline_repo / "README.md").write_text("hello dirty\n")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for tool in ("git", "mktemp", "awk", "sed", "rm", "bash"):
+        src = shutil.which(tool)
+        assert src, f"required tool {tool!r} missing from test environment"
+        (fake_bin / tool).symlink_to(src)
+
     env_no_scan = {k: v for k, v in os.environ.items() if k != "DIT_SKIP_SECRET_SCAN"}
-    env_no_scan["PATH"] = "/usr/bin:/bin"  # strip any user-local gitleaks
+    env_no_scan["PATH"] = str(fake_bin)
 
     proc = subprocess.run(
         [str(SNAPSHOT_SCRIPT), "pipe-gaps", str(pipeline_repo)],
