@@ -48,6 +48,16 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
         docker-compose-plugin \
  && rm -rf /var/lib/apt/lists/*
 
+# gitleaks: pre-push credential scanner used by scripts/snapshot.sh before
+# the snapshot ref is pushed to the pipeline repo's origin. Defense-in-depth
+# on top of the `git add -u` (tracked-files-only) safety default. Pinned for
+# reproducibility; bump intentionally when a new release brings a desired
+# change. See: https://github.com/gitleaks/gitleaks
+RUN curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+        | tar -xz -C /usr/local/bin gitleaks \
+ && chmod +x /usr/local/bin/gitleaks \
+ && gitleaks version
+
 # uv is used by cloudbuild-dit.yaml for the per-run pipeline install. It
 # resolves and installs much faster than pip (~10x on cold cache), which is
 # the bottleneck for short Cloud Build runs. Pinned to the system Python via

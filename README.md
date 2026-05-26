@@ -53,11 +53,11 @@ For the framework only (no workflow deps), `make install` works — but the data
 |---|---|---|
 | Active dev on a pipeline (fast inner loop) | `make install-<pipeline>` | `pip install -e <pipeline-dir>` — working-tree edits picked up immediately. |
 | Reproducible run against a specific committed ref | `make install-<pipeline>-ref REF=<sha-or-branch>` | `pip install --force-reinstall --no-deps git+file://...@<ref>` — non-editable, exactly that commit, ~5-10s per ref. |
-| Test what's currently in the working tree, reproducibly | `make snapshot-<pipeline>` | `git stash create` captures tracked changes (working tree untouched), anchors on a `dit-snapshot-<epoch>` branch, installs from that ref. |
+| Test what's currently in the working tree, reproducibly | `make snapshot-<pipeline>` | Builds a deterministic orphan commit from the dirty tracked-files (temp-index `git write-tree` + `git commit-tree` with frozen dates/identity) → pushes to `refs/dit-snapshots/<pipeline>/<commit-short-sha>` on origin → installs from that ref. Identical tree → identical SHA → cache hits on repeat invocations. Parent SHA recorded in the commit message. |
 | Pipeline's transitive deps changed in target ref | add `FULLDEPS=1` | Drops `--no-deps`, lets pip reinstall the full dep tree (slower; only needed when the target ref bumped or added a dep). |
-| GC the temp snapshot branches | `make clean-snapshots` | Removes `dit-snapshot-*` branches from all three pipeline checkouts. |
+| Remove a specific snapshot ref (secret-leak remediation only) | `make clean-snapshot PIPELINE=<name> REF=<sha-or-full-ref>` | Deletes the ref locally and on origin in one step. Snapshots otherwise live forever by design (bytes-scale, hidden namespace). |
 
-Notes on snapshot mode: `git stash create` captures **tracked** modifications only. Run `git add -A` in the pipeline repo first if untracked source files need to be in the snapshot. The snapshot branch persists for traceability until `make clean-snapshots`.
+Notes on snapshot mode: only files **already tracked in HEAD** are captured (modifications + deletions). Untracked files — including files you `git add`-ed but haven't `git commit`-ed — are **not** included; commit a new file first if you want it in the snapshot. This is the deliberate safety default (see § Safety in Scenario B below); auto-push goes to the pipeline's origin (potentially public), so the capture boundary is "things you've explicitly chosen to track" rather than "anything in the working tree". Requires `git push` permission on the pipeline's origin and `gitleaks` on `PATH` (or `DIT_SKIP_SECRET_SCAN=1` to bypass with a loud banner).
 
 ### Run a workflow
 
@@ -124,10 +124,25 @@ When to use: **iterating on a fix that isn't PR-ready** (e.g. making a pipeline 
 
 Caveats printed at snapshot time:
 - First run against each new tree-state is a cache MISS; **repeat runs of an unchanged tree are a HIT** (snapshot SHA is content-addressable — derived from `git write-tree` with frozen author/committer dates, so identical tree → identical SHA → identical cache key).
-- Only **tracked** modifications are captured — `git add -A` first if you have new files.
+- Only **tracked modifications + deletions** are captured. Untracked files (and files you `git add`-ed but haven't `git commit`-ed yet) are **never** in the snapshot — see § "Safety: auto-push and credential leakage" below for why this is the deliberate default. Commit a new file before running dit if you want it included.
 - The cache row is tagged `unreviewed_code=TRUE` so PR-validation queries skip it.
 - If your changes touch worker code, build+push a custom worker image too (`--worker-image=…`).
 - **Requires `git push` permission on the pipeline repo.** If you're a read-only viewer, dit will fail at push time with a clear error pointing at `make install-<pipeline>-ref REF=<committed-ref>` or asking you to commit + push the changes via a normal branch first.
+
+> **⚠ Safety: auto-push and credential leakage.** `make dit-cloud` pushes the snapshot to the pipeline repo's origin automatically. The pipeline repo may be a **public GitHub repository**. Treat every snapshot as potentially publicly visible.
+>
+> Three defense layers, smallest blast radius first:
+>
+> 1. **`git add -u` (tracked-only) is the default.** Only modifications + deletions to files already in HEAD enter the snapshot. Untracked files (and files you `git add`-ed but haven't `git commit`-ed yet) stay out. Rogue `.env`, downloaded `sa.json`, one-off `query_results.csv`, etc. are not captured.
+> 2. **Pre-push banner shows you the changed paths** before the push happens. Visual review is the last-line-of-defence; if anything surprises you, Ctrl-C immediately.
+> 3. **Pre-push secret scanner (gitleaks).** Before each push, the script extracts the snapshot tree to a temp dir and runs `gitleaks detect`. A finding aborts the snapshot. Required by default: if gitleaks isn't installed and no bypass env var is set, the snapshot refuses to proceed (`brew install gitleaks` / one-line install instructions in the error). Override is `export DIT_SKIP_SECRET_SCAN=1` and emits a loud `WARNING: secret scan BYPASSED` banner — for false positives only, never as a "make this work" shortcut. Ditbox has gitleaks pre-baked.
+>
+> Remediation if a snapshot containing secrets has already landed on origin:
+>
+> 1. **Rotate the credential.** Load-bearing step. Anything ever pushed to a public-shaped repo must be treated as compromised (history snapshots, forks, mirrors, indexers all make untoward pushes effectively permanent).
+> 2. **`make clean-snapshot PIPELINE=<name> REF=<sha>`** — deletes the ref locally + on origin. Necessary but **not** sufficient on its own.
+>
+> If a tracked file contains a secret (the scanner caught one, or you noticed in the banner), the structural fix is `git rm --cached <file>` + add to `.gitignore` + commit the removal — then the next snapshot won't include it.
 
 #### Scenario C — Running against any committed ref (testing main, a colleague's branch, an old commit)
 

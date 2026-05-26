@@ -24,7 +24,7 @@ DEPS_FLAG = $(if $(FULLDEPS),,--no-deps)
     install-pipe-gaps install-port-visits install-pipe-events install-all \
     install-pipe-gaps-ref install-port-visits-ref install-pipe-events-ref \
     snapshot-pipe-gaps snapshot-port-visits snapshot-pipe-events \
-    clean-snapshots \
+    clean-snapshot clean-snapshots \
     publish-ditbox dit-cloud
 
 # === Framework only ===
@@ -63,21 +63,42 @@ install-pipe-events-ref:
 	@test -n "$(REF)" || { echo "REF is required: make $@ REF=<sha-or-branch>"; exit 1; }
 	$(PIP) install --force-reinstall $(DEPS_FLAG) "git+file://$(PIPE_EVENTS_DIR)@$(REF)"
 
-# === Snapshot + install (auto-commit dirty tree on dit-snapshot-<epoch> branch) ===
+# === Snapshot + install ===
+#
+# Build a deterministic orphan snapshot of the pipeline checkout's tracked
+# state under refs/dit-snapshots/<pipeline>/<commit-short-sha>, push it to
+# origin (skipped if the ref already exists), then pip install from that ref.
+# Identical tree state -> identical SHA -> cache hits on repeat runs.
 
 snapshot-pipe-gaps:
-	scripts/snapshot-install.sh "$(PIPE_GAPS_DIR)" $(DEPS_FLAG)
+	scripts/snapshot-install.sh pipe-gaps "$(PIPE_GAPS_DIR)" $(DEPS_FLAG)
 
 snapshot-port-visits:
-	scripts/snapshot-install.sh "$(PORT_VISITS_DIR)" $(DEPS_FLAG)
+	scripts/snapshot-install.sh anchorages_pipeline "$(PORT_VISITS_DIR)" $(DEPS_FLAG)
 
 snapshot-pipe-events:
-	scripts/snapshot-install.sh "$(PIPE_EVENTS_DIR)" $(DEPS_FLAG)
+	scripts/snapshot-install.sh pipe-events "$(PIPE_EVENTS_DIR)" $(DEPS_FLAG)
 
 # === Cleanup ===
+#
+# Snapshots live forever by design (bytes-scale, hidden namespace). The
+# surgical target below exists only for secret-leak remediation -- e.g. a
+# .env file accidentally ended up in a snapshot's tree and got pushed.
+#
+#   make clean-snapshot PIPELINE=pipe-gaps REF=<sha-or-full-ref>
 
+clean-snapshot:
+	@test -n "$(PIPELINE)" || { echo "PIPELINE required: PIPELINE=pipe-gaps | anchorages_pipeline | pipe-events" >&2; exit 1; }
+	@test -n "$(REF)" || { echo "REF required: REF=<sha> or REF=refs/dit-snapshots/<pipeline>/<sha>" >&2; exit 1; }
+	@test -d "$(PROJECTS)/$(PIPELINE)" || { echo "pipeline dir not found: $(PROJECTS)/$(PIPELINE)" >&2; exit 1; }
+	scripts/clean-snapshot.sh "$(PROJECTS)/$(PIPELINE)" "$(REF)"
+
+# Redirect for muscle-memory: the broad sweep was removed in M-pivot-1.
 clean-snapshots:
-	scripts/clean-snapshots.sh "$(PIPE_GAPS_DIR)" "$(PORT_VISITS_DIR)" "$(PIPE_EVENTS_DIR)"
+	@echo "make clean-snapshots was removed in the no-dirty-tree pivot." >&2
+	@echo "Snapshots live forever by design (bytes-scale, hidden namespace)." >&2
+	@echo "For secret-leak remediation: make clean-snapshot PIPELINE=<name> REF=<sha>" >&2
+	@exit 1
 
 # === Cloud Build: ditbox image ===
 #
