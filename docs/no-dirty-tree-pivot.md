@@ -116,11 +116,13 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 - **Replace** the existing broad `make clean-snapshots` with a **surgical** `make clean-snapshot REF=<sha>` target — deletes the specified snapshot ref locally and on origin, intended for secret-leak remediation only (see § Cleanup). The broad sweep is dropped; snapshots live forever by design (bytes-scale storage, hidden namespace).
 - Tests: smoke that (a) the snapshot ref ends up at the right place locally + remotely, (b) two invocations against an unchanged tree produce the same SHA / skip the second push, (c) banner appears, (d) `make clean-snapshot REF=<sha>` removes the ref locally and on origin.
 
-### M-pivot-2 — auto-snapshot inside `make dit-cloud` + `dit run`
+### M-pivot-2 — auto-snapshot inside `make dit-cloud` + `dit run` ✅ LANDED
 
-- `make dit-cloud` detects a dirty pipeline checkout and runs the snapshot+push automatically before the Cloud Build submit. No user-visible flag for the "happy path" (dirty → just snapshot). Add a `--require-clean` opt-out for users who want the run to error rather than auto-snapshot (CI scripts, etc.).
-- Same for local `dit run --runner=dataflow`: detect dirty tree, auto-snapshot, install from the snapshot, proceed.
-- Local `dit run --runner=docker` (runs the pipeline image inside a local container via `dit.runners.docker`) keeps working against the working tree as today — it's the inner-loop fast iteration mode, and the snapshot isn't needed (no Cloud Build / no remote workers; the container reads from the locally-mounted source).
+- `make dit-cloud` detects a dirty pipeline checkout and runs the snapshot+push automatically **on the laptop** (where git-push creds live) before the Cloud Build submit, then threads the resolved snapshot commit into the build as `_PIPELINE_COMMIT` → `DIT_PIPELINE_COMMIT` env var. The workflow records that as `pipeline_commit`. `REQUIRE_CLEAN=1` opts out (errors on dirty). The build still uploads the (byte-identical) working tree as its source — `_PIPELINE_COMMIT` only changes what's *recorded*, not what's installed.
+- Local `dit run --runner=dataflow`: `dit.snapshot.resolve_pipeline_commit` detects a dirty tree, auto-snapshots + pushes in-process, records the snapshot commit. `--require-clean` opts out.
+- Local `dit run --runner=docker` keeps running against the working tree directly (no remote workers → no snapshot needed); recorded as an unreviewed run for provenance.
+- `--allow-dirty-tree` is a deprecated no-op (logs a warning); removed in M-pivot-4. `--suffix` (manual / cross-version) bypasses auto-snapshot and records git state as-is — `cross_version_ais.py` relies on this for its committed worktree refs (and no longer passes `--allow-dirty-tree`).
+- **Implementation note:** auto-snapshot requires an editable dit install so `scripts/snapshot.sh` is locatable. Not a real limitation — only editable installs can be dirty; `-ref`/snapshot installs are already committed (clean).
 - `--allow-dirty-tree` becomes a no-op with a deprecation warning, then removed in a follow-up PR.
 
 ### M-pivot-3 — `unreviewed_code` + `pipeline_commit_parent` columns replace `pipeline_dirty`

@@ -55,8 +55,13 @@ from dit import dates as dit_dates
 from dit.git_info import warn_if_worker_image_misses_dirty_tree
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
+from dit.snapshot import resolve_pipeline_commit
 
 logger = logging.getLogger(__name__)
+
+# Pipeline repo name; namespaces auto-snapshot refs
+# (refs/dit-snapshots/<PIPELINE_NAME>/<sha>).
+PIPELINE_NAME = "anchorages_pipeline"
 
 
 # --------------------------------------------------------------------------
@@ -163,16 +168,17 @@ def _git_info(repo_dir: str) -> tuple[str, bool]:
     return commit, dirty
 
 
-def _resolve_suffix(args: argparse.Namespace, repo_dir: str) -> str:
+def _resolve_suffix(args: argparse.Namespace) -> str:
+    """Build the output-table suffix from the already-resolved commit.
+
+    ``main()`` resolves ``args.commit_sha`` / ``args.dirty`` once (auto-
+    snapshotting a dirty dataflow run via dit.snapshot) before calling this.
+    ``--suffix`` bypasses everything.
+    """
     if args.suffix:
         return args.suffix
-    commit, dirty = _git_info(repo_dir)
-    if dirty and not args.allow_dirty_tree:
-        raise SystemExit(
-            "error: working tree is dirty; pass --allow-dirty-tree, or commit/stash first."
-        )
     uid = uuid.uuid4().hex[:6]
-    body = f"{commit}_dirty_{uid}" if dirty else f"{commit}_{uid}"
+    body = f"{args.commit_sha}_dirty_{uid}" if args.dirty else f"{args.commit_sha}_{uid}"
     return f"{args.experiment_id}_{body}"
 
 
@@ -589,7 +595,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "runs should provide a snapshotted FQN (cross_version_ais.py pins this "
                         "automatically when given a prod-side FQN).")
     p.add_argument("--allow-dirty-tree", action="store_true",
-                   help="Permit auto-suffix on a dirty working tree.")
+                   help="DEPRECATED no-op: dirty trees are auto-snapshotted to a "
+                        "pushed ref. Will be removed in a future release.")
+    p.add_argument("--require-clean", action="store_true",
+                   help="Error on a dirty tree instead of auto-snapshotting "
+                        "(for CI / strict-provenance callers).")
     p.add_argument("--skip-pipelines", action="store_true",
                    help="Skip the pipeline phase; only run comparisons.")
     p.add_argument("--skip-comparisons", action="store_true",
@@ -615,13 +625,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "the daily-tail date range."
         )
 
-    suffix = _resolve_suffix(args, repo_dir=os.getcwd())
+    repo_dir = os.getcwd()
+
+    if args.allow_dirty_tree:
+        logger.warning(
+            "--allow-dirty-tree is deprecated and now a no-op: dirty trees are "
+            "auto-snapshotted to a pushed ref (see docs/no-dirty-tree-pivot.md). "
+            "The flag will be removed in a future release."
+        )
+
+    # Resolve the committed ref this run records (no-dirty-tree policy).
+    # --suffix is the manual / cross-version escape hatch: when set, record git
+    # state as-is (cross_version_ais.py runs committed worktree refs and owns
+    # provenance). Otherwise dirty + --runner=dataflow auto-snapshots + pushes;
+    # the cloud path supplies DIT_PIPELINE_COMMIT instead.
+    if args.suffix:
+        commit_sha, dirty = _git_info(repo_dir)
+    else:
+        commit_sha, dirty = resolve_pipeline_commit(
+            repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
+        )
+    args.commit_sha = commit_sha
+    args.dirty = dirty
+
+    suffix = _resolve_suffix(args)
 
     # Per-invocation lineage attributes, computed once and stashed on args so
     # every Dataflow job + BQ output table from this run shares them. See
     # the dit_run_id / dit_commit_sha / dit_worker_image_tag / dit_launched_by
     # labels in _dynamic_labels.
-    commit_sha, dirty = _git_info(os.getcwd())
     warn_if_worker_image_misses_dirty_tree(
         dirty_fn=lambda: dirty,
         repo_dir=os.getcwd(),
@@ -630,7 +662,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default_worker_image=DEFAULT_WORKER_IMAGE,
     )
     args.run_id = uuid.uuid4().hex[:12]
-    args.commit_sha = commit_sha
     args.worker_image_tag = _worker_image_tag(args.worker_image)
     args.launched_by = os.environ.get("USER", "unknown")
 
