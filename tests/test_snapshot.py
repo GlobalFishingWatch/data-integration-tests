@@ -327,6 +327,30 @@ def test_snapshot_banner_lists_changed_paths(pipeline_repo: Path) -> None:
     assert "README.md" in stderr
 
 
+def test_snapshot_banner_matches_snapshot_contents_not_working_tree(
+    pipeline_repo: Path,
+) -> None:
+    """The banner must list paths that are ACTUALLY in the snapshot, not
+    whatever `git diff HEAD` reports about the working tree. A new file
+    staged in the user's real index appears in `git diff HEAD` but is NOT
+    in the snapshot (the temp index is seeded from HEAD + `add -u`), so it
+    must NOT appear in the banner — otherwise the 'what will be pushed'
+    promise is false."""
+    # A genuine tracked-file modification (will be in the snapshot + banner).
+    (pipeline_repo / "README.md").write_text("hello dirty\n")
+    # A new file staged in the real index (will NOT be in the snapshot).
+    staged_new = pipeline_repo / "staged_only.py"
+    staged_new.write_text("# staged, not committed, not in snapshot\n")
+    _git("add", "staged_only.py", cwd=pipeline_repo)
+
+    _, stderr = _run_snapshot(pipeline_repo)
+
+    assert "README.md" in stderr
+    assert "staged_only.py" not in stderr, (
+        "banner must reflect snapshot contents, not the working-tree diff"
+    )
+
+
 def test_snapshot_refuses_without_gitleaks_or_bypass(
     pipeline_repo: Path, tmp_path: Path
 ) -> None:

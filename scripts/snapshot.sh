@@ -150,11 +150,15 @@ SNAPSHOT_SHA=$(
 
 REF="refs/dit-snapshots/$PIPELINE/${SNAPSHOT_SHA:0:12}"
 
-# Show the user exactly which tracked paths will be in the snapshot.
-# Last-chance visual review before the auto-push goes out — a `.env`
-# accidentally promoted to tracked status, or a credentials file added in
-# error, surfaces here rather than after the fact on origin.
-CHANGED_PATHS=$(git diff --name-only HEAD || true)
+# Show the user exactly which paths will be in the snapshot. Diff the
+# SNAPSHOT TREE against HEAD (not the working tree against HEAD) so the
+# banner matches the snapshot's capture boundary precisely — a file
+# staged in the user's real index but not in the snapshot (e.g. a new
+# untracked file) must NOT appear here, or the "what will be pushed"
+# promise is false. Last-chance visual review before the auto-push: a
+# credentials file accidentally promoted to tracked status surfaces here
+# rather than after the fact on origin.
+CHANGED_PATHS=$(git diff --name-only HEAD "$TREE_SHA" || true)
 
 {
     echo "dit snapshot for $PIPELINE:"
