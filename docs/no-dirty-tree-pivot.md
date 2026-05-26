@@ -123,7 +123,6 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 - Local `dit run --runner=docker` keeps running against the working tree directly (no remote workers → no snapshot needed); recorded as an unreviewed run for provenance.
 - `--allow-dirty-tree` is a deprecated no-op (logs a warning); removed in M-pivot-4. `--suffix` (manual / cross-version) bypasses auto-snapshot and records git state as-is — `cross_version_ais.py` relies on this for its committed worktree refs (and no longer passes `--allow-dirty-tree`).
 - **Implementation note:** auto-snapshot requires an editable dit install so `scripts/snapshot.sh` is locatable. Not a real limitation — only editable installs can be dirty; `-ref`/snapshot installs are already committed (clean).
-- `--allow-dirty-tree` becomes a no-op with a deprecation warning, then removed in a follow-up PR.
 
 ### M-pivot-3 — `unreviewed_code` + `pipeline_commit_parent` columns replace `pipeline_dirty`
 

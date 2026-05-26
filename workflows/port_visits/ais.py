@@ -44,7 +44,6 @@ import itertools
 import logging
 import os
 import re
-import subprocess
 import sys
 import uuid
 from datetime import date, datetime, timedelta
@@ -52,7 +51,7 @@ from typing import Optional, Sequence
 
 from dit import compare as dit_compare
 from dit import dates as dit_dates
-from dit.git_info import warn_if_worker_image_misses_dirty_tree
+from dit.git_info import git_info, warn_if_worker_image_misses_dirty_tree
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.snapshot import resolve_pipeline_commit
@@ -144,29 +143,8 @@ def _validate_experiment_id(value: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Suffix / git info  (lifted from workflows/pipe_gaps/mode_equivalence.py;
-# promote to dit.git_info when a third consumer appears.)
+# Suffix
 # --------------------------------------------------------------------------
-
-def _git_info(repo_dir: str) -> tuple[str, bool]:
-    """Return (short commit, dirty?) for the given repo dir. Falls back to
-    ('unknown', False) outside a git repo."""
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", repo_dir, "rev-parse", "--short", "HEAD"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return ("unknown", False)
-    try:
-        dirty = bool(subprocess.check_output(
-            ["git", "-C", repo_dir, "status", "--porcelain"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip())
-    except subprocess.CalledProcessError:
-        dirty = False
-    return commit, dirty
-
 
 def _resolve_suffix(args: argparse.Namespace) -> str:
     """Build the output-table suffix from the already-resolved commit.
@@ -640,7 +618,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # provenance). Otherwise dirty + --runner=dataflow auto-snapshots + pushes;
     # the cloud path supplies DIT_PIPELINE_COMMIT instead.
     if args.suffix:
-        commit_sha, dirty = _git_info(repo_dir)
+        commit_sha, dirty = git_info(repo_dir)
     else:
         commit_sha, dirty = resolve_pipeline_commit(
             repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
