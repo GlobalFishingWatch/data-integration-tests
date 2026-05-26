@@ -36,10 +36,15 @@ from dit.cache import (
     write_cache,
 )
 from dit.dates import daterange_inclusive
-from dit.git_info import warn_if_worker_image_misses_dirty_tree
+from dit.git_info import git_info, warn_if_worker_image_misses_dirty_tree
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
+from dit.snapshot import resolve_pipeline_commit
+
+# Pipeline repo name; used to namespace auto-snapshot refs
+# (refs/dit-snapshots/<PIPELINE_NAME>/<sha>).
+PIPELINE_NAME = "pipe-gaps"
 
 # Compute once at import time; the dit-side cache buster.
 WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
@@ -137,31 +142,20 @@ def _validate_experiment_id(value: str) -> str:
     return value
 
 
-def _git_info(repo_dir: str) -> tuple[str, bool]:
-    short = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=repo_dir, check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    porcelain = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
-        cwd=repo_dir, check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    return short, bool(porcelain)
+def _resolve_suffix(args: argparse.Namespace) -> str:
+    """Build the output-table suffix from the already-resolved pipeline_commit.
 
-
-def _resolve_suffix(args: argparse.Namespace, repo_dir: str) -> str:
+    ``main()`` resolves ``args.pipeline_commit`` / ``args.pipeline_dirty`` once
+    (via :func:`dit.snapshot.resolve_pipeline_commit`, which auto-snapshots a
+    dirty dataflow run) before calling this, so the suffix references the same
+    committed ref the cache records. ``--suffix`` still bypasses everything.
+    """
     if args.suffix is not None:
         return args.suffix
-    commit, dirty = _git_info(repo_dir)
-    if dirty and not args.allow_dirty_tree:
-        raise SystemExit(
-            f"Refusing to run with uncommitted changes (commit={commit}, dirty=True). "
-            "Commit your changes so the run is traceable, or pass --allow-dirty-tree to "
-            "override (the suffix will include 'dirty' to flag this)."
-        )
+    commit = args.pipeline_commit
     body = (
         f"{commit}_dirty_{uuid.uuid4().hex[:6]}"
-        if dirty
+        if args.pipeline_dirty
         else f"{commit}_{uuid.uuid4().hex[:6]}"
     )
     return f"{args.experiment_id}_{body}"
@@ -689,7 +683,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
              "Auto-default solo_<6-hex> when unset. Regex ^[a-z0-9][a-z0-9_-]{0,31}$. "
              "Bypassed entirely when --suffix is set.",
     )
-    p.add_argument("--allow-dirty-tree", action="store_true")
+    p.add_argument("--allow-dirty-tree", action="store_true",
+                   help="DEPRECATED no-op: dirty trees are auto-snapshotted to a "
+                        "pushed ref. Will be removed in a future release.")
+    p.add_argument("--require-clean", action="store_true",
+                   help="Error on a dirty tree instead of auto-snapshotting "
+                        "(for CI / strict-provenance callers).")
     p.add_argument("--skip-pipelines", action="store_true")
     p.add_argument("--skip-comparisons", action="store_true")
     p.add_argument("--parallel", "--async", dest="parallel", action="store_true")
@@ -722,17 +721,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
     repo_dir = os.getcwd()
-    suffix = _resolve_suffix(args, repo_dir)
+
+    if args.allow_dirty_tree:
+        logger.warning(
+            "--allow-dirty-tree is deprecated and now a no-op: dirty trees are "
+            "auto-snapshotted to a pushed ref (see docs/no-dirty-tree-pivot.md). "
+            "The flag will be removed in a future release."
+        )
+
+    # Resolve the committed ref this run records (no-dirty-tree policy).
+    # Dirty + --runner=dataflow auto-snapshots to refs/dit-snapshots/<pipeline>/<sha>
+    # and pushes; the cloud path provides DIT_PIPELINE_COMMIT instead. Done
+    # before the suffix so both reference the same commit.
+    #
+    # --suffix is the manual / cross-version escape hatch: when set, skip the
+    # auto-snapshot and record git state as-is (the caller has taken control of
+    # provenance, e.g. cross_version_ais.py running committed worktree refs).
+    if args.suffix is not None:
+        pipeline_commit, pipeline_dirty = git_info(repo_dir)
+    else:
+        pipeline_commit, pipeline_dirty = resolve_pipeline_commit(
+            repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
+        )
+    args.pipeline_commit = pipeline_commit
+    args.pipeline_dirty = pipeline_dirty
+
+    suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
 
     # Per-`main()` context used by the run cache (see dit.cache /
     # docs/run-cache.md). Stashed on args so downstream code can read
     # without recomputing.
-    pipeline_commit, pipeline_dirty = _git_info(repo_dir)
     args.run_id = uuid.uuid4().hex[:12]
-    args.pipeline_commit = pipeline_commit
-    args.pipeline_dirty = pipeline_dirty
     args.dit_commit = _dit_commit()
     # resolve_worker_image_to_digest is a one-off ~1-2s gcloud call;
     # fall back to the tag form if it fails (no cache hits then, but

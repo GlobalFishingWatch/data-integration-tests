@@ -27,6 +27,12 @@ substitutions:
   _ARGS: ''           # args appended to `dit run <workflow>`
   _REF: ''            # pipeline ref to install; empty -> editable install from the source upload
   _DIT_REF: main      # dit ref to clone
+  # The committed ref the workflow records as pipeline_commit. For a dirty
+  # checkout, `make dit-cloud` snapshots it on the laptop (where git-push creds
+  # live) and passes the resolved snapshot commit here; the workflow reads it
+  # from the DIT_PIPELINE_COMMIT env var instead of re-deriving git state.
+  # Empty -> the workflow resolves pipeline_commit itself (clean-checkout path).
+  _PIPELINE_COMMIT: ''
   # The submission-side apache-beam version must match the published Dataflow
   # worker image's beam version; otherwise workers fail with "Pipeline
   # construction environment and pipeline runtime environment are not
@@ -42,6 +48,10 @@ steps:
     # convention (see docs/conventions.md and CLAUDE.md § Working agreements).
     name: gcr.io/world-fishing-827/dit/ditbox:latest
     entrypoint: bash
+    env:
+      # Recorded by the workflow as pipeline_commit (see dit.snapshot). Empty
+      # is fine: the workflow falls back to resolving git state itself.
+      - 'DIT_PIPELINE_COMMIT=${_PIPELINE_COMMIT}'
     args:
       - -c
       - |

@@ -310,7 +310,8 @@ def _ais_args_for_binding(
         "--suffix", suffix,
         "--experiment-id", experiment_id,
         "--binding-name", binding_name,
-        "--allow-dirty-tree",  # worktree's git status is clean but ais.py's _git_info still triggers; harmless
+        # No --allow-dirty-tree needed: --suffix makes ais.py record git state
+        # as-is (the worktree is a committed ref) and skip the auto-snapshot path.
     ])
     if worker_image is not None:
         out.extend(["--worker-image", worker_image])

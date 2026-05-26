@@ -145,12 +145,38 @@ ifeq ($(PIPELINE),anchorages_pipeline)
   BEAM_VERSION ?= 2.69.0
 endif
 
+# Resolve the pipeline_commit on the laptop (where git-push creds live) and
+# always thread it into the build as _PIPELINE_COMMIT, so the in-cloud workflow
+# NEVER attempts a snapshot/push from the builder (it has no push creds):
+#   - REF set      -> the resolved short sha of that committed ref.
+#   - dirty (no REF) -> auto-snapshot via scripts/snapshot.sh
+#                       (refs/dit-snapshots/<pipeline>/<sha>) and record the
+#                       snapshot's short sha. REQUIRE_CLEAN=1 errors instead.
+#   - clean (no REF) -> HEAD short sha.
+# The build still uploads the (byte-identical) working tree as its source;
+# _PIPELINE_COMMIT only changes what the workflow records as pipeline_commit.
 dit-cloud:
 	@test -n "$(WORKFLOW)" || { echo "WORKFLOW required: WORKFLOW=workflows/..." >&2; exit 1; }
 	@test -n "$(PIPELINE)" || { echo "PIPELINE required: anchorages_pipeline | pipe-gaps | pipe-events" >&2; exit 1; }
 	@test -d "$(PROJECTS)/$(PIPELINE)" || { echo "pipeline dir not found: $(PROJECTS)/$(PIPELINE)" >&2; exit 1; }
+	@PIPELINE_COMMIT=""; \
+	if [ -n "$(REF)" ]; then \
+	    PIPELINE_COMMIT=$$(git -C "$(PROJECTS)/$(PIPELINE)" rev-parse --short "$(REF)"); \
+	elif [ -n "$$(git -C "$(PROJECTS)/$(PIPELINE)" status --porcelain --untracked-files=no)" ]; then \
+	    if [ -n "$(REQUIRE_CLEAN)" ]; then \
+	        echo "error: $(PIPELINE) checkout is dirty and REQUIRE_CLEAN=1 was set." >&2; \
+	        echo "       commit + push, or drop REQUIRE_CLEAN to auto-snapshot." >&2; \
+	        exit 1; \
+	    fi; \
+	    echo ">>> $(PIPELINE) checkout is dirty; auto-snapshotting..." >&2; \
+	    SNAP_REF=$$(scripts/snapshot.sh "$(PIPELINE)" "$(PROJECTS)/$(PIPELINE)"); \
+	    PIPELINE_COMMIT=$$(git -C "$(PROJECTS)/$(PIPELINE)" rev-parse --short "$$SNAP_REF"); \
+	    echo ">>> snapshot pipeline_commit=$$PIPELINE_COMMIT" >&2; \
+	else \
+	    PIPELINE_COMMIT=$$(git -C "$(PROJECTS)/$(PIPELINE)" rev-parse --short HEAD); \
+	fi; \
 	gcloud builds submit \
 	    --config=cloudbuild-dit.yaml \
 	    --ignore-file=$(CURDIR)/.gcloudignore \
-	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)@@_BEAM_VERSION=$(BEAM_VERSION)" \
+	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)@@_BEAM_VERSION=$(BEAM_VERSION)@@_PIPELINE_COMMIT=$$PIPELINE_COMMIT" \
 	    "$(PROJECTS)/$(PIPELINE)"
