@@ -206,7 +206,10 @@ class CachedRun:
     pipeline: str
     experiment_id: str
     pipeline_commit: str
-    pipeline_dirty: bool
+    # unreviewed_code: TRUE for snapshot refs / unmerged branches, FALSE for
+    # merged-to-main commits (M-pivot-3 rename of the legacy pipeline_dirty
+    # flag). read_cache no longer filters on it; it's informational.
+    unreviewed_code: bool
     dit_commit: str
     workflow_file_sha1: str
     worker_image: str
@@ -218,6 +221,10 @@ class CachedRun:
     finished_at: datetime | None
     status: str
     expires_at: datetime
+    # For snapshot runs: the HEAD the dirty tree was based on (parsed from the
+    # snapshot commit message). NULL for non-snapshot runs. Trails the required
+    # fields with a default so existing positional construction keeps working.
+    pipeline_commit_parent: str | None = None
 
     @classmethod
     def from_bq_row(cls, row: Any) -> "CachedRun":
@@ -237,7 +244,14 @@ class CachedRun:
             pipeline=row.pipeline,
             experiment_id=row.experiment_id,
             pipeline_commit=row.pipeline_commit,
-            pipeline_dirty=bool(row.pipeline_dirty),
+            # Prefer unreviewed_code; fall back to the legacy pipeline_dirty
+            # for the brief window before migration 002 backfills (and for any
+            # reader pointed at a not-yet-migrated table).
+            unreviewed_code=bool(
+                getattr(row, "unreviewed_code", None)
+                if getattr(row, "unreviewed_code", None) is not None
+                else row.pipeline_dirty
+            ),
             dit_commit=row.dit_commit,
             workflow_file_sha1=row.workflow_file_sha1,
             worker_image=row.worker_image,
@@ -249,6 +263,7 @@ class CachedRun:
             finished_at=row.finished_at,
             status=row.status,
             expires_at=row.expires_at,
+            pipeline_commit_parent=getattr(row, "pipeline_commit_parent", None),
         )
 
     def to_bq_row(self) -> dict[str, Any]:
@@ -273,7 +288,12 @@ class CachedRun:
             "pipeline": self.pipeline,
             "experiment_id": self.experiment_id,
             "pipeline_commit": self.pipeline_commit,
-            "pipeline_dirty": self.pipeline_dirty,
+            # Dual-write the legacy column (= unreviewed_code) for one release
+            # so the NOT NULL constraint stays satisfied and older readers
+            # keep working until pipeline_dirty is dropped.
+            "pipeline_dirty": self.unreviewed_code,
+            "unreviewed_code": self.unreviewed_code,
+            "pipeline_commit_parent": self.pipeline_commit_parent,
             "dit_commit": self.dit_commit,
             "workflow_file_sha1": self.workflow_file_sha1,
             "worker_image": self.worker_image,
@@ -327,8 +347,15 @@ def _group_by_dataset(table_fqns: list[str]) -> dict[tuple[str, str], list[str]]
 # --------------------------------------------------------------------------
 
 def read_cache(cache_key: str, *, client: Any = None) -> CachedRun | None:
-    """Return the most-recent successful, non-dirty, non-expired
-    :class:`CachedRun` with the given ``cache_key``, or None.
+    """Return the most-recent successful, non-expired :class:`CachedRun` with
+    the given ``cache_key``, or None.
+
+    No ``unreviewed_code`` filter (M-pivot-3): the cache key is content-
+    addressable on ``pipeline_commit`` (a real or snapshot commit SHA), so an
+    unreviewed snapshot row is a legitimate cache hit for a repeat run of the
+    same uncommitted code — which is exactly the waste the no-dirty-tree pivot
+    set out to eliminate. Strict-provenance callers (cross-pipeline / PR
+    validation) filter ``unreviewed_code = FALSE`` themselves at query time.
     """
     client = client or _make_client()
     from google.cloud import bigquery
@@ -338,7 +365,6 @@ def read_cache(cache_key: str, *, client: Any = None) -> CachedRun | None:
         FROM `{TABLE_FQN}`
         WHERE cache_key = @cache_key
           AND status = '{STATUS_SUCCEEDED}'
-          AND pipeline_dirty = FALSE
           AND expires_at > CURRENT_TIMESTAMP()
         ORDER BY started_at DESC
         LIMIT 1
@@ -444,11 +470,12 @@ def write_cache(row: CachedRun, *, client: Any = None) -> None:
     streaming's sub-second — invisible inside multi-minute Dataflow
     workflows.
 
-    **Dirty-tree handling** lives at the read side, not here: every row
-    is recorded for registry + cleanup purposes regardless of
-    ``pipeline_dirty``. The :func:`read_cache` query filters out
-    ``pipeline_dirty = TRUE`` rows so dirty runs never satisfy a cache
-    lookup, but they remain visible to :func:`cancel_run` for cleanup.
+    **unreviewed_code** (M-pivot-3) replaces the legacy ``pipeline_dirty``
+    flag. Every row is recorded regardless of its value. :func:`read_cache`
+    no longer filters on it — a snapshot row is a valid cache hit for a
+    repeat run of the same content-addressable commit. ``pipeline_dirty`` is
+    dual-written (= ``unreviewed_code``) for one release so the NOT NULL
+    column and older readers keep working until it's dropped.
 
     Exceptions from the BQ query job propagate. ``.result()`` blocks
     until the INSERT commits.
@@ -463,12 +490,14 @@ def write_cache(row: CachedRun, *, client: Any = None) -> None:
     query = f"""
         INSERT INTO `{TABLE_FQN}` (
             run_id, cache_key, workflow, pipeline, experiment_id,
-            pipeline_commit, pipeline_dirty, dit_commit, workflow_file_sha1,
+            pipeline_commit, pipeline_dirty, unreviewed_code,
+            pipeline_commit_parent, dit_commit, workflow_file_sha1,
             worker_image, params_json, output_tables, dataflow_job_ids,
             cloud_build_id, started_at, finished_at, status, expires_at
         ) VALUES (
             @run_id, @cache_key, @workflow, @pipeline, @experiment_id,
-            @pipeline_commit, @pipeline_dirty, @dit_commit, @workflow_file_sha1,
+            @pipeline_commit, @pipeline_dirty, @unreviewed_code,
+            @pipeline_commit_parent, @dit_commit, @workflow_file_sha1,
             @worker_image, PARSE_JSON(@params_json), @output_tables, @dataflow_job_ids,
             @cloud_build_id, @started_at, @finished_at, @status, @expires_at
         )
@@ -480,7 +509,11 @@ def write_cache(row: CachedRun, *, client: Any = None) -> None:
         bigquery.ScalarQueryParameter("pipeline", "STRING", row.pipeline),
         bigquery.ScalarQueryParameter("experiment_id", "STRING", row.experiment_id),
         bigquery.ScalarQueryParameter("pipeline_commit", "STRING", row.pipeline_commit),
-        bigquery.ScalarQueryParameter("pipeline_dirty", "BOOL", row.pipeline_dirty),
+        # Dual-write the legacy NOT NULL column (= unreviewed_code) for one
+        # release; drop once nothing reads pipeline_dirty.
+        bigquery.ScalarQueryParameter("pipeline_dirty", "BOOL", row.unreviewed_code),
+        bigquery.ScalarQueryParameter("unreviewed_code", "BOOL", row.unreviewed_code),
+        bigquery.ScalarQueryParameter("pipeline_commit_parent", "STRING", row.pipeline_commit_parent),
         bigquery.ScalarQueryParameter("dit_commit", "STRING", row.dit_commit),
         bigquery.ScalarQueryParameter("workflow_file_sha1", "STRING", row.workflow_file_sha1),
         bigquery.ScalarQueryParameter("worker_image", "STRING", row.worker_image),

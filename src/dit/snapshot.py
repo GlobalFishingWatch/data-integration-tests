@@ -70,6 +70,30 @@ def create_snapshot(repo_dir: str, pipeline: str) -> str:
     ).stdout.strip()
 
 
+_SNAPSHOT_MSG_PREFIX = "dit snapshot of "
+
+
+def snapshot_parent(commit: str, repo_dir: str) -> str | None:
+    """Return the parent SHA a snapshot commit was based on, or None.
+
+    A dit snapshot commit's subject is ``dit snapshot of <40-char-sha>`` (set
+    by ``scripts/snapshot.sh``). For such a commit, return ``<sha>``; for any
+    other commit (a real branch/main commit, or one we can't read), return
+    None. Recorded in ``dit_runs.pipeline_commit_parent`` so a snapshot run's
+    reproduce context survives even if the snapshot ref is later deleted.
+    """
+    try:
+        subject = subprocess.run(
+            ["git", "log", "-1", "--format=%s", commit],
+            cwd=repo_dir, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if subject.startswith(_SNAPSHOT_MSG_PREFIX):
+        return subject[len(_SNAPSHOT_MSG_PREFIX):].strip() or None
+    return None
+
+
 def resolve_pipeline_commit(
     repo_dir: str,
     pipeline: str,

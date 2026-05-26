@@ -37,6 +37,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         experiment_id="exp01",
         pipeline_commit="abc1234",
         pipeline_dirty=False,
+        pipeline_commit_parent=None,
         dit_commit="def5678",
         worker_image="gcr.io/foo/pipe-gaps:v0.9.6",
         worker_image_digest="gcr.io/foo/pipe-gaps@sha256:0011",
@@ -147,7 +148,7 @@ def _cached_row(**overrides: Any) -> mod.CachedRun:
         pipeline="pipe-gaps",
         experiment_id="prev-exp",
         pipeline_commit="abc1234",
-        pipeline_dirty=False,
+        unreviewed_code=False,
         dit_commit="def5678",
         workflow_file_sha1=mod.WORKFLOW_FILE_SHA1,
         worker_image="gcr.io/foo/pipe-gaps:v0.9.6",
@@ -257,9 +258,9 @@ def test_run_with_cache_stale_row_treats_as_miss():
     assert result == "proj.ds.fresh_bf_table"
 
 
-def test_run_with_cache_writes_dirty_rows():
-    # Design invariant: dirty runs ARE recorded (registry/cleanup purpose);
-    # read_cache filters them out of lookups.
+def test_run_with_cache_writes_unreviewed_rows():
+    # Design invariant: unreviewed (snapshot) runs ARE recorded. args.pipeline_dirty
+    # holds the resolved unreviewed flag; it maps to the row's unreviewed_code.
     execute_fn = MagicMock()
     args = _args(pipeline_dirty=True)
     with (
@@ -274,7 +275,7 @@ def test_run_with_cache_writes_dirty_rows():
             output_fqn="x", execute_kwargs={},
         )
     written_row = mock_write.call_args.args[0]
-    assert written_row.pipeline_dirty is True
+    assert written_row.unreviewed_code is True
 
 
 def test_run_with_cache_includes_extras_in_key():

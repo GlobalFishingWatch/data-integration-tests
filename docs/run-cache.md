@@ -102,7 +102,7 @@ def maybe_cached_run(workflow_fn, args) -> RunReport:
     return report
 ```
 
-**Dirty-tree handling.** When `pipeline_dirty=True` (the submitter's pipeline tree had uncommitted changes), the run is non-reproducible by definition. We `INSERT` a provenance row (with `pipeline_dirty=True` so it's excluded from cache reads) but the row is registry/cleanup-only — never reused.
+**Dirty-tree handling.** *(Superseded by M-pivot-3 — see [`docs/no-dirty-tree-pivot.md`](no-dirty-tree-pivot.md).)* Originally: `pipeline_dirty=True` rows were registry-only and excluded from cache reads. Post-pivot, dirty trees auto-snapshot to a content-addressable committed ref, so `pipeline_commit` is stable and reproducible; the column was renamed `unreviewed_code` and `read_cache` no longer filters on it — repeat runs of the same snapshot are valid cache hits. `unreviewed_code` is now informational (strict-provenance queries filter it explicitly).
 
 **Concurrency.** Two PRs hitting `main`'s 1_bf at the same time both miss the cache (no prior row), both compute, both insert. Idempotent: same key, different `run_id`s. Next PR hits cache. Worth-the-waste; alternative (advisory locks) is heavier than the duplication cost.
 

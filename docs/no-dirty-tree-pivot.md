@@ -124,7 +124,17 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 - `--allow-dirty-tree` is a deprecated no-op (logs a warning); removed in M-pivot-4. `--suffix` (manual / cross-version) bypasses auto-snapshot and records git state as-is — `cross_version_ais.py` relies on this for its committed worktree refs (and no longer passes `--allow-dirty-tree`).
 - **Implementation note:** auto-snapshot requires an editable dit install so `scripts/snapshot.sh` is locatable. Not a real limitation — only editable installs can be dirty; `-ref`/snapshot installs are already committed (clean).
 
-### M-pivot-3 — `unreviewed_code` + `pipeline_commit_parent` columns replace `pipeline_dirty`
+### M-pivot-3 — `unreviewed_code` + `pipeline_commit_parent` columns replace `pipeline_dirty` ✅ LANDED
+
+Shipped as implemented (one deviation from the sketch below): the
+`unreviewed_code` value is the `unreviewed` flag already resolved by
+`dit.snapshot.resolve_pipeline_commit` in M-pivot-2 (snapshot / dirty / env-override → True; clean → False). The `git merge-base --is-ancestor origin/main`
+refinement for "clean-but-not-on-main" branches is **deferred** — it adds a
+`git fetch` round-trip per run and is awkward on the cloud env-override path,
+and the column is now informational (no longer gates caching), so the
+approximation is acceptable. Revisit if strict-provenance queries need the
+precision. Migration in `migrations/002_unreviewed_code.sql`; the cacheability
+win comes from dropping the read filter (below).
 
 - Migration:
   ```sql
