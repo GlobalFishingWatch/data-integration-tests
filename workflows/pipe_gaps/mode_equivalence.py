@@ -40,7 +40,7 @@ from dit.git_info import git_info, warn_if_worker_image_misses_dirty_tree
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
-from dit.snapshot import resolve_pipeline_commit
+from dit.snapshot import resolve_pipeline_commit, snapshot_parent
 
 # Pipeline repo name; used to namespace auto-snapshot refs
 # (refs/dit-snapshots/<PIPELINE_NAME>/<sha>).
@@ -585,10 +585,12 @@ def _run_with_cache(
       call ``execute_fn(**execute_kwargs)``; write a :class:`CachedRun`
       row with the current run's metadata; return ``output_fqn``.
 
-    The cache row is written for **every** completed run including
-    dirty-tree ones (registry purpose). ``read_cache`` filters
-    ``pipeline_dirty = TRUE`` rows out of lookups so dirty runs don't
-    poison future caches.
+    The cache row is written for **every** completed run, including
+    unreviewed (snapshot / dirty-tree) ones. Post M-pivot-3 ``read_cache``
+    no longer filters on ``unreviewed_code``: the cache key is content-
+    addressable on ``pipeline_commit`` (a real or deterministic-snapshot
+    SHA), so a snapshot row is a legitimate hit for a repeat run of the same
+    uncommitted code. ``unreviewed_code`` is informational only.
     """
     cache_key_obj = _build_cache_key(args, mode, **(cache_key_extras or {}))
     cache_key = compute_cache_key(cache_key_obj)
@@ -625,7 +627,12 @@ def _run_with_cache(
         pipeline="pipe-gaps",
         experiment_id=args.experiment_id,
         pipeline_commit=args.pipeline_commit,
-        pipeline_dirty=args.pipeline_dirty,
+        # args.pipeline_dirty holds the unreviewed flag resolved in main():
+        # dirty / env-override / snapshot -> True; clean -> False. (The
+        # is-ancestor-of-main refinement for clean non-main branches is
+        # deferred -- see docs/no-dirty-tree-pivot.md § M-pivot-3.)
+        unreviewed_code=args.pipeline_dirty,
+        pipeline_commit_parent=args.pipeline_commit_parent,
         dit_commit=args.dit_commit,
         workflow_file_sha1=WORKFLOW_FILE_SHA1,
         worker_image=args.worker_image,
@@ -745,6 +752,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     args.pipeline_commit = pipeline_commit
     args.pipeline_dirty = pipeline_dirty
+    # For snapshot runs, record the HEAD the dirty tree was based on (parsed
+    # from the snapshot commit message); None for real/main commits. M-pivot-3.
+    args.pipeline_commit_parent = snapshot_parent(pipeline_commit, repo_dir)
 
     suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)

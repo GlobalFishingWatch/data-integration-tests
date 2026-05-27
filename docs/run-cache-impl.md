@@ -35,7 +35,7 @@ Implement `read_cache`, `verify_tables_exist`, `expires_at_for`.
 
 Implement `CachedRun.to_bq_row` + `write_cache`.
 
-**Reconciled with the design doc**: dirty-tree handling lives at the **read** side, not the write side. `read_cache` already filters `pipeline_dirty = FALSE`, so dirty rows never satisfy a cache lookup; but we still INSERT them for registry / cleanup purposes (`make dit-cancel` finds them via the run_id). No `record_run` wrapper needed — the earlier plan's "skip write when dirty" framing was inconsistent with the design.
+**Reconciled with the design doc**: dirty-tree handling lives at the **read** side, not the write side. We INSERT every row for registry / cleanup purposes (`make dit-cancel` finds them via the run_id). No `record_run` wrapper needed — the earlier plan's "skip write when dirty" framing was inconsistent with the design. *(Updated by M-pivot-3: `read_cache` no longer filters at all — the `pipeline_dirty = FALSE` filter was dropped and the column renamed `unreviewed_code` so content-addressable snapshot rows are cacheable. See [`docs/no-dirty-tree-pivot.md`](no-dirty-tree-pivot.md).)*
 
 **Tasks (done)**:
 - `CachedRun.to_bq_row()` — datetime → ISO-8601 string; params dict → JSON string; nullables pass through. Kept as a "render as dict" helper for debug/log/serialisation; not on the write hot path.

@@ -173,6 +173,8 @@ def _bq_row(**overrides: Any) -> Any:
         experiment_id="exp01",
         pipeline_commit="abc1234",
         pipeline_dirty=False,
+        unreviewed_code=False,
+        pipeline_commit_parent=None,
         dit_commit="def5678",
         workflow_file_sha1="aa" * 20,
         worker_image="gcr.io/foo/pipe-gaps@sha256:0011",
@@ -235,13 +237,16 @@ def test_read_cache_sql_filters_match_design():
     client = _query_returns([])
     read_cache("k", client=client)
     sql = client.query.call_args[0][0]
-    # The query must enforce all four filter conditions per the design.
     assert "cache_key = @cache_key" in sql
     assert "status = 'succeeded'" in sql
-    assert "pipeline_dirty = FALSE" in sql
     assert "expires_at > CURRENT_TIMESTAMP()" in sql
     assert "ORDER BY started_at DESC" in sql
     assert "LIMIT 1" in sql
+    # M-pivot-3: the unreviewed/dirty filter is DROPPED so content-addressable
+    # snapshot rows are cacheable. Neither the legacy nor the new column gates
+    # lookups.
+    assert "pipeline_dirty" not in sql
+    assert "unreviewed_code" not in sql
 
 
 def test_verify_tables_exist_empty_input():
@@ -349,7 +354,8 @@ def _cached_run(**overrides: Any) -> CachedRun:
         pipeline="pipe-gaps",
         experiment_id="exp01",
         pipeline_commit="abc1234",
-        pipeline_dirty=False,
+        unreviewed_code=False,
+        pipeline_commit_parent=None,
         dit_commit="def5678",
         workflow_file_sha1="aa" * 20,
         worker_image="gcr.io/foo/pipe-gaps@sha256:0011",
@@ -368,13 +374,21 @@ def _cached_run(**overrides: Any) -> CachedRun:
 
 def test_to_bq_row_shape():
     row = _cached_run().to_bq_row()
-    # All 18 columns are present.
     assert set(row.keys()) == {
         "run_id", "cache_key", "workflow", "pipeline", "experiment_id",
-        "pipeline_commit", "pipeline_dirty", "dit_commit", "workflow_file_sha1",
+        "pipeline_commit", "pipeline_dirty", "unreviewed_code",
+        "pipeline_commit_parent", "dit_commit", "workflow_file_sha1",
         "worker_image", "params_json", "output_tables", "dataflow_job_ids",
         "cloud_build_id", "started_at", "finished_at", "status", "expires_at",
     }
+
+
+def test_to_bq_row_dual_writes_pipeline_dirty_from_unreviewed():
+    # The legacy pipeline_dirty column is dual-written (= unreviewed_code)
+    # for the transition release.
+    row = _cached_run(unreviewed_code=True).to_bq_row()
+    assert row["unreviewed_code"] is True
+    assert row["pipeline_dirty"] is True
 
 
 def test_to_bq_row_timestamps_are_iso_strings():
@@ -401,6 +415,24 @@ def test_to_bq_row_nullable_fields_pass_through():
     assert row["params_json"] is None
     assert row["cloud_build_id"] is None
     assert row["finished_at"] is None
+
+
+def test_from_bq_row_falls_back_to_pipeline_dirty_pre_migration():
+    """Transition safety: a row from a not-yet-migrated table has no
+    unreviewed_code attribute (or it's NULL). from_bq_row must fall back to
+    the legacy pipeline_dirty so reads keep working before migration 002
+    backfills."""
+    # No unreviewed_code attribute at all (pre-ADD COLUMN).
+    row = _bq_row(pipeline_dirty=True)
+    del row.unreviewed_code
+    del row.pipeline_commit_parent
+    restored = CachedRun.from_bq_row(row)
+    assert restored.unreviewed_code is True
+    assert restored.pipeline_commit_parent is None
+
+    # Column present but NULL (ADDed, not yet backfilled).
+    row2 = _bq_row(pipeline_dirty=True, unreviewed_code=None)
+    assert CachedRun.from_bq_row(row2).unreviewed_code is True
 
 
 def test_to_bq_row_from_bq_row_round_trip():
@@ -437,10 +469,11 @@ def test_write_cache_calls_dml_insert():
     assert "world-fishing-827.tech_great_expectations.dit_runs" in sql
     # JSON column uses the documented PARSE_JSON(STRING_param) pattern.
     assert "PARSE_JSON(@params_json)" in sql
-    # All 18 columns appear as @parameters in the VALUES clause.
+    # All columns appear as @parameters in the VALUES clause.
     expected = {
         "run_id", "cache_key", "workflow", "pipeline", "experiment_id",
-        "pipeline_commit", "pipeline_dirty", "dit_commit", "workflow_file_sha1",
+        "pipeline_commit", "pipeline_dirty", "unreviewed_code",
+        "pipeline_commit_parent", "dit_commit", "workflow_file_sha1",
         "worker_image", "params_json", "output_tables", "dataflow_job_ids",
         "cloud_build_id", "started_at", "finished_at", "status", "expires_at",
     }
@@ -453,12 +486,14 @@ def test_write_cache_calls_dml_insert():
 
 def test_write_cache_binds_params_with_correct_values():
     client = MagicMock()
-    run = _cached_run(run_id="rid-x", cache_key="ck-x", pipeline_dirty=True)
+    run = _cached_run(run_id="rid-x", cache_key="ck-x", unreviewed_code=True)
     write_cache(run, client=client)
     job_config = client.query.call_args.kwargs["job_config"]
     by_name = {p.name: p for p in job_config.query_parameters}
     assert by_name["run_id"].value == "rid-x"
     assert by_name["cache_key"].value == "ck-x"
+    assert by_name["unreviewed_code"].value is True
+    # pipeline_dirty is dual-written from unreviewed_code during the transition.
     assert by_name["pipeline_dirty"].value is True
     # params_json is the JSON-STRING form, server-side PARSE_JSON converts.
     import json as _json
@@ -476,14 +511,15 @@ def test_write_cache_propagates_query_errors():
         write_cache(_cached_run(), client=client)
 
 
-def test_write_cache_writes_dirty_rows_too():
-    # Design invariant: dirty rows ARE inserted (registry purpose); read
-    # path filters them out. Don't suppress writes here.
+def test_write_cache_writes_unreviewed_rows_too():
+    # Design invariant: unreviewed (snapshot) rows ARE inserted. Post-M-pivot-3
+    # they're also cacheable (read_cache no longer filters them) — but the
+    # write path must still record them either way.
     client = MagicMock()
-    write_cache(_cached_run(pipeline_dirty=True), client=client)
+    write_cache(_cached_run(unreviewed_code=True), client=client)
     job_config = client.query.call_args.kwargs["job_config"]
-    dirty = next(p for p in job_config.query_parameters if p.name == "pipeline_dirty")
-    assert dirty.value is True
+    unrev = next(p for p in job_config.query_parameters if p.name == "unreviewed_code")
+    assert unrev.value is True
 
 
 def test_write_cache_handles_null_params():

@@ -19,7 +19,22 @@ CREATE TABLE IF NOT EXISTS `world-fishing-827.tech_great_expectations.dit_runs` 
   pipeline            STRING    NOT NULL,
   experiment_id       STRING    NOT NULL,
   pipeline_commit     STRING    NOT NULL,
+  -- pipeline_dirty: legacy "was the tree dirty" flag. Superseded by
+  -- unreviewed_code (M-pivot-3); retained NOT NULL for one release while
+  -- write_cache dual-writes it (= unreviewed_code), then dropped. See
+  -- migrations/002_unreviewed_code.sql + docs/no-dirty-tree-pivot.md.
   pipeline_dirty      BOOL      NOT NULL,
+  -- unreviewed_code: approximates "not a reviewed/main commit". As shipped
+  -- (M-pivot-3) it's TRUE for snapshot refs / dirty trees / DIT_PIPELINE_COMMIT
+  -- runs and FALSE for a clean checkout of ANY branch (the precise
+  -- merge-base-with-origin/main refinement is deferred). read_cache no longer
+  -- filters on it (snapshots are cacheable); informational only -- strict-
+  -- provenance queries should read FALSE as "clean checkout", not "on main".
+  unreviewed_code     BOOL,
+  -- pipeline_commit_parent: for a snapshot run, the HEAD the dirty tree was
+  -- based on (parsed from the snapshot commit message "dit snapshot of <sha>").
+  -- NULL for non-snapshot runs.
+  pipeline_commit_parent STRING,
   dit_commit          STRING    NOT NULL,
   workflow_file_sha1  STRING    NOT NULL,
   worker_image        STRING    NOT NULL,

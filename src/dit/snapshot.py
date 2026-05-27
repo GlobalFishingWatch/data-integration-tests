@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -68,6 +69,44 @@ def create_snapshot(repo_dir: str, pipeline: str) -> str:
         [str(script), pipeline, repo_dir],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
+
+
+_SNAPSHOT_MSG_PREFIX = "dit snapshot of "
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def snapshot_parent(commit: str, repo_dir: str) -> str | None:
+    """Return the parent SHA a snapshot commit was based on, or None.
+
+    A dit snapshot commit's subject is ``dit snapshot of <40-char-sha>`` (set
+    by ``scripts/snapshot.sh``). For such a commit, return ``<sha>``; for any
+    other commit (a real branch/main commit, or one we can't read), return
+    None. Recorded in ``dit_runs.pipeline_commit_parent`` so a snapshot run's
+    reproduce context survives even if the snapshot ref is later deleted.
+    """
+    # Guard against option injection: a commit-ish starting with '-' would be
+    # parsed by git as a flag. `--end-of-options` forces everything after it to
+    # be treated as a revision; the explicit reject is belt-and-suspenders for
+    # older git. snapshot_parent is only ever called with a resolved commit
+    # SHA, so a leading '-' means malformed input -> no parent.
+    if commit.startswith("-"):
+        return None
+    try:
+        subject = subprocess.run(
+            ["git", "log", "-1", "--format=%s", "--end-of-options", commit],
+            cwd=repo_dir, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if not subject.startswith(_SNAPSHOT_MSG_PREFIX):
+        return None
+    candidate = subject[len(_SNAPSHOT_MSG_PREFIX):].strip()
+    # snapshot.sh records the full 40-char HEAD sha. Validate the shape so a
+    # malformed / hand-edited message can't write junk into the
+    # pipeline_commit_parent column.
+    if _FULL_SHA_RE.fullmatch(candidate):
+        return candidate
+    return None
 
 
 def resolve_pipeline_commit(
