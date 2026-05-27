@@ -155,6 +155,20 @@ def test_snapshot_parent_none_on_unreadable_commit(repo: Path) -> None:
     assert snapshot.snapshot_parent("0000000000000000000000000000000000000000", str(repo)) is None
 
 
+def test_snapshot_parent_rejects_malformed_sha(repo: Path) -> None:
+    """A snapshot-prefixed message whose payload isn't a 40-char hex SHA must
+    NOT be recorded — guards pipeline_commit_parent against junk."""
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=str(repo),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    snap = subprocess.run(
+        ["git", "commit-tree", "-m", "dit snapshot of not-a-real-sha", tree],
+        cwd=str(repo), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert snapshot.snapshot_parent(snap, str(repo)) is None
+
+
 def test_create_snapshot_raises_without_script(monkeypatch: pytest.MonkeyPatch) -> None:
     """Non-editable install (no scripts/ dir) -> clear error rather than a
     confusing FileNotFoundError. Such installs are always a committed ref

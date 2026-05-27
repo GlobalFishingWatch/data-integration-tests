@@ -625,8 +625,10 @@ def _run_with_cache(
         pipeline="pipe-gaps",
         experiment_id=args.experiment_id,
         pipeline_commit=args.pipeline_commit,
-        # args.pipeline_dirty holds the unreviewed flag resolved in main()
-        # (snapshot / dirty / non-main -> True). See M-pivot-3.
+        # args.pipeline_dirty holds the unreviewed flag resolved in main():
+        # dirty / env-override / snapshot -> True; clean -> False. (The
+        # is-ancestor-of-main refinement for clean non-main branches is
+        # deferred -- see docs/no-dirty-tree-pivot.md § M-pivot-3.)
         unreviewed_code=args.pipeline_dirty,
         pipeline_commit_parent=args.pipeline_commit_parent,
         dit_commit=args.dit_commit,

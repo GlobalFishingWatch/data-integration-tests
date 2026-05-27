@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -71,6 +72,7 @@ def create_snapshot(repo_dir: str, pipeline: str) -> str:
 
 
 _SNAPSHOT_MSG_PREFIX = "dit snapshot of "
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 def snapshot_parent(commit: str, repo_dir: str) -> str | None:
@@ -89,8 +91,14 @@ def snapshot_parent(commit: str, repo_dir: str) -> str | None:
         ).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
-    if subject.startswith(_SNAPSHOT_MSG_PREFIX):
-        return subject[len(_SNAPSHOT_MSG_PREFIX):].strip() or None
+    if not subject.startswith(_SNAPSHOT_MSG_PREFIX):
+        return None
+    candidate = subject[len(_SNAPSHOT_MSG_PREFIX):].strip()
+    # snapshot.sh records the full 40-char HEAD sha. Validate the shape so a
+    # malformed / hand-edited message can't write junk into the
+    # pipeline_commit_parent column.
+    if _FULL_SHA_RE.fullmatch(candidate):
+        return candidate
     return None
 
 
