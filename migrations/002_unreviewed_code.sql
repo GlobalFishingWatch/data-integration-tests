@@ -11,11 +11,15 @@
 -- Why two columns:
 --   * unreviewed_code  -- sharper semantic than pipeline_dirty. The
 --     no-dirty-tree pivot makes every run a committed ref, so "dirty" stops
---     meaning anything; "is this code reviewed (merged to main)?" is the real
---     question. read_cache drops its `pipeline_dirty = FALSE` filter so that
---     content-addressable snapshot refs become cacheable on repeat runs;
---     unreviewed_code stays for strict-provenance queries that want to exclude
---     snapshot / unmerged-branch rows.
+--     meaning anything; "is this code reviewed?" is the real question.
+--     read_cache drops its `pipeline_dirty = FALSE` filter so content-
+--     addressable snapshot refs become cacheable on repeat runs.
+--     NOTE (as shipped, M-pivot-3): the flag is an APPROXIMATION -- TRUE for
+--     snapshot refs / dirty trees / DIT_PIPELINE_COMMIT runs, FALSE for a
+--     clean checkout of ANY branch. The precise "merged into origin/main"
+--     check (git merge-base --is-ancestor) is deferred. Strict-provenance
+--     queries must NOT treat unreviewed_code = FALSE as "on main" -- it only
+--     means "ran from a clean checkout".
 --   * pipeline_commit_parent  -- for snapshot rows, the HEAD the dirty tree was
 --     based on. Lets a query reconstruct the reproduce context even if the
 --     snapshot ref is later deleted (secret-leak remediation).

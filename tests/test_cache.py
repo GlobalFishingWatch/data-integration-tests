@@ -417,6 +417,24 @@ def test_to_bq_row_nullable_fields_pass_through():
     assert row["finished_at"] is None
 
 
+def test_from_bq_row_falls_back_to_pipeline_dirty_pre_migration():
+    """Transition safety: a row from a not-yet-migrated table has no
+    unreviewed_code attribute (or it's NULL). from_bq_row must fall back to
+    the legacy pipeline_dirty so reads keep working before migration 002
+    backfills."""
+    # No unreviewed_code attribute at all (pre-ADD COLUMN).
+    row = _bq_row(pipeline_dirty=True)
+    del row.unreviewed_code
+    del row.pipeline_commit_parent
+    restored = CachedRun.from_bq_row(row)
+    assert restored.unreviewed_code is True
+    assert restored.pipeline_commit_parent is None
+
+    # Column present but NULL (ADDed, not yet backfilled).
+    row2 = _bq_row(pipeline_dirty=True, unreviewed_code=None)
+    assert CachedRun.from_bq_row(row2).unreviewed_code is True
+
+
 def test_to_bq_row_from_bq_row_round_trip():
     # Symmetric: to_bq_row -> simulate BQ deserialisation -> from_bq_row
     # should reproduce the same fields the round-trip preserves.

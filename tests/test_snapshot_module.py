@@ -155,6 +155,13 @@ def test_snapshot_parent_none_on_unreadable_commit(repo: Path) -> None:
     assert snapshot.snapshot_parent("0000000000000000000000000000000000000000", str(repo)) is None
 
 
+def test_snapshot_parent_rejects_option_like_commit(repo: Path) -> None:
+    """A commit-ish starting with '-' must not be passed to git as a flag
+    (option injection / provenance corruption). Returns None up front."""
+    assert snapshot.snapshot_parent("--output=/tmp/x", str(repo)) is None
+    assert snapshot.snapshot_parent("-n1", str(repo)) is None
+
+
 def test_snapshot_parent_rejects_malformed_sha(repo: Path) -> None:
     """A snapshot-prefixed message whose payload isn't a 40-char hex SHA must
     NOT be recorded — guards pipeline_commit_parent against junk."""

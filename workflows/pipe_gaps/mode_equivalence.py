@@ -585,10 +585,12 @@ def _run_with_cache(
       call ``execute_fn(**execute_kwargs)``; write a :class:`CachedRun`
       row with the current run's metadata; return ``output_fqn``.
 
-    The cache row is written for **every** completed run including
-    dirty-tree ones (registry purpose). ``read_cache`` filters
-    ``pipeline_dirty = TRUE`` rows out of lookups so dirty runs don't
-    poison future caches.
+    The cache row is written for **every** completed run, including
+    unreviewed (snapshot / dirty-tree) ones. Post M-pivot-3 ``read_cache``
+    no longer filters on ``unreviewed_code``: the cache key is content-
+    addressable on ``pipeline_commit`` (a real or deterministic-snapshot
+    SHA), so a snapshot row is a legitimate hit for a repeat run of the same
+    uncommitted code. ``unreviewed_code`` is informational only.
     """
     cache_key_obj = _build_cache_key(args, mode, **(cache_key_extras or {}))
     cache_key = compute_cache_key(cache_key_obj)

@@ -206,9 +206,13 @@ class CachedRun:
     pipeline: str
     experiment_id: str
     pipeline_commit: str
-    # unreviewed_code: TRUE for snapshot refs / unmerged branches, FALSE for
-    # merged-to-main commits (M-pivot-3 rename of the legacy pipeline_dirty
-    # flag). read_cache no longer filters on it; it's informational.
+    # unreviewed_code: approximates "this code isn't a reviewed/main commit".
+    # As shipped (M-pivot-3) it's the M-pivot-2 resolved flag: TRUE for
+    # snapshot refs, dirty trees, and DIT_PIPELINE_COMMIT-provided commits;
+    # FALSE for a clean checkout (of ANY branch -- the precise
+    # `git merge-base --is-ancestor origin/main` refinement is deferred).
+    # read_cache no longer filters on it; it's informational. Strict-provenance
+    # queries should read FALSE as "clean checkout", not literally "on main".
     unreviewed_code: bool
     dit_commit: str
     workflow_file_sha1: str

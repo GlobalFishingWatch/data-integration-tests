@@ -84,9 +84,16 @@ def snapshot_parent(commit: str, repo_dir: str) -> str | None:
     None. Recorded in ``dit_runs.pipeline_commit_parent`` so a snapshot run's
     reproduce context survives even if the snapshot ref is later deleted.
     """
+    # Guard against option injection: a commit-ish starting with '-' would be
+    # parsed by git as a flag. `--end-of-options` forces everything after it to
+    # be treated as a revision; the explicit reject is belt-and-suspenders for
+    # older git. snapshot_parent is only ever called with a resolved commit
+    # SHA, so a leading '-' means malformed input -> no parent.
+    if commit.startswith("-"):
+        return None
     try:
         subject = subprocess.run(
-            ["git", "log", "-1", "--format=%s", commit],
+            ["git", "log", "-1", "--format=%s", "--end-of-options", commit],
             cwd=repo_dir, check=True, capture_output=True, text=True,
         ).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
