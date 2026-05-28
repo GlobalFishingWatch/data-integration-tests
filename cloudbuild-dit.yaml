@@ -33,6 +33,12 @@ substitutions:
   # from the DIT_PIPELINE_COMMIT env var instead of re-deriving git state.
   # Empty -> the workflow resolves pipeline_commit itself (clean-checkout path).
   _PIPELINE_COMMIT: ''
+  # Whether _PIPELINE_COMMIT is unreviewed (not merged into origin/main).
+  # Resolved on the laptop too: the builder can't fetch the pipeline's (SSH)
+  # origin to run the ancestor check, so without this it would treat every run
+  # as unreviewed (wasted worker-image build + broken cache reuse for reviewed
+  # refs). Empty -> the workflow falls back to its own is_unreviewed check.
+  _UNREVIEWED: ''
   # The submission-side apache-beam version must match the published Dataflow
   # worker image's beam version; otherwise workers fail with "Pipeline
   # construction environment and pipeline runtime environment are not
@@ -52,6 +58,9 @@ steps:
       # Recorded by the workflow as pipeline_commit (see dit.snapshot). Empty
       # is fine: the workflow falls back to resolving git state itself.
       - 'DIT_PIPELINE_COMMIT=${_PIPELINE_COMMIT}'
+      # Laptop-resolved unreviewed flag (the builder can't fetch origin/main to
+      # compute it). Empty -> the workflow falls back to its own check.
+      - 'DIT_UNREVIEWED=${_UNREVIEWED}'
     args:
       - -c
       - |

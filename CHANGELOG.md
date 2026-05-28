@@ -6,6 +6,14 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-05-28
+
+#### Fixed
+- **`make dit-cloud REF=<ref>` now runs the ref's code on the Dataflow workers, not the working tree.** Surfaced by the first live auto-build validation: a `REF=origin/main` baseline silently produced a false `main == fix` equivalence because the workers were running the dirty working tree, not main. Two chained defects:
+  - **Worker image was built from the working tree, not the ref.** `dit.worker_image.ensure_worker_image` built the kaniko context from `repo_dir` (the uploaded working tree) regardless of the `--REF` the submitter installed (`git+file://…@<ref>`) — a submitter-vs-worker code mismatch exactly of the kind this machinery exists to prevent. It now materialises the **commit's** tree via `git archive <commit>` into a temp context (new `dit.worker_image._export_commit_tree`), so workers and submitter run the same code. Bonus: untracked files and `.git` are excluded from the build context for free.
+  - **`is_unreviewed` couldn't reach `origin/main` inside ditbox.** Its `git fetch origin main` fails in the builder (pipelines' `origin` is an SSH URL with no key there), so it fell back to build-when-unsure → every cloud run treated as unreviewed (wasted worker-image builds for reviewed refs + broken cache reuse). `unreviewed` is now resolved **on the laptop** (`merge-base --is-ancestor` against a freshly-fetched `origin/main`) and threaded into the build as `_UNREVIEWED` → `DIT_UNREVIEWED`, mirroring the existing laptop-side `_PIPELINE_COMMIT` resolution. The workflow reads it (`dit.snapshot._unreviewed_from_env_or_check`) and only falls back to the live check when the env var is absent (local `dit run`). 7 new tests (`tests/test_worker_image.py`, `tests/test_snapshot_module.py`).
+  - Unaffected: the dirty-tree common case (no `REF`) was always correct (working tree == snapshot tree == built image). The `--suffix` / cross-version path still computes its own classification (it uses an explicit per-binding `--worker-image`).
+
 ### 2026-05-22
 
 #### Planned (no-dirty-tree pivot — remaining)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -61,33 +62,76 @@ def _image_exists(tag: str) -> bool:
     return proc.returncode == 0
 
 
-def _build_and_push(repo_dir: str, tag: str) -> None:
-    """Submit the kaniko Cloud Build that builds the pipeline's prod target."""
+def _export_commit_tree(repo_dir: str, commit: str, dest: str) -> None:
+    """Materialise ``commit``'s tracked tree into ``dest`` (``git archive``).
+
+    ``git archive <commit> | tar -x -C dest`` exports exactly the commit's tree
+    -- no working-tree state, no untracked files, no ``.git``.
+    ``--end-of-options`` guards against a commit-ish that starts with ``-``.
+    """
+    try:
+        archive = subprocess.run(
+            ["git", "archive", "--format=tar", "--end-of-options", commit],
+            cwd=repo_dir, check=True, capture_output=True,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "git not found on PATH; worker-image auto-build needs git to export "
+            "the commit tree."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+        raise RuntimeError(
+            f"`git archive {commit}` in {repo_dir} failed (is the commit present "
+            f"there?): {stderr}"
+        ) from e
+    try:
+        subprocess.run(["tar", "-x", "-C", dest], input=archive.stdout, check=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "tar not found on PATH; worker-image auto-build needs tar to unpack "
+            "the commit tree."
+        ) from e
+
+
+def _build_and_push(repo_dir: str, tag: str, commit: str) -> None:
+    """Submit the kaniko Cloud Build that builds the pipeline's prod target.
+
+    The build context is ``commit``'s tree (materialised via ``git archive``),
+    NOT ``repo_dir``'s working tree. This is load-bearing for a ``--REF`` run:
+    the submitter installs ``<commit>`` (``git+file://...@<ref>``), but
+    ``repo_dir`` may hold a *different* checkout -- a dirty tree, or a branch
+    other than the ref. Building from the working tree would put the workers on
+    different code than the submitter, which is exactly the submitter-vs-worker
+    mismatch this function exists to close. ``git archive`` also excludes
+    untracked files and ``.git`` from the context (the .gcloudignore hardening
+    against shipping rogue .env/sa.json still applies on top).
+    """
     config = _dit_root() / "docker" / "worker-image" / "cloudbuild.yaml"
     if not config.exists():
         raise RuntimeError(
             f"worker-image build config not found at {config}; auto-build needs "
             "an editable dit install (pip install -e)."
         )
-    # Upload the build context under dit's .gcloudignore (same hardening as
-    # `make dit-cloud`): the pipeline checkout may hold gitignored local files
-    # (.env, sa.json, datasets) we must NOT ship to the Cloud Build staging
-    # bucket. The Dockerfile only COPYs what it needs, but the source tarball
-    # would otherwise include everything not ignored.
     ignore_file = _dit_root() / ".gcloudignore"
-    cmd = ["gcloud", "builds", "submit", f"--config={config}"]
-    if ignore_file.exists():
-        cmd.append(f"--ignore-file={ignore_file}")
-    cmd += [f"--substitutions=_IMAGE={tag}", repo_dir]
-    logger.info("building worker image %s from %s (kaniko Cloud Build)", tag, repo_dir)
-    try:
-        subprocess.run(cmd, check=True)
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            "gcloud not found on PATH; worker-image auto-build needs the Cloud "
-            "SDK. Install it, or pass an explicit --worker-image so dit skips "
-            "the build."
-        ) from e
+    with tempfile.TemporaryDirectory(prefix="dit-worker-ctx-") as ctx:
+        _export_commit_tree(repo_dir, commit, ctx)
+        cmd = ["gcloud", "builds", "submit", f"--config={config}"]
+        if ignore_file.exists():
+            cmd.append(f"--ignore-file={ignore_file}")
+        cmd += [f"--substitutions=_IMAGE={tag}", ctx]
+        logger.info(
+            "building worker image %s from %s@%s (kaniko Cloud Build)",
+            tag, repo_dir, commit,
+        )
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                "gcloud not found on PATH; worker-image auto-build needs the Cloud "
+                "SDK. Install it, or pass an explicit --worker-image so dit skips "
+                "the build."
+            ) from e
 
 
 def ensure_worker_image(
@@ -132,5 +176,5 @@ def ensure_worker_image(
         "run executes unreviewed code (%s) against the default worker image; "
         "auto-building a worker image so the workers actually run it.", commit,
     )
-    _build_and_push(repo_dir, tag)
+    _build_and_push(repo_dir, tag, commit)
     return tag
