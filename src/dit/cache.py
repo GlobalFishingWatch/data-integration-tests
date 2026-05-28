@@ -571,10 +571,21 @@ def read_rows_for_run(run_id: str, *, client: Any = None) -> list[CachedRun]:
 # Cancellation helpers (used by `make dit-cancel`; see Milestone 5)
 # --------------------------------------------------------------------------
 
-#: Dataflow job states that are still cancellable. Anything not in this set
-#: (Done, Failed, Cancelled, Drained, ...) is already terminal -- cancelling
-#: it is a no-op, so we skip the call to keep the path idempotent + quiet.
-_CANCELLABLE_DATAFLOW_STATES = frozenset({"Running", "Pending"})
+#: Dataflow job states that are already TERMINAL -- the job is finished and
+#: cancelling it is a no-op, so we skip the call to keep the path idempotent
+#: + quiet. Stated as the terminal set (not the active set) deliberately:
+#: anything NOT in here is treated as still-active and gets cancelled, so a
+#: transient/queued state we don't enumerate (e.g. ``Queued``, ``Pending``,
+#: ``Cancelling``, ``Draining``, ``Stopped``, or any future enum value) is
+#: cancelled rather than silently skipped -- a skipped-but-not-terminal job
+#: would start running after the cancel, defeating the cleanup.
+#:
+#: These are the displayed enum values ``gcloud dataflow jobs list
+#: --format=json(state)`` returns (e.g. ``Running`` / ``Done`` / ``Queued``),
+#: not the API's ``JOB_STATE_*`` form.
+_TERMINAL_DATAFLOW_STATES = frozenset(
+    {"Done", "Failed", "Cancelled", "Drained", "Updated"}
+)
 
 
 def _looks_like_table_fqn(value: str) -> bool:
@@ -692,53 +703,81 @@ def cancel_run(
 
     The single control-plane cleanup entry point behind ``dit cache-cancel`` /
     ``make dit-cancel``. Operates on **all rows sharing ``run_id``** (one per
-    mode). Three steps, each idempotent so re-running on a partially- or
-    fully-cancelled run is safe:
+    mode). Each step is idempotent so re-running on a partially- or
+    fully-cancelled run is safe.
+
+    **Ordering is load-bearing**: Dataflow-job discovery + cancel runs FIRST,
+    before the row lookup gates anything. Cache rows are written only AFTER a
+    mode completes, so the primary cancel target -- an in-flight (stuck /
+    still-running) run -- has a live ``dit_run_id``-labelled Dataflow job but
+    NO row yet. Gating on rows first (the previous behaviour) would raise and
+    leave that job running, which is exactly the case cancel exists for. So:
 
     1. **Cancel Dataflow jobs** discovered by the ``dit_run_id=<run_id>``
-       label (NOT the row's ``dataflow_job_ids``, which are always ``[]``).
-       Only jobs in a cancellable state (Running / Pending) are cancelled.
-    2. **Delete output tables** recorded on the rows. CRITICAL SAFETY: only
-       fully-qualified ``project.dataset.table`` values are deleted, at the
-       table level. A value that looks like a dataset (or is otherwise
-       malformed) is skipped with a warning -- ``dit_exp_*`` snapshot datasets
-       and any dataset-level delete are categorically out of scope (manual
-       deletion of shared snapshot datasets has broken live runs before; see
-       CLAUDE.md).
-    3. **UPDATE status='cancelled'** on every row of the run.
+       label (NOT the rows' ``dataflow_job_ids``, which are always ``[]``).
+       Only jobs not in a terminal state are cancelled. Runs whether or not
+       any cache row exists yet.
+    2. **If rows exist**: delete the output tables recorded on them. CRITICAL
+       SAFETY: only fully-qualified ``project.dataset.table`` values are
+       deleted, at the table level. A value that looks like a dataset (or is
+       otherwise malformed) is skipped with a warning -- ``dit_exp_*`` snapshot
+       datasets and any dataset-level delete are categorically out of scope
+       (manual deletion of shared snapshot datasets has broken live runs
+       before; see CLAUDE.md). Then **UPDATE status='cancelled'** on every row.
+       A run with a live job but no row yet has nothing to delete / mark; the
+       row(s) it eventually writes will carry the mode's normal status (the
+       cancelled Dataflow job means those modes won't actually complete).
 
     ``region`` defaults to ``DIT_DATAFLOW_REGION`` then ``us-central1`` --
     matching the same env knob both workflows resolve their region from. Pass
     explicitly for non-default placements.
 
-    Raises ``ValueError`` when ``run_id`` matches no rows (a typo'd id should
-    surface loudly, not silently no-op).
+    Raises ``ValueError`` only when ``run_id`` matches BOTH no rows AND no
+    labelled Dataflow jobs -- a genuinely-unknown id (likely a typo) surfaces
+    loudly. A labelled job without a row is a real in-flight run and is
+    cancelled, never rejected.
     """
     region = region or os.environ.get("DIT_DATAFLOW_REGION", "us-central1")
     client = client or _make_client()
 
-    rows = read_rows_for_run(run_id, client=client)
-    if not rows:
-        raise ValueError(
-            f"cancel_run: no rows found for run_id={run_id!r} in {TABLE_FQN}. "
-            "Check the id (the per-run 12-hex from the workflow's run_id= log line)."
-        )
-
-    logger.info(
-        "cancel_run %s: %d row(s); region=%s", run_id, len(rows), region,
-    )
-
-    # Step 1 -- cancel Dataflow jobs discovered by label.
+    # Step 1 -- cancel Dataflow jobs discovered by label. FIRST, because an
+    # in-flight run (the primary cancel target) has a live labelled job but no
+    # cache row yet (rows are written only on mode completion).
     jobs = _discover_dataflow_jobs(run_id, region)
-    logger.info("cancel_run %s: discovered %d Dataflow job(s) by label", run_id, len(jobs))
+    logger.info(
+        "cancel_run %s: discovered %d Dataflow job(s) by label; region=%s",
+        run_id, len(jobs), region,
+    )
     for job in jobs:
-        if job["state"] in _CANCELLABLE_DATAFLOW_STATES:
-            _cancel_dataflow_job(job["id"], region)
-        else:
+        if job["state"] in _TERMINAL_DATAFLOW_STATES:
             logger.info(
                 "skip Dataflow job %s (state=%s; already terminal)",
                 job["id"], job["state"],
             )
+        else:
+            _cancel_dataflow_job(job["id"], region)
+
+    rows = read_rows_for_run(run_id, client=client)
+
+    # A genuinely-unknown run_id (no rows AND no labelled jobs) surfaces
+    # loudly; but a labelled-job-without-row is a real in-flight run we've
+    # just cancelled, so it must NOT raise.
+    if not rows and not jobs:
+        raise ValueError(
+            f"cancel_run: no rows and no labelled Dataflow jobs found for "
+            f"run_id={run_id!r} in {TABLE_FQN} / region={region}. "
+            "Check the id (the per-run 12-hex from the workflow's run_id= log line)."
+        )
+
+    if not rows:
+        logger.info(
+            "cancel_run %s: no cache row yet (in-flight run); cancelled "
+            "%d labelled job(s), nothing to delete / mark.",
+            run_id, len(jobs),
+        )
+        return
+
+    logger.info("cancel_run %s: %d row(s)", run_id, len(rows))
 
     # Step 2 -- delete output tables (table-level only; dataset-shaped or
     # malformed values are skipped). Dedupe across the run's rows so a table
@@ -759,6 +798,6 @@ def cancel_run(
                 continue
             _delete_output_table(fqn, client=client)
 
-    # Step 3 -- mark the run cancelled.
+    # Mark the run cancelled.
     _mark_run_cancelled(run_id, client=client)
     logger.info("cancel_run %s: marked %d row(s) status=%s", run_id, len(rows), STATUS_CANCELLED)

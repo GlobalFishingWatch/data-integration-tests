@@ -28,6 +28,11 @@ def _args(**overrides: Any) -> argparse.Namespace:
         named_anchorages="world-fishing-827.anchorages.named_anchorages_v1",
         thinned_message_table=None,
         dest_dataset="tech_great_expectations",
+        # Submitter image identity (Fix 1): build_from_source decides whether
+        # the key folds the published image's digest or a build marker.
+        build_from_source=False,
+        image_tag="gfw/pipe-anchorages:v4.6.4",
+        submitter_image_digest="gcr.io/foo/pipe-anchorages@sha256:5ub",
         # Per-`main()` context normally set inside main():
         run_id="rid01",
         experiment_id="exp01",
@@ -198,7 +203,12 @@ def test_run_with_cache_miss_runs_and_writes():
     assert written.run_id == "rid01"
     # Returns the FRESH visits-table FQN we just computed.
     assert result == mod._visits_table(args, suffix, mod.MODE_BF)
-    assert written.output_tables == [result]
+    # Records BOTH the visits table (comparison target, first) AND the per-mode
+    # thinned port_events intermediate (Fix 4: cleanup target).
+    assert written.output_tables == [
+        result,
+        mod._thinned_table(args, suffix, mod.MODE_BF),
+    ]
 
 
 def test_run_with_cache_stale_recomputes():
@@ -229,3 +239,127 @@ def test_run_with_cache_writes_unreviewed_rows():
         mod._run_with_cache(args, mod.MODE_BF, "exp01_abc_x", execute_fn)
     written = mock_write.call_args.args[0]
     assert written.unreviewed_code is True
+
+
+# --------------------------------------------------------------------------
+# Fix 1 — submitter image identity in the cache key
+# --------------------------------------------------------------------------
+
+def test_canonical_params_dict_published_image_folds_submitter_digest():
+    # build_from_source=False: the published submitter image's digest is folded
+    # into the key (stamped on args in main()); not the raw build marker.
+    p = mod.canonical_params_dict(
+        _args(build_from_source=False,
+              submitter_image_digest="gcr.io/x/pa@sha256:beef"),
+        mod.MODE_BF,
+    )
+    assert p["submitter_image_digest"] == "gcr.io/x/pa@sha256:beef"
+    assert "submitter_build_from_source" not in p
+
+
+def test_canonical_params_dict_build_from_source_uses_marker_not_digest():
+    # build_from_source=True: the submitter image is built from the worktree, so
+    # its content == pipeline_commit (already in the CacheKey). A marker keeps a
+    # build-from-source run distinct from a published-image run at same commit.
+    p = mod.canonical_params_dict(_args(build_from_source=True), mod.MODE_BF)
+    assert p["submitter_build_from_source"] is True
+    assert "submitter_image_digest" not in p
+
+
+def test_canonical_params_dict_different_published_submitter_images_differ():
+    # SOUNDNESS: two runs, same commit + same worker image, but DIFFERENT
+    # published submitter images must NOT share a cache key.
+    a = mod.canonical_params_dict(
+        _args(build_from_source=False,
+              submitter_image_digest="gcr.io/x/pa@sha256:aaaa"),
+        mod.MODE_BF,
+    )
+    b = mod.canonical_params_dict(
+        _args(build_from_source=False,
+              submitter_image_digest="gcr.io/x/pa@sha256:bbbb"),
+        mod.MODE_BF,
+    )
+    assert a != b
+
+
+def test_canonical_params_dict_published_vs_build_from_source_differ():
+    # A published-image run and a build-from-source run differ in the key even
+    # at the same commit (different artefacts).
+    pub = mod.canonical_params_dict(
+        _args(build_from_source=False,
+              submitter_image_digest="gcr.io/x/pa@sha256:aaaa"),
+        mod.MODE_BF,
+    )
+    bfs = mod.canonical_params_dict(_args(build_from_source=True), mod.MODE_BF)
+    assert pub != bfs
+
+
+def test_build_cache_key_differs_on_submitter_image():
+    # The end-to-end CacheKey (not just params) changes with the submitter image.
+    from dit.cache import compute_cache_key
+    k1 = mod._build_cache_key(
+        _args(build_from_source=False, submitter_image_digest="gcr.io/x/pa@sha256:aaaa"),
+        mod.MODE_BF,
+    )
+    k2 = mod._build_cache_key(
+        _args(build_from_source=False, submitter_image_digest="gcr.io/x/pa@sha256:bbbb"),
+        mod.MODE_BF,
+    )
+    assert compute_cache_key(k1) != compute_cache_key(k2)
+
+
+def test_submitter_image_identity_falls_back_to_tag_when_digest_unstamped():
+    # If main()'s digest resolution failed it stamps the raw tag; if it never
+    # ran (compare-only / unit paths), getattr falls back to args.image_tag so
+    # the key is still tag-distinct rather than blowing up.
+    args = _args(build_from_source=False)
+    del args.submitter_image_digest  # simulate "never stamped"
+    p = mod.canonical_params_dict(args, mod.MODE_BF)
+    assert p["submitter_image_digest"] == args.image_tag
+
+
+# --------------------------------------------------------------------------
+# Fix 4 — port_events intermediate recorded for cleanup
+# --------------------------------------------------------------------------
+
+def test_run_with_cache_miss_records_visits_and_port_events():
+    # A cache miss records BOTH the visits table (comparison, output_tables[0])
+    # and the per-mode thinned port_events intermediate, so cancel_run can clean
+    # up the intermediate that would otherwise be orphaned.
+    args = _args()
+    suffix = "exp01_abc1234_aabbcc"
+    execute_fn = MagicMock()
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True, True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
+                     return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
+    ):
+        result = mod._run_with_cache(args, mod.MODE_BF, suffix, execute_fn)
+    written = mock_write.call_args.args[0]
+    visits = mod._visits_table(args, suffix, mod.MODE_BF)
+    port_events = mod._thinned_table(args, suffix, mod.MODE_BF)
+    assert result == visits  # comparison target unchanged
+    assert written.output_tables[0] == visits  # visits FIRST (the hit returns [0])
+    assert port_events in written.output_tables
+    assert len(written.output_tables) == 2
+
+
+def test_run_with_cache_miss_external_thinned_table_records_only_visits():
+    # When --thinned-message-table is set, step 1 is skipped and the workflow
+    # creates no thinned table of its own; only the visits table is recorded
+    # (the external thinned table belongs to the caller, not us).
+    args = _args(thinned_message_table="proj.ds.external_thinned")
+    suffix = "exp01_abc1234_aabbcc"
+    execute_fn = MagicMock()
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
+                     return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
+    ):
+        mod._run_with_cache(args, mod.MODE_BF, suffix, execute_fn)
+    written = mock_write.call_args.args[0]
+    assert written.output_tables == [mod._visits_table(args, suffix, mod.MODE_BF)]

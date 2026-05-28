@@ -118,11 +118,34 @@ def _patch_rows(rows: list[CachedRun]):
     return patch.object(dit_cache, "read_rows_for_run", return_value=rows)
 
 
-def test_cancel_run_no_rows_raises() -> None:
+def test_cancel_run_no_rows_and_no_jobs_raises() -> None:
+    # A genuinely-unknown run_id: no cache rows AND no labelled Dataflow jobs.
+    # That (and only that) surfaces loudly.
     client = MagicMock()
-    with _patch_rows([]):
-        with pytest.raises(ValueError, match="no rows found"):
+    run = MagicMock(return_value=_gcloud_jobs())  # empty jobs list
+    with _patch_rows([]), patch.object(dit_cache.subprocess, "run", run):
+        with pytest.raises(ValueError, match="no rows and no labelled"):
             cancel_run("missing", client=client, region="us-central1")
+
+
+def test_cancel_run_no_rows_but_labelled_job_cancels_without_raising() -> None:
+    # FUNCTIONAL GAP (Fix 2): an in-flight run has a live dit_run_id-labelled
+    # Dataflow job but NO cache row yet (rows are written only on mode
+    # completion). cancel_run must cancel the job and NOT raise.
+    client = MagicMock()
+    run = MagicMock()
+    run.side_effect = [
+        _gcloud_jobs({"id": "job-inflight", "name": "n", "state": "Running"}),
+        SimpleNamespace(returncode=0, stdout="", stderr=""),  # cancel
+    ]
+    with _patch_rows([]), patch.object(dit_cache.subprocess, "run", run):
+        cancel_run("rid01", client=client, region="us-central1")  # no raise
+    # The in-flight job was cancelled.
+    cancel_argv = run.call_args_list[1].args[0]
+    assert "cancel" in cancel_argv and "job-inflight" in cancel_argv
+    # No row -> nothing to delete, no UPDATE issued.
+    client.delete_table.assert_not_called()
+    assert not any("UPDATE" in c.args[0] for c in client.query.call_args_list)
 
 
 def test_cancel_run_discovers_jobs_by_label_and_cancels_running() -> None:
@@ -167,6 +190,31 @@ def test_cancel_run_deletes_output_tables() -> None:
     # not_found_ok keeps deletion idempotent.
     for c in client.delete_table.call_args_list:
         assert c.kwargs.get("not_found_ok") is True
+
+
+def test_cancel_run_deletes_both_visits_and_port_events() -> None:
+    # Fix 4: a port-visits cache row records BOTH the visits table and the
+    # per-mode thinned port_events intermediate; cancel_run must delete both
+    # so the intermediate isn't orphaned.
+    client = MagicMock()
+    rows = [
+        _cached_run(
+            workflow="workflows/port_visits/ais.py",
+            pipeline="anchorages_pipeline",
+            output_tables=[
+                "world-fishing-827.tech_great_expectations.port_visits_exp_c_u_1_bf",
+                "world-fishing-827.tech_great_expectations.port_events_exp_c_u_1_bf",
+            ],
+        )
+    ]
+    run = MagicMock(return_value=_gcloud_jobs())  # no jobs found
+    with _patch_rows(rows), patch.object(dit_cache.subprocess, "run", run):
+        cancel_run("rid01", client=client, region="us-central1")
+    deleted = {c.args[0] for c in client.delete_table.call_args_list}
+    assert deleted == {
+        "world-fishing-827.tech_great_expectations.port_visits_exp_c_u_1_bf",
+        "world-fishing-827.tech_great_expectations.port_events_exp_c_u_1_bf",
+    }
 
 
 def test_cancel_run_dedupes_tables_across_rows() -> None:
@@ -247,6 +295,35 @@ def test_cancel_run_tolerates_gcloud_list_failure() -> None:
         cancel_run("rid01", client=client, region="us-central1")
     client.delete_table.assert_called_once()
     assert any("UPDATE" in c.args[0] for c in client.query.call_args_list)
+
+
+def test_cancel_run_cancels_queued_job() -> None:
+    # ROBUSTNESS (Fix 3): a Queued job is non-terminal -- it would start later
+    # if left alone -- so it must be cancelled, not skipped.
+    client = MagicMock()
+    rows = [_cached_run()]
+    run = MagicMock()
+    run.side_effect = [
+        _gcloud_jobs({"id": "job-queued", "name": "n", "state": "Queued"}),
+        SimpleNamespace(returncode=0, stdout="", stderr=""),  # cancel
+    ]
+    with _patch_rows(rows), patch.object(dit_cache.subprocess, "run", run):
+        cancel_run("rid01", client=client, region="us-central1")
+    cancel_argv = run.call_args_list[1].args[0]
+    assert "cancel" in cancel_argv and "job-queued" in cancel_argv
+    assert run.call_count == 2  # list + cancel
+
+
+def test_cancel_run_skips_terminal_done_job() -> None:
+    # A terminal Done job is a no-op to cancel -> skipped (no cancel subprocess).
+    client = MagicMock()
+    rows = [_cached_run()]
+    run = MagicMock(
+        return_value=_gcloud_jobs({"id": "job-done", "name": "n", "state": "Done"})
+    )
+    with _patch_rows(rows), patch.object(dit_cache.subprocess, "run", run):
+        cancel_run("rid01", client=client, region="us-central1")
+    assert run.call_count == 1  # list only; no cancel for a terminal job
 
 
 def test_cancel_run_idempotent_when_jobs_terminal() -> None:

@@ -27,7 +27,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -281,19 +281,30 @@ def run_with_cache(
     cache_key: CacheKey,
     output_fqn: str,
     execute_kwargs: dict[str, Any],
+    extra_output_tables: Sequence[str] = (),
     log_label: str = "",
 ) -> str:
     """Wrap an ``execute_*`` call with cache lookup + record-on-miss.
 
     Returns the FQN of the output table to use for downstream comparisons:
 
-    * On cache **hit** (matching key + output tables verified to still exist):
-      skip ``execute_fn`` entirely; return the cached row's
-      ``output_tables[0]`` (the cached FQN, which differs from the current
-      run's ``output_fqn`` because of the per-run UUID suffix).
-    * On cache **miss** or **stale** (row exists but tables expired): call
+    * On cache **hit** (matching key + all recorded output tables verified to
+      still exist): skip ``execute_fn`` entirely; return the cached row's
+      ``output_tables[0]`` (the cached comparison FQN, which differs from the
+      current run's ``output_fqn`` because of the per-run UUID suffix).
+    * On cache **miss** or **stale** (row exists but some table expired): call
       ``execute_fn(**execute_kwargs)``; write a :class:`CachedRun` row with the
       current run's metadata; return ``output_fqn``.
+
+    ``output_fqn`` is the **comparison** FQN -- always recorded FIRST in the
+    row's ``output_tables`` list, so a cache hit's ``output_tables[0]`` is the
+    table to compare. ``extra_output_tables`` are additional artefacts the run
+    produced (e.g. port-visits' per-mode thinned ``port_events_*`` intermediate)
+    that must be tracked for cleanup (``cancel_run`` deletes every recorded
+    output table) but are NOT comparison targets. They participate in
+    existence-verification on a hit (a missing intermediate is a stale entry)
+    and in the cache row's TTL (:func:`expires_at_for` over all outputs).
+    pipe-gaps passes none -> byte-identical single-element ``output_tables``.
 
     The cache row is written for **every** completed run, including unreviewed
     (snapshot / dirty-tree) ones. Post M-pivot-3 ``read_cache`` no longer
@@ -335,7 +346,13 @@ def run_with_cache(
     execute_fn(**execute_kwargs)
     finished_at = datetime.now(timezone.utc)
 
+    # Comparison FQN first (output_tables[0] is what a future hit returns),
+    # then any extra artefacts (deduped, order-preserving) so cleanup can drop
+    # every table this run produced -- not just the comparison target.
     output_tables = [output_fqn]
+    for fqn in extra_output_tables:
+        if fqn not in output_tables:
+            output_tables.append(fqn)
     row = CachedRun(
         run_id=ctx.run_id,
         cache_key=computed_key,

@@ -52,7 +52,7 @@ from typing import Optional, Sequence
 from dit import compare as dit_compare
 from dit import dates as dit_dates
 from dit import workflow as dit_workflow
-from dit.cache import CacheKey, sha1_of_workflow_file
+from dit.cache import CacheKey, resolve_worker_image_to_digest, sha1_of_workflow_file
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
@@ -492,6 +492,50 @@ def execute_bftruncate(args: argparse.Namespace, suffix: str) -> None:
 # Run cache integration (M5b of dit.cache rollout; see docs/run-cache-impl.md)
 # --------------------------------------------------------------------------
 
+def _submitter_image_identity(args: argparse.Namespace) -> dict:
+    """Cache-key contribution that content-addresses the **submitter** image.
+
+    SOUNDNESS (M5 fix): a port-visits run loads pipe-anchorages code in TWO
+    places, both of which determine output:
+
+    * the **submitter** image (``args.image_tag``, run by ``dit_docker.run``)
+      builds and submits the Beam graph -- the pipeline-construction code; and
+    * the **worker** image (``--sdk_container_image={args.worker_image}``) runs
+      the DoFns on Dataflow.
+
+    The cache key already content-addresses the worker image (via
+    ``worker_image_digest``) and the local source (via ``pipeline_commit``).
+    Without the submitter image too, two runs with the SAME worker image + SAME
+    local commit but DIFFERENT submitter images would collide on a wrong cache
+    hit. So the submitter image's identity must be in the key. Two cases:
+
+    * ``build_from_source=True`` -- the submitter image is built fresh from the
+      local worktree, so its content is already captured by ``pipeline_commit``
+      (a real or deterministic-snapshot SHA). No extra field needed; we record
+      a marker so a build-from-source run and a published-image run at the same
+      commit still differ in the key (they are different artefacts).
+    * ``build_from_source=False`` -- the submitter is the published
+      ``args.image_tag``. We add its resolved digest (``submitter_image_digest``,
+      stamped on ``args`` in :func:`main` via the same
+      :func:`resolve_worker_image_to_digest` machinery the worker image uses).
+      If resolution failed, ``main`` stamps the raw tag string instead so
+      different tags at least don't collide (logged there as tag-based).
+
+    Mode-independent (the submitter image is identical across modes), so this
+    sits outside the ``_MODES_USING_TAIL`` branch.
+    """
+    if args.build_from_source:
+        return {"submitter_build_from_source": True}
+    # Published submitter image: digest (preferred) or raw tag (fallback),
+    # stamped on args in main(). getattr keeps the compare-only / test paths
+    # that never call main() working (they don't hit a real submitter image).
+    return {
+        "submitter_image_digest": getattr(
+            args, "submitter_image_digest", args.image_tag
+        )
+    }
+
+
 def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     """Output-affecting params for a port-visits mode-equivalence run.
 
@@ -504,11 +548,16 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
 
     Output content depends on: the mode, the inclusive date window, the
     source dataset stem (the input AIS cohort), the named-anchorages
-    reference, and -- when set -- ``thinned_message_table`` (skips step 1 and
-    reads pre-thinned messages from that table, which changes what step 2
-    sees). Excludes plumbing (datasets, regions, SAs), naming
-    (experiment_id, suffix, binding), and runner-only knobs (image_tag,
-    worker_image, build_from_source, parallel).
+    reference, the **submitter image identity** (see
+    :func:`_submitter_image_identity` -- the pipeline-construction code that
+    builds/submits the Beam graph; mode-independent), and -- when set --
+    ``thinned_message_table`` (skips step 1 and reads pre-thinned messages from
+    that table, which changes what step 2 sees). Excludes plumbing (datasets,
+    regions, SAs), naming (experiment_id, suffix, binding), and runner-only
+    knobs (worker_image is in the key via ``worker_image_digest`` on the
+    CacheKey itself; ``parallel`` doesn't affect output). NOTE: ``image_tag``
+    is NOT a pure runner-only knob -- it IS the submitter image, so its
+    identity is folded in via ``_submitter_image_identity`` above.
     """
     params: dict = {
         "mode": mode,
@@ -517,6 +566,7 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
         "source_dataset_stem": args.source_dataset_stem,
         "named_anchorages": args.named_anchorages,
         "thinned_message_table": args.thinned_message_table,
+        **_submitter_image_identity(args),
     }
     if mode in _MODES_USING_TAIL:
         params["tail_days"] = args.tail_days
@@ -541,9 +591,23 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
     :class:`RunContext` (stamped on ``args`` in :func:`main`) + the
     port-visits workflow/pipeline identity into the generic wrapper. Returns
     the visits-table FQN to compare (cached on hit, freshly computed on miss).
+
+    The two-step chain (thin_port_messages -> port_visits) produces TWO tables
+    per mode: the visits table (the comparison target, passed as ``output_fqn``)
+    and the per-mode thinned ``port_events_<suffix>_<mode>`` intermediate. Both
+    are recorded on the cache row so ``cancel_run`` cleans up both -- otherwise
+    the intermediate is orphaned. EXCEPTION: when ``--thinned-message-table`` is
+    set, step 1 is skipped and the workflow does NOT create a thinned table (it
+    reads the user's external one), so there's nothing of ours to record /
+    clean up -- we record only the visits table in that case.
     """
     cache_key = _build_cache_key(args, mode)
     output_fqn = _visits_table(args, suffix, mode)
+    # Only OUR thinned table is a cleanup target; the external one (when
+    # --thinned-message-table is set) belongs to the caller, never us.
+    extra_output_tables = (
+        () if args.thinned_message_table else (_thinned_table(args, suffix, mode),)
+    )
     return dit_workflow.run_with_cache(
         execute_fn,
         ctx=args.run_context,
@@ -553,6 +617,7 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
         cache_key=cache_key,
         output_fqn=output_fqn,
         execute_kwargs={"args": args, "suffix": suffix},
+        extra_output_tables=extra_output_tables,
         log_label=mode,
     )
 
@@ -685,6 +750,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args.worker_image = ctx.worker_image
     args.worker_image_digest = ctx.worker_image_digest
     args.run_id = ctx.run_id
+
+    # SOUNDNESS (Fix 1): the submitter image (args.image_tag, run by
+    # dit_docker.run to build/submit the Beam graph) is a second code source
+    # that determines output, alongside the worker image. For a published
+    # submitter image (no --build-from-source) resolve it to a content-
+    # addressable digest the same way resolve_run_context resolves the worker
+    # image, so two different published submitter images don't collide on a
+    # cache hit. build_from_source folds into pipeline_commit instead (the
+    # image is built from the worktree) -- see _submitter_image_identity.
+    if not args.build_from_source:
+        try:
+            args.submitter_image_digest = resolve_worker_image_to_digest(args.image_tag)
+        except RuntimeError as e:
+            logger.warning(
+                "could not resolve submitter image %s to a digest (%s); the "
+                "cache key falls back to the raw tag string for this run "
+                "(tag-based, NOT digest-based -- a :tag retag won't invalidate "
+                "the cache). Different tags still don't collide.",
+                args.image_tag, e,
+            )
+            args.submitter_image_digest = args.image_tag
 
     suffix = _resolve_suffix(args)
 
