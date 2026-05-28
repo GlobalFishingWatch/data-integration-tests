@@ -2,7 +2,7 @@
 
 **Status:** implemented (M1–M4) + evolved by the no-dirty-tree pivot. Owner: dit. Drafted 2026-05-22.
 
-> **⚠ Historical-design note.** This doc captures the *original* cache design, in which `pipeline_dirty` gated cache reads (`AND NOT pipeline_dirty`) and dirty rows were write-only. **M-pivot-3 superseded that:** dirty trees auto-snapshot to a content-addressable committed ref, `read_cache` no longer filters at all, the `pipeline_dirty` column was renamed `unreviewed_code` (informational), and a `pipeline_commit_parent` column was added. Where the Schema / lookup-SQL sections below still show `pipeline_dirty` / `AND NOT pipeline_dirty`, read them as the historical shape — the current schema is `migrations/001_dit_meta_runs.sql` + `migrations/002_unreviewed_code.sql`, and the current behaviour is in [`docs/no-dirty-tree-pivot.md`](no-dirty-tree-pivot.md) § M-pivot-3. A full rewrite of this doc lands in M-pivot-5.
+> **Note — superseded by the no-dirty-tree pivot.** This doc is the original cache design (the "Why" still holds). The dirty-tree handling it describes was reworked: dirty trees auto-snapshot to a content-addressable committed ref, `read_cache` no longer filters at all, `pipeline_dirty` was superseded by `unreviewed_code` (TRUE unless the commit is merged into `origin/main`; gates worker-image auto-build, doesn't gate reads), and `pipeline_commit_parent` was added. The Schema + lookup-SQL below are reconciled with that (M-pivot-5); the authoritative current behaviour lives in [`docs/no-dirty-tree-pivot.md`](no-dirty-tree-pivot.md) and the live schema in `migrations/001_dit_meta_runs.sql` + `migrations/002_unreviewed_code.sql`.
 
 ## Why
 
@@ -26,8 +26,10 @@ CREATE TABLE `world-fishing-827.tech_great_expectations.dit_runs` (
   workflow         STRING    NOT NULL,  -- e.g. "workflows/pipe_gaps/mode_equivalence.py"
   pipeline         STRING    NOT NULL,  -- "pipe-gaps" / "anchorages_pipeline" / "pipe-events"
   experiment_id    STRING    NOT NULL,
-  pipeline_commit  STRING    NOT NULL,  -- short or full SHA of the pipeline tree at submit time
-  pipeline_dirty   BOOL      NOT NULL,  -- if true, the row is provenance-only -- writes skip the cache
+  pipeline_commit  STRING    NOT NULL,  -- short or full SHA (real or snapshot) the run executed
+  pipeline_dirty   BOOL      NOT NULL,  -- LEGACY (M-pivot-3); dual-written = unreviewed_code, dropped a release later
+  unreviewed_code  BOOL,                -- M-pivot-4: TRUE unless `commit` is merged into origin/main; gates worker-image auto-build; read_cache does NOT filter on it
+  pipeline_commit_parent STRING,        -- M-pivot-3: for snapshot rows, the HEAD the dirty tree was based on; NULL otherwise
   dit_commit       STRING    NOT NULL,  -- provenance only, NOT in cache_key (refactor-safe)
   workflow_file_sha1 STRING  NOT NULL,  -- IN cache_key -- behaviour-relevant
   worker_image     STRING    NOT NULL,  -- digest form: `<repo>@sha256:...` (tag form is unstable)
@@ -72,7 +74,7 @@ cache_key = sha256(json.dumps({
 **Inputs that do NOT go in:**
 - `dit_commit` — refactors shouldn't invalidate the cache.
 - `experiment_id`, `run_id`, `suffix`, `dest_dataset` — output naming, not output content.
-- `--parallel`, `--allow-dirty-tree`, `--skip-comparisons` — execution flags, not output content.
+- `--parallel`, `--require-clean`, `--skip-comparisons` — execution flags, not output content.
 
 **Per-workflow filter.** Each workflow's `parse_args` exposes a `canonical_params_dict(args) -> dict` function listing the output-affecting keys. Reviewer ensures new args land in the right side (output vs plumbing). When in doubt, default to including — false invalidation costs one recompute; false cache hit costs a wrong verdict.
 
@@ -85,7 +87,9 @@ def maybe_cached_run(workflow_fn, args) -> RunReport:
         "SELECT * FROM tech_great_expectations.dit_runs "
         "WHERE cache_key = @k AND status='succeeded' "
         "  AND expires_at > CURRENT_TIMESTAMP() "
-        "  AND NOT pipeline_dirty "
+        # M-pivot-3 dropped the `AND NOT pipeline_dirty` filter: the cache key
+        # is content-addressable on pipeline_commit (a real or snapshot SHA),
+        # so an unreviewed snapshot row is a legitimate hit on a repeat run.
         "ORDER BY started_at DESC LIMIT 1",
         params={"k": key},
     ).first()
