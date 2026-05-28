@@ -51,11 +51,14 @@ from typing import Optional, Sequence
 
 from dit import compare as dit_compare
 from dit import dates as dit_dates
-from dit.git_info import git_info
+from dit import workflow as dit_workflow
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
-from dit.snapshot import is_unreviewed, resolve_pipeline_commit
-from dit.worker_image import ensure_worker_image
+from dit.workflow import (
+    add_experiment_id_arg,
+    add_infra_args,
+    resolve_run_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,21 +82,15 @@ _JOB_STEP_NAMES = {
     "port_visits": "visits",
 }
 
-# Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
-DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
-DEFAULT_DATAFLOW_SA = os.environ.get(
-    "DIT_DATAFLOW_SA", "automated-testing@world-fishing-827.iam.gserviceaccount.com"
-)
-DEFAULT_DATAFLOW_REGION = os.environ.get("DIT_DATAFLOW_REGION", "us-central1")
-DEFAULT_DATAFLOW_TEMP_BUCKET = os.environ.get("DIT_DATAFLOW_TEMP_BUCKET", "pipe-temp-us-central-ttl7")
-DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
-    "DIT_DATAFLOW_SUBNETWORK", "regions/us-central1/subnetworks/gfw-internal-us-central1"
-)
+# Per-user infra knobs identical to both workflows (--dest-dataset,
+# --service-account, --dataflow-*) live in dit.workflow; add_infra_args wires
+# them onto the parser. --bq-temp-dataset is workflow-specific and stays here.
+#
 # Pre-existing BQ dataset Beam uses as its temp dataset for ReadFromBigQuery
 # EXPORT staging; lets the SA skip bigquery.datasets.create. Inherits
 # ${PROJECT}.${DIT_DEST_DATASET} unless overridden.
 DEFAULT_BQ_TEMP_DATASET = os.environ.get(
-    "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{DEFAULT_DEST_DATASET}"
+    "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{dit_workflow.DEFAULT_DEST_DATASET}"
 )
 
 # Workflow-specific defaults (no env var; one-off overrides via CLI flag).
@@ -120,27 +117,6 @@ DEFAULT_WORKER_IMAGE = (
 # Comparison contract for port-visits (truncate shape, no SCD-2).
 COMPARE_KEYS = ("visit_id",)
 COMPARE_VIEW_SUFFIX = ""
-
-# BQ-table-name-safe slug; max 32 chars. Compiled once.
-_EXPERIMENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-
-
-def _default_experiment_id() -> str:
-    """Auto-generate a per-invocation experiment id when none is provided.
-
-    The literal ``solo_`` prefix marks "not part of a cross-version
-    experiment" so BQ filtering can ignore them.
-    """
-    return f"solo_{uuid.uuid4().hex[:6]}"
-
-
-def _validate_experiment_id(value: str) -> str:
-    if not _EXPERIMENT_ID_RE.match(value):
-        raise SystemExit(
-            f"error: invalid --experiment-id {value!r}: must match "
-            f"{_EXPERIMENT_ID_RE.pattern} (BQ-table-name safe; max 32 chars)."
-        )
-    return value
 
 
 # --------------------------------------------------------------------------
@@ -523,8 +499,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--runner", choices=["dataflow", "docker"], default="dataflow",
                    help="dataflow: submit DataflowRunner from inside the container (default). "
                         "docker: run DirectRunner inside the container (for local sanity checks).")
-    p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
-                   help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
+    # Infra knobs identical to both workflows (--dest-dataset, --service-account,
+    # --dataflow-*) come from dit.workflow.add_infra_args (called below).
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET,
                    help="Pre-existing BQ dataset for Beam EXPORT staging; "
                         "env-var fallback DIT_BQ_TEMP_DATASET (defaults to "
@@ -546,20 +522,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Fall back to `docker compose run dev` when no published image is available.")
     p.add_argument("--suffix", default=None,
                    help="Output-table suffix; auto-generated from git HEAD when omitted.")
-    env_experiment_id = os.environ.get("DIT_EXPERIMENT_ID") or None
-    p.add_argument(
-        "--experiment-id",
-        type=_validate_experiment_id,
-        default=(
-            _validate_experiment_id(env_experiment_id)
-            if env_experiment_id
-            else _default_experiment_id()
-        ),
-        help="Slug prepended to the output-table suffix (<experiment_id>_<commit>_<uuid>) "
-             "for cross-version run linkage. Env-var fallback DIT_EXPERIMENT_ID. "
-             "Auto-default solo_<6-hex> when unset. Regex ^[a-z0-9][a-z0-9_-]{0,31}$. "
-             "Bypassed entirely when --suffix is set.",
-    )
+    add_experiment_id_arg(p)
     p.add_argument("--binding-name", default="",
                    help="Optional binding label (e.g. 'before', 'after') used by the "
                         "cross-version wrapper. Surfaces in Dataflow job names and BQ labels "
@@ -582,11 +545,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Skip the comparison phase; only run pipelines.")
     p.add_argument("--parallel", action="store_true",
                    help="Run the three modes' pipelines in parallel threads (each submits Dataflow concurrently).")
-    # Dataflow knobs
-    p.add_argument("--service-account", default=DEFAULT_DATAFLOW_SA)
-    p.add_argument("--dataflow-region", default=DEFAULT_DATAFLOW_REGION)
-    p.add_argument("--dataflow-temp-bucket", default=DEFAULT_DATAFLOW_TEMP_BUCKET)
-    p.add_argument("--dataflow-subnetwork", default=DEFAULT_DATAFLOW_SUBNETWORK)
+    # Infra knobs: --dest-dataset, --service-account, --dataflow-region,
+    # --dataflow-temp-bucket, --dataflow-subnetwork (identical to both workflows).
+    add_infra_args(p)
     return p.parse_args(argv)
 
 
@@ -603,48 +564,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     repo_dir = os.getcwd()
 
-    # Resolve the committed ref this run records (no-dirty-tree policy).
-    # --suffix is the manual / cross-version escape hatch: when set, record git
-    # state as-is (cross_version_ais.py runs committed worktree refs and owns
-    # provenance). Otherwise dirty + --runner=dataflow auto-snapshots + pushes;
-    # the cloud path supplies DIT_PIPELINE_COMMIT instead.
-    if args.suffix:
-        # Manual / cross-version escape hatch: don't auto-snapshot, but still
-        # classify accurately -- unreviewed if the tree is dirty OR the commit
-        # isn't merged into origin/main (e.g. cross_version_ais.py worktrees at
-        # PR refs). The dirty bit alone would skip the worker-image auto-build
-        # for a clean-but-unmerged worktree.
-        commit_sha, dirty = git_info(repo_dir)
-        unreviewed = dirty or is_unreviewed(commit_sha, repo_dir)
-    else:
-        commit_sha, unreviewed = resolve_pipeline_commit(
-            repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
-        )
-    args.commit_sha = commit_sha
-    args.unreviewed = unreviewed
-
-    # Close the submitter-vs-worker gap (M-pivot-4): if this run executes
-    # unreviewed code against the default worker image, auto-build a
-    # content-addressable worker image from the source so the workers actually
-    # run it. No-op for reviewed code, an explicit --worker-image, or the
-    # docker runner. Done before the worker-image-tag label is derived.
-    args.worker_image = ensure_worker_image(
-        pipeline=PIPELINE_NAME,
+    # Resolve the committed ref, worker image, and per-run lineage context in
+    # one shot via the shared workflow harness (no-dirty-tree policy + the
+    # --suffix manual/cross-version escape hatch live in dit.workflow). Pass
+    # `args.suffix or None` so a falsy suffix (the default None or an empty
+    # string) routes through the auto-snapshot path -- matching this workflow's
+    # historical truthy `if args.suffix:` check. Port-visits has NO run-cache
+    # integration, so resolve_digest=False below skips the worker-image digest
+    # lookup it would never use.
+    ctx = resolve_run_context(
         repo_dir=repo_dir,
-        commit=args.commit_sha,
+        pipeline_name=PIPELINE_NAME,
         runner=args.runner,
-        unreviewed=args.unreviewed,
+        require_clean=args.require_clean,
+        suffix=args.suffix or None,
         worker_image=args.worker_image,
         default_worker_image=DEFAULT_WORKER_IMAGE,
+        # No run-cache here, so the worker-image digest is unused; skip the
+        # gcloud describe (keeps this path side-effect-free, matching the
+        # pre-refactor behavior where ais never resolved a digest).
+        resolve_digest=False,
     )
+    args.commit_sha = ctx.pipeline_commit
+    args.unreviewed = ctx.unreviewed
+    args.worker_image = ctx.worker_image
+    args.run_id = ctx.run_id
 
     suffix = _resolve_suffix(args)
 
     # Per-invocation lineage attributes, computed once and stashed on args so
     # every Dataflow job + BQ output table from this run shares them. See
     # the dit_run_id / dit_commit_sha / dit_worker_image_tag / dit_launched_by
-    # labels in _dynamic_labels.
-    args.run_id = uuid.uuid4().hex[:12]
+    # labels in _dynamic_labels. run_id comes from the resolved RunContext;
+    # the worker-image tag + launched-by are port-visits-specific label fields.
     args.worker_image_tag = _worker_image_tag(args.worker_image)
     args.launched_by = os.environ.get("USER", "unknown")
 

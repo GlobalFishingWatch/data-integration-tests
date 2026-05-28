@@ -12,13 +12,23 @@ from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from dit import workflow as dit_workflow
+from dit.workflow import RunContext
+
 # This import works even without pipe_gaps; the workflow's pipe_gaps imports
 # are inside function bodies, not at module level.
 from workflows.pipe_gaps import mode_equivalence as mod
 
 
 def _args(**overrides: Any) -> argparse.Namespace:
-    """Build an argparse-like namespace with the fields the cache wrapper reads."""
+    """Build an argparse-like namespace with the fields the cache wrapper reads.
+
+    The cache wrapper (``mod._run_with_cache`` -> ``dit.workflow.run_with_cache``)
+    reads the per-run lineage off ``args.run_context`` (a :class:`RunContext`),
+    while ``mod._build_cache_key`` reads ``args.pipeline_commit`` /
+    ``args.worker_image_digest`` directly. We populate both from the same flat
+    overrides so a single ``_args(...)`` call configures everything.
+    """
     base = dict(
         start="2020-01-01",
         end="2020-12-31",
@@ -43,7 +53,18 @@ def _args(**overrides: Any) -> argparse.Namespace:
         worker_image_digest="gcr.io/foo/pipe-gaps@sha256:0011",
     )
     base.update(overrides)
-    return argparse.Namespace(**base)
+    ns = argparse.Namespace(**base)
+    # Stamp the RunContext the same way main() does (resolve_run_context()).
+    ns.run_context = RunContext(
+        pipeline_commit=ns.pipeline_commit,
+        unreviewed=ns.unreviewed,
+        pipeline_commit_parent=ns.pipeline_commit_parent,
+        worker_image=ns.worker_image,
+        worker_image_digest=ns.worker_image_digest,
+        run_id=ns.run_id,
+        dit_commit=ns.dit_commit,
+    )
+    return ns
 
 
 # --------------------------------------------------------------------------
@@ -140,7 +161,7 @@ def test_build_cache_key_extras_merge_into_params():
 # _run_with_cache
 # --------------------------------------------------------------------------
 
-def _cached_row(**overrides: Any) -> mod.CachedRun:
+def _cached_row(**overrides: Any) -> dit_workflow.CachedRun:
     base = dict(
         run_id="prev-run",
         cache_key="prev-key",
@@ -158,19 +179,19 @@ def _cached_row(**overrides: Any) -> mod.CachedRun:
         cloud_build_id=None,
         started_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
         finished_at=datetime(2026, 5, 1, 0, 30, tzinfo=timezone.utc),
-        status=mod.STATUS_SUCCEEDED,
+        status=dit_workflow.STATUS_SUCCEEDED,
         expires_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
     )
     base.update(overrides)
-    return mod.CachedRun(**base)
+    return dit_workflow.CachedRun(**base)
 
 
 def test_run_with_cache_hit_skips_execute_fn():
     execute_fn = MagicMock()
     with (
-        patch.object(mod, "read_cache", return_value=_cached_row()),
-        patch.object(mod, "verify_tables_exist", return_value=[True]),
-        patch.object(mod, "write_cache") as mock_write,
+        patch.object(dit_workflow, "read_cache", return_value=_cached_row()),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
     ):
         result = mod._run_with_cache(
             execute_fn,
@@ -188,10 +209,10 @@ def test_run_with_cache_hit_skips_execute_fn():
 def test_run_with_cache_miss_runs_and_writes():
     execute_fn = MagicMock()
     with (
-        patch.object(mod, "read_cache", return_value=None),
-        patch.object(mod, "verify_tables_exist", return_value=[True]),
-        patch.object(mod, "write_cache") as mock_write,
-        patch.object(mod, "expires_at_for",
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
                      return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
     ):
         result = mod._run_with_cache(
@@ -205,7 +226,7 @@ def test_run_with_cache_miss_runs_and_writes():
     mock_write.assert_called_once()
     written_row = mock_write.call_args.args[0]
     assert written_row.output_tables == ["proj.ds.fresh_bf_table"]
-    assert written_row.status == mod.STATUS_SUCCEEDED
+    assert written_row.status == dit_workflow.STATUS_SUCCEEDED
     assert written_row.pipeline == "pipe-gaps"
     # Returns the FRESH FQN (we just computed it).
     assert result == "proj.ds.fresh_bf_table"
@@ -216,11 +237,11 @@ def test_run_with_cache_empty_output_tables_treats_as_miss():
     # the guard, all([]) -> True and indexing [0] would IndexError.
     execute_fn = MagicMock()
     with (
-        patch.object(mod, "read_cache", return_value=_cached_row(output_tables=[])),
-        patch.object(mod, "verify_tables_exist", return_value=[]),
-        patch.object(mod, "write_cache") as mock_write,
+        patch.object(dit_workflow, "read_cache", return_value=_cached_row(output_tables=[])),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
         patch.object(
-            mod, "expires_at_for",
+            dit_workflow, "expires_at_for",
             return_value=datetime(2026, 9, 1, tzinfo=timezone.utc),
         ),
     ):
@@ -240,10 +261,10 @@ def test_run_with_cache_stale_row_treats_as_miss():
     # Row exists but the referenced tables don't (TTL'd out).
     execute_fn = MagicMock()
     with (
-        patch.object(mod, "read_cache", return_value=_cached_row()),
-        patch.object(mod, "verify_tables_exist", return_value=[False]),
-        patch.object(mod, "write_cache") as mock_write,
-        patch.object(mod, "expires_at_for",
+        patch.object(dit_workflow, "read_cache", return_value=_cached_row()),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[False]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
                      return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
     ):
         result = mod._run_with_cache(
@@ -264,10 +285,10 @@ def test_run_with_cache_writes_unreviewed_rows():
     execute_fn = MagicMock()
     args = _args(unreviewed=True)
     with (
-        patch.object(mod, "read_cache", return_value=None),
-        patch.object(mod, "verify_tables_exist", return_value=[True]),
-        patch.object(mod, "write_cache") as mock_write,
-        patch.object(mod, "expires_at_for",
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
                      return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
     ):
         mod._run_with_cache(
@@ -286,10 +307,10 @@ def test_run_with_cache_includes_extras_in_key():
         calls.append(key)
         return None
     with (
-        patch.object(mod, "read_cache", side_effect=fake_read),
-        patch.object(mod, "verify_tables_exist", return_value=[True]),
-        patch.object(mod, "write_cache"),
-        patch.object(mod, "expires_at_for",
+        patch.object(dit_workflow, "read_cache", side_effect=fake_read),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache"),
+        patch.object(dit_workflow, "expires_at_for",
                      return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
     ):
         mod._run_with_cache(

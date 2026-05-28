@@ -11,37 +11,27 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
-import subprocess
 import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
-from dit.cache import (
-    STATUS_SUCCEEDED,
-    CachedRun,
-    CacheKey,
-    compute_cache_key,
-    expires_at_for,
-    read_cache,
-    resolve_worker_image_to_digest,
-    sha1_of_workflow_file,
-    verify_tables_exist,
-    write_cache,
-)
+from dit import workflow as dit_workflow
+from dit.cache import CacheKey, sha1_of_workflow_file
 from dit.dates import daterange_inclusive
-from dit.git_info import git_info
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
-from dit.snapshot import is_unreviewed, resolve_pipeline_commit, snapshot_parent
-from dit.worker_image import ensure_worker_image
+from dit.workflow import (
+    add_experiment_id_arg,
+    add_infra_args,
+    resolve_run_context,
+)
 
 # Pipeline repo name; used to namespace auto-snapshot refs
 # (refs/dit-snapshots/<PIPELINE_NAME>/<sha>).
@@ -68,18 +58,11 @@ MODE_BFD = "2_bfd"
 MODE_BFTRUNCATE = "3_bftruncate"
 MODE_MUTATE_RECOVER = "4_mutate_recover"
 
-# Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
-DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
-DEFAULT_DATAFLOW_SA = os.environ.get(
-    "DIT_DATAFLOW_SA", "automated-testing@world-fishing-827.iam.gserviceaccount.com"
-)
+# Per-user infra knobs identical to both workflows (--dest-dataset,
+# --service-account, --dataflow-*) live in dit.workflow; add_infra_args wires
+# them onto the parser. --bq-temp-dataset is workflow-local and stays here.
 DEFAULT_BQ_TEMP_DATASET = os.environ.get(
-    "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{DEFAULT_DEST_DATASET}"
-)
-DEFAULT_DATAFLOW_REGION = os.environ.get("DIT_DATAFLOW_REGION", "us-central1")
-DEFAULT_DATAFLOW_TEMP_BUCKET = os.environ.get("DIT_DATAFLOW_TEMP_BUCKET", "pipe-temp-us-central-ttl7")
-DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
-    "DIT_DATAFLOW_SUBNETWORK", "regions/us-central1/subnetworks/gfw-internal-us-central1"
+    "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{dit_workflow.DEFAULT_DEST_DATASET}"
 )
 
 # Workflow-specific defaults (no env var; one-off overrides via CLI flag).
@@ -120,27 +103,6 @@ RUNNERS = ("docker", "dataflow")
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
-
-# BQ-table-name-safe slug; max 32 chars. Compiled once.
-_EXPERIMENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-
-
-def _default_experiment_id() -> str:
-    """Auto-generate a per-invocation experiment id when none is provided.
-
-    The literal ``solo_`` prefix marks "not part of a cross-version
-    experiment" so BQ filtering can ignore them.
-    """
-    return f"solo_{uuid.uuid4().hex[:6]}"
-
-
-def _validate_experiment_id(value: str) -> str:
-    if not _EXPERIMENT_ID_RE.match(value):
-        raise SystemExit(
-            f"error: invalid --experiment-id {value!r}: must match "
-            f"{_EXPERIMENT_ID_RE.pattern} (BQ-table-name safe; max 32 chars)."
-        )
-    return value
 
 
 def _resolve_suffix(args: argparse.Namespace) -> str:
@@ -542,26 +504,6 @@ def _build_cache_key(args: argparse.Namespace, mode: str, **extra_params: Any) -
     )
 
 
-def _dit_commit() -> str:
-    """Short git SHA of the dit checkout the workflow was loaded from.
-
-    Best-effort — returns ``"unknown"`` outside a git repo (e.g. when
-    dit is pip-installed from a tarball). The value is recorded for
-    provenance only; it does NOT feed into the cache key (dit
-    refactors shouldn't invalidate cache entries).
-    """
-    try:
-        import dit
-        # dit/__init__.py -> dit/ -> src/ -> repo root
-        dit_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(dit.__file__))))
-        return subprocess.check_output(
-            ["git", "-C", dit_root, "rev-parse", "--short", "HEAD"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError, ImportError):
-        return "unknown"
-
-
 def _run_with_cache(
     execute_fn: Callable[..., None],
     *,
@@ -571,85 +513,26 @@ def _run_with_cache(
     execute_kwargs: dict[str, Any],
     cache_key_extras: Optional[dict[str, Any]] = None,
 ) -> str:
-    """Wrap an ``execute_*`` call with cache lookup + record-on-miss.
+    """Workflow-local adapter over :func:`dit.workflow.run_with_cache`.
 
-    Returns the FQN of the output table to use for downstream
-    comparisons:
-
-    * On cache **hit** (matching key + output tables verified to still
-      exist): skip ``execute_fn`` entirely; return the cached row's
-      ``output_tables[0]`` (the cached FQN, which differs from the
-      current run's ``output_fqn`` because of the per-run UUID suffix).
-    * On cache **miss** or **stale** (row exists but tables expired):
-      call ``execute_fn(**execute_kwargs)``; write a :class:`CachedRun`
-      row with the current run's metadata; return ``output_fqn``.
-
-    The cache row is written for **every** completed run, including
-    unreviewed (snapshot / dirty-tree) ones. Post M-pivot-3 ``read_cache``
-    no longer filters on ``unreviewed_code``: the cache key is content-
-    addressable on ``pipeline_commit`` (a real or deterministic-snapshot
-    SHA), so a snapshot row is a legitimate hit for a repeat run of the same
-    uncommitted code. ``unreviewed_code`` is informational only.
+    Builds the mode-aware :class:`CacheKey` from the stamped ``args`` context
+    (via :func:`_build_cache_key`) and threads the per-run :class:`RunContext`
+    (stamped onto ``args`` in :func:`main`) and the pipe-gaps workflow/pipeline
+    identity into the generic wrapper. Keeps the call-site signature unchanged
+    so :func:`main`'s ``_wrap_*`` closures don't churn.
     """
-    cache_key_obj = _build_cache_key(args, mode, **(cache_key_extras or {}))
-    cache_key = compute_cache_key(cache_key_obj)
-    key_short = cache_key[:12]
-
-    cached = read_cache(cache_key)
-    if cached is not None:
-        # Empty output_tables on a "succeeded" row is a degenerate state
-        # (shouldn't happen given our write path, but guard against it
-        # in case future runs / manual seeds write malformed rows -- the
-        # vacuous `all([]) == True` would otherwise step into an
-        # IndexError on `cached.output_tables[0]`).
-        if cached.output_tables and all(verify_tables_exist(cached.output_tables)):
-            logger.info(
-                "cache HIT  mode=%-16s key=%s -> %s",
-                mode, key_short, cached.output_tables[0],
-            )
-            return cached.output_tables[0]
-        reason = "empty output_tables" if not cached.output_tables else "tables expired"
-        logger.info(
-            "cache STALE mode=%-16s key=%s (%s); recomputing",
-            mode, key_short, reason,
-        )
-
-    started_at = datetime.now(timezone.utc)
-    execute_fn(**execute_kwargs)
-    finished_at = datetime.now(timezone.utc)
-
-    output_tables = [output_fqn]
-    row = CachedRun(
-        run_id=args.run_id,
-        cache_key=cache_key,
+    cache_key = _build_cache_key(args, mode, **(cache_key_extras or {}))
+    return dit_workflow.run_with_cache(
+        execute_fn,
+        ctx=args.run_context,
         workflow=WORKFLOW_NAME,
         pipeline="pipe-gaps",
         experiment_id=args.experiment_id,
-        pipeline_commit=args.pipeline_commit,
-        # args.unreviewed: True when the code isn't merged into origin/main
-        # (snapshot / dirty / unmerged commit via is_unreviewed). See M-pivot-4.
-        unreviewed_code=args.unreviewed,
-        pipeline_commit_parent=args.pipeline_commit_parent,
-        dit_commit=args.dit_commit,
-        workflow_file_sha1=WORKFLOW_FILE_SHA1,
-        worker_image=args.worker_image,
-        params=cache_key_obj.params,
-        output_tables=output_tables,
-        # TODO(M5): runner doesn't return Dataflow job IDs yet; cancel_run
-        # will need to find them via the dit_run_id label until then.
-        dataflow_job_ids=[],
-        cloud_build_id=os.environ.get("BUILD_ID"),
-        started_at=started_at,
-        finished_at=finished_at,
-        status=STATUS_SUCCEEDED,
-        expires_at=expires_at_for(output_tables),
+        cache_key=cache_key,
+        output_fqn=output_fqn,
+        execute_kwargs=execute_kwargs,
+        log_label=mode,
     )
-    write_cache(row)
-    logger.info(
-        "cache MISS mode=%-16s key=%s -> wrote run %s",
-        mode, key_short, args.run_id,
-    )
-    return output_fqn
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -673,33 +556,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    choices=["True", "False"])
     p.add_argument("--skip-open-gaps", action="store_true")
     p.add_argument("--suffix", default=None)
-    env_experiment_id = os.environ.get("DIT_EXPERIMENT_ID") or None
-    p.add_argument(
-        "--experiment-id",
-        type=_validate_experiment_id,
-        default=(
-            _validate_experiment_id(env_experiment_id)
-            if env_experiment_id
-            else _default_experiment_id()
-        ),
-        help="Slug prepended to the output-table suffix (<experiment_id>_<commit>_<uuid>) "
-             "for cross-version run linkage. Env-var fallback DIT_EXPERIMENT_ID. "
-             "Auto-default solo_<6-hex> when unset. Regex ^[a-z0-9][a-z0-9_-]{0,31}$. "
-             "Bypassed entirely when --suffix is set.",
-    )
+    add_experiment_id_arg(p)
     p.add_argument("--require-clean", action="store_true",
                    help="Error on a dirty tree instead of auto-snapshotting "
                         "(for CI / strict-provenance callers).")
     p.add_argument("--skip-pipelines", action="store_true")
     p.add_argument("--skip-comparisons", action="store_true")
     p.add_argument("--parallel", "--async", dest="parallel", action="store_true")
-    p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
-                   help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
-    p.add_argument("--service-account", default=DEFAULT_DATAFLOW_SA)
+    add_infra_args(p)
+    # --bq-temp-dataset is workflow-local; not part of add_infra_args.
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
-    p.add_argument("--dataflow-region", default=DEFAULT_DATAFLOW_REGION)
-    p.add_argument("--dataflow-temp-bucket", default=DEFAULT_DATAFLOW_TEMP_BUCKET)
-    p.add_argument("--dataflow-subnetwork", default=DEFAULT_DATAFLOW_SUBNETWORK)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
                    help=f"Local image tag for the docker runner (default: "
                         f"{DEFAULT_IMAGE_TAG}). Built from source; not used "
@@ -723,76 +589,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     end = date.fromisoformat(args.end)
     repo_dir = os.getcwd()
 
-    # Resolve the committed ref this run records (no-dirty-tree policy).
-    # Dirty + --runner=dataflow auto-snapshots to refs/dit-snapshots/<pipeline>/<sha>
-    # and pushes; the cloud path provides DIT_PIPELINE_COMMIT instead. Done
-    # before the suffix so both reference the same commit.
-    #
-    # --suffix is the manual / cross-version escape hatch: when set, skip the
-    # auto-snapshot and record git state as-is (the caller has taken control of
-    # provenance, e.g. cross_version_ais.py running committed worktree refs).
-    if args.suffix is not None:
-        # Manual / cross-version escape hatch: don't auto-snapshot. But still
-        # classify accurately -- a run is unreviewed if the tree is dirty
-        # (uncommitted) OR the commit isn't merged into origin/main (e.g.
-        # cross_version_ais.py worktrees at PR refs). Using only the dirty bit
-        # here would let a clean unmerged commit look reviewed and skip the
-        # worker-image auto-build.
-        pipeline_commit, dirty = git_info(repo_dir)
-        unreviewed = dirty or is_unreviewed(pipeline_commit, repo_dir)
-    else:
-        pipeline_commit, unreviewed = resolve_pipeline_commit(
-            repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
-        )
-    args.pipeline_commit = pipeline_commit
-    args.unreviewed = unreviewed
-    # For snapshot runs, record the HEAD the dirty tree was based on (parsed
-    # from the snapshot commit message); None for real/main commits. M-pivot-3.
-    args.pipeline_commit_parent = snapshot_parent(pipeline_commit, repo_dir)
-
-    # Close the submitter-vs-worker gap (M-pivot-4): if this run executes
-    # unreviewed code against the default worker image, the workers would run
-    # the stale published code. Auto-build a content-addressable worker image
-    # from the source so they actually run this code. No-op for reviewed code,
-    # an explicit --worker-image, or the docker runner. Done before the digest
-    # resolution so the cache key reflects the image actually used.
-    args.worker_image = ensure_worker_image(
-        pipeline=PIPELINE_NAME,
+    # Resolve the committed ref, worker image, and per-run lineage context in
+    # one shot via the shared workflow harness (no-dirty-tree policy + the
+    # --suffix manual/cross-version escape hatch live in dit.workflow). Stamp
+    # the fields onto args so the rest of this module (suffix builder, cache
+    # wrapper, base_cfg) reads them from one place.
+    ctx = resolve_run_context(
         repo_dir=repo_dir,
-        commit=args.pipeline_commit,
+        pipeline_name=PIPELINE_NAME,
         runner=args.runner,
-        unreviewed=args.unreviewed,
+        require_clean=args.require_clean,
+        suffix=args.suffix,
         worker_image=args.worker_image,
         default_worker_image=DEFAULT_WORKER_IMAGE,
     )
+    args.run_context = ctx
+    args.pipeline_commit = ctx.pipeline_commit
+    args.unreviewed = ctx.unreviewed
+    args.pipeline_commit_parent = ctx.pipeline_commit_parent
+    args.worker_image = ctx.worker_image
+    args.worker_image_digest = ctx.worker_image_digest
+    args.run_id = ctx.run_id
+    args.dit_commit = ctx.dit_commit
 
     suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
-
-    # Per-`main()` context used by the run cache (see dit.cache /
-    # docs/run-cache.md). Stashed on args so downstream code can read
-    # without recomputing.
-    args.run_id = uuid.uuid4().hex[:12]
-    args.dit_commit = _dit_commit()
-    # resolve_worker_image_to_digest is a one-off ~1-2s gcloud call;
-    # fall back to the tag form if it fails (no cache hits then, but
-    # the run still produces output).
-    try:
-        args.worker_image_digest = resolve_worker_image_to_digest(args.worker_image)
-    except RuntimeError as e:
-        logger.warning(
-            "could not resolve %s to a digest (%s); falling back to tag form. "
-            "Cache lookups will likely miss.",
-            args.worker_image, e,
-        )
-        args.worker_image_digest = args.worker_image
-    logger.info(
-        "run_id=%s pipeline_commit=%s%s dit_commit=%s",
-        args.run_id, args.pipeline_commit,
-        " (UNREVIEWED)" if args.unreviewed else "",
-        args.dit_commit,
-    )
 
     source_messages = args.source_messages
     source_segments = args.source_segments
