@@ -1,6 +1,6 @@
 # Pivot: no dirty trees, push every snapshot
 
-**Status:** in progress. M-pivot-1 through M-pivot-4 have shipped (PRs #22, #23, #24, #25); M-pivot-5 (docs catch-up) remains. Drafted 2026-05-22.
+**Status:** ✅ landed. M-pivot-1 through M-pivot-5 shipped (PRs #22, #23, #24, #25 + this docs pass). Open follow-ups in § Loose ends / follow-ups. Drafted 2026-05-22.
 
 ## Why
 
@@ -169,12 +169,23 @@ Scope grew during implementation: rather than just *delete* the worker-image-sta
 - `pipeline_dirty` column + dual-write **kept** (deferred drop — avoids the NOT-NULL-column migration/code coupling window; see the M-pivot-3 note).
 - Memories updated (`[[dit-runs-cache]]`, `[[submitter-vs-worker-split]]`, `[[no-dirty-tree-policy]]`).
 
-### M-pivot-5 — docs catch-up
+### M-pivot-5 — docs catch-up ✅ LANDED
 
-- README Features: drop `--allow-dirty-tree` mention; add the auto-snapshot behaviour.
-- README Usage Scenarios: new section (drafted alongside this plan; see README diff in this PR).
-- `docs/run-cache.md` and `docs/run-cache-impl.md`: update for the `unreviewed_code` rename.
-- `CHANGELOG.md`: `Removed` entries for `--allow-dirty-tree`, `warn_if_worker_image_misses_dirty_tree`, `pipeline_dirty` column; `Added` entries for auto-snapshot, `unreviewed_code`.
+- README Features: `--allow-dirty-tree` bullet replaced with the auto-snapshot + auto-build behaviour; the "future-state note" relabelled to the (now-shipped) "no-dirty-tree policy".
+- README Usage Scenarios: shipped (drafted in #21).
+- `docs/run-cache.md` + `docs/run-cache-impl.md`: schema, lookup-SQL, flag lists, and code sketches reconciled with the shipped `unreviewed_code` / `pipeline_commit_parent` model (the historical-design banner now points at the live migrations + this doc).
+- `CHANGELOG.md`: `Added`/`Removed` entries for each milestone landed as they shipped.
+- README Operational next steps: item 0 marked landed; loose ends linked to § Loose ends below.
+
+## Loose ends / follow-ups
+
+Tracked here so future iterations don't lose them:
+
+- **pipe-gaps Dockerfile layer reorder** — [GlobalFishingWatch/pipe-gaps#128](https://github.com/GlobalFishingWatch/pipe-gaps/pull/128). Moves the deps install before `COPY src` so auto-built pipe-gaps worker images rebuild in seconds (not ~1-2 min) on a source-only change. `anchorages_pipeline` is already correctly layered. Auto-build works without it. **Merge owned by the pipeline team.**
+- **Drop the legacy `pipeline_dirty` column** — M-pivot-3 dual-writes it (`= unreviewed_code`) for one release so older readers don't break. Once nothing reads it, a follow-up migration `ALTER TABLE ... DROP COLUMN pipeline_dirty` + removal of the dual-write in `dit.cache.write_cache` / `CachedRun`.
+- **Live end-to-end validation of auto-build** — the nested-build actAs path is proven (2026-05-28 test) and the unit surface is covered with mocks, but the *real* kaniko worker-image build + a Dataflow run against the freshly-built image haven't run yet. First real `make dit-cloud` against an unreviewed pipe-gaps tree validates it (watch: kaniko build succeeds + pushes to `gcr.io/world-fishing-827/dit/pipe-gaps:dit-<sha>`; Dataflow workers pull it).
+- **`is_unreviewed` per-run `git fetch origin main`** — adds ~1s + a network dependency to every clean/override run. Fine today; if it becomes a bottleneck (e.g. many parallel cross-version bindings), consider a short-lived cache of the `origin/main` tip per process.
+- **M5/M6 inherit the model cleanly** — when port-visits gets the run cache (M5) and the SIGTERM cancel trap (M6), they use the same `resolve_pipeline_commit` / `ensure_worker_image` / `unreviewed_code` surface; no dirty-tree special-casing to port.
 
 ## Schema changes summary
 

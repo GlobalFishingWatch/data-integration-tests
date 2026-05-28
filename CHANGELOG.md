@@ -10,10 +10,12 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 #### Planned (no-dirty-tree pivot — remaining)
 
-- **M-pivot-5: docs catch-up** — reconcile `docs/run-cache.md` / `docs/run-cache-impl.md` fully with the shipped `unreviewed_code` model (forward-pointers added in M-pivot-3; full rewrite pending).
 - **Drop the legacy `pipeline_dirty` column** once the one-release dual-write window has passed (M-pivot-3 keeps it dual-written for compatibility).
 
-_(M-pivot-1 through M-pivot-4 have landed — see the dated Added/Removed entries below and `docs/no-dirty-tree-pivot.md`.)_
+_(M-pivot-1 through M-pivot-5 have landed — see the dated Added/Removed entries below and `docs/no-dirty-tree-pivot.md`, including its § Loose ends / follow-ups.)_
+
+#### Changed
+- **M-pivot-5 (docs catch-up):** `docs/run-cache.md` + `docs/run-cache-impl.md` reconciled with the shipped `unreviewed_code` / `pipeline_commit_parent` model (schema, lookup SQL, flag lists, code sketches); README's `--allow-dirty-tree` "scheduled for removal" notes replaced with the shipped no-dirty-tree policy + auto-build behaviour; the pivot doc gained a § Loose ends / follow-ups. No code change.
 
 #### Added
 - **M-pivot-4 of the no-dirty-tree migration landed: auto-built worker images close the submitter-vs-worker gap.** A `--runner=dataflow` run loads pipeline code in two places — the submitter from the (snapshotted) source, but the *workers* from the container named by `--worker-image`. So a run of unreviewed code (snapshot / dirty / unmerged) against the **default** worker image would have the workers silently execute stale published code — a footgun the snapshot mechanism can't fix (the worker image is a separate registry artifact). New `dit.worker_image.ensure_worker_image` closes it: when a run is unreviewed *and* `--worker-image` is the default, it builds a content-addressable worker image from the source via a kaniko Cloud Build (`docker/worker-image/cloudbuild.yaml`, shared cache) tagged `gcr.io/world-fishing-827/dit/<pipeline>:dit-<commit>`, and uses it. "Unreviewed" is now an accurate `git merge-base --is-ancestor origin/main` check (`dit.snapshot.is_unreviewed`) — not just "dirty" — so a **clean feature branch** (committed but unmerged) auto-builds too, and a clean `main` run does *not* (uses the published default). This un-defers the ancestor refinement from M-pivot-3, which is required now that the flag gates auto-build rather than being merely informational. Idempotent (existing tag → skip build); no-op for reviewed code, an explicit `--worker-image`, or the docker runner. Called from both workflows' `main()`, so it covers `make dit-cloud` (a nested Cloud Build inside ditbox) and local `dit run --runner=dataflow` alike. 8 tests in `tests/test_worker_image.py`.

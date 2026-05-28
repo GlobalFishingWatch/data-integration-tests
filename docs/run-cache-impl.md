@@ -124,8 +124,7 @@ def run_with_cache(workflow_fn, *, cache_key, output_fqn, **kwargs) -> str:
             logger.info("cache HIT: reusing %s", cached.output_tables[0])
             return cached.output_tables[0]
     workflow_fn(**kwargs)
-    if not args.allow_dirty_tree:  # equivalently: not pipeline_dirty
-        dit_cache.record_run(...)
+    dit_cache.write_cache(...)   # every run is recorded (incl. unreviewed); read_cache no longer filters
     return output_fqn
 
 bf_fqn  = run_with_cache(execute_bf,         cache_key=bf_key,  output_fqn=bf_table,  ...)
