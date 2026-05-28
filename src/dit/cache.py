@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -537,14 +538,227 @@ def write_cache(row: CachedRun, *, client: Any = None) -> None:
     client.query(query, job_config=job_config).result()
 
 
+def read_rows_for_run(run_id: str, *, client: Any = None) -> list[CachedRun]:
+    """Return every :class:`CachedRun` row sharing ``run_id``.
+
+    A single ``dit run`` invocation writes one row per mode (all sharing the
+    per-``main()`` ``run_id``; ``cache_key`` distinguishes the modes), so the
+    cleanup path keys on ``run_id`` to operate on all sibling modes at once.
+
+    Unlike :func:`read_cache`, this does NOT filter on ``status`` /
+    ``expires_at``: the cleanup path must see ``running`` (in-flight) and
+    already-``cancelled`` rows too, for both discovery and idempotency.
+    """
+    client = client or _make_client()
+    from google.cloud import bigquery
+
+    query = f"""
+        SELECT *
+        FROM `{TABLE_FQN}`
+        WHERE run_id = @run_id
+        ORDER BY started_at DESC
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
+        ]
+    )
+    rows = list(client.query(query, job_config=job_config).result())
+    return [CachedRun.from_bq_row(r) for r in rows]
+
+
 # --------------------------------------------------------------------------
 # Cancellation helpers (used by `make dit-cancel`; see Milestone 5)
 # --------------------------------------------------------------------------
 
-def cancel_run(run_id: str) -> None:
-    """Cancel an in-flight or stale run: cancel Dataflow jobs, drop
-    output tables, mark the row ``cancelled``.
+#: Dataflow job states that are still cancellable. Anything not in this set
+#: (Done, Failed, Cancelled, Drained, ...) is already terminal -- cancelling
+#: it is a no-op, so we skip the call to keep the path idempotent + quiet.
+_CANCELLABLE_DATAFLOW_STATES = frozenset({"Running", "Pending"})
 
-    Idempotent — re-running on an already-cancelled run is a no-op.
+
+def _looks_like_table_fqn(value: str) -> bool:
+    """True iff ``value`` is a fully-qualified ``project.dataset.table`` ref.
+
+    The cleanup path issues table-level deletes ONLY. A value that is not
+    exactly three dot-separated non-empty parts (e.g. a bare dataset
+    ``project.dataset``, or a ``dit_exp_*`` snapshot dataset) is rejected so a
+    malformed / dataset-shaped ``output_tables`` entry can never escalate into
+    a dataset delete. See the safety note in :func:`cancel_run`.
     """
-    raise NotImplementedError("cancel_run — see docs/run-cache-impl.md § Milestone 5")
+    parts = value.split(".")
+    return len(parts) == 3 and all(parts)
+
+
+def _discover_dataflow_jobs(run_id: str, region: str) -> list[dict[str, str]]:
+    """List Dataflow jobs labelled ``dit_run_id=<run_id>`` in ``region``.
+
+    Discovery is by label, NOT by the row's stored ``dataflow_job_ids`` --
+    those are always ``[]`` because neither runner captures the submitted job
+    id back into the row (the in-process pipe-gaps runner and the docker
+    runner both submit opaquely). The ``dit_run_id`` label, stamped by both
+    workflows, is the reliable join key. See docs/run-cache-impl.md § M5a.
+
+    Returns a list of ``{"id": ..., "name": ..., "state": ...}`` dicts (empty
+    on no matches or a failed/again-tolerated gcloud call).
+    """
+    result = subprocess.run(
+        [
+            "gcloud", "dataflow", "jobs", "list",
+            f"--region={region}",
+            f"--filter=labels.dit_run_id={run_id}",
+            "--format=json(id,name,state)",
+            "--project=world-fishing-827",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "gcloud dataflow jobs list failed for run_id=%s (rc=%d): %s",
+            run_id, result.returncode, result.stderr.strip(),
+        )
+        return []
+    try:
+        jobs = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        logger.warning("could not parse gcloud jobs-list output for run_id=%s", run_id)
+        return []
+    return [
+        {"id": j.get("id", ""), "name": j.get("name", ""), "state": j.get("state", "")}
+        for j in jobs
+    ]
+
+
+def _cancel_dataflow_job(job_id: str, region: str) -> None:
+    """Cancel one Dataflow job. Tolerant: logs and continues on failure
+    (the job may have already finished between discovery and cancel)."""
+    result = subprocess.run(
+        [
+            "gcloud", "dataflow", "jobs", "cancel", job_id,
+            f"--region={region}",
+            "--project=world-fishing-827",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "could not cancel Dataflow job %s (rc=%d): %s",
+            job_id, result.returncode, result.stderr.strip(),
+        )
+    else:
+        logger.info("cancelled Dataflow job %s", job_id)
+
+
+def _delete_output_table(fqn: str, *, client: Any) -> None:
+    """Delete a single output table (``not_found_ok`` -> idempotent).
+
+    SAFETY: caller must have already validated ``fqn`` via
+    :func:`_looks_like_table_fqn`. ``Client.delete_table`` only ever targets a
+    table; it cannot delete a dataset.
+    """
+    client.delete_table(fqn, not_found_ok=True)
+    logger.info("deleted output table %s", fqn)
+
+
+def _mark_run_cancelled(run_id: str, *, client: Any) -> None:
+    """DML UPDATE every row of ``run_id`` to ``status='cancelled'``.
+
+    DML (not streaming) writes mean the rows are immediately mutable -- the
+    whole reason :func:`write_cache` uses DML INSERT (see its docstring)."""
+    from google.cloud import bigquery
+
+    query = f"""
+        UPDATE `{TABLE_FQN}`
+        SET status = @cancelled
+        WHERE run_id = @run_id
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("cancelled", "STRING", STATUS_CANCELLED),
+            bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
+        ]
+    )
+    client.query(query, job_config=job_config).result()
+
+
+def cancel_run(
+    run_id: str,
+    *,
+    region: str | None = None,
+    client: Any = None,
+) -> None:
+    """Cancel an in-flight or stale run: cancel its Dataflow jobs, drop its
+    output tables, mark every row of the run ``cancelled``.
+
+    The single control-plane cleanup entry point behind ``dit cache-cancel`` /
+    ``make dit-cancel``. Operates on **all rows sharing ``run_id``** (one per
+    mode). Three steps, each idempotent so re-running on a partially- or
+    fully-cancelled run is safe:
+
+    1. **Cancel Dataflow jobs** discovered by the ``dit_run_id=<run_id>``
+       label (NOT the row's ``dataflow_job_ids``, which are always ``[]``).
+       Only jobs in a cancellable state (Running / Pending) are cancelled.
+    2. **Delete output tables** recorded on the rows. CRITICAL SAFETY: only
+       fully-qualified ``project.dataset.table`` values are deleted, at the
+       table level. A value that looks like a dataset (or is otherwise
+       malformed) is skipped with a warning -- ``dit_exp_*`` snapshot datasets
+       and any dataset-level delete are categorically out of scope (manual
+       deletion of shared snapshot datasets has broken live runs before; see
+       CLAUDE.md).
+    3. **UPDATE status='cancelled'** on every row of the run.
+
+    ``region`` defaults to ``DIT_DATAFLOW_REGION`` then ``us-central1`` --
+    matching the same env knob both workflows resolve their region from. Pass
+    explicitly for non-default placements.
+
+    Raises ``ValueError`` when ``run_id`` matches no rows (a typo'd id should
+    surface loudly, not silently no-op).
+    """
+    region = region or os.environ.get("DIT_DATAFLOW_REGION", "us-central1")
+    client = client or _make_client()
+
+    rows = read_rows_for_run(run_id, client=client)
+    if not rows:
+        raise ValueError(
+            f"cancel_run: no rows found for run_id={run_id!r} in {TABLE_FQN}. "
+            "Check the id (the per-run 12-hex from the workflow's run_id= log line)."
+        )
+
+    logger.info(
+        "cancel_run %s: %d row(s); region=%s", run_id, len(rows), region,
+    )
+
+    # Step 1 -- cancel Dataflow jobs discovered by label.
+    jobs = _discover_dataflow_jobs(run_id, region)
+    logger.info("cancel_run %s: discovered %d Dataflow job(s) by label", run_id, len(jobs))
+    for job in jobs:
+        if job["state"] in _CANCELLABLE_DATAFLOW_STATES:
+            _cancel_dataflow_job(job["id"], region)
+        else:
+            logger.info(
+                "skip Dataflow job %s (state=%s; already terminal)",
+                job["id"], job["state"],
+            )
+
+    # Step 2 -- delete output tables (table-level only; dataset-shaped or
+    # malformed values are skipped). Dedupe across the run's rows so a table
+    # referenced by multiple modes isn't deleted (a harmless no-op) twice.
+    seen: set[str] = set()
+    for row in rows:
+        for fqn in row.output_tables:
+            if fqn in seen:
+                continue
+            seen.add(fqn)
+            if not _looks_like_table_fqn(fqn):
+                logger.warning(
+                    "cancel_run %s: skipping non-table output value %r "
+                    "(not a fully-qualified project.dataset.table; refusing to "
+                    "delete a dataset or malformed ref)",
+                    run_id, fqn,
+                )
+                continue
+            _delete_output_table(fqn, client=client)
+
+    # Step 3 -- mark the run cancelled.
+    _mark_run_cancelled(run_id, client=client)
+    logger.info("cancel_run %s: marked %d row(s) status=%s", run_id, len(rows), STATUS_CANCELLED)

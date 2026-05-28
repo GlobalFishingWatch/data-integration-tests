@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -105,6 +106,58 @@ COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
 
 
+# --------------------------------------------------------------------------
+# Dataflow labels
+# --------------------------------------------------------------------------
+# Mirrors port_visits/ais.py's per-run static labels. The dit_run_id label is
+# the load-bearing one: `make dit-cancel` / dit.cache.cancel_run discover this
+# run's Dataflow jobs by `labels.dit_run_id=<run_id>` (the runner never
+# captures submitted job ids back into the cache row -- dataflow_job_ids is
+# always []). The others are provenance niceties for ad-hoc filtering.
+#
+# Unlike port-visits (which forwards labels as --labels=k=v CLI flags to the
+# in-container pipe-anchorages process), pipe-gaps submits Dataflow in-process
+# via dit.runners.dataflow, so labels are threaded as a `labels` list in
+# unknown_parsed_args -> Beam's GoogleCloudOptions.labels (a list of "k=v").
+
+_UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
+
+
+def _safe_label_value(value: str) -> str:
+    """Coerce arbitrary strings into BQ-label-safe form (``[a-z0-9_-]``,
+    max 63 chars). Matches port_visits/ais.py's sanitiser."""
+    return _UNSAFE_LABEL_CHAR_RE.sub("-", value.lower())[:63]
+
+
+def _dit_run_labels(args: argparse.Namespace) -> list[str]:
+    """Per-run static Dataflow labels (``"key=value"`` strings).
+
+    Computed once from the resolved RunContext stamped on ``args``; the same
+    set is applied to every mode's Dataflow job so cleanup-by-label sweeps the
+    whole run. Free-form values pass through ``_safe_label_value`` for BQ's
+    label constraints; the hex ``run_id`` is already label-safe.
+    """
+    return [
+        f"dit_run_id={args.run_id}",
+        f"dit_commit_sha={_safe_label_value(args.pipeline_commit)}",
+        f"dit_worker_image_tag={_safe_label_value(_worker_image_tag(args.worker_image))}",
+        f"dit_launched_by={_safe_label_value(os.environ.get('USER', 'unknown'))}",
+    ]
+
+
+_DIGEST_RE = re.compile(r"@sha\d{3}:[0-9a-f]+$", re.IGNORECASE)
+
+
+def _worker_image_tag(image: str) -> str:
+    """Extract the tag portion of a docker image ref (digest stripped first).
+
+    Mirrors port_visits/ais.py._worker_image_tag: ``foo/bar:tag`` -> ``tag``;
+    ``foo/bar@sha256:..`` -> ``latest``.
+    """
+    image = _DIGEST_RE.sub("", image)
+    return image.rsplit(":", 1)[-1] if ":" in image else "latest"
+
+
 def _resolve_suffix(args: argparse.Namespace) -> str:
     """Build the output-table suffix from the already-resolved pipeline_commit.
 
@@ -142,7 +195,15 @@ def _make_config(
     dataflow_subnetwork: Optional[str] = None,
     worker_image: Optional[str] = None,
     job_name: Optional[str] = None,
+    labels: Optional[Sequence[str]] = None,
 ) -> SimpleNamespace:
+    # `labels` (a list of "key=value" strings) is seeded into unknown_parsed_args
+    # so it flows into Beam's GoogleCloudOptions.labels via the PipelineFactory
+    # (which spreads **unknown_parsed_args into the Pipeline constructor). The
+    # dit_run_id label is what make dit-cancel discovers the run's jobs by.
+    unknown_parsed_args: dict[str, Any] = {"project": PROJECT}
+    if labels:
+        unknown_parsed_args["labels"] = list(labels)
     cfg = SimpleNamespace(
         date_range=(start.isoformat(), end.isoformat()),
         bq_input_messages=bq_input_messages,
@@ -154,7 +215,7 @@ def _make_config(
         window_period_d=window_period_d,
         filter_good_seg=filter_good_seg,
         skip_open_gaps=skip_open_gaps,
-        unknown_parsed_args={"project": PROJECT},
+        unknown_parsed_args=unknown_parsed_args,
         unknown_unparsed_args=[],
     )
     cfg.service_account = service_account
@@ -619,6 +680,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     source_messages = args.source_messages
     source_segments = args.source_segments
 
+    # Per-run static Dataflow labels (incl. the dit_run_id cleanup key),
+    # shared by every mode's job. Threaded into the dataflow runner via cfg ->
+    # unknown_parsed_args -> GoogleCloudOptions.labels.
+    dit_labels = _dit_run_labels(args)
+    logger.info("dit labels: %s", dit_labels)
+
     base_cfg = dict(
         bq_input_messages=source_messages,
         bq_input_segments=source_segments,
@@ -634,6 +701,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dataflow_temp_bucket=args.dataflow_temp_bucket or None,
         dataflow_subnetwork=args.dataflow_subnetwork or None,
         worker_image=args.worker_image or None,
+        labels=dit_labels,
     )
 
     base = f"{PROJECT}.{args.dest_dataset}.three_way_{suffix}"

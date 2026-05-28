@@ -52,5 +52,32 @@ def run(workflow_path: Path, workflow_args: tuple[str, ...]) -> None:
     sys.exit(workflow_main(list(workflow_args)))
 
 
+@main.command("cache-cancel")
+@click.argument("run_id")
+@click.option(
+    "--region",
+    default=None,
+    help="Dataflow region to search for the run's jobs. "
+         "Defaults to DIT_DATAFLOW_REGION, then us-central1.",
+)
+def cache_cancel(run_id: str, region: str | None) -> None:
+    """Cancel run RUN_ID: cancel its Dataflow jobs, drop its output tables,
+    and mark its dit_runs rows cancelled.
+
+    RUN_ID is the per-run 12-hex id the workflow logs (``run_id=...``) and
+    stamps as the ``dit_run_id`` Dataflow label. All sibling modes sharing
+    that id are cleaned up together. Idempotent.
+    """
+    # Lazy import so `dit run` / `dit --help` don't import the BQ-touching
+    # module (and its lazy google-cloud-bigquery dependency) unnecessarily.
+    from dit.cache import cancel_run
+
+    try:
+        cancel_run(run_id, region=region)
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
