@@ -561,7 +561,7 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
 # Comparisons
 # --------------------------------------------------------------------------
 
-def compare_all(args: argparse.Namespace, mode_fqns: dict[str, str]) -> int:
+def compare_all(mode_fqns: dict[str, str]) -> int:
     """Pairwise-compare the three modes' visits tables.
 
     ``mode_fqns`` maps each mode label to the FQN to compare -- the
@@ -739,7 +739,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.skip_comparisons:
         return 0
-    return compare_all(args, mode_fqns)
+    return compare_all(mode_fqns)
 
 
 if __name__ == "__main__":
