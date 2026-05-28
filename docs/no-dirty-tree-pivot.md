@@ -150,13 +150,21 @@ win comes from dropping the read filter (below).
 - Drop the `pipeline_dirty` column in a follow-up after one release cycle.
 - Update `dit.cache.CachedRun` dataclass: rename `pipeline_dirty` → `unreviewed_code`; add `pipeline_commit_parent: str | None = None`.
 
-### M-pivot-4 — remove `--allow-dirty-tree` + dead code
+### M-pivot-4 — auto-build worker image + remove dead code ✅ LANDED
 
-- Delete `--allow-dirty-tree` from the argparse blocks in both workflows.
-- Delete `dit.git_info.warn_if_worker_image_misses_dirty_tree` + its tests.
-- Delete the dirty-tree handling in `_resolve_suffix` (the `_dirty` substring branch).
-- Drop the dirty-row tests from `test_pipe_gaps_mode_equivalence.py` and `test_cache.py`.
-- Update memories: `[[dit-runs-cache]]` and `[[submitter-vs-worker-split]]` lose their dirty-tree paragraphs; new `[[no-dirty-tree-policy]]` memory documents the new state.
+Scope grew during implementation: rather than just *delete* the worker-image-staleness warning, we **close the gap it guarded** by auto-building the worker image. (Discussion: the snapshot makes submitter code reproducible but workers still load from `--worker-image` — a separate container-registry artifact the snapshot never touches. So unreviewed code + default image = workers silently run stale code, regardless of git state. Deleting the warning without a replacement would lose a real, load-bearing signal.)
+
+**Auto-build (new `dit.worker_image.ensure_worker_image`):** when a `--runner=dataflow` run executes unreviewed code (`unreviewed=True`) against the *default* worker image, build a content-addressable worker image from the pipeline source and use it; otherwise return `--worker-image` unchanged (no-op for reviewed code, an explicit override, or the docker runner).
+- Build via kaniko Cloud Build (`docker/worker-image/cloudbuild.yaml`, same pinned executor + shared `kaniko-cache` repo as ditbox). Tag `gcr.io/world-fishing-827/dit/<pipeline>:dit-<pipeline_commit>` — content-addressable, so **idempotent**: an existing tag skips the build.
+- Called from each workflow's `main()`, so **one mechanism covers both entry points**: `make dit-cloud` (workflow runs inside ditbox → a *nested* Cloud Build, kept fast by the shared cache) and local `dit run --runner=dataflow` (submits from the laptop). Done before the worker-image digest/label is derived so the cache key reflects the image actually used.
+- Prerequisite: `pipe-gaps`'s Dockerfile is mis-layered for caching (source copied before the deps install), so source-only rebuilds bust the deps layer. A separate PR in the pipe-gaps repo reorders it (deps before `COPY src`) — `anchorages_pipeline` is already correctly layered. Auto-build *works* without the reorder, just slower (~1-2 min vs seconds) on source changes.
+
+**Dead-code removal (the original M-pivot-4 scope):**
+- Deleted `--allow-dirty-tree` from both workflows' argparse + the deprecation blocks.
+- Deleted `dit.git_info.warn_if_worker_image_misses_dirty_tree` + its only test file (`tests/test_git_info.py`); `git_info` stays.
+- Dropped the `_dirty` substring from `_resolve_suffix` in both workflows (suffix is always `<experiment_id>_<commit>_<uuid>`).
+- `pipeline_dirty` column + dual-write **kept** (deferred drop — avoids the NOT-NULL-column migration/code coupling window; see the M-pivot-3 note).
+- Memories updated (`[[dit-runs-cache]]`, `[[submitter-vs-worker-split]]`, `[[no-dirty-tree-policy]]`).
 
 ### M-pivot-5 — docs catch-up
 

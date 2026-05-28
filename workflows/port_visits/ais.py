@@ -55,6 +55,7 @@ from dit.git_info import git_info
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.snapshot import resolve_pipeline_commit
+from dit.worker_image import ensure_worker_image
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +616,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     args.commit_sha = commit_sha
     args.dirty = dirty
+
+    # Close the submitter-vs-worker gap (M-pivot-4): if this run executes
+    # unreviewed code against the default worker image, auto-build a
+    # content-addressable worker image from the source so the workers actually
+    # run it. No-op for reviewed code, an explicit --worker-image, or the
+    # docker runner. Done before the worker-image-tag label is derived.
+    args.worker_image = ensure_worker_image(
+        pipeline=PIPELINE_NAME,
+        repo_dir=repo_dir,
+        commit=args.commit_sha,
+        runner=args.runner,
+        unreviewed=args.dirty,
+        worker_image=args.worker_image,
+        default_worker_image=DEFAULT_WORKER_IMAGE,
+    )
 
     suffix = _resolve_suffix(args)
 

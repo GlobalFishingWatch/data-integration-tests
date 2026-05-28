@@ -41,6 +41,7 @@ from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
 from dit.snapshot import resolve_pipeline_commit, snapshot_parent
+from dit.worker_image import ensure_worker_image
 
 # Pipeline repo name; used to namespace auto-snapshot refs
 # (refs/dit-snapshots/<PIPELINE_NAME>/<sha>).
@@ -743,6 +744,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # For snapshot runs, record the HEAD the dirty tree was based on (parsed
     # from the snapshot commit message); None for real/main commits. M-pivot-3.
     args.pipeline_commit_parent = snapshot_parent(pipeline_commit, repo_dir)
+
+    # Close the submitter-vs-worker gap (M-pivot-4): if this run executes
+    # unreviewed code against the default worker image, the workers would run
+    # the stale published code. Auto-build a content-addressable worker image
+    # from the source so they actually run this code. No-op for reviewed code,
+    # an explicit --worker-image, or the docker runner. Done before the digest
+    # resolution so the cache key reflects the image actually used.
+    args.worker_image = ensure_worker_image(
+        pipeline=PIPELINE_NAME,
+        repo_dir=repo_dir,
+        commit=args.pipeline_commit,
+        runner=args.runner,
+        unreviewed=args.pipeline_dirty,
+        worker_image=args.worker_image,
+        default_worker_image=DEFAULT_WORKER_IMAGE,
+    )
 
     suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)
