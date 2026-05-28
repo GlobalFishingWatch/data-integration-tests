@@ -57,18 +57,23 @@ Wire `dit.cache` into `workflows/pipe_gaps/mode_equivalence.py`.
 
 **Estimated effort**: 1 day. The threading work (cfg attributes, label addition) is the bulk; the cache-call sites are 4 lines each.
 
-### Milestone 5 — Workflow integration (port-visits) + `make dit-cancel`
+### Milestone 5 — port-visits cache + cleanup control plane
 
-Port-visits is structurally similar to pipe-gaps (same `execute_bf` / `execute_bfd` / `execute_bftruncate` shape; already has `dit_run_id`).
+Refined 2026-05-29. Splits into two independent pieces. The `dit.workflow` harness extraction (PR #28) already moved `run_with_cache` + the run-context preamble into shared code, so M5b is now mostly "supply port-visits' own cache key" rather than copying the wrapper.
 
-**Tasks**:
-- `canonical_params_dict` for port_visits (similar to M4; ais-specific fields).
-- Wrap `execute_*` (same shape as pipe-gaps).
-- Add `make dit-cancel RUN_ID=<id>` Makefile target. Shell script that calls `dit cache-cancel <run-id>`; the CLI in turn calls `cancel_run(run_id)`.
-- Implement `cancel_run(run_id)` in `dit.cache`: look up the row, cancel Dataflow jobs via `gcloud dataflow jobs cancel`, drop output tables via `bq rm -f`, UPDATE the row's status to `cancelled`. Idempotent.
-- **Tests**: integration tests against a mocked `bigquery.Client` + mocked `subprocess.run`. Round-trip: a row at status='running' → cancel_run → status='cancelled' + jobs/tables cleanup attempted.
+**M5a — cleanup control plane (`cancel_run` + `dit cache-cancel` + `make dit-cancel`).** Standalone; no port-visits dependency. `dit.cache.cancel_run(run_id)` is currently a `NotImplementedError` stub in `src/dit/cache.py`; `dit.cli` is a `click` group, so `dit cache-cancel` is one new `@main.command`.
+- `cancel_run(run_id)` looks up **all rows for that run_id** (one per mode — they share the run_id; `cache_key` distinguishes modes), cancels their Dataflow jobs, `bq rm -f`s their `output_tables`, and `UPDATE`s `status='cancelled'`. Idempotent (tolerate already-gone jobs/tables).
+- **Job discovery (the real design point).** Every written row has `dataflow_job_ids=[]` — the runner never captured them. So `cancel_run` discovers jobs **by label**: `gcloud dataflow jobs list --region=<r> --filter="labels.dit_run_id=<id>"`, NOT the stored list. **Prereq**: confirm both workflows stamp `dit_run_id` as a Dataflow label (port-visits does; verify pipe-gaps' submission does, add if not). Capturing job IDs back into the row from the in-process pipe-gaps runner is a later nice-to-have.
+- `@main.command("cache-cancel")` → `cancel_run`; `make dit-cancel RUN_ID=<id>` shells it (validate RUN_ID non-empty).
+- **Permissions to verify first**: `dataflow.jobs.cancel` + BQ table-delete on `tech_great_expectations` — for **both** the laptop user (interactive `make dit-cancel`) and `automated-testing@` (the M6 cloud SIGTERM path).
+- **Tests**: mocked `bigquery.Client` + `subprocess.run`; round-trip `status='running'` → `cancel_run` → `status='cancelled'` + cancel/rm attempted; idempotency.
 
-**Estimated effort**: 1 day.
+**M5b — wire port-visits caching.** `ais.py` currently passes `resolve_digest=False` (no cache).
+- Add `WORKFLOW_FILE_SHA1` + a port-visits `canonical_params_dict` (output-affecting fields only: start/end, `source_dataset_stem`, `named_anchorages`, `tail_days`, mode).
+- Flip `resolve_digest=True` (caching needs the digest), build a `CacheKey`, wrap each `execute_*` via the shared `dit.workflow.run_with_cache(..., log_label=mode)`. `compare_tables` still takes the returned (cached-or-fresh) FQN.
+- **Tests**: stub `read_cache` Some/None → skip-on-hit / compute-on-miss (mirror `test_pipe_gaps_mode_equivalence.py`).
+
+**Estimated effort**: ~1–1.5 days (1 PR each, or combined). M6 (SIGTERM → `cancel_run`) is the natural follow-on once M5a lands.
 
 ### Milestone 6 — SIGTERM trap inside `dit run`
 
