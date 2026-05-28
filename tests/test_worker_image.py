@@ -86,3 +86,23 @@ def test_build_raises_without_config(monkeypatch: pytest.MonkeyPatch, tmp_path) 
     monkeypatch.setattr(worker_image, "_dit_root", lambda: tmp_path)
     with pytest.raises(RuntimeError, match="editable dit install"):
         worker_image._build_and_push("/repo", "gcr.io/x/y:z")
+
+
+def _raise_fnf(*a, **k):
+    raise FileNotFoundError("gcloud")
+
+
+def test_image_exists_clear_error_without_gcloud(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker_image.subprocess, "run", _raise_fnf)
+    with pytest.raises(RuntimeError, match="gcloud not found"):
+        worker_image._image_exists("gcr.io/x/y:z")
+
+
+def test_build_clear_error_without_gcloud(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    # Real cloudbuild config exists (dit root); gcloud is what's missing.
+    (tmp_path / "docker" / "worker-image").mkdir(parents=True)
+    (tmp_path / "docker" / "worker-image" / "cloudbuild.yaml").write_text("steps: []\n")
+    monkeypatch.setattr(worker_image, "_dit_root", lambda: tmp_path)
+    monkeypatch.setattr(worker_image.subprocess, "run", _raise_fnf)
+    with pytest.raises(RuntimeError, match="gcloud not found"):
+        worker_image._build_and_push("/repo", "gcr.io/x/y:z")

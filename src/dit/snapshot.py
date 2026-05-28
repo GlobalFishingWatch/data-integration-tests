@@ -148,10 +148,14 @@ def is_unreviewed(commit: str, repo_dir: str) -> bool:
         )
         return True
     # `--end-of-options` forces `commit` to be read as a revision, not a flag.
-    result = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", "--end-of-options", commit, "origin/main"],
-        cwd=repo_dir, capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "--end-of-options", commit, "origin/main"],
+            cwd=repo_dir, capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        logger.warning("git not found; treating %s as unreviewed (build-when-unsure).", commit)
+        return True
     if result.returncode == 0:
         return False  # ancestor of origin/main -> reviewed
     if result.returncode == 1:

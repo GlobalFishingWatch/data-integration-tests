@@ -47,10 +47,17 @@ def worker_image_tag(pipeline: str, commit: str) -> str:
 
 def _image_exists(tag: str) -> bool:
     """True iff ``tag`` already resolves in the registry (gcr.io)."""
-    proc = subprocess.run(
-        ["gcloud", "container", "images", "describe", tag],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["gcloud", "container", "images", "describe", tag],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "gcloud not found on PATH; worker-image auto-build needs the Cloud "
+            "SDK. Install it, or pass an explicit --worker-image so dit skips "
+            "the build."
+        ) from e
     return proc.returncode == 0
 
 
@@ -73,7 +80,14 @@ def _build_and_push(repo_dir: str, tag: str) -> None:
         cmd.append(f"--ignore-file={ignore_file}")
     cmd += [f"--substitutions=_IMAGE={tag}", repo_dir]
     logger.info("building worker image %s from %s (kaniko Cloud Build)", tag, repo_dir)
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "gcloud not found on PATH; worker-image auto-build needs the Cloud "
+            "SDK. Install it, or pass an explicit --worker-image so dit skips "
+            "the build."
+        ) from e
 
 
 def ensure_worker_image(
