@@ -486,6 +486,80 @@ def test_run_with_cache_stale_recomputes() -> None:
     assert result == "proj.ds.fresh_table"
 
 
+def test_run_with_cache_records_extra_output_tables() -> None:
+    """Fix 4: extra_output_tables are recorded AFTER output_fqn (which stays
+    first / the comparison target) so cleanup drops every produced table."""
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True, True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
+                     return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
+    ):
+        result = dit_workflow.run_with_cache(
+            MagicMock(),
+            ctx=_ctx(),
+            workflow="wf",
+            pipeline="anchorages_pipeline",
+            experiment_id="exp01",
+            cache_key=_cache_key(),
+            output_fqn="proj.ds.visits",
+            execute_kwargs={},
+            extra_output_tables=("proj.ds.port_events",),
+        )
+    written = mock_write.call_args.args[0]
+    # comparison FQN returned + first in the list; extras follow.
+    assert result == "proj.ds.visits"
+    assert written.output_tables == ["proj.ds.visits", "proj.ds.port_events"]
+
+
+def test_run_with_cache_default_extras_keep_single_output_table() -> None:
+    """pipe-gaps passes no extras -> byte-identical single-element list."""
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
+                     return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
+    ):
+        dit_workflow.run_with_cache(
+            MagicMock(),
+            ctx=_ctx(),
+            workflow="wf",
+            pipeline="pipe-gaps",
+            experiment_id="exp01",
+            cache_key=_cache_key(),
+            output_fqn="proj.ds.only",
+            execute_kwargs={},
+        )
+    written = mock_write.call_args.args[0]
+    assert written.output_tables == ["proj.ds.only"]
+
+
+def test_run_with_cache_dedupes_extra_equal_to_output_fqn() -> None:
+    """A defensive guard: an extra equal to output_fqn isn't duplicated."""
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
+                     return_value=datetime(2026, 9, 1, tzinfo=timezone.utc)),
+    ):
+        dit_workflow.run_with_cache(
+            MagicMock(),
+            ctx=_ctx(),
+            workflow="wf",
+            pipeline="pipe-gaps",
+            experiment_id="exp01",
+            cache_key=_cache_key(),
+            output_fqn="proj.ds.t",
+            execute_kwargs={},
+            extra_output_tables=("proj.ds.t",),
+        )
+    written = mock_write.call_args.args[0]
+    assert written.output_tables == ["proj.ds.t"]
+
+
 def test_run_with_cache_empty_output_tables_treated_as_miss() -> None:
     """Degenerate 'succeeded' row with no output_tables must not IndexError;
     treat as a miss and recompute."""

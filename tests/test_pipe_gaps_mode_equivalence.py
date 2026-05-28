@@ -324,3 +324,58 @@ def test_run_with_cache_includes_extras_in_key():
             cache_key_extras={"restricted_ssvids": ["b"]},
         )
     assert calls[0] != calls[1], "different extras -> different cache keys"
+
+
+# --------------------------------------------------------------------------
+# Dataflow labels (M5a): pipe-gaps stamps dit_run_id so cancel_run can find
+# this run's jobs by label.
+# --------------------------------------------------------------------------
+
+def test_dit_run_labels_includes_run_id():
+    labels = mod._dit_run_labels(_args(run_id="abc123def456"))
+    assert "dit_run_id=abc123def456" in labels
+
+
+def test_dit_run_labels_full_set():
+    args = _args(
+        run_id="abc123def456",
+        pipeline_commit="deadbeef",
+        worker_image="us-central1-docker.pkg.dev/foo/core/pipe-gaps:v0.9.6",
+    )
+    labels = mod._dit_run_labels(args)
+    keys = {label.split("=", 1)[0] for label in labels}
+    assert keys == {
+        "dit_run_id", "dit_commit_sha", "dit_worker_image_tag", "dit_launched_by",
+    }
+    # The image-tag label is sanitised to BQ-label-safe form (dots -> dashes).
+    assert "dit_worker_image_tag=v0-9-6" in labels
+
+
+def test_make_config_threads_labels_into_unknown_parsed_args():
+    from datetime import date
+
+    labels = ["dit_run_id=rid01", "dit_commit_sha=abc"]
+    cfg = mod._make_config(
+        start=date(2020, 1, 1), end=date(2020, 2, 1),
+        bq_input_messages="a", bq_input_segments="b", bq_output_gaps="c",
+        ssvids=(), min_gap_length=1.0, n_hours_before=12, window_period_d=2,
+        filter_good_seg=True, skip_open_gaps=False, labels=labels,
+    )
+    # The labels list flows into unknown_parsed_args, which the PipelineFactory
+    # spreads into the Beam Pipeline -> GoogleCloudOptions.labels.
+    assert cfg.unknown_parsed_args["labels"] == labels
+    # project is still present (not clobbered).
+    assert cfg.unknown_parsed_args["project"] == mod.PROJECT
+
+
+def test_make_config_no_labels_omits_key():
+    from datetime import date
+
+    cfg = mod._make_config(
+        start=date(2020, 1, 1), end=date(2020, 2, 1),
+        bq_input_messages="a", bq_input_segments="b", bq_output_gaps="c",
+        ssvids=(), min_gap_length=1.0, n_hours_before=12, window_period_d=2,
+        filter_good_seg=True, skip_open_gaps=False,
+    )
+    # No labels passed -> no labels key (so Beam doesn't get an empty list).
+    assert "labels" not in cfg.unknown_parsed_args

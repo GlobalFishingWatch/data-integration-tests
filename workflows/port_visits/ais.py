@@ -52,6 +52,7 @@ from typing import Optional, Sequence
 from dit import compare as dit_compare
 from dit import dates as dit_dates
 from dit import workflow as dit_workflow
+from dit.cache import CacheKey, resolve_worker_image_to_digest, sha1_of_workflow_file
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
@@ -65,6 +66,24 @@ logger = logging.getLogger(__name__)
 # Pipeline repo name; namespaces auto-snapshot refs
 # (refs/dit-snapshots/<PIPELINE_NAME>/<sha>).
 PIPELINE_NAME = "anchorages_pipeline"
+
+# Compute once at import time; the dit-side cache buster (workflow-file edits
+# invalidate the cache, pure dit.* refactors don't).
+WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
+
+#: The workflow name recorded on every CachedRun row.
+WORKFLOW_NAME = "workflows/port_visits/ais.py"
+
+# Mode labels. Single source of truth shared by execute_* and the cache key.
+MODE_BF = "1_bf"
+MODE_BFD = "2_bfd"
+MODE_BFTRUNCATE = "3_bftruncate"
+
+#: Modes whose output depends on ``tail_days`` (the daily-slice modes).
+#: ``MODE_BF`` runs a single big range and ignores it, so ``tail_days`` must
+#: NOT contribute to BF's cache key (else a ``--tail-days`` change would
+#: needlessly invalidate BF, matching the pipe-gaps mode-aware rule).
+_MODES_USING_TAIL = frozenset({MODE_BFD, MODE_BFTRUNCATE})
 
 
 # --------------------------------------------------------------------------
@@ -434,7 +453,7 @@ def _parse_date(s: str) -> date:
 def execute_bf(args: argparse.Namespace, suffix: str) -> None:
     start = _parse_date(args.start)
     end = _parse_date(args.end)
-    _run_slice(args, mode="1_bf", slice_start=start, slice_end=end, suffix=suffix,
+    _run_slice(args, mode=MODE_BF, slice_start=start, slice_end=end, suffix=suffix,
                iteration=1, total_iterations=1)
 
 
@@ -443,7 +462,7 @@ def execute_bfd(args: argparse.Namespace, suffix: str) -> None:
     end = _parse_date(args.end)
     initial_end = end - timedelta(days=args.tail_days)
     total = 1 + args.tail_days
-    _run_slice(args, mode="2_bfd", slice_start=start, slice_end=initial_end, suffix=suffix,
+    _run_slice(args, mode=MODE_BFD, slice_start=start, slice_end=initial_end, suffix=suffix,
                iteration=1, total_iterations=total)
     # daterange_inclusive is half-open per dit.dates contract; +1 day on end
     # to include the final `end` date.
@@ -451,7 +470,7 @@ def execute_bfd(args: argparse.Namespace, suffix: str) -> None:
         dit_dates.daterange_inclusive(initial_end + timedelta(days=1), end + timedelta(days=1)),
         start=2,
     ):
-        _run_slice(args, mode="2_bfd", slice_start=d, slice_end=d, suffix=suffix,
+        _run_slice(args, mode=MODE_BFD, slice_start=d, slice_end=d, suffix=suffix,
                    iteration=i, total_iterations=total)
 
 
@@ -459,27 +478,168 @@ def execute_bftruncate(args: argparse.Namespace, suffix: str) -> None:
     start = _parse_date(args.start)
     end = _parse_date(args.end)
     total = 1 + args.tail_days
-    _run_slice(args, mode="3_bftruncate", slice_start=start, slice_end=end, suffix=suffix,
+    _run_slice(args, mode=MODE_BFTRUNCATE, slice_start=start, slice_end=end, suffix=suffix,
                iteration=1, total_iterations=total)
     for i, d in enumerate(
         dit_dates.daterange_inclusive(end - timedelta(days=args.tail_days - 1), end + timedelta(days=1)),
         start=2,
     ):
-        _run_slice(args, mode="3_bftruncate", slice_start=d, slice_end=d, suffix=suffix,
+        _run_slice(args, mode=MODE_BFTRUNCATE, slice_start=d, slice_end=d, suffix=suffix,
                    iteration=i, total_iterations=total)
+
+
+# --------------------------------------------------------------------------
+# Run cache integration (M5b of dit.cache rollout; see docs/run-cache-impl.md)
+# --------------------------------------------------------------------------
+
+def _submitter_image_identity(args: argparse.Namespace) -> dict:
+    """Cache-key contribution that content-addresses the **submitter** image.
+
+    SOUNDNESS (M5 fix): a port-visits run loads pipe-anchorages code in TWO
+    places, both of which determine output:
+
+    * the **submitter** image (``args.image_tag``, run by ``dit_docker.run``)
+      builds and submits the Beam graph -- the pipeline-construction code; and
+    * the **worker** image (``--sdk_container_image={args.worker_image}``) runs
+      the DoFns on Dataflow.
+
+    The cache key already content-addresses the worker image (via
+    ``worker_image_digest``) and the local source (via ``pipeline_commit``).
+    Without the submitter image too, two runs with the SAME worker image + SAME
+    local commit but DIFFERENT submitter images would collide on a wrong cache
+    hit. So the submitter image's identity must be in the key. Two cases:
+
+    * ``build_from_source=True`` -- the submitter image is built fresh from the
+      local worktree, so its content is already captured by ``pipeline_commit``
+      (a real or deterministic-snapshot SHA). No extra field needed; we record
+      a marker so a build-from-source run and a published-image run at the same
+      commit still differ in the key (they are different artefacts).
+    * ``build_from_source=False`` -- the submitter is the published
+      ``args.image_tag``. We add its resolved digest (``submitter_image_digest``,
+      stamped on ``args`` in :func:`main` via the same
+      :func:`resolve_worker_image_to_digest` machinery the worker image uses).
+      If resolution failed, ``main`` stamps the raw tag string instead so
+      different tags at least don't collide (logged there as tag-based).
+
+    Mode-independent (the submitter image is identical across modes), so this
+    sits outside the ``_MODES_USING_TAIL`` branch.
+    """
+    if args.build_from_source:
+        return {"submitter_build_from_source": True}
+    # Published submitter image: digest (preferred) or raw tag (fallback),
+    # stamped on args in main(). getattr keeps the compare-only / test paths
+    # that never call main() working (they don't hit a real submitter image).
+    return {
+        "submitter_image_digest": getattr(
+            args, "submitter_image_digest", args.image_tag
+        )
+    }
+
+
+def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
+    """Output-affecting params for a port-visits mode-equivalence run.
+
+    Mode-aware (matches pipe-gaps): only the fields each mode actually
+    consumes contribute to its cache key. The daily-slice modes
+    (``2_bfd`` / ``3_bftruncate``) read ``tail_days``; ``1_bf`` runs a single
+    big range and ignores it, so including ``tail_days`` in BF's key would
+    invalidate its cache on every ``--tail-days`` change for no behavioural
+    reason.
+
+    Output content depends on: the mode, the inclusive date window, the
+    source dataset stem (the input AIS cohort), the named-anchorages
+    reference, the **submitter image identity** (see
+    :func:`_submitter_image_identity` -- the pipeline-construction code that
+    builds/submits the Beam graph; mode-independent), and -- when set --
+    ``thinned_message_table`` (skips step 1 and reads pre-thinned messages from
+    that table, which changes what step 2 sees). Excludes plumbing (datasets,
+    regions, SAs), naming (experiment_id, suffix, binding), and runner-only
+    knobs (worker_image is in the key via ``worker_image_digest`` on the
+    CacheKey itself; ``parallel`` doesn't affect output). NOTE: ``image_tag``
+    is NOT a pure runner-only knob -- it IS the submitter image, so its
+    identity is folded in via ``_submitter_image_identity`` above.
+    """
+    params: dict = {
+        "mode": mode,
+        "start": args.start,
+        "end": args.end,
+        "source_dataset_stem": args.source_dataset_stem,
+        "named_anchorages": args.named_anchorages,
+        "thinned_message_table": args.thinned_message_table,
+        **_submitter_image_identity(args),
+    }
+    if mode in _MODES_USING_TAIL:
+        params["tail_days"] = args.tail_days
+    return params
+
+
+def _build_cache_key(args: argparse.Namespace, mode: str) -> CacheKey:
+    """Compose a :class:`CacheKey` for the given mode from the stamped
+    ``args`` context (commit + worker-image digest resolved in :func:`main`)."""
+    return CacheKey(
+        pipeline_commit=args.commit_sha,
+        worker_image_digest=args.worker_image_digest,
+        workflow_file_sha1=WORKFLOW_FILE_SHA1,
+        params=canonical_params_dict(args, mode),
+    )
+
+
+def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn) -> str:
+    """Workflow-local adapter over :func:`dit.workflow.run_with_cache`.
+
+    Builds the mode-aware :class:`CacheKey` and threads the per-run
+    :class:`RunContext` (stamped on ``args`` in :func:`main`) + the
+    port-visits workflow/pipeline identity into the generic wrapper. Returns
+    the visits-table FQN to compare (cached on hit, freshly computed on miss).
+
+    The two-step chain (thin_port_messages -> port_visits) produces TWO tables
+    per mode: the visits table (the comparison target, passed as ``output_fqn``)
+    and the per-mode thinned ``port_events_<suffix>_<mode>`` intermediate. Both
+    are recorded on the cache row so ``cancel_run`` cleans up both -- otherwise
+    the intermediate is orphaned. EXCEPTION: when ``--thinned-message-table`` is
+    set, step 1 is skipped and the workflow does NOT create a thinned table (it
+    reads the user's external one), so there's nothing of ours to record /
+    clean up -- we record only the visits table in that case.
+    """
+    cache_key = _build_cache_key(args, mode)
+    output_fqn = _visits_table(args, suffix, mode)
+    # Only OUR thinned table is a cleanup target; the external one (when
+    # --thinned-message-table is set) belongs to the caller, never us.
+    extra_output_tables = (
+        () if args.thinned_message_table else (_thinned_table(args, suffix, mode),)
+    )
+    return dit_workflow.run_with_cache(
+        execute_fn,
+        ctx=args.run_context,
+        workflow=WORKFLOW_NAME,
+        pipeline=PIPELINE_NAME,
+        experiment_id=args.experiment_id,
+        cache_key=cache_key,
+        output_fqn=output_fqn,
+        execute_kwargs={"args": args, "suffix": suffix},
+        extra_output_tables=extra_output_tables,
+        log_label=mode,
+    )
 
 
 # --------------------------------------------------------------------------
 # Comparisons
 # --------------------------------------------------------------------------
 
-def compare_all(args: argparse.Namespace, suffix: str) -> int:
-    modes = ["1_bf", "2_bfd", "3_bftruncate"]
+def compare_all(mode_fqns: dict[str, str]) -> int:
+    """Pairwise-compare the three modes' visits tables.
+
+    ``mode_fqns`` maps each mode label to the FQN to compare -- the
+    cached-or-fresh table returned by the cache wrapper (a cache hit reuses a
+    prior run's UUID-suffixed table, so the FQN is NOT derivable from the
+    current run's ``suffix`` alone).
+    """
+    modes = [MODE_BF, MODE_BFD, MODE_BFTRUNCATE]
     overall = 0
     for a, b in itertools.combinations(modes, 2):
         rc = dit_compare.compare_tables(
-            _visits_table(args, suffix, a),
-            _visits_table(args, suffix, b),
+            mode_fqns[a],
+            mode_fqns[b],
             keys=COMPARE_KEYS,
             view_suffix=COMPARE_VIEW_SUFFIX,
         )
@@ -569,9 +729,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --suffix manual/cross-version escape hatch live in dit.workflow). Pass
     # `args.suffix or None` so a falsy suffix (the default None or an empty
     # string) routes through the auto-snapshot path -- matching this workflow's
-    # historical truthy `if args.suffix:` check. Port-visits has NO run-cache
-    # integration, so resolve_digest=False below skips the worker-image digest
-    # lookup it would never use.
+    # historical truthy `if args.suffix:` check. resolve_digest=True (M5b):
+    # the run cache keys on the worker-image digest, so we resolve it here.
     ctx = resolve_run_context(
         repo_dir=repo_dir,
         pipeline_name=PIPELINE_NAME,
@@ -580,15 +739,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         suffix=args.suffix or None,
         worker_image=args.worker_image,
         default_worker_image=DEFAULT_WORKER_IMAGE,
-        # No run-cache here, so the worker-image digest is unused; skip the
-        # gcloud describe (keeps this path side-effect-free, matching the
-        # pre-refactor behavior where ais never resolved a digest).
-        resolve_digest=False,
+        # Run-cache wired in M5b: resolve the worker image to a content-
+        # addressable digest so :tag retags invalidate the cache cleanly.
+        # Falls back to the tag form on failure (cache misses, run still works).
+        resolve_digest=True,
     )
+    args.run_context = ctx
     args.commit_sha = ctx.pipeline_commit
     args.unreviewed = ctx.unreviewed
     args.worker_image = ctx.worker_image
+    args.worker_image_digest = ctx.worker_image_digest
     args.run_id = ctx.run_id
+
+    # SOUNDNESS (Fix 1): the submitter image (args.image_tag, run by
+    # dit_docker.run to build/submit the Beam graph) is a second code source
+    # that determines output, alongside the worker image. For a published
+    # submitter image (no --build-from-source) resolve it to a content-
+    # addressable digest the same way resolve_run_context resolves the worker
+    # image, so two different published submitter images don't collide on a
+    # cache hit. build_from_source folds into pipeline_commit instead (the
+    # image is built from the worktree) -- see _submitter_image_identity.
+    if not args.build_from_source:
+        try:
+            args.submitter_image_digest = resolve_worker_image_to_digest(args.image_tag)
+        except RuntimeError as e:
+            logger.warning(
+                "could not resolve submitter image %s to a digest (%s); the "
+                "cache key falls back to the raw tag string for this run "
+                "(tag-based, NOT digest-based -- a :tag retag won't invalidate "
+                "the cache). Different tags still don't collide.",
+                args.image_tag, e,
+            )
+            args.submitter_image_digest = args.image_tag
 
     suffix = _resolve_suffix(args)
 
@@ -608,20 +790,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
     logger.info("runner: %s", args.runner)
 
+    # Per-mode FQN to compare. Default to this run's freshly-suffixed visits
+    # tables; the cache wrapper overwrites each with the cached FQN on a hit.
+    # This default is also what the --skip-pipelines (compare-only) path uses:
+    # the user pre-populated those tables, so we compare them directly without
+    # consulting the cache.
+    mode_fqns: dict[str, str] = {
+        mode: _visits_table(args, suffix, mode)
+        for mode in (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
+    }
+
     if not args.skip_pipelines:
-        mode_fns = [execute_bf, execute_bfd, execute_bftruncate]
+        # Each mode flows through the run cache: an identical
+        # (commit, worker-image digest, workflow-file sha1, params) tuple
+        # reuses a prior run's visits table instead of re-submitting Dataflow.
+        # run_with_cache returns the FQN to compare (cached on hit, fresh
+        # on miss). compare keys on the visits table only.
+        mode_execs = [
+            (MODE_BF, execute_bf),
+            (MODE_BFD, execute_bfd),
+            (MODE_BFTRUNCATE, execute_bftruncate),
+        ]
         if args.parallel:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(mode_fns)) as pool:
-                futures = [pool.submit(fn, args, suffix) for fn in mode_fns]
-                for fut in concurrent.futures.as_completed(futures):
-                    fut.result()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(mode_execs)) as pool:
+                future_to_mode = {
+                    pool.submit(_run_with_cache, args, mode, suffix, fn): mode
+                    for mode, fn in mode_execs
+                }
+                for fut in concurrent.futures.as_completed(future_to_mode):
+                    mode_fqns[future_to_mode[fut]] = fut.result()
         else:
-            for fn in mode_fns:
-                fn(args, suffix)
+            for mode, fn in mode_execs:
+                mode_fqns[mode] = _run_with_cache(args, mode, suffix, fn)
 
     if args.skip_comparisons:
         return 0
-    return compare_all(args, suffix)
+    return compare_all(mode_fqns)
 
 
 if __name__ == "__main__":

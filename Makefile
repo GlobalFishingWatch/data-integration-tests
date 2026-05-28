@@ -25,7 +25,7 @@ DEPS_FLAG = $(if $(FULLDEPS),,--no-deps)
     install-pipe-gaps-ref install-port-visits-ref install-pipe-events-ref \
     snapshot-pipe-gaps snapshot-port-visits snapshot-pipe-events \
     clean-snapshot clean-snapshots \
-    publish-ditbox dit-cloud
+    publish-ditbox dit-cloud dit-cancel
 
 # === Framework only ===
 
@@ -203,3 +203,23 @@ dit-cloud:
 	    --ignore-file=$(CURDIR)/.gcloudignore \
 	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)@@_BEAM_VERSION=$(BEAM_VERSION)@@_PIPELINE_COMMIT=$$PIPELINE_COMMIT@@_UNREVIEWED=$$UNREVIEWED" \
 	    "$(PROJECTS)/$(PIPELINE)"
+
+# === Run cleanup: cancel a run's Dataflow jobs + drop its output tables ===
+#
+# Cancels all sibling modes of a run (they share the per-run 12-hex RUN_ID,
+# stamped as the dit_run_id Dataflow label + recorded on every dit_runs row).
+# Dataflow jobs are discovered by that label; output tables come off the rows
+# (table-level deletes only -- never a dataset). Marks the rows cancelled.
+# Idempotent.
+#
+# Required:
+#   RUN_ID=<12-hex>   # the run_id= the workflow logs at startup
+# Optional:
+#   REGION=<region>   # Dataflow region to search; defaults to DIT_DATAFLOW_REGION then us-central1
+#
+# Example:
+#   make dit-cancel RUN_ID=a1b2c3d4e5f6
+
+dit-cancel:
+	@test -n "$(RUN_ID)" || { echo "RUN_ID required: make dit-cancel RUN_ID=<12-hex run id>" >&2; exit 1; }
+	dit cache-cancel "$(RUN_ID)" $(if $(REGION),--region "$(REGION)",)
