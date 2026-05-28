@@ -1,0 +1,53 @@
+# Cloud Build config for auto-building a Dataflow worker image from a pipeline
+# checkout (M-pivot-4). Driven by dit.worker_image.ensure_worker_image, which
+# submits this build when a run executes unreviewed code against the default
+# worker image -- otherwise the snapshotted code never reaches the workers (the
+# submitter-vs-worker split; see docs/no-dirty-tree-pivot.md § M-pivot-4).
+#
+# Usage (normally invoked by dit, not by hand):
+#   gcloud builds submit \
+#       --config=docker/worker-image/cloudbuild.yaml \
+#       --substitutions=_IMAGE=gcr.io/world-fishing-827/dit/pipe-gaps:dit-<commit> \
+#       <pipeline-checkout-dir>
+#
+# The build context (--source / the positional dir) is the PIPELINE checkout;
+# its own Dockerfile's `prod` target is what Dataflow workers run.
+#
+# Content-addressable: _IMAGE is tagged dit-<pipeline_commit>, so an unchanged
+# tree resolves to the same tag and ensure_worker_image skips the build
+# entirely (the image already exists in the registry).
+
+substitutions:
+  # Full destination tag, e.g.
+  #   gcr.io/world-fishing-827/dit/pipe-gaps:dit-<commit>
+  # dit images live under gcr.io/world-fishing-827/dit/* (docs/conventions.md).
+  _IMAGE: ''
+  # Multi-stage target that bakes the pipeline package for worker execution.
+  # Both pipe-gaps and anchorages_pipeline expose a `prod` stage.
+  _TARGET: prod
+  # Pipeline Dockerfile path within the build context.
+  _DOCKERFILE: Dockerfile
+  # Shared org-wide kaniko cache repo (same as docker/ditbox/cloudbuild.yaml).
+  # Project-level uploadArtifacts on world-fishing-827 covers writes here.
+  _CACHE_REPO: gcr.io/world-fishing-827/github.com/globalfishingwatch/kaniko-cache
+
+steps:
+  # Same pinned kaniko executor digest as docker/ditbox/cloudbuild.yaml (that
+  # registry publishes only :latest / :debug, so digest pinning is the only
+  # reproducible option). Keep the two in sync when refreshing.
+  - name: gcr.io/kaniko-project/executor@sha256:4e7a52dd1f14872430652bb3b027405b8dfd17c4538751c620ac005741ef9698
+    args:
+      - --destination=${_IMAGE}
+      - --target=${_TARGET}
+      - --cache=true
+      - --cache-ttl=8760h
+      - --cache-repo=${_CACHE_REPO}
+      - --dockerfile=${_DOCKERFILE}
+      - --context=dir:///workspace
+      - --log-format=text
+
+serviceAccount: projects/world-fishing-827/serviceAccounts/automated-testing@world-fishing-827.iam.gserviceaccount.com
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8

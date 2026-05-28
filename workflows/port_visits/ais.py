@@ -51,10 +51,11 @@ from typing import Optional, Sequence
 
 from dit import compare as dit_compare
 from dit import dates as dit_dates
-from dit.git_info import git_info, warn_if_worker_image_misses_dirty_tree
+from dit.git_info import git_info
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
-from dit.snapshot import resolve_pipeline_commit
+from dit.snapshot import is_unreviewed, resolve_pipeline_commit
+from dit.worker_image import ensure_worker_image
 
 logger = logging.getLogger(__name__)
 
@@ -149,15 +150,15 @@ def _validate_experiment_id(value: str) -> str:
 def _resolve_suffix(args: argparse.Namespace) -> str:
     """Build the output-table suffix from the already-resolved commit.
 
-    ``main()`` resolves ``args.commit_sha`` / ``args.dirty`` once (auto-
-    snapshotting a dirty dataflow run via dit.snapshot) before calling this.
-    ``--suffix`` bypasses everything.
+    ``main()`` resolves ``args.commit_sha`` once (auto-snapshotting a dirty
+    dataflow run via dit.snapshot) before calling this. Every run executes a
+    committed ref (real or snapshot), so the suffix is always
+    ``<experiment_id>_<commit>_<uuid>`` -- the legacy ``_dirty`` marker was
+    dropped in M-pivot-4. ``--suffix`` bypasses everything.
     """
     if args.suffix:
         return args.suffix
-    uid = uuid.uuid4().hex[:6]
-    body = f"{args.commit_sha}_dirty_{uid}" if args.dirty else f"{args.commit_sha}_{uid}"
-    return f"{args.experiment_id}_{body}"
+    return f"{args.experiment_id}_{args.commit_sha}_{uuid.uuid4().hex[:6]}"
 
 
 # --------------------------------------------------------------------------
@@ -572,9 +573,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "dominant cost of running the thin step on full AIS data. Cross-version "
                         "runs should provide a snapshotted FQN (cross_version_ais.py pins this "
                         "automatically when given a prod-side FQN).")
-    p.add_argument("--allow-dirty-tree", action="store_true",
-                   help="DEPRECATED no-op: dirty trees are auto-snapshotted to a "
-                        "pushed ref. Will be removed in a future release.")
     p.add_argument("--require-clean", action="store_true",
                    help="Error on a dirty tree instead of auto-snapshotting "
                         "(for CI / strict-provenance callers).")
@@ -605,26 +603,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     repo_dir = os.getcwd()
 
-    if args.allow_dirty_tree:
-        logger.warning(
-            "--allow-dirty-tree is deprecated and now a no-op: dirty trees are "
-            "auto-snapshotted to a pushed ref (see docs/no-dirty-tree-pivot.md). "
-            "The flag will be removed in a future release."
-        )
-
     # Resolve the committed ref this run records (no-dirty-tree policy).
     # --suffix is the manual / cross-version escape hatch: when set, record git
     # state as-is (cross_version_ais.py runs committed worktree refs and owns
     # provenance). Otherwise dirty + --runner=dataflow auto-snapshots + pushes;
     # the cloud path supplies DIT_PIPELINE_COMMIT instead.
     if args.suffix:
+        # Manual / cross-version escape hatch: don't auto-snapshot, but still
+        # classify accurately -- unreviewed if the tree is dirty OR the commit
+        # isn't merged into origin/main (e.g. cross_version_ais.py worktrees at
+        # PR refs). The dirty bit alone would skip the worker-image auto-build
+        # for a clean-but-unmerged worktree.
         commit_sha, dirty = git_info(repo_dir)
+        unreviewed = dirty or is_unreviewed(commit_sha, repo_dir)
     else:
-        commit_sha, dirty = resolve_pipeline_commit(
+        commit_sha, unreviewed = resolve_pipeline_commit(
             repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
         )
     args.commit_sha = commit_sha
-    args.dirty = dirty
+    args.unreviewed = unreviewed
+
+    # Close the submitter-vs-worker gap (M-pivot-4): if this run executes
+    # unreviewed code against the default worker image, auto-build a
+    # content-addressable worker image from the source so the workers actually
+    # run it. No-op for reviewed code, an explicit --worker-image, or the
+    # docker runner. Done before the worker-image-tag label is derived.
+    args.worker_image = ensure_worker_image(
+        pipeline=PIPELINE_NAME,
+        repo_dir=repo_dir,
+        commit=args.commit_sha,
+        runner=args.runner,
+        unreviewed=args.unreviewed,
+        worker_image=args.worker_image,
+        default_worker_image=DEFAULT_WORKER_IMAGE,
+    )
 
     suffix = _resolve_suffix(args)
 
@@ -632,13 +644,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # every Dataflow job + BQ output table from this run shares them. See
     # the dit_run_id / dit_commit_sha / dit_worker_image_tag / dit_launched_by
     # labels in _dynamic_labels.
-    warn_if_worker_image_misses_dirty_tree(
-        dirty_fn=lambda: dirty,
-        repo_dir=os.getcwd(),
-        runner=args.runner,
-        worker_image=args.worker_image,
-        default_worker_image=DEFAULT_WORKER_IMAGE,
-    )
     args.run_id = uuid.uuid4().hex[:12]
     args.worker_image_tag = _worker_image_tag(args.worker_image)
     args.launched_by = os.environ.get("USER", "unknown")

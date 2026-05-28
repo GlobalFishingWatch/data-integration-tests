@@ -58,29 +58,40 @@ def test_git_info_untracked_is_not_dirty(repo: Path) -> None:
 # resolve_pipeline_commit — git + snapshot mocked
 # --------------------------------------------------------------------------
 
-def test_env_override_short_circuits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_override_classifies_via_is_unreviewed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(snapshot.ENV_PIPELINE_COMMIT, "deadbeef")
     calls = []
-    monkeypatch.setattr(snapshot, "git_info", lambda d: calls.append(d) or ("x", False))
+    monkeypatch.setattr(snapshot, "git_info", lambda d: calls.append("git_info") or ("x", False))
     monkeypatch.setattr(snapshot, "create_snapshot", lambda d, p: calls.append("snap"))
+    seen = []
+    monkeypatch.setattr(snapshot, "is_unreviewed", lambda c, d: seen.append(c) or True)
 
     commit, unreviewed = snapshot.resolve_pipeline_commit(
         "/repo", "pipe-gaps", runner="dataflow"
     )
+    # The override commit is recorded and classified via is_unreviewed.
     assert (commit, unreviewed) == ("deadbeef", True)
-    assert calls == [], "env override must not touch git or the snapshot script"
+    assert seen == ["deadbeef"]
+    assert calls == [], "env override must not touch git_info or the snapshot script"
 
 
-def test_clean_tree_returns_head_not_unreviewed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_clean_tree_classifies_via_is_unreviewed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A clean checkout's reviewed/unreviewed status comes from is_unreviewed
+    (the ancestor-of-main check) -- clean main is reviewed, a clean feature
+    branch is unreviewed."""
     monkeypatch.delenv(snapshot.ENV_PIPELINE_COMMIT, raising=False)
     monkeypatch.setattr(snapshot, "git_info", lambda d: ("abc1234", False))
     snapped = []
     monkeypatch.setattr(snapshot, "create_snapshot", lambda d, p: snapped.append((d, p)))
 
-    commit, unreviewed = snapshot.resolve_pipeline_commit(
-        "/repo", "pipe-gaps", runner="dataflow"
-    )
-    assert (commit, unreviewed) == ("abc1234", False)
+    # Clean + on main -> reviewed.
+    monkeypatch.setattr(snapshot, "is_unreviewed", lambda c, d: False)
+    assert snapshot.resolve_pipeline_commit("/repo", "pipe-gaps", runner="dataflow") == ("abc1234", False)
+
+    # Clean + unmerged feature branch -> unreviewed (the case the dirty-only gate missed).
+    monkeypatch.setattr(snapshot, "is_unreviewed", lambda c, d: True)
+    assert snapshot.resolve_pipeline_commit("/repo", "pipe-gaps", runner="dataflow") == ("abc1234", True)
+
     assert snapped == [], "clean tree must not snapshot"
 
 
@@ -89,11 +100,12 @@ def test_dirty_docker_no_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(snapshot, "git_info", lambda d: ("abc1234", True))
     snapped = []
     monkeypatch.setattr(snapshot, "create_snapshot", lambda d, p: snapped.append((d, p)))
+    monkeypatch.setattr(snapshot, "is_unreviewed", lambda c, d: pytest.fail("dirty is known unreviewed; no ancestor check"))
 
     commit, unreviewed = snapshot.resolve_pipeline_commit(
         "/repo", "pipe-gaps", runner="docker"
     )
-    # Docker runs the working tree directly; record as unreviewed, no push.
+    # Docker runs the working tree directly; dirty -> known unreviewed, no push.
     assert (commit, unreviewed) == ("abc1234", True)
     assert snapped == [], "docker runner must not snapshot/push"
 
@@ -183,3 +195,69 @@ def test_create_snapshot_raises_without_script(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(snapshot, "snapshot_script", lambda: Path("/nonexistent/snapshot.sh"))
     with pytest.raises(RuntimeError, match="editable dit install"):
         snapshot.create_snapshot("/repo", "pipe-gaps")
+
+
+# --------------------------------------------------------------------------
+# is_unreviewed — against a real repo with origin/main
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def repo_with_main(tmp_path: Path) -> Path:
+    """Work repo with a bare origin holding `main`; HEAD == origin/main."""
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    _git("init", "--bare", "-q", str(origin), cwd=tmp_path)
+    _git("init", "-q", "-b", "main", str(work), cwd=tmp_path)
+    _git("config", "user.email", "t@dit.local", cwd=work)
+    _git("config", "user.name", "t", cwd=work)
+    _git("remote", "add", "origin", str(origin), cwd=work)
+    (work / "f.txt").write_text("one\n")
+    _git("add", ".", cwd=work)
+    _git("commit", "-q", "-m", "init", cwd=work)
+    _git("push", "-q", "-u", "origin", "main", cwd=work)
+    return work
+
+
+def test_is_unreviewed_main_commit_is_reviewed(repo_with_main: Path) -> None:
+    head = git_info(str(repo_with_main))[0]
+    assert snapshot.is_unreviewed(head, str(repo_with_main)) is False
+
+
+def test_is_unreviewed_unmerged_branch_is_unreviewed(repo_with_main: Path) -> None:
+    """A clean feature branch (committed, not merged to main) is unreviewed --
+    the case the old dirty-only gate missed."""
+    _git("checkout", "-q", "-b", "feature", cwd=repo_with_main)
+    (repo_with_main / "f.txt").write_text("two\n")
+    _git("commit", "-aqm", "feature change", cwd=repo_with_main)
+    feature_sha = git_info(str(repo_with_main))[0]
+    assert snapshot.is_unreviewed(feature_sha, str(repo_with_main)) is True
+
+
+def test_is_unreviewed_snapshot_orphan_short_circuits(repo_with_main: Path) -> None:
+    """A dit snapshot (orphan) is unreviewed without any fetch/merge-base."""
+    tree = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"], cwd=str(repo_with_main),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    head_full = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_with_main),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    snap = subprocess.run(
+        ["git", "commit-tree", "-m", f"dit snapshot of {head_full}", tree],
+        cwd=str(repo_with_main), check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert snapshot.is_unreviewed(snap, str(repo_with_main)) is True
+
+
+def test_is_unreviewed_fetch_failure_defaults_unreviewed(tmp_path: Path) -> None:
+    """No origin to fetch -> build-when-unsure -> treat as unreviewed."""
+    work = tmp_path / "noremote"
+    _git("init", "-q", "-b", "main", str(work), cwd=tmp_path)
+    _git("config", "user.email", "t@dit.local", cwd=work)
+    _git("config", "user.name", "t", cwd=work)
+    (work / "f.txt").write_text("one\n")
+    _git("add", ".", cwd=work)
+    _git("commit", "-q", "-m", "init", cwd=work)
+    head = git_info(str(work))[0]
+    assert snapshot.is_unreviewed(head, str(work)) is True

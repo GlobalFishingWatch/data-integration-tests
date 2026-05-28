@@ -206,13 +206,13 @@ class CachedRun:
     pipeline: str
     experiment_id: str
     pipeline_commit: str
-    # unreviewed_code: approximates "this code isn't a reviewed/main commit".
-    # As shipped (M-pivot-3) it's the M-pivot-2 resolved flag: TRUE for
-    # snapshot refs, dirty trees, and DIT_PIPELINE_COMMIT-provided commits;
-    # FALSE for a clean checkout (of ANY branch -- the precise
-    # `git merge-base --is-ancestor origin/main` refinement is deferred).
-    # read_cache no longer filters on it; it's informational. Strict-provenance
-    # queries should read FALSE as "clean checkout", not literally "on main".
+    # unreviewed_code: TRUE when this code isn't merged into origin/main --
+    # snapshot refs and dirty trees (known unreviewed), plus committed-but-
+    # unmerged commits, detected via `git merge-base --is-ancestor origin/main`
+    # (dit.snapshot.is_unreviewed, M-pivot-4). FALSE for a commit on/merged into
+    # main. read_cache doesn't filter on it (it's informational for strict-
+    # provenance queries); it DOES gate worker-image auto-build, which is why
+    # the ancestor check has to be accurate rather than a dirty-only proxy.
     unreviewed_code: bool
     dit_commit: str
     workflow_file_sha1: str

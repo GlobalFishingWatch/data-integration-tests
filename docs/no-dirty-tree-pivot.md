@@ -1,6 +1,6 @@
 # Pivot: no dirty trees, push every snapshot
 
-**Status:** planning / design. Not landed. Drafted 2026-05-22.
+**Status:** in progress. M-pivot-1 through M-pivot-4 have shipped (PRs #22, #23, #24, #25); M-pivot-5 (docs catch-up) remains. Drafted 2026-05-22.
 
 ## Why
 
@@ -126,15 +126,17 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 
 ### M-pivot-3 — `unreviewed_code` + `pipeline_commit_parent` columns replace `pipeline_dirty` ✅ LANDED
 
-Shipped as implemented (one deviation from the sketch below): the
-`unreviewed_code` value is the `unreviewed` flag already resolved by
-`dit.snapshot.resolve_pipeline_commit` in M-pivot-2 (snapshot / dirty / env-override → True; clean → False). The `git merge-base --is-ancestor origin/main`
-refinement for "clean-but-not-on-main" branches is **deferred** — it adds a
-`git fetch` round-trip per run and is awkward on the cloud env-override path,
-and the column is now informational (no longer gates caching), so the
-approximation is acceptable. Revisit if strict-provenance queries need the
-precision. Migration in `migrations/002_unreviewed_code.sql`; the cacheability
-win comes from dropping the read filter (below).
+Shipped as implemented. In M-pivot-3 the `unreviewed_code` value was the
+coarse M-pivot-2 flag (snapshot / dirty / env-override → True; clean → False)
+and the `git merge-base --is-ancestor origin/main` refinement was **deferred**
+because the column was merely informational. **M-pivot-4 un-deferred it**
+(`dit.snapshot.is_unreviewed`) — once the flag started *gating* worker-image
+auto-build, the coarse version was wrong in both directions (clean feature
+branches under-built; clean `main` via the cloud env-override over-built), so
+it now does the accurate ancestor check (with a per-run `git fetch origin main`,
+falling back to unreviewed=True on failure). Migration in
+`migrations/002_unreviewed_code.sql`; the cacheability win comes from dropping
+the read filter (below).
 
 - Migration:
   ```sql
@@ -142,7 +144,7 @@ win comes from dropping the read filter (below).
   ALTER TABLE tech_great_expectations.dit_runs ADD COLUMN pipeline_commit_parent STRING;
   ```
 - `_run_with_cache` writes:
-  - `unreviewed_code` — **as shipped**, this is the M-pivot-2 resolved flag: `TRUE` for snapshot refs / dirty trees / `DIT_PIPELINE_COMMIT` runs, `FALSE` for a clean checkout of any branch. *(Sketch, deferred: the sharper `TRUE` unless `git merge-base --is-ancestor <commit> origin/main` — after a `git fetch origin main` — would also flag clean-but-not-on-main branches. Deferred because it costs a per-run `git fetch`, is awkward on the cloud env-override path, and the column is informational now that it no longer gates caching. Until then, strict-provenance queries should read `FALSE` as "clean checkout", not "on main".)*
+  - `unreviewed_code` — `TRUE` when the code isn't merged into `origin/main`: snapshot refs / dirty trees (known unreviewed without a network call), plus committed-but-unmerged commits detected by `dit.snapshot.is_unreviewed` (`git fetch origin main` + `git merge-base --is-ancestor <commit> origin/main`; falls back to `TRUE` if the fetch/check can't run). `FALSE` for a commit on/merged into `main`. M-pivot-3 shipped this as the coarse dirty-only flag with the ancestor check deferred; **M-pivot-4 made it accurate** because the flag now gates worker-image auto-build (`dit.worker_image.ensure_worker_image`) — a coarse flag under-built clean feature branches and over-built clean `main`.
   - `pipeline_commit_parent`: the SHA the snapshot was based on (extracted from the snapshot commit message — pattern `dit snapshot of <40-char-sha>`, validated as 40-char hex). NULL for non-snapshot rows.
 - `read_cache` default behaviour: returns all rows (`unreviewed_code` is informational). PR-validation queries that want strict provenance filter `WHERE unreviewed_code = FALSE` explicitly.
 - Drop the `pipeline_dirty = FALSE` filter from `read_cache`.
@@ -150,13 +152,22 @@ win comes from dropping the read filter (below).
 - Drop the `pipeline_dirty` column in a follow-up after one release cycle.
 - Update `dit.cache.CachedRun` dataclass: rename `pipeline_dirty` → `unreviewed_code`; add `pipeline_commit_parent: str | None = None`.
 
-### M-pivot-4 — remove `--allow-dirty-tree` + dead code
+### M-pivot-4 — auto-build worker image + remove dead code ✅ LANDED
 
-- Delete `--allow-dirty-tree` from the argparse blocks in both workflows.
-- Delete `dit.git_info.warn_if_worker_image_misses_dirty_tree` + its tests.
-- Delete the dirty-tree handling in `_resolve_suffix` (the `_dirty` substring branch).
-- Drop the dirty-row tests from `test_pipe_gaps_mode_equivalence.py` and `test_cache.py`.
-- Update memories: `[[dit-runs-cache]]` and `[[submitter-vs-worker-split]]` lose their dirty-tree paragraphs; new `[[no-dirty-tree-policy]]` memory documents the new state.
+Scope grew during implementation: rather than just *delete* the worker-image-staleness warning, we **close the gap it guarded** by auto-building the worker image. (Discussion: the snapshot makes submitter code reproducible but workers still load from `--worker-image` — a separate container-registry artifact the snapshot never touches. So unreviewed code + default image = workers silently run stale code, regardless of git state. Deleting the warning without a replacement would lose a real, load-bearing signal.)
+
+**Auto-build (new `dit.worker_image.ensure_worker_image`):** when a `--runner=dataflow` run executes unreviewed code (`unreviewed=True`) against the *default* worker image, build a content-addressable worker image from the pipeline source and use it; otherwise return `--worker-image` unchanged (no-op for reviewed code, an explicit override, or the docker runner).
+- Build via kaniko Cloud Build (`docker/worker-image/cloudbuild.yaml`, same pinned executor + shared `kaniko-cache` repo as ditbox). Tag `gcr.io/world-fishing-827/dit/<pipeline>:dit-<pipeline_commit>` — content-addressable, so **idempotent**: an existing tag skips the build.
+- Called from each workflow's `main()`, so **one mechanism covers both entry points**: `make dit-cloud` (workflow runs inside ditbox → a *nested* Cloud Build, kept fast by the shared cache) and local `dit run --runner=dataflow` (submits from the laptop). Done before the worker-image digest/label is derived so the cache key reflects the image actually used.
+- **The nested-build path was validated empirically (2026-05-28).** An open question was whether `automated-testing@` (the SA the dit-cloud build runs as) could submit the nested worker-image build that specifies `automated-testing@` as its own service account — i.e. whether it has `iam.serviceAccounts.actAs` on itself. It is NOT in the project `roles/iam.serviceAccountUser` binding, but it IS in the project `roles/iam.serviceAccountTokenCreator` binding. A throwaway test (an outer build running as `automated-testing@` submitting an inner build specifying `automated-testing@`) **succeeded**, so the nested submit works with existing permissions — no IAM change required. (We considered an in-build kaniko `:debug` step and a laptop-submitted build to avoid the actAs requirement; both became unnecessary once the requirement turned out to be already satisfied. The nested design is the cleanest — the workflow decides *and* builds in one place for both paths.)
+- Prerequisite: `pipe-gaps`'s Dockerfile is mis-layered for caching (source copied before the deps install), so source-only rebuilds bust the deps layer. A separate PR in the pipe-gaps repo reorders it (deps before `COPY src`) — `anchorages_pipeline` is already correctly layered. Auto-build *works* without the reorder, just slower (~1-2 min vs seconds) on source changes.
+
+**Dead-code removal (the original M-pivot-4 scope):**
+- Deleted `--allow-dirty-tree` from both workflows' argparse + the deprecation blocks.
+- Deleted `dit.git_info.warn_if_worker_image_misses_dirty_tree` + its only test file (`tests/test_git_info.py`); `git_info` stays.
+- Dropped the `_dirty` substring from `_resolve_suffix` in both workflows (suffix is always `<experiment_id>_<commit>_<uuid>`).
+- `pipeline_dirty` column + dual-write **kept** (deferred drop — avoids the NOT-NULL-column migration/code coupling window; see the M-pivot-3 note).
+- Memories updated (`[[dit-runs-cache]]`, `[[submitter-vs-worker-split]]`, `[[no-dirty-tree-policy]]`).
 
 ### M-pivot-5 — docs catch-up
 
