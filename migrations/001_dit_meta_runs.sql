@@ -24,12 +24,11 @@ CREATE TABLE IF NOT EXISTS `world-fishing-827.tech_great_expectations.dit_runs` 
   -- write_cache dual-writes it (= unreviewed_code), then dropped. See
   -- migrations/002_unreviewed_code.sql + docs/no-dirty-tree-pivot.md.
   pipeline_dirty      BOOL      NOT NULL,
-  -- unreviewed_code: approximates "not a reviewed/main commit". As shipped
-  -- (M-pivot-3) it's TRUE for snapshot refs / dirty trees / DIT_PIPELINE_COMMIT
-  -- runs and FALSE for a clean checkout of ANY branch (the precise
-  -- merge-base-with-origin/main refinement is deferred). read_cache no longer
-  -- filters on it (snapshots are cacheable); informational only -- strict-
-  -- provenance queries should read FALSE as "clean checkout", not "on main".
+  -- unreviewed_code: TRUE when the code isn't merged into origin/main --
+  -- snapshot refs / dirty trees, plus committed-but-unmerged commits detected
+  -- via `git merge-base --is-ancestor origin/main` (M-pivot-4). FALSE for a
+  -- commit on/merged into main. read_cache no longer filters on it (snapshots
+  -- are cacheable); it's informational AND gates worker-image auto-build.
   unreviewed_code     BOOL,
   -- pipeline_commit_parent: for a snapshot run, the HEAD the dirty tree was
   -- based on (parsed from the snapshot commit message "dit snapshot of <sha>").

@@ -109,6 +109,54 @@ def snapshot_parent(commit: str, repo_dir: str) -> str | None:
     return None
 
 
+def is_unreviewed(commit: str, repo_dir: str, *, main_ref: str = "origin/main") -> bool:
+    """Return True iff ``commit`` is NOT merged into ``origin/main``.
+
+    "Unreviewed" = not an ancestor of ``origin/main`` (M-pivot-4; this is the
+    ``git merge-base --is-ancestor`` refinement that M-pivot-3 deferred while
+    the flag was merely informational — it now *gates* worker-image auto-build,
+    so it has to be accurate):
+
+    * snapshot orphan commit -> not an ancestor -> unreviewed (short-circuited
+      via :func:`snapshot_parent` so we skip the network round-trip);
+    * clean checkout on ``main`` -> ancestor -> reviewed;
+    * clean feature branch (committed but not merged) -> not an ancestor ->
+      unreviewed (this is the case the dirty-only gate used to miss).
+
+    ``git fetch origin main`` runs first so the ancestry check is current. If
+    the fetch or the check can't run (offline, no ``origin``, unknown commit),
+    err on the side of **unreviewed=True** — building a worker image when
+    unsure is safer than silently running stale published workers.
+    """
+    # A dit snapshot is an orphan by construction -> never an ancestor of main.
+    if snapshot_parent(commit, repo_dir) is not None:
+        return True
+    try:
+        subprocess.run(
+            ["git", "fetch", "--quiet", "origin", "main"],
+            cwd=repo_dir, check=True, capture_output=True, text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.warning(
+            "could not fetch %s; treating %s as unreviewed (build-when-unsure).",
+            main_ref, commit,
+        )
+        return True
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, main_ref],
+        cwd=repo_dir, capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        return False  # ancestor of main -> reviewed
+    if result.returncode == 1:
+        return True   # not an ancestor -> unreviewed
+    logger.warning(
+        "`git merge-base --is-ancestor %s %s` errored (rc=%s); treating as "
+        "unreviewed (build-when-unsure).", commit, main_ref, result.returncode,
+    )
+    return True
+
+
 def resolve_pipeline_commit(
     repo_dir: str,
     pipeline: str,
@@ -118,26 +166,38 @@ def resolve_pipeline_commit(
 ) -> tuple[str, bool]:
     """Return ``(pipeline_commit, unreviewed)`` for this run.
 
-    * ``DIT_PIPELINE_COMMIT`` set -> ``(value, True)``. Cloud path: the
-      snapshot already happened on the laptop; just record it. Treated as
-      unreviewed (a snapshot or ad-hoc ref, by construction).
-    * clean tree -> ``(HEAD short sha, False)``. The reviewed/main path.
+    ``unreviewed`` gates worker-image auto-build (see
+    :func:`dit.worker_image.ensure_worker_image`), so it must be accurate in
+    both directions — a clean feature branch is unreviewed (its committed code
+    isn't in the published image), and a clean ``main`` checkout is reviewed.
+    The committed/clean cases delegate to :func:`is_unreviewed` (the
+    ancestor-of-``origin/main`` check); the dirty/snapshot cases are known
+    unreviewed without a network round-trip.
+
+    * ``DIT_PIPELINE_COMMIT`` set -> ``(value, is_unreviewed(value))``. Cloud
+      path: the laptop already resolved the commit (snapshot sha for a dirty
+      tree, HEAD/REF sha otherwise); we record it and classify it. A snapshot
+      sha short-circuits to unreviewed; a real sha runs the ancestor check.
+    * clean tree -> ``(HEAD short sha, is_unreviewed(HEAD))``.
     * dirty + ``runner != "dataflow"`` -> ``(HEAD short sha, True)`` with NO
-      snapshot. The docker runner executes the pipeline image locally against
-      the mounted working tree; no remote workers means a pushed snapshot
-      adds nothing. Recorded as unreviewed for provenance.
+      snapshot. The docker runner executes the working tree directly; no remote
+      workers, so a pushed snapshot adds nothing. Uncommitted -> unreviewed.
     * dirty + ``runner == "dataflow"`` + ``require_clean`` -> ``SystemExit``.
     * dirty + ``runner == "dataflow"`` -> auto-snapshot + push, return
       ``(snapshot short sha, True)``.
     """
     override = os.environ.get(ENV_PIPELINE_COMMIT, "").strip()
     if override:
-        logger.info("pipeline_commit from %s: %s", ENV_PIPELINE_COMMIT, override)
-        return override, True
+        unreviewed = is_unreviewed(override, repo_dir)
+        logger.info(
+            "pipeline_commit from %s: %s (unreviewed=%s)",
+            ENV_PIPELINE_COMMIT, override, unreviewed,
+        )
+        return override, unreviewed
 
     short, dirty = git_info(repo_dir)
     if not dirty:
-        return short, False
+        return short, is_unreviewed(short, repo_dir)
 
     if runner != "dataflow":
         logger.warning(

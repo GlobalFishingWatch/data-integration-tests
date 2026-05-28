@@ -14,12 +14,12 @@
 --     meaning anything; "is this code reviewed?" is the real question.
 --     read_cache drops its `pipeline_dirty = FALSE` filter so content-
 --     addressable snapshot refs become cacheable on repeat runs.
---     NOTE (as shipped, M-pivot-3): the flag is an APPROXIMATION -- TRUE for
---     snapshot refs / dirty trees / DIT_PIPELINE_COMMIT runs, FALSE for a
---     clean checkout of ANY branch. The precise "merged into origin/main"
---     check (git merge-base --is-ancestor) is deferred. Strict-provenance
---     queries must NOT treat unreviewed_code = FALSE as "on main" -- it only
---     means "ran from a clean checkout".
+--     unreviewed_code is TRUE when the code isn't merged into origin/main:
+--     snapshot refs / dirty trees, plus committed-but-unmerged commits
+--     detected via `git merge-base --is-ancestor origin/main`
+--     (dit.snapshot.is_unreviewed, M-pivot-4). FALSE means merged-to-main.
+--     It's informational for strict-provenance queries AND gates worker-image
+--     auto-build (M-pivot-4), which is why it has to be accurate.
 --   * pipeline_commit_parent  -- for snapshot rows, the HEAD the dirty tree was
 --     based on. Lets a query reconstruct the reproduce context even if the
 --     snapshot ref is later deleted (secret-leak remediation).

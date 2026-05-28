@@ -126,15 +126,17 @@ Each milestone is a separate PR. Ordering matters; earlier PRs can land independ
 
 ### M-pivot-3 — `unreviewed_code` + `pipeline_commit_parent` columns replace `pipeline_dirty` ✅ LANDED
 
-Shipped as implemented (one deviation from the sketch below): the
-`unreviewed_code` value is the `unreviewed` flag already resolved by
-`dit.snapshot.resolve_pipeline_commit` in M-pivot-2 (snapshot / dirty / env-override → True; clean → False). The `git merge-base --is-ancestor origin/main`
-refinement for "clean-but-not-on-main" branches is **deferred** — it adds a
-`git fetch` round-trip per run and is awkward on the cloud env-override path,
-and the column is now informational (no longer gates caching), so the
-approximation is acceptable. Revisit if strict-provenance queries need the
-precision. Migration in `migrations/002_unreviewed_code.sql`; the cacheability
-win comes from dropping the read filter (below).
+Shipped as implemented. In M-pivot-3 the `unreviewed_code` value was the
+coarse M-pivot-2 flag (snapshot / dirty / env-override → True; clean → False)
+and the `git merge-base --is-ancestor origin/main` refinement was **deferred**
+because the column was merely informational. **M-pivot-4 un-deferred it**
+(`dit.snapshot.is_unreviewed`) — once the flag started *gating* worker-image
+auto-build, the coarse version was wrong in both directions (clean feature
+branches under-built; clean `main` via the cloud env-override over-built), so
+it now does the accurate ancestor check (with a per-run `git fetch origin main`,
+falling back to unreviewed=True on failure). Migration in
+`migrations/002_unreviewed_code.sql`; the cacheability win comes from dropping
+the read filter (below).
 
 - Migration:
   ```sql
@@ -142,7 +144,7 @@ win comes from dropping the read filter (below).
   ALTER TABLE tech_great_expectations.dit_runs ADD COLUMN pipeline_commit_parent STRING;
   ```
 - `_run_with_cache` writes:
-  - `unreviewed_code` — **as shipped**, this is the M-pivot-2 resolved flag: `TRUE` for snapshot refs / dirty trees / `DIT_PIPELINE_COMMIT` runs, `FALSE` for a clean checkout of any branch. *(Sketch, deferred: the sharper `TRUE` unless `git merge-base --is-ancestor <commit> origin/main` — after a `git fetch origin main` — would also flag clean-but-not-on-main branches. Deferred because it costs a per-run `git fetch`, is awkward on the cloud env-override path, and the column is informational now that it no longer gates caching. Until then, strict-provenance queries should read `FALSE` as "clean checkout", not "on main".)*
+  - `unreviewed_code` — `TRUE` when the code isn't merged into `origin/main`: snapshot refs / dirty trees (known unreviewed without a network call), plus committed-but-unmerged commits detected by `dit.snapshot.is_unreviewed` (`git fetch origin main` + `git merge-base --is-ancestor <commit> origin/main`; falls back to `TRUE` if the fetch/check can't run). `FALSE` for a commit on/merged into `main`. M-pivot-3 shipped this as the coarse dirty-only flag with the ancestor check deferred; **M-pivot-4 made it accurate** because the flag now gates worker-image auto-build (`dit.worker_image.ensure_worker_image`) — a coarse flag under-built clean feature branches and over-built clean `main`.
   - `pipeline_commit_parent`: the SHA the snapshot was based on (extracted from the snapshot commit message — pattern `dit snapshot of <40-char-sha>`, validated as 40-char hex). NULL for non-snapshot rows.
 - `read_cache` default behaviour: returns all rows (`unreviewed_code` is informational). PR-validation queries that want strict provenance filter `WHERE unreviewed_code = FALSE` explicitly.
 - Drop the `pipeline_dirty = FALSE` filter from `read_cache`.
