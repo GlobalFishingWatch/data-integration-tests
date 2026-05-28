@@ -36,7 +36,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         run_id="rid01",
         experiment_id="exp01",
         pipeline_commit="abc1234",
-        pipeline_dirty=False,
+        unreviewed=False,
         pipeline_commit_parent=None,
         dit_commit="def5678",
         worker_image="gcr.io/foo/pipe-gaps:v0.9.6",
@@ -259,10 +259,10 @@ def test_run_with_cache_stale_row_treats_as_miss():
 
 
 def test_run_with_cache_writes_unreviewed_rows():
-    # Design invariant: unreviewed (snapshot) runs ARE recorded. args.pipeline_dirty
-    # holds the resolved unreviewed flag; it maps to the row's unreviewed_code.
+    # Design invariant: unreviewed (snapshot / unmerged) runs ARE recorded.
+    # args.unreviewed holds the resolved flag; it maps to the row's unreviewed_code.
     execute_fn = MagicMock()
-    args = _args(pipeline_dirty=True)
+    args = _args(unreviewed=True)
     with (
         patch.object(mod, "read_cache", return_value=None),
         patch.object(mod, "verify_tables_exist", return_value=[True]),

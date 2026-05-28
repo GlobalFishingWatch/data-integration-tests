@@ -109,7 +109,7 @@ def snapshot_parent(commit: str, repo_dir: str) -> str | None:
     return None
 
 
-def is_unreviewed(commit: str, repo_dir: str, *, main_ref: str = "origin/main") -> bool:
+def is_unreviewed(commit: str, repo_dir: str) -> bool:
     """Return True iff ``commit`` is NOT merged into ``origin/main``.
 
     "Unreviewed" = not an ancestor of ``origin/main`` (M-pivot-4; this is the
@@ -128,6 +128,11 @@ def is_unreviewed(commit: str, repo_dir: str, *, main_ref: str = "origin/main") 
     err on the side of **unreviewed=True** — building a worker image when
     unsure is safer than silently running stale published workers.
     """
+    # Malformed commit-ish (e.g. a leading '-' from a bad DIT_PIPELINE_COMMIT)
+    # would be parsed by git as an option -> treat as unreviewed (build-when-
+    # unsure) rather than risk option injection.
+    if commit.startswith("-"):
+        return True
     # A dit snapshot is an orphan by construction -> never an ancestor of main.
     if snapshot_parent(commit, repo_dir) is not None:
         return True
@@ -138,21 +143,22 @@ def is_unreviewed(commit: str, repo_dir: str, *, main_ref: str = "origin/main") 
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning(
-            "could not fetch %s; treating %s as unreviewed (build-when-unsure).",
-            main_ref, commit,
+            "could not fetch origin/main; treating %s as unreviewed "
+            "(build-when-unsure).", commit,
         )
         return True
+    # `--end-of-options` forces `commit` to be read as a revision, not a flag.
     result = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", commit, main_ref],
+        ["git", "merge-base", "--is-ancestor", "--end-of-options", commit, "origin/main"],
         cwd=repo_dir, capture_output=True, text=True,
     )
     if result.returncode == 0:
-        return False  # ancestor of main -> reviewed
+        return False  # ancestor of origin/main -> reviewed
     if result.returncode == 1:
         return True   # not an ancestor -> unreviewed
     logger.warning(
-        "`git merge-base --is-ancestor %s %s` errored (rc=%s); treating as "
-        "unreviewed (build-when-unsure).", commit, main_ref, result.returncode,
+        "`git merge-base --is-ancestor %s origin/main` errored (rc=%s); treating "
+        "as unreviewed (build-when-unsure).", commit, result.returncode,
     )
     return True
 

@@ -62,16 +62,18 @@ def _build_and_push(repo_dir: str, tag: str) -> None:
             f"worker-image build config not found at {config}; auto-build needs "
             "an editable dit install (pip install -e)."
         )
+    # Upload the build context under dit's .gcloudignore (same hardening as
+    # `make dit-cloud`): the pipeline checkout may hold gitignored local files
+    # (.env, sa.json, datasets) we must NOT ship to the Cloud Build staging
+    # bucket. The Dockerfile only COPYs what it needs, but the source tarball
+    # would otherwise include everything not ignored.
+    ignore_file = _dit_root() / ".gcloudignore"
+    cmd = ["gcloud", "builds", "submit", f"--config={config}"]
+    if ignore_file.exists():
+        cmd.append(f"--ignore-file={ignore_file}")
+    cmd += [f"--substitutions=_IMAGE={tag}", repo_dir]
     logger.info("building worker image %s from %s (kaniko Cloud Build)", tag, repo_dir)
-    subprocess.run(
-        [
-            "gcloud", "builds", "submit",
-            f"--config={config}",
-            f"--substitutions=_IMAGE={tag}",
-            repo_dir,
-        ],
-        check=True,
-    )
+    subprocess.run(cmd, check=True)
 
 
 def ensure_worker_image(

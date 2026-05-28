@@ -54,7 +54,7 @@ from dit import dates as dit_dates
 from dit.git_info import git_info
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
-from dit.snapshot import resolve_pipeline_commit
+from dit.snapshot import is_unreviewed, resolve_pipeline_commit
 from dit.worker_image import ensure_worker_image
 
 logger = logging.getLogger(__name__)
@@ -609,13 +609,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # provenance). Otherwise dirty + --runner=dataflow auto-snapshots + pushes;
     # the cloud path supplies DIT_PIPELINE_COMMIT instead.
     if args.suffix:
+        # Manual / cross-version escape hatch: don't auto-snapshot, but still
+        # classify accurately -- unreviewed if the tree is dirty OR the commit
+        # isn't merged into origin/main (e.g. cross_version_ais.py worktrees at
+        # PR refs). The dirty bit alone would skip the worker-image auto-build
+        # for a clean-but-unmerged worktree.
         commit_sha, dirty = git_info(repo_dir)
+        unreviewed = dirty or is_unreviewed(commit_sha, repo_dir)
     else:
-        commit_sha, dirty = resolve_pipeline_commit(
+        commit_sha, unreviewed = resolve_pipeline_commit(
             repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
         )
     args.commit_sha = commit_sha
-    args.dirty = dirty
+    args.unreviewed = unreviewed
 
     # Close the submitter-vs-worker gap (M-pivot-4): if this run executes
     # unreviewed code against the default worker image, auto-build a
@@ -627,7 +633,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repo_dir=repo_dir,
         commit=args.commit_sha,
         runner=args.runner,
-        unreviewed=args.dirty,
+        unreviewed=args.unreviewed,
         worker_image=args.worker_image,
         default_worker_image=DEFAULT_WORKER_IMAGE,
     )

@@ -40,7 +40,7 @@ from dit.git_info import git_info
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
-from dit.snapshot import resolve_pipeline_commit, snapshot_parent
+from dit.snapshot import is_unreviewed, resolve_pipeline_commit, snapshot_parent
 from dit.worker_image import ensure_worker_image
 
 # Pipeline repo name; used to namespace auto-snapshot refs
@@ -626,11 +626,9 @@ def _run_with_cache(
         pipeline="pipe-gaps",
         experiment_id=args.experiment_id,
         pipeline_commit=args.pipeline_commit,
-        # args.pipeline_dirty holds the unreviewed flag resolved in main():
-        # dirty / env-override / snapshot -> True; clean -> False. (The
-        # is-ancestor-of-main refinement for clean non-main branches is
-        # deferred -- see docs/no-dirty-tree-pivot.md § M-pivot-3.)
-        unreviewed_code=args.pipeline_dirty,
+        # args.unreviewed: True when the code isn't merged into origin/main
+        # (snapshot / dirty / unmerged commit via is_unreviewed). See M-pivot-4.
+        unreviewed_code=args.unreviewed,
         pipeline_commit_parent=args.pipeline_commit_parent,
         dit_commit=args.dit_commit,
         workflow_file_sha1=WORKFLOW_FILE_SHA1,
@@ -734,13 +732,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # auto-snapshot and record git state as-is (the caller has taken control of
     # provenance, e.g. cross_version_ais.py running committed worktree refs).
     if args.suffix is not None:
-        pipeline_commit, pipeline_dirty = git_info(repo_dir)
+        # Manual / cross-version escape hatch: don't auto-snapshot. But still
+        # classify accurately -- a run is unreviewed if the tree is dirty
+        # (uncommitted) OR the commit isn't merged into origin/main (e.g.
+        # cross_version_ais.py worktrees at PR refs). Using only the dirty bit
+        # here would let a clean unmerged commit look reviewed and skip the
+        # worker-image auto-build.
+        pipeline_commit, dirty = git_info(repo_dir)
+        unreviewed = dirty or is_unreviewed(pipeline_commit, repo_dir)
     else:
-        pipeline_commit, pipeline_dirty = resolve_pipeline_commit(
+        pipeline_commit, unreviewed = resolve_pipeline_commit(
             repo_dir, PIPELINE_NAME, runner=args.runner, require_clean=args.require_clean,
         )
     args.pipeline_commit = pipeline_commit
-    args.pipeline_dirty = pipeline_dirty
+    args.unreviewed = unreviewed
     # For snapshot runs, record the HEAD the dirty tree was based on (parsed
     # from the snapshot commit message); None for real/main commits. M-pivot-3.
     args.pipeline_commit_parent = snapshot_parent(pipeline_commit, repo_dir)
@@ -756,7 +761,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         repo_dir=repo_dir,
         commit=args.pipeline_commit,
         runner=args.runner,
-        unreviewed=args.pipeline_dirty,
+        unreviewed=args.unreviewed,
         worker_image=args.worker_image,
         default_worker_image=DEFAULT_WORKER_IMAGE,
     )
@@ -785,7 +790,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info(
         "run_id=%s pipeline_commit=%s%s dit_commit=%s",
         args.run_id, args.pipeline_commit,
-        " (DIRTY)" if args.pipeline_dirty else "",
+        " (UNREVIEWED)" if args.unreviewed else "",
         args.dit_commit,
     )
 
