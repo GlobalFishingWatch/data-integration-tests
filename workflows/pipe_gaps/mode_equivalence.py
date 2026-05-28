@@ -60,7 +60,7 @@ MODE_MUTATE_RECOVER = "4_mutate_recover"
 
 # Per-user infra knobs identical to both workflows (--dest-dataset,
 # --service-account, --dataflow-*) live in dit.workflow; add_infra_args wires
-# them onto the parser. --bq-temp-dataset is pipe-gaps-specific and stays here.
+# them onto the parser. --bq-temp-dataset is workflow-local and stays here.
 DEFAULT_BQ_TEMP_DATASET = os.environ.get(
     "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{dit_workflow.DEFAULT_DEST_DATASET}"
 )
@@ -564,7 +564,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--skip-comparisons", action="store_true")
     p.add_argument("--parallel", "--async", dest="parallel", action="store_true")
     add_infra_args(p)
-    # --bq-temp-dataset is pipe-gaps-specific; not part of add_infra_args.
+    # --bq-temp-dataset is workflow-local; not part of add_infra_args.
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
                    help=f"Local image tag for the docker runner (default: "

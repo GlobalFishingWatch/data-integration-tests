@@ -54,8 +54,8 @@ logger = logging.getLogger(__name__)
 # (a) Infra-knob defaults + args
 # --------------------------------------------------------------------------
 # Per-user infra knobs: defaults below, override via DIT_* env vars or CLI flags.
-# These five are IDENTICAL in both workflows; pipe-gaps keeps the workflow-
-# specific --bq-temp-dataset (DEFAULT_BQ_TEMP_DATASET) locally.
+# These five are IDENTICAL in both workflows. --bq-temp-dataset is NOT here:
+# it's workflow-local (each consumer defines its own DEFAULT_BQ_TEMP_DATASET).
 DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
 DEFAULT_DATAFLOW_SA = os.environ.get(
     "DIT_DATAFLOW_SA", "automated-testing@world-fishing-827.iam.gserviceaccount.com"
@@ -73,7 +73,8 @@ def add_infra_args(parser: argparse.ArgumentParser) -> None:
     Adds exactly ``--dest-dataset``, ``--service-account``,
     ``--dataflow-region``, ``--dataflow-temp-bucket``, ``--dataflow-subnetwork``
     with the defaults above. Does NOT add ``--bq-temp-dataset`` -- that is
-    pipe-gaps-specific (DEFAULT_BQ_TEMP_DATASET) and stays in the workflow.
+    workflow-local (each consumer defines its own DEFAULT_BQ_TEMP_DATASET;
+    both pipe-gaps and port-visits wire it themselves).
     """
     parser.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                         help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
