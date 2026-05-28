@@ -155,6 +155,14 @@ endif
 #   - clean (no REF) -> HEAD short sha.
 # The build still uploads the (byte-identical) working tree as its source;
 # _PIPELINE_COMMIT only changes what the workflow records as pipeline_commit.
+#
+# Fire-and-forget by default: `gcloud builds submit --async` uploads the source
+# + creates the build, then returns immediately with a build id (the cold
+# worker-image build + Dataflow run happen cloud-side, so your laptop is free in
+# seconds). Pass WAIT=1 to stream logs and block on the result instead -- needed
+# when you want the build's exit code (CI) or to watch/debug a run live.
+ASYNC_FLAG = $(if $(WAIT),,--async)
+
 dit-cloud:
 	@test -n "$(WORKFLOW)" || { echo "WORKFLOW required: WORKFLOW=workflows/..." >&2; exit 1; }
 	@test -n "$(PIPELINE)" || { echo "PIPELINE required: anchorages_pipeline | pipe-gaps | pipe-events" >&2; exit 1; }
@@ -175,7 +183,7 @@ dit-cloud:
 	else \
 	    PIPELINE_COMMIT=$$(git -C "$(PROJECTS)/$(PIPELINE)" rev-parse --short HEAD); \
 	fi; \
-	gcloud builds submit \
+	gcloud builds submit $(ASYNC_FLAG) \
 	    --config=cloudbuild-dit.yaml \
 	    --ignore-file=$(CURDIR)/.gcloudignore \
 	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)@@_BEAM_VERSION=$(BEAM_VERSION)@@_PIPELINE_COMMIT=$$PIPELINE_COMMIT" \
