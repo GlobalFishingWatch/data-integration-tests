@@ -601,7 +601,7 @@ def _looks_like_table_fqn(value: str) -> bool:
     return len(parts) == 3 and all(parts)
 
 
-def _discover_dataflow_jobs(run_id: str, region: str) -> list[dict[str, str]]:
+def _discover_dataflow_jobs(run_id: str, region: str) -> list[dict[str, str]] | None:
     """List Dataflow jobs labelled ``dit_run_id=<run_id>`` in ``region``.
 
     Discovery is by label, NOT by the row's stored ``dataflow_job_ids`` --
@@ -610,8 +610,13 @@ def _discover_dataflow_jobs(run_id: str, region: str) -> list[dict[str, str]]:
     runner both submit opaquely). The ``dit_run_id`` label, stamped by both
     workflows, is the reliable join key. See docs/run-cache-impl.md § M5a.
 
-    Returns a list of ``{"id": ..., "name": ..., "state": ...}`` dicts (empty
-    on no matches or a failed/again-tolerated gcloud call).
+    Returns a list of ``{"id": ..., "name": ..., "state": ...}`` dicts on a
+    successful query (``[]`` when no jobs carry the label), or ``None`` when
+    the gcloud call itself failed (non-zero exit or unparseable output).
+    ``None`` is distinct from ``[]`` on purpose: :func:`cancel_run` must not
+    conflate "discovery failed, state unknown" with "discovery succeeded, no
+    jobs" -- the latter (plus no rows) means a genuinely-unknown run_id; the
+    former does not (see the no-rows handling in :func:`cancel_run`).
     """
     result = subprocess.run(
         [
@@ -628,12 +633,12 @@ def _discover_dataflow_jobs(run_id: str, region: str) -> list[dict[str, str]]:
             "gcloud dataflow jobs list failed for run_id=%s (rc=%d): %s",
             run_id, result.returncode, result.stderr.strip(),
         )
-        return []
+        return None
     try:
         jobs = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
         logger.warning("could not parse gcloud jobs-list output for run_id=%s", run_id)
-        return []
+        return None
     return [
         {"id": j.get("id", ""), "name": j.get("name", ""), "state": j.get("state", "")}
         for j in jobs
@@ -743,11 +748,21 @@ def cancel_run(
     # Step 1 -- cancel Dataflow jobs discovered by label. FIRST, because an
     # in-flight run (the primary cancel target) has a live labelled job but no
     # cache row yet (rows are written only on mode completion).
-    jobs = _discover_dataflow_jobs(run_id, region)
-    logger.info(
-        "cancel_run %s: discovered %d Dataflow job(s) by label; region=%s",
-        run_id, len(jobs), region,
-    )
+    discovered = _discover_dataflow_jobs(run_id, region)
+    discovery_failed = discovered is None
+    jobs = discovered or []
+    if discovery_failed:
+        logger.warning(
+            "cancel_run %s: Dataflow job discovery FAILED (gcloud jobs list "
+            "errored); cannot cancel jobs by label this run -- proceeding with "
+            "row-based cleanup only. region=%s",
+            run_id, region,
+        )
+    else:
+        logger.info(
+            "cancel_run %s: discovered %d Dataflow job(s) by label; region=%s",
+            run_id, len(jobs), region,
+        )
     for job in jobs:
         if job["state"] in _TERMINAL_DATAFLOW_STATES:
             logger.info(
@@ -759,17 +774,27 @@ def cancel_run(
 
     rows = read_rows_for_run(run_id, client=client)
 
-    # A genuinely-unknown run_id (no rows AND no labelled jobs) surfaces
-    # loudly; but a labelled-job-without-row is a real in-flight run we've
-    # just cancelled, so it must NOT raise.
-    if not rows and not jobs:
-        raise ValueError(
-            f"cancel_run: no rows and no labelled Dataflow jobs found for "
-            f"run_id={run_id!r} in {TABLE_FQN} / region={region}. "
-            "Check the id (the per-run 12-hex from the workflow's run_id= log line)."
-        )
-
     if not rows:
+        # Discovery FAILING is not a genuinely-unknown id: the run may well
+        # exist with live jobs we simply couldn't list. Surface that distinctly
+        # so the user retries (auth / region) instead of concluding the id is
+        # wrong -- conflating the two was the bug here.
+        if discovery_failed:
+            raise RuntimeError(
+                f"cancel_run: could not list Dataflow jobs for run_id={run_id!r} "
+                f"(gcloud jobs list failed) and no cache rows exist, so the run's "
+                f"state can't be determined. Check gcloud auth / region={region} "
+                "and retry -- this is NOT necessarily an unknown id."
+            )
+        # Discovery succeeded and found nothing, and there are no rows: a
+        # genuinely-unknown run_id (likely a typo) surfaces loudly.
+        if not jobs:
+            raise ValueError(
+                f"cancel_run: no rows and no labelled Dataflow jobs found for "
+                f"run_id={run_id!r} in {TABLE_FQN} / region={region}. "
+                "Check the id (the per-run 12-hex from the workflow's run_id= log line)."
+            )
+        # Labelled job(s) but no row yet: a real in-flight run we've cancelled.
         logger.info(
             "cancel_run %s: no cache row yet (in-flight run); cancelled "
             "%d labelled job(s), nothing to delete / mark.",

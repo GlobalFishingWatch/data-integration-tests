@@ -297,6 +297,21 @@ def test_cancel_run_tolerates_gcloud_list_failure() -> None:
     assert any("UPDATE" in c.args[0] for c in client.query.call_args_list)
 
 
+def test_cancel_run_no_rows_and_discovery_failed_raises_runtime() -> None:
+    # A gcloud jobs-list FAILURE with no cache rows must NOT be reported as an
+    # unknown run_id: the run may exist with live jobs we just couldn't list.
+    # It surfaces as a RuntimeError pointing at auth/region -- distinct from the
+    # ValueError raised when discovery SUCCEEDS but finds nothing (genuine typo).
+    client = MagicMock()
+    run = MagicMock(return_value=SimpleNamespace(returncode=1, stdout="", stderr="boom"))
+    with _patch_rows([]), patch.object(dit_cache.subprocess, "run", run):
+        with pytest.raises(RuntimeError, match="could not list Dataflow jobs"):
+            cancel_run("rid01", client=client, region="us-central1")
+    # Nothing destructive happened: no table deletes, no status UPDATE.
+    client.delete_table.assert_not_called()
+    assert not any("UPDATE" in c.args[0] for c in client.query.call_args_list)
+
+
 def test_cancel_run_cancels_queued_job() -> None:
     # ROBUSTNESS (Fix 3): a Queued job is non-terminal -- it would start later
     # if left alone -- so it must be cancelled, not skipped.
