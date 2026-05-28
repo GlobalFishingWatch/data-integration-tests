@@ -1,6 +1,6 @@
 # Pivot: no dirty trees, push every snapshot
 
-**Status:** planning / design. Not landed. Drafted 2026-05-22.
+**Status:** in progress. M-pivot-1 through M-pivot-4 have shipped (PRs #22, #23, #24, #25); M-pivot-5 (docs catch-up) remains. Drafted 2026-05-22.
 
 ## Why
 
