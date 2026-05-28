@@ -36,7 +36,7 @@ from dit.cache import (
     write_cache,
 )
 from dit.dates import daterange_inclusive
-from dit.git_info import git_info, warn_if_worker_image_misses_dirty_tree
+from dit.git_info import git_info
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
@@ -145,20 +145,18 @@ def _validate_experiment_id(value: str) -> str:
 def _resolve_suffix(args: argparse.Namespace) -> str:
     """Build the output-table suffix from the already-resolved pipeline_commit.
 
-    ``main()`` resolves ``args.pipeline_commit`` / ``args.pipeline_dirty`` once
-    (via :func:`dit.snapshot.resolve_pipeline_commit`, which auto-snapshots a
-    dirty dataflow run) before calling this, so the suffix references the same
+    ``main()`` resolves ``args.pipeline_commit`` once (via
+    :func:`dit.snapshot.resolve_pipeline_commit`, which auto-snapshots a dirty
+    dataflow run) before calling this, so the suffix references the same
     committed ref the cache records. ``--suffix`` still bypasses everything.
     """
     if args.suffix is not None:
         return args.suffix
-    commit = args.pipeline_commit
-    body = (
-        f"{commit}_dirty_{uuid.uuid4().hex[:6]}"
-        if args.pipeline_dirty
-        else f"{commit}_{uuid.uuid4().hex[:6]}"
-    )
-    return f"{args.experiment_id}_{body}"
+    # Every run now executes a committed ref (real or snapshot), so the suffix
+    # is always <experiment_id>_<commit>_<uuid> -- the legacy `_dirty` marker
+    # was dropped in M-pivot-4 (provenance lives in pipeline_commit /
+    # unreviewed_code, not the table name).
+    return f"{args.experiment_id}_{args.pipeline_commit}_{uuid.uuid4().hex[:6]}"
 
 
 def _make_config(
@@ -690,9 +688,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
              "Auto-default solo_<6-hex> when unset. Regex ^[a-z0-9][a-z0-9_-]{0,31}$. "
              "Bypassed entirely when --suffix is set.",
     )
-    p.add_argument("--allow-dirty-tree", action="store_true",
-                   help="DEPRECATED no-op: dirty trees are auto-snapshotted to a "
-                        "pushed ref. Will be removed in a future release.")
     p.add_argument("--require-clean", action="store_true",
                    help="Error on a dirty tree instead of auto-snapshotting "
                         "(for CI / strict-provenance callers).")
@@ -728,13 +723,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
     repo_dir = os.getcwd()
-
-    if args.allow_dirty_tree:
-        logger.warning(
-            "--allow-dirty-tree is deprecated and now a no-op: dirty trees are "
-            "auto-snapshotted to a pushed ref (see docs/no-dirty-tree-pivot.md). "
-            "The flag will be removed in a future release."
-        )
 
     # Resolve the committed ref this run records (no-dirty-tree policy).
     # Dirty + --runner=dataflow auto-snapshots to refs/dit-snapshots/<pipeline>/<sha>
@@ -782,14 +770,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.run_id, args.pipeline_commit,
         " (DIRTY)" if args.pipeline_dirty else "",
         args.dit_commit,
-    )
-
-    warn_if_worker_image_misses_dirty_tree(
-        dirty_fn=lambda: pipeline_dirty,
-        repo_dir=repo_dir,
-        runner=args.runner,
-        worker_image=args.worker_image,
-        default_worker_image=DEFAULT_WORKER_IMAGE,
     )
 
     source_messages = args.source_messages
