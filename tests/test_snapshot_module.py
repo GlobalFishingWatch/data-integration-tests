@@ -60,6 +60,7 @@ def test_git_info_untracked_is_not_dirty(repo: Path) -> None:
 
 def test_env_override_classifies_via_is_unreviewed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(snapshot.ENV_PIPELINE_COMMIT, "deadbeef")
+    monkeypatch.delenv(snapshot.ENV_UNREVIEWED, raising=False)  # force the live-check path
     calls = []
     monkeypatch.setattr(snapshot, "git_info", lambda d: calls.append("git_info") or ("x", False))
     monkeypatch.setattr(snapshot, "create_snapshot", lambda d, p: calls.append("snap"))
@@ -73,6 +74,41 @@ def test_env_override_classifies_via_is_unreviewed(monkeypatch: pytest.MonkeyPat
     assert (commit, unreviewed) == ("deadbeef", True)
     assert seen == ["deadbeef"]
     assert calls == [], "env override must not touch git_info or the snapshot script"
+
+
+def test_env_override_uses_dit_unreviewed_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cloud path: the laptop-resolved DIT_UNREVIEWED is used verbatim, WITHOUT
+    calling is_unreviewed (which can't fetch origin/main in the builder)."""
+    monkeypatch.setenv(snapshot.ENV_PIPELINE_COMMIT, "6cd6706")
+    monkeypatch.setenv(snapshot.ENV_UNREVIEWED, "false")
+    monkeypatch.setattr(
+        snapshot, "is_unreviewed",
+        lambda c, d: pytest.fail("must use DIT_UNREVIEWED, not the live check"),
+    )
+    assert snapshot.resolve_pipeline_commit(
+        "/repo", "pipe-gaps", runner="dataflow"
+    ) == ("6cd6706", False)
+
+
+def test_env_override_uses_dit_unreviewed_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(snapshot.ENV_PIPELINE_COMMIT, "abc1234")
+    monkeypatch.setenv(snapshot.ENV_UNREVIEWED, "true")
+    monkeypatch.setattr(snapshot, "is_unreviewed", lambda c, d: pytest.fail("must not call"))
+    assert snapshot.resolve_pipeline_commit(
+        "/repo", "pipe-gaps", runner="dataflow"
+    ) == ("abc1234", True)
+
+
+def test_env_override_invalid_dit_unreviewed_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unparseable DIT_UNREVIEWED falls back to the live check (don't trust junk)."""
+    monkeypatch.setenv(snapshot.ENV_PIPELINE_COMMIT, "abc1234")
+    monkeypatch.setenv(snapshot.ENV_UNREVIEWED, "maybe")
+    seen = []
+    monkeypatch.setattr(snapshot, "is_unreviewed", lambda c, d: seen.append(c) or False)
+    assert snapshot.resolve_pipeline_commit(
+        "/repo", "pipe-gaps", runner="dataflow"
+    ) == ("abc1234", False)
+    assert seen == ["abc1234"]
 
 
 def test_clean_tree_classifies_via_is_unreviewed(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -38,6 +38,7 @@ from dit.git_info import git_info
 logger = logging.getLogger(__name__)
 
 ENV_PIPELINE_COMMIT = "DIT_PIPELINE_COMMIT"
+ENV_UNREVIEWED = "DIT_UNREVIEWED"
 
 
 def _dit_root() -> Path:
@@ -167,6 +168,29 @@ def is_unreviewed(commit: str, repo_dir: str) -> bool:
     return True
 
 
+def _unreviewed_from_env_or_check(commit: str, repo_dir: str) -> bool:
+    """Laptop-resolved ``DIT_UNREVIEWED`` if set, else the live is_unreviewed check.
+
+    The cloud builder (ditbox) can't run is_unreviewed's ``git fetch origin
+    main`` -- a pipeline's ``origin`` is typically an SSH URL with no key in the
+    builder, so the fetch fails and is_unreviewed would degrade to
+    build-when-unsure for *every* cloud run (treating even a clean ``origin/main``
+    ref as unreviewed, which both wastes a build and breaks cache reuse for
+    reviewed refs). So ``make dit-cloud`` resolves unreviewed on the laptop
+    (where the push creds + ``origin/main`` live) and threads it in as
+    ``DIT_UNREVIEWED``, mirroring how the commit is resolved laptop-side
+    (``DIT_PIPELINE_COMMIT``). Falls back to the live check when the env var is
+    absent or unparseable -- a local ``dit run`` (origin reachable), or an older
+    Makefile that doesn't set it.
+    """
+    raw = os.environ.get(ENV_UNREVIEWED, "").strip().lower()
+    if raw in ("true", "1"):
+        return True
+    if raw in ("false", "0"):
+        return False
+    return is_unreviewed(commit, repo_dir)
+
+
 def resolve_pipeline_commit(
     repo_dir: str,
     pipeline: str,
@@ -184,10 +208,13 @@ def resolve_pipeline_commit(
     ancestor-of-``origin/main`` check); the dirty/snapshot cases are known
     unreviewed without a network round-trip.
 
-    * ``DIT_PIPELINE_COMMIT`` set -> ``(value, is_unreviewed(value))``. Cloud
-      path: the laptop already resolved the commit (snapshot sha for a dirty
-      tree, HEAD/REF sha otherwise); we record it and classify it. A snapshot
-      sha short-circuits to unreviewed; a real sha runs the ancestor check.
+    * ``DIT_PIPELINE_COMMIT`` set -> ``(value, unreviewed)``. Cloud path: the
+      laptop already resolved the commit (snapshot sha for a dirty tree,
+      HEAD/REF sha otherwise) AND, when it can, the unreviewed flag (threaded in
+      as ``DIT_UNREVIEWED`` because the builder can't fetch ``origin/main`` to
+      run the ancestor check). We record the commit and use the laptop's flag,
+      falling back to the live :func:`is_unreviewed` check when ``DIT_UNREVIEWED``
+      is unset (see :func:`_unreviewed_from_env_or_check`).
     * clean tree -> ``(HEAD short sha, is_unreviewed(HEAD))``.
     * dirty + ``runner != "dataflow"`` -> ``(HEAD short sha, True)`` with NO
       snapshot. The docker runner executes the working tree directly; no remote
@@ -198,7 +225,7 @@ def resolve_pipeline_commit(
     """
     override = os.environ.get(ENV_PIPELINE_COMMIT, "").strip()
     if override:
-        unreviewed = is_unreviewed(override, repo_dir)
+        unreviewed = _unreviewed_from_env_or_check(override, repo_dir)
         logger.info(
             "pipeline_commit from %s: %s (unreviewed=%s)",
             ENV_PIPELINE_COMMIT, override, unreviewed,

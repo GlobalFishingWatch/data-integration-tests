@@ -156,6 +156,15 @@ endif
 # The build still uploads the (byte-identical) working tree as its source;
 # _PIPELINE_COMMIT only changes what the workflow records as pipeline_commit.
 #
+# _UNREVIEWED (not-merged-into-origin/main) is ALSO resolved here, for the same
+# reason: the builder can't fetch the pipeline's (SSH) origin to run the
+# ancestor check itself, so it would treat every cloud run as unreviewed --
+# wasting a worker-image build for a reviewed ref and breaking its cache reuse.
+# `merge-base --is-ancestor` against a freshly-fetched origin/main gives the
+# right answer on the laptop; a snapshot orphan / unmerged ref is correctly
+# not-an-ancestor -> unreviewed. Defaults to true (build-when-unsure) if the
+# check can't run.
+#
 # Fire-and-forget by default: `gcloud builds submit --async` uploads the source
 # + creates the build, then returns immediately with a build id (the cold
 # worker-image build + Dataflow run happen cloud-side, so your laptop is free in
@@ -183,8 +192,14 @@ dit-cloud:
 	else \
 	    PIPELINE_COMMIT=$$(git -C "$(PROJECTS)/$(PIPELINE)" rev-parse --short HEAD); \
 	fi; \
+	UNREVIEWED=true; \
+	git -C "$(PROJECTS)/$(PIPELINE)" fetch --quiet origin main 2>/dev/null || true; \
+	if git -C "$(PROJECTS)/$(PIPELINE)" merge-base --is-ancestor "$$PIPELINE_COMMIT" origin/main 2>/dev/null; then \
+	    UNREVIEWED=false; \
+	fi; \
+	echo ">>> pipeline_commit=$$PIPELINE_COMMIT unreviewed=$$UNREVIEWED" >&2; \
 	gcloud builds submit $(ASYNC_FLAG) \
 	    --config=cloudbuild-dit.yaml \
 	    --ignore-file=$(CURDIR)/.gcloudignore \
-	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)@@_BEAM_VERSION=$(BEAM_VERSION)@@_PIPELINE_COMMIT=$$PIPELINE_COMMIT" \
+	    --substitutions="^@@^_WORKFLOW=$(WORKFLOW)@@_PIPELINE=$(PIPELINE)@@_ARGS=$(ARGS)@@_REF=$(REF)@@_DIT_REF=$(or $(DIT_REF),main)@@_BEAM_VERSION=$(BEAM_VERSION)@@_PIPELINE_COMMIT=$$PIPELINE_COMMIT@@_UNREVIEWED=$$UNREVIEWED" \
 	    "$(PROJECTS)/$(PIPELINE)"
