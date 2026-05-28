@@ -348,8 +348,22 @@ This lets dit ship and be useful with zero pipeline-repo changes (the ad-hoc pat
 
 **Deliverables.**
 - `workflows/pipe_events/fishing.py` — calls `dit.runners.docker.run(...)` against `gfw/pipe-events:<tag>`. Adds automated comparisons.
-- Replacement shim in `pipe-events/integration_tests/staging-bf_bfd_bftruncate.sh`.
+- Replacement shim in `pipe-events/integration_tests/` (the bash originals are `pipe3-bf_bfd_bftruncate.sh` + the `*_async.sh` variants; there is no exact `staging-bf_bfd_bftruncate.sh`).
 - Optional: `dit/phases.py` if extraction warranted.
+
+**Refined plan (2026-05-29).** Reading the bash original (`pipe3-bf_bfd_bftruncate.sh`) confirms the **same bf / bfd / bftruncate** shape (full backfill; backfill-to-tail + daily loop; full + daily-loop-truncate), each driving `scripts/generate_incremental_fishing_events.sh --pipeline_prefix <mode> --start_d --end_d --source_pipe_dataset ...`. Crucially the **bash does no comparison** — it writes three prefixed outputs for manual inspection. So Phase 3's value-add is the automated comparison it never had: `compare_tables(view_suffix="_last_versions", keys=[...])` across the three modes (SCD-2 shape, like pipe-gaps).
+
+pipe-events is **structurally different from the other two consumers**, which is the whole point of it being the third:
+- **BQ-SQL pipeline, not Beam/Dataflow** — runs BQ jobs orchestrated by a container, using `_SESSION.*` temp tables for isolation (so `--parallel` is safe). It's a **docker-runner** consumer with **no Dataflow worker image** and no Beam submitter-vs-worker split.
+
+**Harness-fit findings (the 3-consumer signal — decide deliberately):**
+- `dit.workflow.add_infra_args` bundles Dataflow knobs (`--dataflow-region/temp-bucket/subnetwork`) a BQ-SQL pipeline doesn't use → either split it into `add_dataset_args` + `add_dataflow_args`, or pipe-events skips it.
+- The run-cache key's `worker_image_digest` is Dataflow-shaped and doesn't map to a build-from-source BQ-SQL run (code identity is `pipeline_commit` + the container image) → **defer caching for pipe-events** (ship uncached, like port-visits initially); settle the docker-runner cache-key shape separately.
+- `resolve_run_context` otherwise fits — `ensure_worker_image` no-ops for the docker runner, and it still records `pipeline_commit`/`unreviewed` for provenance.
+
+**Refined extraction hypothesis.** Opening `execute_*` across all three (Beam-in-process / Beam-via-container / BQ-SQL-via-container), the *date-slice arithmetic* (bf = full; bfd = range−tail + daily loop; bftruncate = full + daily loop) is likely the genuinely-shared part, worth a small `dit.phases` that yields `(start, end)` slices — while per-slice *execution* stays per-workflow. That's more surgical than the full `Phase`/`Mode`/`Oracle` dataclasses; confirm against the real third file.
+
+**Open investigations before coding.** (1) the pipe-events container entrypoint the docker runner targets (the bash calls a sibling shell script — is there a CLI/entrypoint in the image, à la pipe-anchorages' `--entrypoint pipe-anchorages`?); (2) the SCD-2 keys for the fishing-events output (`fishing_events_v` schema); (3) a contract audit + adoption-matrix update in `docs/pipeline-contract.md`. **Estimated effort**: ~2–3 days; best done after M5b so the harness is settled before the third consumer stresses it.
 
 ## Phase 4+ vision (one paragraph each)
 
