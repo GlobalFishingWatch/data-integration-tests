@@ -56,8 +56,11 @@ def compare_tables(
     preserving the "non-zero means something went wrong" contract.
 
     ``view_suffix`` is appended to both fully-qualified table names before
-    the call. SCD-2 consumers (pipe-gaps, pipe-events) pass
-    ``"_last_versions"``; truncate-shape consumers (port visits) pass ``""``.
+    the call. SCD-2 consumers (pipe-gaps) pass ``"_last_versions"``;
+    truncate-shape consumers (port visits, pipe-events) pass ``""``.
+    pipe-events is keyed by ``event_id`` with table-level (date-suffixed)
+    versioning and no SCD-2 columns, so it compares the latest-version VIEW
+    directly with ``view_suffix=""``.
 
     ``tolerance`` maps column name to absolute tolerance, forwarded as
     ``--tolerance=<col>:<value>`` to ``table-check`` (which natively

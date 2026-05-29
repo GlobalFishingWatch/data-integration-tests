@@ -113,7 +113,7 @@ A flag that prints the generated queries or pipeline graph without executing. Us
 
 ## Adoption matrix
 
-Snapshot as of 2026-05-15. **U** = universal, **B** = Beam-only, **C** = Beam-in-container, **S** = BQ-SQL-only, **R** = strongly recommended.
+Snapshot as of 2026-05-29 (pipe-events column re-verified during the Phase 3 port; see below). **U** = universal, **B** = Beam-only, **C** = Beam-in-container, **S** = BQ-SQL-only, **R** = strongly recommended.
 
 | # | Requirement | pipe-gaps | pipe-anchorages | pipe-events |
 |---|---|---|---|---|
@@ -131,6 +131,13 @@ Snapshot as of 2026-05-15. **U** = universal, **B** = Beam-only, **C** = Beam-in
 | 12 | `--test` mode (nice) | — | — | ✓ |
 
 Legend: ✓ = satisfies, ✗ = missing, partial = present with caveats, — = N/A for this pipeline's architecture.
+
+**pipe-events Phase 3 audit (2026-05-29).** Re-verified the pipe-events column against the source during the `workflows/pipe_events/fishing.py` port. All entries confirmed:
+- **§1 (half-open):** the generate script passes `-end $end_d` as an exclusive incremental-query bound and `end_d = current_day + 1` for daily slices; the dit workflow uses `[start, end)`.
+- **§4 (truncate/merge):** `incremental_events` accumulates into a persistent `_merged` table via `_SESSION` temp tables + truncate-then-merge; `auth_and_regions` / `fishing_restrictive` `WRITE_TRUNCATE` into date-versioned `_v{date}` tables with a view to the latest. **NOT SCD-2** (no `valid_from`/`valid_to`/`is_current`) — the comparison is the truncate shape on `event_id` via the latest-version view, not `_last_versions`.
+- **§9 / §10:** `_SESSION`-isolated; every step's source/dest is a CLI flag (`-dest`, `-dest_tbl_prefix`, `-source_*`, `-mtbl`), so per-mode prefixes never collide.
+- **§11 (✗):** no ssvid filter; test-scale reduction comes from the `pipe_ais_test_*` staging cohort instead. Filed as a future upstream issue (a `--ssvid_filter` with INCLUDE semantics would let pipe-events tests run on a vessel subset like pipe-anchorages does).
+- **No workflow-side workarounds** were needed for pipe-events (contrast pipe-anchorages' `--temp_dataset` + None-labels patches) — the one infra addition was the docker runner's `volumes`/`service` params for the `gcp` auth volume, which is dit-side plumbing, not a pipeline workaround.
 
 ## Process: adding a new pipeline to `dit`'s scope
 
