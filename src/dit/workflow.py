@@ -68,29 +68,30 @@ DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
 
 
 def add_dataset_args(parser: argparse.ArgumentParser) -> None:
-    """Add the dataset / project-shaped infra knobs that EVERY consumer uses.
+    """Add the dataset-shaped infra knob that EVERY consumer uses.
 
-    Adds ``--dest-dataset`` (output dataset) and ``--service-account`` (the
-    GCP service account that runs the work -- Dataflow workers for the Beam
-    consumers, the BQ jobs for the BQ-SQL consumer). These are runner-agnostic:
-    a BQ-SQL pipeline (pipe-events) needs both but none of the Dataflow
-    placement knobs, so it calls this and skips :func:`add_dataflow_args`.
+    Adds ``--dest-dataset`` (output dataset) only -- runner-agnostic. A BQ-SQL
+    pipeline (pipe-events) needs it but none of the Dataflow knobs, incl.
+    ``--service-account`` (that is the Dataflow worker SA; pipe-events
+    authenticates via the mounted ``gcp`` ADC volume, not an SA flag), so it
+    calls this and skips :func:`add_dataflow_args`.
 
     Does NOT add ``--bq-temp-dataset`` -- that is workflow-local (each Beam
     consumer defines its own DEFAULT_BQ_TEMP_DATASET).
     """
     parser.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                         help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
-    parser.add_argument("--service-account", default=DEFAULT_DATAFLOW_SA)
 
 
 def add_dataflow_args(parser: argparse.ArgumentParser) -> None:
-    """Add the Dataflow placement knobs the Beam consumers use.
+    """Add the Dataflow knobs the Beam consumers use.
 
-    Adds ``--dataflow-region``, ``--dataflow-temp-bucket``,
-    ``--dataflow-subnetwork``. A BQ-SQL pipeline (pipe-events) runs no
-    Dataflow and must NOT add these.
+    Adds ``--service-account`` (the SA Dataflow workers run as),
+    ``--dataflow-region``, ``--dataflow-temp-bucket``, ``--dataflow-subnetwork``.
+    A BQ-SQL pipeline (pipe-events) runs no Dataflow and authenticates via the
+    mounted ``gcp`` ADC volume, so it must NOT add these.
     """
+    parser.add_argument("--service-account", default=DEFAULT_DATAFLOW_SA)
     parser.add_argument("--dataflow-region", default=DEFAULT_DATAFLOW_REGION)
     parser.add_argument("--dataflow-temp-bucket", default=DEFAULT_DATAFLOW_TEMP_BUCKET)
     parser.add_argument("--dataflow-subnetwork", default=DEFAULT_DATAFLOW_SUBNETWORK)

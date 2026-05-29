@@ -109,12 +109,13 @@ def test_add_infra_args_flags_override() -> None:
 # --------------------------------------------------------------------------
 
 def test_add_dataset_args_wires_only_dataset_knobs() -> None:
-    # The runner-agnostic dataset/SA knobs EVERY consumer uses; NO Dataflow knobs.
+    # The runner-agnostic dataset knob EVERY consumer uses; NO Dataflow knobs
+    # (incl. --service-account, which is the Dataflow worker SA).
     p = argparse.ArgumentParser()
     add_dataset_args(p)
     args = p.parse_args([])
     assert args.dest_dataset == dit_workflow.DEFAULT_DEST_DATASET
-    assert args.service_account == dit_workflow.DEFAULT_DATAFLOW_SA
+    assert not hasattr(args, "service_account")
     assert not hasattr(args, "dataflow_region")
     assert not hasattr(args, "dataflow_temp_bucket")
     assert not hasattr(args, "dataflow_subnetwork")
@@ -124,11 +125,11 @@ def test_add_dataflow_args_wires_only_dataflow_knobs() -> None:
     p = argparse.ArgumentParser()
     add_dataflow_args(p)
     args = p.parse_args([])
+    assert args.service_account == dit_workflow.DEFAULT_DATAFLOW_SA
     assert args.dataflow_region == dit_workflow.DEFAULT_DATAFLOW_REGION
     assert args.dataflow_temp_bucket == dit_workflow.DEFAULT_DATAFLOW_TEMP_BUCKET
     assert args.dataflow_subnetwork == dit_workflow.DEFAULT_DATAFLOW_SUBNETWORK
     assert not hasattr(args, "dest_dataset")
-    assert not hasattr(args, "service_account")
 
 
 def test_add_infra_args_namespace_identical_to_split_composition() -> None:
