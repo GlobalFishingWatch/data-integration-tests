@@ -107,10 +107,16 @@ def run(
     project_name: str | None = None,    # docker compose -p; auto-uniquified if None
     build_from_source: bool = False,    # opt-in fallback for unpublished images
     entrypoint: str | None = None,      # overrides image's default ENTRYPOINT
+    volumes: Sequence[str] = (),        # -v mount specs (e.g. "gcp:/root/.config")
+    service: str = "dev",               # compose service on the build_from_source path
 ) -> int:
 ```
 
-Source: `pipe-gaps/tests/integration/mode_equivalence.py` lines 257–281 (`_run_docker`). Each invocation gets a unique compose project name to avoid network races. `entrypoint` lets workflows override the image's default (pipe-gaps passes `entrypoint="pipe-gaps"` because its dev image has no baked-in entrypoint).
+Source: `pipe-gaps/tests/integration/mode_equivalence.py` lines 257–281 (`_run_docker`). Each invocation gets a unique compose project name to avoid network races. `entrypoint` lets workflows override the image's default (pipe-gaps passes `entrypoint="pipe-gaps"` because its dev image has no baked-in entrypoint; pipe-events passes `entrypoint="pipe"` to reach its Python CLI behind the image's `scripts/run` ENTRYPOINT).
+
+`volumes` (Phase 3) threads `-v` mount specs through to BOTH the `docker run` (published) and `docker compose run` (build-from-source) paths. pipe-events authenticates to GCP via a docker **named volume** `gcp` mounted at `/root/.config` (created out-of-band with `docker volume create gcp` + `gcloud auth login`); its workflow passes `volumes=["gcp:/root/.config"]`. The default empty tuple keeps the Beam consumers (pipe-gaps, port-visits) byte-identical — no `-v` flags are emitted unless requested.
+
+`service` (Phase 3) names the compose service used on the build-from-source path (`docker compose run <service>` + `docker compose build <service>`). Defaults to `"dev"` (the Beam consumers' service); pipe-events' compose service is named `"pipeline"`.
 
 ### `dit.runners.dataflow`
 
