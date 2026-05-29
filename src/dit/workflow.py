@@ -67,21 +67,47 @@ DEFAULT_DATAFLOW_SUBNETWORK = os.environ.get(
 )
 
 
-def add_infra_args(parser: argparse.ArgumentParser) -> None:
-    """Add the infra knobs identical to both workflows to ``parser``.
+def add_dataset_args(parser: argparse.ArgumentParser) -> None:
+    """Add the dataset-shaped infra knob that EVERY consumer uses.
 
-    Adds exactly ``--dest-dataset``, ``--service-account``,
-    ``--dataflow-region``, ``--dataflow-temp-bucket``, ``--dataflow-subnetwork``
-    with the defaults above. Does NOT add ``--bq-temp-dataset`` -- that is
-    workflow-local (each consumer defines its own DEFAULT_BQ_TEMP_DATASET;
-    both pipe-gaps and port-visits wire it themselves).
+    Adds ``--dest-dataset`` (output dataset) only -- runner-agnostic. A BQ-SQL
+    pipeline (pipe-events) needs it but none of the Dataflow knobs, incl.
+    ``--service-account`` (that is the Dataflow worker SA; pipe-events
+    authenticates via the mounted ``gcp`` ADC volume, not an SA flag), so it
+    calls this and skips :func:`add_dataflow_args`.
+
+    Does NOT add ``--bq-temp-dataset`` -- that is workflow-local (each Beam
+    consumer defines its own DEFAULT_BQ_TEMP_DATASET).
     """
     parser.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                         help="BQ dataset for output tables; env-var fallback DIT_DEST_DATASET.")
+
+
+def add_dataflow_args(parser: argparse.ArgumentParser) -> None:
+    """Add the Dataflow knobs the Beam consumers use.
+
+    Adds ``--service-account`` (the SA Dataflow workers run as),
+    ``--dataflow-region``, ``--dataflow-temp-bucket``, ``--dataflow-subnetwork``.
+    A BQ-SQL pipeline (pipe-events) runs no Dataflow and authenticates via the
+    mounted ``gcp`` ADC volume, so it must NOT add these.
+    """
     parser.add_argument("--service-account", default=DEFAULT_DATAFLOW_SA)
     parser.add_argument("--dataflow-region", default=DEFAULT_DATAFLOW_REGION)
     parser.add_argument("--dataflow-temp-bucket", default=DEFAULT_DATAFLOW_TEMP_BUCKET)
     parser.add_argument("--dataflow-subnetwork", default=DEFAULT_DATAFLOW_SUBNETWORK)
+
+
+def add_infra_args(parser: argparse.ArgumentParser) -> None:
+    """Add the full infra-knob set used by the two Beam workflows.
+
+    Composition of :func:`add_dataset_args` + :func:`add_dataflow_args`, so
+    the namespace is identical to the pre-split helper: ``--dest-dataset``,
+    ``--service-account``, ``--dataflow-region``, ``--dataflow-temp-bucket``,
+    ``--dataflow-subnetwork``. pipe-gaps and port-visits keep calling this;
+    pipe-events calls only :func:`add_dataset_args` (no Dataflow knobs).
+    """
+    add_dataset_args(parser)
+    add_dataflow_args(parser)
 
 
 # --------------------------------------------------------------------------

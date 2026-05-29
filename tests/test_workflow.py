@@ -25,6 +25,8 @@ from dit.cache import CacheKey
 from dit.workflow import (
     EXPERIMENT_ID_RE,
     RunContext,
+    add_dataflow_args,
+    add_dataset_args,
     add_experiment_id_arg,
     add_infra_args,
     default_experiment_id,
@@ -100,6 +102,54 @@ def test_add_infra_args_flags_override() -> None:
     args = p.parse_args(["--dest-dataset", "my_ds", "--dataflow-region", "europe-west1"])
     assert args.dest_dataset == "my_ds"
     assert args.dataflow_region == "europe-west1"
+
+
+# --------------------------------------------------------------------------
+# (a) add_infra_args split: add_dataset_args + add_dataflow_args (Phase 3)
+# --------------------------------------------------------------------------
+
+def test_add_dataset_args_wires_only_dataset_knobs() -> None:
+    # The runner-agnostic dataset knob EVERY consumer uses; NO Dataflow knobs
+    # (incl. --service-account, which is the Dataflow worker SA).
+    p = argparse.ArgumentParser()
+    add_dataset_args(p)
+    args = p.parse_args([])
+    assert args.dest_dataset == dit_workflow.DEFAULT_DEST_DATASET
+    assert not hasattr(args, "service_account")
+    assert not hasattr(args, "dataflow_region")
+    assert not hasattr(args, "dataflow_temp_bucket")
+    assert not hasattr(args, "dataflow_subnetwork")
+
+
+def test_add_dataflow_args_wires_only_dataflow_knobs() -> None:
+    p = argparse.ArgumentParser()
+    add_dataflow_args(p)
+    args = p.parse_args([])
+    assert args.service_account == dit_workflow.DEFAULT_DATAFLOW_SA
+    assert args.dataflow_region == dit_workflow.DEFAULT_DATAFLOW_REGION
+    assert args.dataflow_temp_bucket == dit_workflow.DEFAULT_DATAFLOW_TEMP_BUCKET
+    assert args.dataflow_subnetwork == dit_workflow.DEFAULT_DATAFLOW_SUBNETWORK
+    assert not hasattr(args, "dest_dataset")
+
+
+def test_add_infra_args_namespace_identical_to_split_composition() -> None:
+    # The Beam consumers keep calling add_infra_args; its parsed namespace must
+    # be byte-identical to dataset+dataflow composed (no behaviour change).
+    p_combined = argparse.ArgumentParser()
+    add_infra_args(p_combined)
+    ns_combined = vars(p_combined.parse_args([]))
+
+    p_split = argparse.ArgumentParser()
+    add_dataset_args(p_split)
+    add_dataflow_args(p_split)
+    ns_split = vars(p_split.parse_args([]))
+
+    assert ns_combined == ns_split
+    # and the exact key set the two Beam workflows depend on:
+    assert set(ns_combined) == {
+        "dest_dataset", "service_account",
+        "dataflow_region", "dataflow_temp_bucket", "dataflow_subnetwork",
+    }
 
 
 def test_add_experiment_id_arg_auto_default(monkeypatch: pytest.MonkeyPatch) -> None:

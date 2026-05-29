@@ -19,7 +19,7 @@ User-confirmed decisions:
 |---|---|
 | Phase 1 — pipe-gaps port | **Code complete.** Real-BQ verification + Track 5 (pipe-gaps repo shim) pending. |
 | Phase 2 — port-visits | **AIS-staging verified 2026-05-15** (3/3 pairwise green on `visit_id`). VMS not started; AIS-full not started. |
-| Phase 3 — pipe-events port | Not started. |
+| Phase 3 — pipe-events port | **Code complete (2026-05-29).** Workflow + automated comparison landed; framework extraction deliberately deferred. Live e2e run + pipe-events-repo shim pending. |
 | Phase 4 — composer-dags param sync | Not started. |
 | Phase 5 — mutation library | Not started. |
 | Phase 6 — phase sharing / hash-based caching | Not started. |
@@ -107,10 +107,16 @@ def run(
     project_name: str | None = None,    # docker compose -p; auto-uniquified if None
     build_from_source: bool = False,    # opt-in fallback for unpublished images
     entrypoint: str | None = None,      # overrides image's default ENTRYPOINT
+    volumes: Sequence[str] = (),        # -v mount specs (e.g. "gcp:/root/.config")
+    service: str = "dev",               # compose service on the build_from_source path
 ) -> int:
 ```
 
-Source: `pipe-gaps/tests/integration/mode_equivalence.py` lines 257–281 (`_run_docker`). Each invocation gets a unique compose project name to avoid network races. `entrypoint` lets workflows override the image's default (pipe-gaps passes `entrypoint="pipe-gaps"` because its dev image has no baked-in entrypoint).
+Source: `pipe-gaps/tests/integration/mode_equivalence.py` lines 257–281 (`_run_docker`). Each invocation gets a unique compose project name to avoid network races. `entrypoint` lets workflows override the image's default (pipe-gaps passes `entrypoint="pipe-gaps"` because its dev image has no baked-in entrypoint; pipe-events passes `entrypoint="pipe"` to reach its Python CLI behind the image's `scripts/run` ENTRYPOINT).
+
+`volumes` (Phase 3) threads `-v` mount specs through to BOTH the `docker run` (published) and `docker compose run` (build-from-source) paths. pipe-events authenticates to GCP via a docker **named volume** `gcp` mounted at `/root/.config` (created out-of-band with `docker volume create gcp` + `gcloud auth login`); its workflow passes `volumes=["gcp:/root/.config"]`. The default empty tuple keeps the Beam consumers (pipe-gaps, port-visits) byte-identical — no `-v` flags are emitted unless requested.
+
+`service` (Phase 3) names the compose service used on the build-from-source path (`docker compose run <service>` + `docker compose build <service>`). Defaults to `"dev"` (the Beam consumers' service); pipe-events' compose service is named `"pipeline"`.
 
 ### `dit.runners.dataflow`
 
@@ -347,11 +353,13 @@ This lets dit ship and be useful with zero pipeline-repo changes (the ad-hoc pat
 **Decision rule.** Open `workflows/pipe_gaps/mode_equivalence.py`, `workflows/port_visits/{ais,vms}.py`, and `workflows/pipe_events/fishing.py` side-by-side. If `execute_bf` / `execute_bfd` / `execute_bftruncate` are ≥80% identical: extract `dit.phases.backfill(...)` and `dit.phases.daily_tail(...)` per the vision doc. If they look meaningfully different per pipeline (which is plausible given pipe-events' BQ-session model vs Beam): record the explicit deferral in `dit/phases.py` (or `workflows/README.md`) and don't extract. Three is the right number to decide.
 
 **Deliverables.**
-- `workflows/pipe_events/fishing.py` — calls `dit.runners.docker.run(...)` against `gfw/pipe-events:<tag>`. Adds automated comparisons.
-- Replacement shim in `pipe-events/integration_tests/` (the bash originals are `pipe3-bf_bfd_bftruncate.sh` + the `*_async.sh` variants; there is no exact `staging-bf_bfd_bftruncate.sh`).
-- Optional: `dit/phases.py` if extraction warranted.
+- `workflows/pipe_events/fishing.py` — calls `dit.runners.docker.run(...)` against `gfw/pipe-events:<tag>`. Adds automated comparisons. ✓ landed 2026-05-29.
+- Replacement shim in `pipe-events/integration_tests/` (the bash originals are `pipe3-bf_bfd_bftruncate.sh` + the `*_async.sh` variants; there is no exact `staging-bf_bfd_bftruncate.sh`). **Follow-up — NOT done in the Phase 3 PR.** That is a separate processing-repo change; this PR touches only the dit repo (per the "stay clear of pipeline repos beyond fix branches" working agreement). Owner: whoever lands the pipe-events-side shim.
+- `dit/phases.py` if extraction warranted → **deferred** (see § Framework-extraction decision below; recorded in `workflows/README.md`).
 
-**Refined plan (2026-05-29).** Reading the bash original (`pipe3-bf_bfd_bftruncate.sh`) confirms the **same bf / bfd / bftruncate** shape (full backfill; backfill-to-tail + daily loop; full + daily-loop-truncate), each driving `scripts/generate_incremental_fishing_events.sh --pipeline_prefix <mode> --start_d --end_d --source_pipe_dataset ...`. Crucially the **bash does no comparison** — it writes three prefixed outputs for manual inspection. So Phase 3's value-add is the automated comparison it never had: `compare_tables(view_suffix="_last_versions", keys=[...])` across the three modes (SCD-2 shape, like pipe-gaps).
+**Refined plan (2026-05-29).** Reading the bash original (`pipe3-bf_bfd_bftruncate.sh`) confirms the **same bf / bfd / bftruncate** shape (full backfill; backfill-to-tail + daily loop; full + daily-loop-truncate), each driving `scripts/generate_incremental_fishing_events.sh --pipeline_prefix <mode> --start_d --end_d --source_pipe_dataset ...`. Crucially the **bash does no comparison** — it writes three prefixed outputs for manual inspection. So Phase 3's value-add is the automated comparison it never had.
+
+**Comparison shape — CORRECTED (2026-05-29, Phase 3 implementation).** An earlier draft of this plan said the comparison was SCD-2 (`compare_tables(view_suffix="_last_versions", keys=[...])`, like pipe-gaps). That was wrong. The fishing-events schema (`assets/bigquery/fishing-events-4-authorization-schema.json`) is keyed by **`event_id`** with NO SCD-2 columns (no `valid_from` / `valid_to` / `is_current`) and there is no `_last_versions` view (none exists in `assets/` or `pipe_events/`). Versioning is **table-level**: each run writes a date-suffixed `{prefix}_fishing_events_v{YYYYMMDD}` table plus a `{prefix}_fishing_events` view pointing at the latest. So the cross-mode comparison is the **truncate shape** — `compare_tables(a, b, keys=("event_id",), view_suffix="")`, exactly like port-visits, NOT pipe-gaps. The workflow compares the `_fishing_events` **view** (which abstracts each mode's differing `_v{date}` suffix — different modes end at different dates) and, as a second target, the `_product_events_fishing` (restrictive) view. See `workflows/pipe_events/fishing.py`.
 
 pipe-events is **structurally different from the other two consumers**, which is the whole point of it being the third:
 - **BQ-SQL pipeline, not Beam/Dataflow** — runs BQ jobs orchestrated by a container, using `_SESSION.*` temp tables for isolation (so `--parallel` is safe). It's a **docker-runner** consumer with **no Dataflow worker image** and no Beam submitter-vs-worker split.
@@ -361,9 +369,9 @@ pipe-events is **structurally different from the other two consumers**, which is
 - The run-cache key's `worker_image_digest` is Dataflow-shaped and doesn't map to a build-from-source BQ-SQL run (code identity is `pipeline_commit` + the container image) → **defer caching for pipe-events** (ship uncached, like port-visits initially); settle the docker-runner cache-key shape separately.
 - `resolve_run_context` otherwise fits — `ensure_worker_image` no-ops for the docker runner, and it still records `pipeline_commit`/`unreviewed` for provenance.
 
-**Refined extraction hypothesis.** Opening `execute_*` across all three (Beam-in-process / Beam-via-container / BQ-SQL-via-container), the *date-slice arithmetic* (bf = full; bfd = range−tail + daily loop; bftruncate = full + daily loop) is likely the genuinely-shared part, worth a small `dit.phases` that yields `(start, end)` slices — while per-slice *execution* stays per-workflow. That's more surgical than the full `Phase`/`Mode`/`Oracle` dataclasses; confirm against the real third file.
+**Framework-extraction decision (2026-05-29) — DEFERRED, do not extract `dit.phases`.** Putting `execute_bf/bfd/bftruncate` from all three consumers side-by-side (Beam-in-process / Beam-via-container / BQ-SQL-via-container): the per-slice **execution** bodies are <20% similar (different runners, step counts — 1 vs 2 vs 4 — table-naming, and arg shapes). The genuinely-shared part is only the **date-slice arithmetic**, but even that diverges in the daily-window definition: pipe-gaps subtracts `backfill_days_w` to build each daily slice (`[d - W, d)`); port-visits and pipe-events use 1-day slices (`[d, d+1)` / single-day-end). A `dit.phases` yielding `(start, end)` slices would save ~6 lines per workflow at the cost of a leaky abstraction that must model three different daily-window conventions. **Verdict: keep the three `execute_*` explicit; revisit only if a fourth consumer shares one of the existing daily-window shapes exactly.** Full reasoning recorded in `workflows/README.md`. Three was the right number to decide — and the decision is "the shapes are different enough to keep them explicit."
 
-**Open investigations before coding.** (1) the pipe-events container entrypoint the docker runner targets (the bash calls a sibling shell script — is there a CLI/entrypoint in the image, à la pipe-anchorages' `--entrypoint pipe-anchorages`?); (2) the SCD-2 keys for the fishing-events output (`fishing_events_v` schema); (3) a contract audit + adoption-matrix update in `docs/pipeline-contract.md`. **Estimated effort**: ~2–3 days; best done after M5b so the harness is settled before the third consumer stresses it.
+**Open investigations — RESOLVED (2026-05-29).** (1) **Container entrypoint:** the image bakes `scripts/run` as ENTRYPOINT; the bash overrides it with `--entrypoint pipe` (the `pipe = pipe_events.cli:main` console script) and runs against the `pipeline` compose service. The dit workflow uses `dit_docker.run(entrypoint="pipe", service="pipeline", volumes=["gcp:/root/.config"])`. (2) **Output keys:** NOT SCD-2 — keyed by `event_id`, table-level versioning, compared via the latest-version view (see the Comparison shape correction above). (3) **Contract audit + adoption matrix:** updated in `docs/pipeline-contract.md` in the Phase 3 PR. **Estimated effort** was ~2–3 days; landed in one branch (commits A–E) after M5b.
 
 ## Phase 4+ vision (one paragraph each)
 
