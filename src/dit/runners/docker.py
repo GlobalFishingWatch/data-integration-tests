@@ -46,6 +46,79 @@ def _ensure_built(project_name: str, *, service: str = "dev") -> None:
         _BUILT_PROJECTS.add(project_name)
 
 
+_CLOUD_AUTH_ENV = "DIT_CLOUD_AUTH_ADC"
+_ADC_PATH_IN_CONTAINER = "/root/.config/gcloud/application_default_credentials.json"
+_LAPTOP_AUTH_PREFIX = "/root/.config"
+
+
+def _is_laptop_auth_mount(volume_spec: str) -> bool:
+    """True iff ``volume_spec`` mounts onto the laptop-mode ADC location.
+
+    Laptop mode mounts the ``gcp`` named volume at ``/root/.config`` (or any
+    subdirectory of it). In cloud-auth mode those mounts are dropped because
+    the named volume does not exist in Cloud Build and would shadow the
+    cloud-auth bind-mount we are about to add at the standard ADC path.
+
+    A docker ``-v`` spec is ``<source>:<target>[:<mode>]``. We classify by
+    ``target`` (the second colon-separated field): if it equals
+    ``/root/.config`` or starts with ``/root/.config/`` the mount is treated
+    as laptop-mode auth.
+    """
+    parts = volume_spec.split(":")
+    if len(parts) < 2:
+        return False
+    target = parts[1]
+    return target == _LAPTOP_AUTH_PREFIX or target.startswith(_LAPTOP_AUTH_PREFIX + "/")
+
+
+def _apply_cloud_auth_mode(volumes: Sequence[str]) -> list[str]:
+    """Return the final ``-v`` flag list, applying cloud-auth mode if active.
+
+    Triggered solely by the ``DIT_CLOUD_AUTH_ADC`` env var (path to a readable
+    short-lived ADC file on the build host). When set:
+
+    * any caller-supplied volume targeting ``/root/.config`` (or below) is
+      dropped (the laptop-mode ``gcp:/root/.config`` named volume does not
+      exist in Cloud Build); dropped specs are logged at INFO so the override
+      is visible.
+    * a single ``:ro`` bind-mount of the ADC file to
+      ``/root/.config/gcloud/application_default_credentials.json`` is
+      appended -- the standard ADC path google-cloud-bigquery / google-auth
+      look at when ``GOOGLE_APPLICATION_CREDENTIALS`` is unset.
+
+    When the env var is unset, returns the laptop-mode flags unchanged:
+    behaviour is byte-identical to pre-cloud-auth callers.
+
+    Pure function over the env var + ``volumes``; safe to unit-test directly.
+    """
+    adc_path = os.environ.get(_CLOUD_AUTH_ENV)
+
+    flags: list[str] = []
+    if not adc_path:
+        for vol in volumes:
+            flags.extend(["-v", vol])
+        return flags
+
+    kept: list[str] = []
+    for vol in volumes:
+        if _is_laptop_auth_mount(vol):
+            logger.info(
+                "docker: cloud-auth mode active (%s set); dropping laptop-mode mount %r",
+                _CLOUD_AUTH_ENV, vol,
+            )
+            continue
+        kept.append(vol)
+
+    for vol in kept:
+        flags.extend(["-v", vol])
+    flags.extend(["-v", f"{adc_path}:{_ADC_PATH_IN_CONTAINER}:ro"])
+    logger.info(
+        "docker: cloud-auth mode active; bind-mounting ADC %s -> %s (ro)",
+        adc_path, _ADC_PATH_IN_CONTAINER,
+    )
+    return flags
+
+
 def run(
     image_tag: str,
     args: list[str],
@@ -88,14 +161,26 @@ def run(
     Beam consumers are unaffected; pipe-events' compose service is named
     ``"pipeline"``.
 
+    **Cloud-auth mode (env-triggered, no parameter).** When the
+    ``DIT_CLOUD_AUTH_ADC`` env var is set (path to a readable short-lived ADC
+    file on the build host), the runner drops any caller-supplied volume
+    targeting ``/root/.config`` (or below) -- the laptop-mode ``gcp`` named
+    volume does not exist in Cloud Build -- and bind-mounts the ADC file
+    ``:ro`` at the standard path
+    (``/root/.config/gcloud/application_default_credentials.json``) inside the
+    container. The workflow's ``volumes=["gcp:/root/.config"]`` argument is
+    therefore left unchanged; the same workflow code runs identically on
+    laptop, prod (Workload Identity via metadata server, no mount), and the
+    ditbox cloud path (this mode). The trigger is intentionally an env var
+    rather than a parameter so workflows stay unaware of the execution
+    context.
+
     Returns the docker subprocess exit code.
     """
     base = project_name or "dit-runner"
     unique_project = f"{base}-{uuid.uuid4().hex[:8]}"
 
-    volume_flags: list[str] = []
-    for vol in volumes:
-        volume_flags.extend(["-v", vol])
+    volume_flags = _apply_cloud_auth_mode(volumes)
 
     if build_from_source:
         _ensure_built(unique_project, service=service)

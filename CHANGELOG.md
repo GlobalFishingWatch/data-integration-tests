@@ -6,6 +6,17 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-02
+
+#### Added
+- **`dit.runners.docker` cloud-auth mode + Cloud Build write-ADC step (the auth half of ditbox-for-pipe-events).** Closes the laptop-vs-cloud auth gap for docker-runner pipelines (pipe-events today; any future docker-runner consumer for free) without touching the pipeline code or the workflow contract. Three execution contexts now converge on the standard ADC path (`/root/.config/gcloud/application_default_credentials.json`) inside the container: **laptop** (workflow mounts the user's `gcp` named volume — unchanged), **production** (GKE Workload Identity via metadata server — reference only, dit doesn't reproduce), **ditbox** (Cloud Build writes a short-lived ADC file to `/workspace`; docker runner bind-mounts it `:ro` at the standard path). The workflow's `volumes=["gcp:/root/.config"]` is unchanged — the cloud-auth mode is **env-triggered** (`DIT_CLOUD_AUTH_ADC` set → on), not a workflow parameter, so the same workflow code runs identically in all three contexts.
+  - **Runner changes (`src/dit/runners/docker.py`).** New pure helper `_apply_cloud_auth_mode(volumes)` returns the final `-v` flag list. When the env var is set: any caller-supplied mount whose target is `/root/.config` (or a subdirectory) is dropped (named volume doesn't exist in Cloud Build and would shadow the bind-mount) — drops are logged at INFO — and a `:ro` bind-mount of the ADC file is added at the standard path. Applies to both the `docker run` (published) and `docker compose run` (build-from-source) paths. When the env var is unset, behaviour is byte-identical to today.
+  - **`cloudbuild-dit.yaml` write-ADC step.** Generates a **short-lived** ADC at `/workspace/dit-adc.json` from `gcloud auth application-default print-access-token` (run against the Cloud Build SA's metadata-server identity); writes an `authorized_user`-shaped JSON where `token` is the active field and the refresh-related fields are clearly-marked placeholders. **Permanent SA keys are not generated.** If the build outlives the ~60-min token TTL the next BQ call gets a loud `invalid_grant` (the placeholder refresh_token fails the OAuth endpoint) — silent fallback to any other identity is impossible by design. Logging hygiene: no `set -x` during token handling, token passed to python via env (never argv), no `echo` of token contents.
+  - **Forbidden alternatives considered:** `service_account` JSON (permanent SA key on disk) — forbidden by spec; `impersonated_service_account` — requires `source_credentials` with a real refresh_token the build SA doesn't have; `external_account` (WIF) — Cloud Build uses direct SA attachment, not WIF.
+  - **User-gated follow-up:** the live token-write step has not been exercised against real Cloud Build in this change (same gating as M5 / Phase 3). A future hardening pass would have the build SA impersonate a dedicated narrow-scope SA before issuing the token, rather than re-using the build SA's identity directly.
+  - 16 new tests in `tests/test_runners_docker.py` (mocks subprocess; no live docker / Cloud Build). The pipe-events repo + workflow code is **unchanged**.
+  - See [`docs/conventions.md`](docs/conventions.md) § "Auth in the cloud path (ditbox)" for the three-context table and the hardening follow-up.
+
 ### 2026-05-29
 
 #### Added

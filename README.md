@@ -88,6 +88,8 @@ dit run workflows/pipe_events/fishing.py --parallel --build-from-source
 
 The workflow authenticates by mounting that `gcp` named volume at `/root/.config` (via the docker runner's `volumes` param). It runs the 4-step incremental fishing-events chain per mode and asserts the three modes (`1_bf` / `2_bfd` / `3_bftruncate`) produce identical `_fishing_events` (and `_product_events_fishing`) output — the comparison the original bash never had.
 
+When the same workflow runs **inside Cloud Build** (`make dit-cloud`), there is no `gcp` named volume to mount; instead the docker runner picks up `DIT_CLOUD_AUTH_ADC` (set by `cloudbuild-dit.yaml`) and bind-mounts a **short-lived** ADC file `:ro` at the standard path inside the inner container. The workflow code is unchanged across laptop / cloud — see [`docs/conventions.md`](docs/conventions.md) § "Auth in the cloud path (ditbox)" for the three-context table.
+
 ## Usage scenarios
 
 dit covers a small set of orthogonal axes, summarised first, then walked through as concrete scenarios. **Best-practice paths are flagged ⭐.**
