@@ -10,28 +10,27 @@ this dit run actually executes:
   worker image, the workers silently run the *old published* code -- the
   submitter-vs-worker split. M-pivot-4 closed that gap by auto-building a
   worker image from the pipeline source.
-* **The docker runner** (pipe-events). The runner ``docker run``s a published
-  image directly. The "default" image is a *local* compose tag
-  (``gfw/pipe-events``) that does NOT resolve in cloud (ditbox / Cloud Build)
-  -- nothing pushed it there. In cloud mode the docker runner needs a real
-  registry path to pull from, and that's the same auto-build artefact.
+* **The docker runner** (pipe-events). dit's docker runner ``docker run``s a
+  published image directly. pipe-events publishes canonical versioned images
+  to ``us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/github-globalfishingwatch-pipe-events:vX.Y.Z``
+  (the same registry shape Beam pipelines use for their canonical images;
+  read-only to dit by IAM). If a run executes unreviewed code against the
+  default canonical image, the same submitter-vs-worker-shaped gap applies:
+  the docker run would execute the published code, not the user's changes.
 
-Both consumers want the same artefact: a content-addressable, kaniko-built
-image at ``gcr.io/world-fishing-827/dit/<pipeline>:dit-<pipeline_commit>``.
+Both consumers want the same artefact when an auto-build is needed: a
+content-addressable, kaniko-built image at
+``gcr.io/world-fishing-827/dit/<pipeline>:dit-<pipeline_commit>``.
 :func:`ensure_pipeline_image` is the single entry point producing it. The
 build is idempotent -- the tag is ``dit-<pipeline_commit>``, so an unchanged
 tree resolves to the same tag and an existing image is reused (no rebuild).
 
-The trigger differs slightly between the two consumers:
-
-* **Dataflow worker** (``runner="dataflow"``): build only when the run is
-  unreviewed (reviewed code is assumed already in the default published
-  worker image). An explicit ``--worker-image`` is always respected.
-* **Docker runner** (``runner="docker"``): build when ``need_registry_image``
-  is set (the caller has decided "the local default is unreachable from this
-  runtime" -- typically cloud mode where the compose-local tag won't pull).
-  For pipe-events there is no upstream published image at all, so the
-  registry artefact is the only way to run from a non-local context.
+**Trigger is symmetric across both consumers**: build when ALL of (a)
+``worker_image == default_worker_image`` (no explicit override) and (b) the
+run is ``unreviewed`` (the published default doesn't have these changes).
+An explicit ``--worker-image`` / ``--image-tag`` is always respected.
+Reviewed code at the pinned default version is pulled from the canonical
+registry; only unreviewed code triggers a fresh build under the dit namespace.
 
 The kaniko Cloud Build (``docker/worker-image/cloudbuild.yaml``) targets the
 pipeline's Dockerfile ``prod`` stage by default; both Beam pipelines and
@@ -169,63 +168,28 @@ def ensure_pipeline_image(
     pipeline: str,
     repo_dir: str,
     commit: str,
-    runner: str,
     unreviewed: bool,
     worker_image: str,
     default_worker_image: str,
-    need_registry_image: bool = False,
 ) -> str:
     """Return the pipeline image the run should use, building one if needed.
 
-    Serves both consumers (see module docstring):
-
-    * **Dataflow** (``runner == "dataflow"``): builds when ALL of (a)
-      ``worker_image == default_worker_image`` and (b) ``unreviewed``. An
-      explicit ``--worker-image`` is always respected; reviewed code is
-      assumed already published in the default worker image.
-    * **Docker runner** (``runner == "docker"``): builds when ``worker_image
-      == default_worker_image`` AND ``need_registry_image`` is True. The
-      ``unreviewed`` flag does NOT gate the docker-runner path: the default
-      tag is a *local* compose identifier (e.g. ``gfw/pipe-events``) that does
-      not resolve in any cloud context whether the code is reviewed or not, so
-      a registry artefact is needed unconditionally when the caller signals
-      "this runtime can't reach the local default". Laptop callers leave
-      ``need_registry_image=False`` and keep using the compose
-      ``build_from_source`` path; cloud callers (e.g. inside ditbox / Cloud
-      Build) set ``need_registry_image=True`` so the runner has something it
-      can ``docker run`` against.
+    Same trigger for both consumers (Beam workers + dit's docker runner):
+    build when ALL of (a) ``worker_image == default_worker_image`` (no
+    explicit override) and (b) ``unreviewed`` is True (the published default
+    doesn't have these changes). Otherwise returns ``worker_image`` unchanged.
 
     Returns the (possibly newly-built) image tag. Idempotent: if the
     ``dit-<commit>`` tag already exists in the registry, the build is skipped.
     """
-    if runner == "dataflow":
-        if worker_image != default_worker_image:
-            logger.info(
-                "worker image overridden (%s); not auto-building", worker_image,
-            )
-            return worker_image
-        if not unreviewed:
-            return worker_image
-        trigger_reason = (
-            f"run executes unreviewed code ({commit}) against the default "
-            "worker image"
+    if worker_image != default_worker_image:
+        logger.info(
+            "worker image overridden (%s); not auto-building", worker_image,
         )
-    elif runner == "docker":
-        if not need_registry_image:
-            # Laptop docker-runner path: the local compose tag is fine; the
-            # runner builds from source via docker compose.
-            return worker_image
-        if worker_image != default_worker_image:
-            logger.info(
-                "docker image overridden (%s); not auto-building", worker_image,
-            )
-            return worker_image
-        trigger_reason = (
-            f"docker-runner cloud mode: local default {worker_image!r} won't "
-            "resolve in this runtime; auto-building a registry image"
-        )
-    else:
-        # Unknown runner: opt out (be conservative; never surprise-build).
+        return worker_image
+    if not unreviewed:
+        # Reviewed code at the pinned default: pull from the canonical
+        # registry; nothing to build.
         return worker_image
 
     tag = pipeline_image_tag(pipeline, commit)
@@ -234,8 +198,9 @@ def ensure_pipeline_image(
         return tag
 
     logger.warning(
-        "%s; building a content-addressable image so the consumer actually "
-        "runs this code.", trigger_reason,
+        "run executes unreviewed code (%s) against the default image; "
+        "building a content-addressable image so the consumer actually runs "
+        "this code.", commit,
     )
     _build_and_push(repo_dir, tag, commit)
     return tag

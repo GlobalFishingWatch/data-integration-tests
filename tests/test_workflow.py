@@ -338,11 +338,9 @@ def test_resolve_run_context_threads_worker_image_into_ensure() -> None:
         pipeline="pipe-gaps",
         repo_dir="/repo",
         commit="commit99",
-        runner="dataflow",
         unreviewed=True,
         worker_image="default:img",
         default_worker_image="default:img",
-        need_registry_image=False,
     )
     # the digest is resolved against the image ensure_pipeline_image returned.
     mock_digest.assert_called_once_with("built:custom")

@@ -204,7 +204,6 @@ def resolve_run_context(
     worker_image: str,
     default_worker_image: str,
     resolve_digest: bool = True,
-    need_registry_image: bool = False,
 ) -> RunContext:
     """Resolve the committed ref, worker image, and per-run lineage context.
 
@@ -228,12 +227,6 @@ def resolve_run_context(
     port-visits) — the digest is unused there, so skipping the ~1-2s gcloud
     describe keeps the run-context resolution side-effect-free for them.
 
-    ``need_registry_image`` (default False): docker-runner consumers only.
-    Forwards to :func:`dit.worker_image.ensure_pipeline_image` to trigger the
-    auto-build when the local default image won't resolve in this runtime
-    (i.e. in cloud mode -- the compose-local tag like ``gfw/pipe-events`` was
-    never pushed to a registry). Beam consumers leave this False; the
-    Dataflow path's trigger is the unreviewed-code flag, not this signal.
     """
     if suffix is not None:
         pipeline_commit, dirty = git_info(repo_dir)
@@ -248,24 +241,20 @@ def resolve_run_context(
     pipeline_commit_parent = snapshot_parent(pipeline_commit, repo_dir)
 
     # Ensure a registry-pullable pipeline image exists for whatever consumer
-    # will execute it. For the Beam (Dataflow) consumer this closes the
-    # submitter-vs-worker gap (M-pivot-4): if the run executes unreviewed code
-    # against the default published worker image, the workers would run the
-    # stale published code, so we auto-build a content-addressable image from
-    # the source. For the docker-runner consumer it produces a registry image
-    # for cloud mode where the local compose tag is unreachable (the
-    # ``need_registry_image`` switch). No-op for reviewed Beam code, an
-    # explicit override, or a laptop docker-runner call. Done before the
-    # digest resolution so the cache key reflects the image actually used.
+    # will execute it. M-pivot-4 closes the submitter-vs-worker gap: if the
+    # run executes unreviewed code against the default canonical image, the
+    # consumer would otherwise run the stale published code, so we auto-build
+    # a content-addressable image from the source. Same trigger for both
+    # consumers (Beam workers + dit's docker runner). No-op for reviewed code
+    # or an explicit override. Done before the digest resolution so the cache
+    # key reflects the image actually used.
     worker_image = ensure_pipeline_image(
         pipeline=pipeline_name,
         repo_dir=repo_dir,
         commit=pipeline_commit,
-        runner=runner,
         unreviewed=unreviewed,
         worker_image=worker_image,
         default_worker_image=default_worker_image,
-        need_registry_image=need_registry_image,
     )
 
     run_id = uuid.uuid4().hex[:12]

@@ -22,20 +22,19 @@ consumers:
   ``/root/.config`` (created out-of-band: ``docker volume create gcp`` +
   ``gcloud auth login``). Threaded via the runner's ``volumes`` param.
 
-**Cloud-mode auto-build (image-availability half of ditbox-for-pipe-events).**
-The default ``--image-tag`` (``gfw/pipe-events``) is a *local* compose
-identifier with no canonical published counterpart, so a cloud run (inside
-ditbox / Cloud Build) can't ``docker pull`` it. When the cloud-mode signal
-``DIT_CLOUD_AUTH_ADC`` is set (path to the short-lived ADC file the build
-step writes -- see ``docs/conventions.md``), this workflow triggers the
-generalised pipeline-image auto-build via ``need_registry_image=True``,
-which produces ``gcr.io/world-fishing-827/dit/pipe-events:dit-<commit>`` and
-stamps the FQN onto ``args.image_tag``. The same env var that gates the
-auth-side cloud behaviour gates this; no second knob, no workflow parameter.
-``--build-from-source`` short-circuits the auto-build path (the compose
-service builds the image from the mounted working tree). Laptop mode (env
-var unset) is byte-identical to today -- ``args.image_tag`` keeps its
-``gfw/pipe-events`` default and the runner pulls / builds locally.
+**Image resolution (symmetric with Beam consumers).** Default ``--image-tag``
+is the canonical published pipe-events image
+(``us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/...:vX.Y.Z``,
+matching what composer-dags-production pins in prod; readable but not
+writable by dit per the absolute prod-infra boundary). For *reviewed* code at
+the default version the docker runner pulls that canonical image directly.
+For *unreviewed* code (snapshot / dirty / unmerged) the harness auto-builds
+a content-addressable ``gcr.io/world-fishing-827/dit/pipe-events:dit-<commit>``
+via the same M-pivot-4 kaniko machinery the Beam workflows use, and stamps
+the FQN onto ``args.image_tag``. An explicit ``--image-tag`` override is
+always respected. ``--build-from-source`` opts out entirely: the runner
+ignores ``args.image_tag`` and the compose ``pipeline`` service builds the
+image from the mounted working tree (laptop's natural inner-loop pattern).
 
 Each mode drives the same **4-step docker chain** per date slice
 (``docker compose run --entrypoint pipe pipeline <op> <args>``):
@@ -133,7 +132,10 @@ DEFAULT_END = "2013-01-01"     # exclusive
 DEFAULT_TAIL_DAYS = 3
 
 # Local docker-compose image identifier (docker-compose.yaml: gfw/pipe-events).
-DEFAULT_IMAGE_TAG = "gfw/pipe-events"
+DEFAULT_IMAGE_TAG = (
+    "us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/"
+    "github-globalfishingwatch-pipe-events:v4.2.17"
+)
 
 # The compose service + entrypoint the bash uses:
 #   docker compose run --entrypoint pipe pipeline <op> <args>
@@ -479,26 +481,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     repo_dir = os.getcwd()
 
-    # Cloud-mode signal: DIT_CLOUD_AUTH_ADC is the env var ditbox / Cloud Build
-    # sets (path to the short-lived ADC file the build step writes) -- the
-    # canonical "we are inside ditbox" indicator (see docs/conventions.md §
-    # "Auth in the cloud path"). In that context the default --image-tag
-    # (gfw/pipe-events) is a *local* compose identifier with no published
-    # counterpart, so the docker runner has nothing to pull. We trigger the
-    # generalised pipeline-image auto-build, then stamp args.image_tag with
-    # the resulting registry FQN so _run_step pulls from there.
-    # --build-from-source explicitly opts back into compose-build (from the
-    # mounted working tree, no registry image needed).
-    cloud_mode = (
-        os.environ.get("DIT_CLOUD_AUTH_ADC") is not None
-        and not args.build_from_source
-    )
-
     # Resolve the committed ref + provenance via the shared harness. No run
     # cache for pipe-events (no Dataflow worker image to digest), so
-    # resolve_digest=False — skips the gcloud describe. need_registry_image
-    # gates the docker-runner auto-build; we still record pipeline_commit /
-    # unreviewed for provenance regardless.
+    # resolve_digest=False — skips the gcloud describe. ensure_pipeline_image
+    # (called inside resolve_run_context) returns the canonical default tag
+    # for reviewed code, an auto-built dit/pipe-events:dit-<commit> for
+    # unreviewed code, or an explicit override unchanged. Same trigger as the
+    # Beam consumers; we still record pipeline_commit / unreviewed for
+    # provenance regardless.
     ctx = resolve_run_context(
         repo_dir=repo_dir,
         pipeline_name=PIPELINE_NAME,
@@ -508,18 +498,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_image=args.image_tag,
         default_worker_image=DEFAULT_IMAGE_TAG,
         resolve_digest=False,
-        need_registry_image=cloud_mode,
     )
     args.run_context = ctx
     args.commit_sha = ctx.pipeline_commit
     args.unreviewed = ctx.unreviewed
     args.run_id = ctx.run_id
-    # In cloud mode the harness returned the auto-built registry FQN; stamp
-    # it onto args.image_tag so _run_step's dit_docker.run pulls THAT image.
-    # In laptop mode ensure_pipeline_image returned the default tag unchanged,
-    # so this is a byte-identical no-op for laptop users.
-    if cloud_mode:
-        args.image_tag = ctx.worker_image
+    # Stamp the harness-resolved image (canonical / auto-built / override) onto
+    # args.image_tag so _run_step's dit_docker.run pulls THAT image. Ignored
+    # by the docker runner when build_from_source=True (compose builds the
+    # pipeline service from the mounted working tree).
+    args.image_tag = ctx.worker_image
 
     suffix = _resolve_suffix(args)
 

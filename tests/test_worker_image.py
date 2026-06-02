@@ -1,15 +1,11 @@
 """Unit tests for ``dit.worker_image.ensure_pipeline_image``.
 
 The gcloud calls (image existence check + kaniko build submit) are mocked;
-these cover the trigger matrix and idempotency, not a real build. The trigger
-matrix differs by consumer:
-
-* Dataflow worker (``runner="dataflow"``): build only when the run is
-  unreviewed AND the worker image is left at the default.
-* Docker runner (``runner="docker"``): build only when
-  ``need_registry_image=True`` (cloud-mode signal) AND the image is left at
-  the default; ``unreviewed`` does NOT gate this path -- the default local
-  compose tag never resolves in cloud regardless of review state.
+these cover the trigger matrix and idempotency, not a real build. Trigger is
+symmetric across both consumers (Beam workers + dit's docker runner): build
+when ALL of (a) ``worker_image == default_worker_image`` (no explicit
+override) and (b) ``unreviewed`` is True (published default doesn't have
+these changes). Otherwise pass through.
 """
 
 from __future__ import annotations
@@ -29,7 +25,6 @@ def _kwargs(**overrides):
         pipeline="pipe-gaps",
         repo_dir="/repo",
         commit="abc1234",
-        runner="dataflow",
         unreviewed=True,
         worker_image=DEFAULT,
         default_worker_image=DEFAULT,
@@ -64,38 +59,35 @@ def test_ensure_alias_preserves_old_name() -> None:
 
 
 # --------------------------------------------------------------------------
-# Dataflow trigger matrix (unchanged)
+# Trigger matrix (symmetric across both consumers)
 # --------------------------------------------------------------------------
 
-def test_dataflow_docker_runner_default_never_builds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default docker-runner path (no need_registry_image): never builds."""
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
-    monkeypatch.setattr(worker_image, "_image_exists", lambda t: pytest.fail("checked"))
-    out = worker_image.ensure_pipeline_image(**_kwargs(runner="docker"))
-    assert out == DEFAULT
-
-
-def test_dataflow_explicit_worker_image_respected(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_explicit_worker_image_respected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit non-default ``worker_image`` is always respected, regardless
+    of ``unreviewed`` — the caller is in control."""
     monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
     custom = "gcr.io/world-fishing-827/dit/pipe-gaps:my-custom"
     out = worker_image.ensure_pipeline_image(**_kwargs(worker_image=custom))
     assert out == custom
 
 
-def test_dataflow_reviewed_code_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reviewed_code_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reviewed code at the pinned default: no build, return canonical."""
     monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
     out = worker_image.ensure_pipeline_image(**_kwargs(unreviewed=False))
     assert out == DEFAULT
 
 
-def test_dataflow_unreviewed_existing_image_skips_build(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unreviewed_existing_image_skips_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unreviewed code + default + image already in dit/ registry: no rebuild."""
     monkeypatch.setattr(worker_image, "_image_exists", lambda t: True)
     monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("rebuilt"))
     out = worker_image.ensure_pipeline_image(**_kwargs())
     assert out == "gcr.io/world-fishing-827/dit/pipe-gaps:dit-abc1234"
 
 
-def test_dataflow_unreviewed_missing_image_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unreviewed_missing_image_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unreviewed code + default + image missing: kaniko build under dit/."""
     monkeypatch.setattr(worker_image, "_image_exists", lambda t: False)
     built = []
     monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: built.append((repo, tag, commit)))
@@ -106,6 +98,7 @@ def test_dataflow_unreviewed_missing_image_builds(monkeypatch: pytest.MonkeyPatc
 
 
 def test_pipeline_namespacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The produced tag is keyed on the pipeline name, not hardcoded."""
     monkeypatch.setattr(worker_image, "_image_exists", lambda t: False)
     captured = {}
     monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: captured.update(tag=tag))
@@ -115,87 +108,15 @@ def test_pipeline_namespacing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["tag"] == "gcr.io/world-fishing-827/dit/anchorages_pipeline:dit-def5678"
 
 
-# --------------------------------------------------------------------------
-# Docker-runner trigger matrix (new -- pipe-events / docker-runner generalisation)
-# --------------------------------------------------------------------------
-
-PIPE_EVENTS_LOCAL = "gfw/pipe-events"
-
-
-def _docker_kwargs(**overrides):
-    """Docker-runner shape: local compose tag as both worker_image + default."""
-    base = dict(
-        pipeline="pipe-events",
-        repo_dir="/repo",
-        commit="abc1234",
-        runner="docker",
-        unreviewed=False,
-        worker_image=PIPE_EVENTS_LOCAL,
-        default_worker_image=PIPE_EVENTS_LOCAL,
-        need_registry_image=False,
-    )
-    base.update(overrides)
-    return base
-
-
-def test_docker_laptop_path_returns_default_no_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    """need_registry_image=False (laptop) keeps the local compose tag, no build."""
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
-    monkeypatch.setattr(worker_image, "_image_exists", lambda t: pytest.fail("checked"))
-    out = worker_image.ensure_pipeline_image(**_docker_kwargs())
-    assert out == PIPE_EVENTS_LOCAL
-
-
-def test_docker_cloud_existing_image_skips_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    """need_registry_image=True + image already in registry: no build."""
-    monkeypatch.setattr(worker_image, "_image_exists", lambda t: True)
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("rebuilt"))
-    out = worker_image.ensure_pipeline_image(**_docker_kwargs(need_registry_image=True))
-    assert out == "gcr.io/world-fishing-827/dit/pipe-events:dit-abc1234"
-
-
-def test_docker_cloud_missing_image_builds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """need_registry_image=True + image missing: build the docker-runner image."""
+def test_pipe_events_pipeline_namespacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pipe-events (the docker-runner consumer) uses the same machinery."""
     monkeypatch.setattr(worker_image, "_image_exists", lambda t: False)
-    built = []
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: built.append((repo, tag, commit)))
-    out = worker_image.ensure_pipeline_image(**_docker_kwargs(need_registry_image=True))
-    tag = "gcr.io/world-fishing-827/dit/pipe-events:dit-abc1234"
-    assert out == tag
-    assert built == [("/repo", tag, "abc1234")]
-
-
-def test_docker_cloud_reviewed_code_still_builds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """unreviewed gating does NOT apply to the docker-runner path -- the local
-    compose tag never resolves in cloud regardless of review state.
-    """
-    monkeypatch.setattr(worker_image, "_image_exists", lambda t: False)
-    built = []
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: built.append((repo, tag, commit)))
-    out = worker_image.ensure_pipeline_image(
-        **_docker_kwargs(need_registry_image=True, unreviewed=False)
+    captured = {}
+    monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: captured.update(tag=tag))
+    worker_image.ensure_pipeline_image(
+        **_kwargs(pipeline="pipe-events", commit="abc1234")
     )
-    assert out == "gcr.io/world-fishing-827/dit/pipe-events:dit-abc1234"
-    assert len(built) == 1
-
-
-def test_docker_cloud_explicit_override_respected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An explicit non-default image is always respected, even with the cloud
-    signal set -- the caller is in control."""
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
-    custom = "gcr.io/world-fishing-827/dit/pipe-events:my-custom"
-    out = worker_image.ensure_pipeline_image(
-        **_docker_kwargs(need_registry_image=True, worker_image=custom)
-    )
-    assert out == custom
-
-
-def test_unknown_runner_never_builds(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Defensive: an unknown runner string opts out of any build."""
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
-    monkeypatch.setattr(worker_image, "_image_exists", lambda t: pytest.fail("checked"))
-    out = worker_image.ensure_pipeline_image(**_kwargs(runner="unknown"))
-    assert out == DEFAULT
+    assert captured["tag"] == "gcr.io/world-fishing-827/dit/pipe-events:dit-abc1234"
 
 
 # --------------------------------------------------------------------------
