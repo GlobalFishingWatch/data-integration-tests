@@ -59,6 +59,17 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-02 — Auth hardening (dedicated runner SA) considered and declined
+
+After landing PR #34 (cloud-auth mode with `authorized_user`-shaped ADC + literal placeholder strings in `client_id`/`client_secret`/`refresh_token`), the documented next step had been to replace the placeholder shape with an `impersonated_service_account` ADC pointing at a new `dit-pipe-events-runner@` SA. Reconsidered: **drop it.** Reasoning:
+
+- `automated-testing@`'s perms are already scoped — the absolute prod-infra boundary (see [[prod-infra-boundary]]) keeps it out of `gfw-int-infrastructure`, writes are dit-namespaced, tokens are ~1h-lived. A narrower runner SA reduces blast radius marginally but adds an SA + 2 IAM bindings to maintain without addressing a real threat.
+- The placeholder-JSON shape is a *cosmetic* concern (literal `"placeholder"` strings + loud `invalid_grant` failure mode), not a security one. No silent fallback path.
+- `--network=host` (Option C, metadata-server access from the inner container) was the obvious alternative once the new-SA path was off the table; reconsidered honestly and also declined — trades the cosmetic-JSON smell for a structural shared-network-namespace concession that reviews worse and gives a compromised container token-refresh-on-demand instead of a fixed-TTL leak window.
+- Only path that materially changes the auth model is Option A (migrate ditbox to GKE / Cloud Run Jobs) — reserved as a future *architectural* upgrade.
+
+**Sections moved:** `docs/conventions.md` § "Auth in the cloud path (ditbox)" — "Future hardening" subsection rewritten from "not yet implemented" to "considered and declined" with the explicit reasoning above. Memory `[[next-stages-m5-pipe-events]]` auth bullet updated to match (no further hardening planned). No code change.
+
 ### 2026-06-02 — Implement ditbox cloud-auth mode (token-only ADC bind-mount; short-lived; future hardening = impersonation SA)
 
 Implementing the **auth half** of the ditbox-for-pipe-events story laid out in the 2026-06-01 entry. The **image-availability half** (M-pivot-4 generalisation: dit's existing kaniko auto-build pushing under `gcr.io/world-fishing-827/dit/<pipeline>` extended to feed dit's docker runner, not just Dataflow workers) **remains pending** — this PR is the auth half only. The two halves are independent on purpose: the auth mode lets a Cloud-Build-spawned `pipe-events` container reach BQ regardless of which image it pulls; the image-availability half decides what tag that image carries.
