@@ -1,9 +1,32 @@
 """Mode-equivalence integration test for pipe-events fishing events.
 
-Ports ``pipe-events/integration_tests/pipe3-bf_bfd_bftruncate.sh`` to dit, and
-adds the cross-mode comparison the bash never had: the bash wrote three
-prefixed outputs for manual inspection; this workflow asserts they are
-identical (any divergence is a test failure).
+Ports the three pipe-events bash integration scripts
+(``integration_tests/staging-bf_bfd_bftruncate_async.sh`` /
+``pipe3-bf_bfd_bftruncate.sh`` / ``pipe3-bf_bfd_bftruncate_async.sh``) into a
+single dit workflow, and adds the cross-mode comparison the bash never had:
+the bash wrote three prefixed outputs for manual inspection; this workflow
+asserts they are identical (any divergence is a test failure).
+
+The three bash variants differ only in default values (date window, tail
+days, source cohort, static-measures table); the mode shape, 4-step docker
+chain, and comparison contract are identical. So they collapse into ONE
+workflow file with overridable CLI defaults. **Defaults follow the staging
+script** (2020 calendar year against the AIS test cohort) -- the right thing
+for routine validation; the production-scale variants are reachable by CLI
+override:
+
+* ``pipe3`` sync (full prod cohort, 1 year of 2012):
+  ``--start 2012-01-01 --end 2013-01-01
+    --internal-ds world-fishing-827.pipe_ais_v3_internal
+    --published-ds world-fishing-827.pipe_ais_v3_published``
+
+* ``pipe3`` async (full prod cohort, 2012 -> 2025-05-04, 15-day tail):
+  add ``--end 2025-05-04 --tail-days 15`` to the override above.
+
+The staging script is the **default first run** per pipe-events' own
+``CLAUDE.md`` ("Always run staging first; only run pipe3 for final
+validation"). Production-scale runs are deliberately gated behind explicit
+flags so you don't fire one off by accident.
 
 pipe-events is dit's **third consumer** and the first non-Beam one. It is a
 **BQ-SQL pipeline run via docker** (NOT Beam/Dataflow): the container
@@ -64,8 +87,9 @@ Modes (mirroring the bash):
 Date semantics: ``--start`` / ``--end`` are **half-open** ``[start, end)`` —
 matching the bash, which passes ``-end $end_d`` as an exclusive bound to the
 incremental query and uses ``end_d = current_day + 1`` for each daily slice.
-(The bash's ``start_year=2012`` / ``end_year_plus_one-01-01`` shape is
-``start=2012-01-01``, ``end=2013-01-01``.)
+(The bash's ``start_year=N`` / ``end_year_plus_one-01-01`` shape maps to
+``start=N-01-01``, ``end=(N+1)-01-01`` — e.g. staging's 2020 becomes
+``start=2020-01-01``, ``end=2021-01-01``.)
 
 Comparison (the value-add): the fishing-events schema is keyed by
 **``event_id``** with NO SCD-2 columns (no ``valid_from``/``valid_to``/
@@ -128,10 +152,13 @@ DEFAULT_PUBLISHED_DS = f"{PROJECT}.pipe_ais_test_202408290000_published"
 DEFAULT_PIPE_STATIC = f"{PROJECT}.pipe_static"
 DEFAULT_PIPE_REGIONS_LAYERS = f"{PROJECT}.pipe_regions_layers"
 
-# pipe3-bf_bfd_bftruncate.sh runs the 2012 calendar year:
-#   start_year-01-01 .. end_year_plus_one-01-01 (end exclusive).
-DEFAULT_START = "2012-01-01"   # inclusive
-DEFAULT_END = "2013-01-01"     # exclusive
+# Defaults follow ``staging-bf_bfd_bftruncate_async.sh``: 2020 calendar year
+# against the AIS test cohort (the generate-script's own defaults). Half-open
+# window ``[start, end)``. pipe-events' own CLAUDE.md says: always run
+# staging first (smaller cohort, cheaper); pipe3 is for final validation
+# only. Override at the CLI for pipe3 (see module docstring above).
+DEFAULT_START = "2020-01-01"   # inclusive
+DEFAULT_END = "2021-01-01"     # exclusive
 DEFAULT_TAIL_DAYS = 3
 
 # Canonical published pipe-events image, pinned at the prod version that
@@ -331,7 +358,8 @@ def _run_slice(
 
 
 # --------------------------------------------------------------------------
-# Modes (date-slice arithmetic mirroring pipe3-bf_bfd_bftruncate.sh)
+# Modes (date-slice arithmetic mirroring the staging / pipe3 bash scripts —
+# identical across all three variants, only the default window differs)
 # --------------------------------------------------------------------------
 
 def _daily_slices(end: date, tail_days: int) -> list[date]:
