@@ -1,14 +1,15 @@
 """Mode-equivalence integration test for pipe-events fishing events.
 
 Ports the three pipe-events bash integration scripts
-(``integration_tests/staging-bf_bfd_bftruncate_async.sh`` /
-``pipe3-bf_bfd_bftruncate.sh`` / ``pipe3-bf_bfd_bftruncate_async.sh``) into a
+(``pipe-events/integration_tests/staging-bf_bfd_bftruncate_async.sh`` /
+``pipe-events/integration_tests/pipe3-bf_bfd_bftruncate.sh`` /
+``pipe-events/integration_tests/pipe3-bf_bfd_bftruncate_async.sh``) into a
 single dit workflow, and adds the cross-mode comparison the bash never had:
 the bash wrote three prefixed outputs for manual inspection; this workflow
 asserts they are identical (any divergence is a test failure).
 
-The three bash variants differ only in default values (date window, tail
-days, source cohort, static-measures table); the mode shape, 4-step docker
+The three bash variants differ only in **CLI-overridable defaults** (date
+window, tail days, source AIS datasets); the mode shape, 4-step docker
 chain, and comparison contract are identical. So they collapse into ONE
 workflow file with overridable CLI defaults. **Defaults follow the staging
 script** (2020 calendar year against the AIS test cohort) -- the right thing
@@ -359,7 +360,7 @@ def _run_slice(
 
 # --------------------------------------------------------------------------
 # Modes (date-slice arithmetic mirroring the staging / pipe3 bash scripts —
-# identical across all three variants, only the default window differs)
+# identical across all three variants; only CLI-overridable defaults differ)
 # --------------------------------------------------------------------------
 
 def _daily_slices(end: date, tail_days: int) -> list[date]:
