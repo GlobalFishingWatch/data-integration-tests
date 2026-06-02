@@ -105,8 +105,11 @@ steps:
   #         token lifetime is comfortably longer than any single run.
   #
   # Logging hygiene:
-  #   The access token is written via `> /workspace/dit-adc.json` (direct
-  #   redirection), never `echo`'d, and this step deliberately does NOT use
+  #   The access token is captured into the `DIT_ADC_TOKEN` shell env var via
+  #   `$(gcloud auth application-default print-access-token)` (never `echo`'d),
+  #   then the embedded `python3` reads it from `os.environ` and writes the
+  #   ADC JSON via `open('/workspace/dit-adc.json', 'w')` — token contents
+  #   never appear on the build log. This step deliberately does NOT use
   #   `set -x`. The file's permissions are not relaxed: it sits at the
   #   default 0644 under /workspace, accessible to subsequent build steps
   #   that mount /workspace (which all run as the same Cloud Build user).

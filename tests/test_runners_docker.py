@@ -137,7 +137,6 @@ def test_build_from_source_builds_named_service():
     assert "pipeline" in build_calls[0]
 
 
-
 # --------------------------------------------------------------------------
 # Cloud-auth mode (DIT_CLOUD_AUTH_ADC env-triggered) — Commit A
 # --------------------------------------------------------------------------
