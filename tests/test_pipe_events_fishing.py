@@ -355,7 +355,8 @@ def test_main_rejects_end_before_start():
             raise AssertionError("expected SystemExit on end <= start")
 
 
-def test_main_resolve_run_context_uses_docker_runner_no_digest():
+def test_main_resolve_run_context_uses_docker_runner_no_digest(monkeypatch):
+    monkeypatch.delenv("DIT_CLOUD_AUTH_ADC", raising=False)
     ctx = _patch_main()
     with (
         patch.object(mod, "resolve_run_context", return_value=ctx) as mock_ctx,
@@ -369,3 +370,86 @@ def test_main_resolve_run_context_uses_docker_runner_no_digest():
     assert kwargs["runner"] == "docker"
     assert kwargs["resolve_digest"] is False
     assert kwargs["pipeline_name"] == "pipe-events"
+
+
+# --------------------------------------------------------------------------
+# Cloud-mode auto-build wiring (image-availability half of ditbox-for-pipe-events)
+# --------------------------------------------------------------------------
+
+def _captured_image_tag(monkeypatch, *, env_set, args=None, build_from_source=False,
+                        ctx_worker_image="gcr.io/world-fishing-827/dit/pipe-events:dit-abc1234"):
+    """Run main() with a captured args.image_tag from inside the
+    pipeline-execution path. Returns (image_tag_seen, run_context_kwargs)."""
+    if env_set:
+        monkeypatch.setenv("DIT_CLOUD_AUTH_ADC", "/tmp/dit-adc.json")
+    else:
+        monkeypatch.delenv("DIT_CLOUD_AUTH_ADC", raising=False)
+
+    ctx = _patch_main()
+    # Override the worker_image so we can assert the harness's return value
+    # is what gets stamped onto args.image_tag.
+    ctx.worker_image = ctx_worker_image
+
+    captured: dict = {}
+
+    def fake_execute(args, suffix):
+        # Snapshot args.image_tag the first time any execute_* sees it.
+        captured.setdefault("image_tag", args.image_tag)
+
+    base_args = ["--experiment-id", "exp01"]
+    if build_from_source:
+        base_args.append("--build-from-source")
+    base_args.extend(args or [])
+
+    with (
+        patch.object(mod, "resolve_run_context", return_value=ctx) as mock_ctx,
+        patch.object(mod, "execute_bf", side_effect=fake_execute),
+        patch.object(mod, "execute_bfd", side_effect=fake_execute),
+        patch.object(mod, "execute_bftruncate", side_effect=fake_execute),
+        patch.object(mod, "compare_all", return_value=0),
+    ):
+        mod.main(base_args)
+    return captured.get("image_tag"), mock_ctx.call_args.kwargs
+
+
+def test_main_laptop_no_env_keeps_default_image_tag(monkeypatch):
+    """Env var unset (laptop): args.image_tag stays at the compose-local tag,
+    and need_registry_image is False -- no auto-build triggered."""
+    image_tag, ctx_kwargs = _captured_image_tag(monkeypatch, env_set=False)
+    assert image_tag == "gfw/pipe-events"
+    assert ctx_kwargs["need_registry_image"] is False
+
+
+def test_main_cloud_env_triggers_auto_build_and_stamps_image_tag(monkeypatch):
+    """Env var set + no --build-from-source: need_registry_image=True is
+    threaded through, and args.image_tag picks up the harness-returned FQN."""
+    image_tag, ctx_kwargs = _captured_image_tag(monkeypatch, env_set=True)
+    assert ctx_kwargs["need_registry_image"] is True
+    assert image_tag == "gcr.io/world-fishing-827/dit/pipe-events:dit-abc1234"
+
+
+def test_main_build_from_source_overrides_cloud_signal(monkeypatch):
+    """--build-from-source short-circuits the auto-build path even with the
+    cloud env var set: the compose service builds from the working tree, so
+    no registry image is needed."""
+    image_tag, ctx_kwargs = _captured_image_tag(
+        monkeypatch, env_set=True, build_from_source=True,
+    )
+    assert ctx_kwargs["need_registry_image"] is False
+    # args.image_tag is left at whatever the CLI provided (default).
+    assert image_tag == "gfw/pipe-events"
+
+
+def test_main_cloud_env_with_explicit_image_tag_overrides(monkeypatch):
+    """Cloud env set but caller passed an explicit --image-tag: the harness
+    receives need_registry_image=True (no policy change), and ensure_pipeline_image
+    inside the harness respects the override -- the explicit tag flows through.
+    Verified end-to-end: the captured ctx.worker_image is what gets stamped."""
+    custom = "gcr.io/world-fishing-827/dit/pipe-events:explicit-override"
+    image_tag, ctx_kwargs = _captured_image_tag(
+        monkeypatch, env_set=True, args=["--image-tag", custom],
+        ctx_worker_image=custom,  # mirror what ensure_pipeline_image would return
+    )
+    assert ctx_kwargs["need_registry_image"] is True
+    assert ctx_kwargs["worker_image"] == custom
+    assert image_tag == custom

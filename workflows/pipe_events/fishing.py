@@ -17,11 +17,25 @@ consumers:
 * **No run cache** (deferred — the cache key's ``worker_image_digest`` is
   Dataflow-shaped; settle the docker-runner cache-key shape separately).
   ``resolve_run_context`` still runs for provenance (it records
-  ``pipeline_commit`` / ``unreviewed``; ``ensure_worker_image`` no-ops for
-  the docker runner).
+  ``pipeline_commit`` / ``unreviewed``).
 * Authenticates via a docker **named volume** ``gcp`` mounted at
   ``/root/.config`` (created out-of-band: ``docker volume create gcp`` +
   ``gcloud auth login``). Threaded via the runner's ``volumes`` param.
+
+**Cloud-mode auto-build (image-availability half of ditbox-for-pipe-events).**
+The default ``--image-tag`` (``gfw/pipe-events``) is a *local* compose
+identifier with no canonical published counterpart, so a cloud run (inside
+ditbox / Cloud Build) can't ``docker pull`` it. When the cloud-mode signal
+``DIT_CLOUD_AUTH_ADC`` is set (path to the short-lived ADC file the build
+step writes -- see ``docs/conventions.md``), this workflow triggers the
+generalised pipeline-image auto-build via ``need_registry_image=True``,
+which produces ``gcr.io/world-fishing-827/dit/pipe-events:dit-<commit>`` and
+stamps the FQN onto ``args.image_tag``. The same env var that gates the
+auth-side cloud behaviour gates this; no second knob, no workflow parameter.
+``--build-from-source`` short-circuits the auto-build path (the compose
+service builds the image from the mounted working tree). Laptop mode (env
+var unset) is byte-identical to today -- ``args.image_tag`` keeps its
+``gfw/pipe-events`` default and the runner pulls / builds locally.
 
 Each mode drives the same **4-step docker chain** per date slice
 (``docker compose run --entrypoint pipe pipeline <op> <args>``):
@@ -465,10 +479,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     repo_dir = os.getcwd()
 
+    # Cloud-mode signal: DIT_CLOUD_AUTH_ADC is the env var ditbox / Cloud Build
+    # sets (path to the short-lived ADC file the build step writes) -- the
+    # canonical "we are inside ditbox" indicator (see docs/conventions.md §
+    # "Auth in the cloud path"). In that context the default --image-tag
+    # (gfw/pipe-events) is a *local* compose identifier with no published
+    # counterpart, so the docker runner has nothing to pull. We trigger the
+    # generalised pipeline-image auto-build, then stamp args.image_tag with
+    # the resulting registry FQN so _run_step pulls from there.
+    # --build-from-source explicitly opts back into compose-build (from the
+    # mounted working tree, no registry image needed).
+    cloud_mode = (
+        os.environ.get("DIT_CLOUD_AUTH_ADC") is not None
+        and not args.build_from_source
+    )
+
     # Resolve the committed ref + provenance via the shared harness. No run
     # cache for pipe-events (no Dataflow worker image to digest), so
-    # resolve_digest=False — skips the gcloud describe. ensure_worker_image
-    # no-ops for the docker runner; we still record pipeline_commit/unreviewed.
+    # resolve_digest=False — skips the gcloud describe. need_registry_image
+    # gates the docker-runner auto-build; we still record pipeline_commit /
+    # unreviewed for provenance regardless.
     ctx = resolve_run_context(
         repo_dir=repo_dir,
         pipeline_name=PIPELINE_NAME,
@@ -478,11 +508,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_image=args.image_tag,
         default_worker_image=DEFAULT_IMAGE_TAG,
         resolve_digest=False,
+        need_registry_image=cloud_mode,
     )
     args.run_context = ctx
     args.commit_sha = ctx.pipeline_commit
     args.unreviewed = ctx.unreviewed
     args.run_id = ctx.run_id
+    # In cloud mode the harness returned the auto-built registry FQN; stamp
+    # it onto args.image_tag so _run_step's dit_docker.run pulls THAT image.
+    # In laptop mode ensure_pipeline_image returned the default tag unchanged,
+    # so this is a byte-identical no-op for laptop users.
+    if cloud_mode:
+        args.image_tag = ctx.worker_image
 
     suffix = _resolve_suffix(args)
 
