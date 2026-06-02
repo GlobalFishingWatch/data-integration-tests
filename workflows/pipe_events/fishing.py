@@ -20,7 +20,10 @@ consumers:
   ``pipeline_commit`` / ``unreviewed``).
 * Authenticates via a docker **named volume** ``gcp`` mounted at
   ``/root/.config`` (created out-of-band: ``docker volume create gcp`` +
-  ``gcloud auth login``). Threaded via the runner's ``volumes`` param.
+  ``gcloud auth application-default login`` -- the container reads ADC from
+  ``/root/.config/gcloud/application_default_credentials.json``, which only
+  ``application-default login`` populates; plain ``auth login`` won't). Threaded
+  via the runner's ``volumes`` param.
 
 **Image resolution (symmetric with Beam consumers).** Default ``--image-tag``
 is the canonical published pipe-events image
@@ -131,7 +134,12 @@ DEFAULT_START = "2012-01-01"   # inclusive
 DEFAULT_END = "2013-01-01"     # exclusive
 DEFAULT_TAIL_DAYS = 3
 
-# Local docker-compose image identifier (docker-compose.yaml: gfw/pipe-events).
+# Canonical published pipe-events image, pinned at the prod version that
+# composer-dags-production currently runs (``Versions.PIPE_EVENTS = "v4.2.17"``
+# in ``dags/core/ais/v3.py``). Read-only to dit by IAM per the absolute
+# prod-infra boundary; the docker runner pulls from here for reviewed code.
+# ``--build-from-source`` short-circuits this entirely (the runner builds the
+# compose ``pipeline`` service from the mounted working tree instead).
 DEFAULT_IMAGE_TAG = (
     "us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/"
     "github-globalfishingwatch-pipe-events:v4.2.17"
@@ -498,6 +506,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_image=args.image_tag,
         default_worker_image=DEFAULT_IMAGE_TAG,
         resolve_digest=False,
+        build_from_source=args.build_from_source,
     )
     args.run_context = ctx
     args.commit_sha = ctx.pipeline_commit

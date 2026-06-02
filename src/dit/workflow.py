@@ -204,6 +204,7 @@ def resolve_run_context(
     worker_image: str,
     default_worker_image: str,
     resolve_digest: bool = True,
+    build_from_source: bool = False,
 ) -> RunContext:
     """Resolve the committed ref, worker image, and per-run lineage context.
 
@@ -227,6 +228,13 @@ def resolve_run_context(
     port-visits) — the digest is unused there, so skipping the ~1-2s gcloud
     describe keeps the run-context resolution side-effect-free for them.
 
+    ``build_from_source`` (default False): the docker-runner caller is opting
+    out of registry-image consumption (the runner will build the container
+    from the working tree via ``docker compose``, ignoring ``image_tag``).
+    When True, :func:`ensure_pipeline_image` is bypassed entirely — no
+    unnecessary kaniko build is incurred for an image the runner won't pull.
+    Beam consumers don't pass this; default False keeps their behaviour
+    unchanged.
     """
     if suffix is not None:
         pipeline_commit, dirty = git_info(repo_dir)
@@ -248,14 +256,19 @@ def resolve_run_context(
     # consumers (Beam workers + dit's docker runner). No-op for reviewed code
     # or an explicit override. Done before the digest resolution so the cache
     # key reflects the image actually used.
-    worker_image = ensure_pipeline_image(
-        pipeline=pipeline_name,
-        repo_dir=repo_dir,
-        commit=pipeline_commit,
-        unreviewed=unreviewed,
-        worker_image=worker_image,
-        default_worker_image=default_worker_image,
-    )
+    #
+    # ``build_from_source=True`` short-circuits the auto-build entirely: the
+    # docker runner will build the container from the working tree via
+    # compose and ignore ``image_tag``, so the kaniko submit would be wasted.
+    if not build_from_source:
+        worker_image = ensure_pipeline_image(
+            pipeline=pipeline_name,
+            repo_dir=repo_dir,
+            commit=pipeline_commit,
+            unreviewed=unreviewed,
+            worker_image=worker_image,
+            default_worker_image=default_worker_image,
+        )
 
     run_id = uuid.uuid4().hex[:12]
     dc = dit_commit()

@@ -374,6 +374,57 @@ def test_resolve_run_context_resolve_digest_false_skips_gcloud() -> None:
     assert ctx.worker_image_digest == "img:tag"  # tag form, no gcloud call
 
 
+def test_resolve_run_context_build_from_source_bypasses_ensure_pipeline_image() -> None:
+    """build_from_source=True signals the docker runner will build the
+    container locally via compose, so the harness must NOT call
+    ensure_pipeline_image — kaniko would build an image that's never pulled."""
+    with (
+        patch.object(dit_workflow, "resolve_pipeline_commit",
+                     return_value=("abc1234", True)),  # unreviewed, would normally build
+        patch.object(dit_workflow, "snapshot_parent", return_value=None),
+        patch.object(dit_workflow, "ensure_pipeline_image") as mock_ensure,
+        patch.object(dit_workflow, "dit_commit", return_value="x"),
+    ):
+        ctx = dit_workflow.resolve_run_context(
+            repo_dir="/repo",
+            pipeline_name="pipe-events",
+            runner="docker",
+            require_clean=False,
+            suffix=None,
+            worker_image="canonical:v1",
+            default_worker_image="canonical:v1",
+            resolve_digest=False,
+            build_from_source=True,
+        )
+    mock_ensure.assert_not_called()
+    # worker_image flows through unchanged from input.
+    assert ctx.worker_image == "canonical:v1"
+
+
+def test_resolve_run_context_build_from_source_false_still_calls_ensure() -> None:
+    """The default (build_from_source=False) path keeps the auto-build trigger
+    active — no regression for Beam consumers."""
+    with (
+        patch.object(dit_workflow, "resolve_pipeline_commit",
+                     return_value=("abc1234", True)),
+        patch.object(dit_workflow, "snapshot_parent", return_value=None),
+        patch.object(dit_workflow, "ensure_pipeline_image",
+                     return_value="built:img") as mock_ensure,
+        patch.object(dit_workflow, "dit_commit", return_value="x"),
+    ):
+        dit_workflow.resolve_run_context(
+            repo_dir="/repo",
+            pipeline_name="pipe-gaps",
+            runner="dataflow",
+            require_clean=False,
+            suffix=None,
+            worker_image="default:img",
+            default_worker_image="default:img",
+            resolve_digest=False,
+        )
+    mock_ensure.assert_called_once()
+
+
 # --------------------------------------------------------------------------
 # (d) run_with_cache
 # --------------------------------------------------------------------------

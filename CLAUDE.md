@@ -69,6 +69,8 @@ Closes the second half of the ditbox-for-pipe-events story sketched in the 2026-
 
 **Trade-off accepted.** On laptop, a default-image-tag run of unreviewed pipe-events code (no `--build-from-source`) now triggers the M-pivot-4 kaniko build, requiring laptop gcloud + Cloud Build perms. This matches how Beam workflows on laptop already work for unreviewed code — same cost, same ergonomics, same submit path. The natural laptop inner-loop pattern for pipe-events remains `--build-from-source` (compose builds the working tree); the symmetric design changes only the default-no-flag behaviour.
 
+**`--build-from-source` opts out at two levels.** Beyond the runtime opt-out (docker runner ignores `image_tag` and runs the compose `pipeline` service), `resolve_run_context` gains a `build_from_source: bool = False` parameter that, when True, bypasses `ensure_pipeline_image` entirely — avoiding an unnecessary kaniko submission for an unreviewed build-from-source run where the produced image would never be pulled. Beam consumers don't pass this; default keeps their behaviour unchanged.
+
 **User-gated validation (out of scope here).** The live `gcloud builds submit` inside a real ditbox-in-Cloud-Build run, the resulting registry pull, and the docker-in-docker invocation with the auto-built image have not been exercised against live infra. Same gating shape as M5 / Phase 3 / PR #34 (cloud-auth half). The next step is a user-driven live `make dit-cloud PIPELINE=pipe-events ...` against the AIS-staging cohort.
 
 ### 2026-06-02 — Auth hardening (dedicated runner SA) considered and declined

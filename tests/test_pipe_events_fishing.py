@@ -445,6 +445,22 @@ def test_main_build_from_source_still_stamps(monkeypatch):
     assert image_tag == canonical
 
 
+def test_main_build_from_source_signals_harness_to_skip_auto_build(monkeypatch):
+    """--build-from-source must be threaded into resolve_run_context as
+    build_from_source=True so the harness bypasses the kaniko auto-build path
+    (the runner ignores image_tag in build-from-source mode, so the build
+    would be wasted)."""
+    _, ctx_kwargs = _captured_image_tag(monkeypatch, build_from_source=True)
+    assert ctx_kwargs["build_from_source"] is True
+
+
+def test_main_no_build_from_source_passes_false_to_harness(monkeypatch):
+    """Default path: build_from_source=False reaches the harness, so the
+    auto-build path is governed by the normal unreviewed + default trigger."""
+    _, ctx_kwargs = _captured_image_tag(monkeypatch, build_from_source=False)
+    assert ctx_kwargs["build_from_source"] is False
+
+
 def test_main_resolve_run_context_called_without_need_registry_image(monkeypatch):
     """need_registry_image was removed from the harness — the symmetric trigger
     (unreviewed + default) carries the auto-build for both consumers. Pin that
