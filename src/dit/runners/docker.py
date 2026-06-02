@@ -46,8 +46,7 @@ def _ensure_built(project_name: str, *, service: str = "dev") -> None:
         _BUILT_PROJECTS.add(project_name)
 
 
-_CLOUD_AUTH_ENV = "DIT_CLOUD_AUTH_ADC"
-_ADC_PATH_IN_CONTAINER = "/root/.config/gcloud/application_default_credentials.json"
+_CLOUD_MODE_ENV = "DIT_CLOUD_MODE"
 _LAPTOP_AUTH_PREFIX = "/root/.config"
 
 
@@ -55,9 +54,9 @@ def _is_laptop_auth_mount(volume_spec: str) -> bool:
     """True iff ``volume_spec`` mounts onto the laptop-mode ADC location.
 
     Laptop mode mounts the ``gcp`` named volume at ``/root/.config`` (or any
-    subdirectory of it). In cloud-auth mode those mounts are dropped because
-    the named volume does not exist in Cloud Build and would shadow the
-    cloud-auth bind-mount we are about to add at the standard ADC path.
+    subdirectory of it). In cloud mode those mounts are dropped because the
+    named volume does not exist in Cloud Build; the inner container reaches
+    ADC via the metadata server (over ``--network=host``) instead.
 
     A docker ``-v`` spec is ``<source>:<target>[:<mode>]``. We classify by
     ``target`` (the second colon-separated field): if it equals
@@ -71,52 +70,60 @@ def _is_laptop_auth_mount(volume_spec: str) -> bool:
     return target == _LAPTOP_AUTH_PREFIX or target.startswith(_LAPTOP_AUTH_PREFIX + "/")
 
 
-def _apply_cloud_auth_mode(volumes: Sequence[str]) -> list[str]:
-    """Return the final ``-v`` flag list, applying cloud-auth mode if active.
+def _apply_cloud_mode(volumes: Sequence[str]) -> list[str]:
+    """Return the docker flags to insert before the image/service positional.
 
-    Triggered solely by the ``DIT_CLOUD_AUTH_ADC`` env var (path to a readable
-    short-lived ADC file on the build host). When set:
+    Triggered solely by the ``DIT_CLOUD_MODE`` env var (any non-empty value).
+    When set ("we are running inside ditbox / Cloud Build"):
 
+    * ``--network=host`` is added so the inner container shares the build
+      VM's network namespace and can reach Cloud Build's metadata server at
+      ``169.254.169.254`` -- google-auth's ADC discovery chain finds the
+      metadata server and obtains a fresh OAuth token bound to the build SA,
+      same mechanism prod uses via GKE Workload Identity.
     * any caller-supplied volume targeting ``/root/.config`` (or below) is
-      dropped (the laptop-mode ``gcp:/root/.config`` named volume does not
-      exist in Cloud Build); dropped specs are logged at INFO so the override
-      is visible.
-    * a single ``:ro`` bind-mount of the ADC file to
-      ``/root/.config/gcloud/application_default_credentials.json`` is
-      appended -- the standard ADC path google-cloud-bigquery / google-auth
-      look at when ``GOOGLE_APPLICATION_CREDENTIALS`` is unset.
+      dropped -- the laptop-mode ``gcp:/root/.config`` named volume doesn't
+      exist in Cloud Build and would mount as an empty anonymous volume,
+      shadowing whatever the base image has there (typically nothing
+      load-bearing, but cleaner to drop than to leave an empty mount).
+      Dropped specs are logged at INFO so the override is visible.
 
-    When the env var is unset, returns the laptop-mode flags unchanged:
-    behaviour is byte-identical to pre-cloud-auth callers.
+    When the env var is unset (laptop), returns the laptop-mode ``-v`` flags
+    unchanged: behaviour is byte-identical to pre-cloud-mode callers.
+
+    Earlier the cloud path bind-mounted a short-lived ADC JSON file at the
+    standard ADC location. That approach was abandoned after live testing:
+    the older ``google-auth`` baked into pipe-events' Python 3.8 image tries
+    to refresh ``authorized_user`` credentials before the first API call,
+    ignoring the pre-issued ``token`` field, and a refresh with placeholder
+    OAuth client material fails with ``invalid_client``. Metadata-server
+    access via ``--network=host`` sidesteps the issue entirely -- the
+    container never holds long-lived material, just like prod.
 
     Pure function over the env var + ``volumes``; safe to unit-test directly.
     """
-    adc_path = os.environ.get(_CLOUD_AUTH_ENV)
+    cloud_mode = bool(os.environ.get(_CLOUD_MODE_ENV))
 
-    flags: list[str] = []
-    if not adc_path:
+    if not cloud_mode:
+        flags: list[str] = []
         for vol in volumes:
             flags.extend(["-v", vol])
         return flags
 
-    kept: list[str] = []
+    out: list[str] = ["--network=host"]
     for vol in volumes:
         if _is_laptop_auth_mount(vol):
             logger.info(
-                "docker: cloud-auth mode active (%s set); dropping laptop-mode mount %r",
-                _CLOUD_AUTH_ENV, vol,
+                "docker: cloud mode active (%s set); dropping laptop-mode mount %r",
+                _CLOUD_MODE_ENV, vol,
             )
             continue
-        kept.append(vol)
-
-    for vol in kept:
-        flags.extend(["-v", vol])
-    flags.extend(["-v", f"{adc_path}:{_ADC_PATH_IN_CONTAINER}:ro"])
+        out.extend(["-v", vol])
     logger.info(
-        "docker: cloud-auth mode active; bind-mounting ADC %s -> %s (ro)",
-        adc_path, _ADC_PATH_IN_CONTAINER,
+        "docker: cloud mode active; adding --network=host so the inner "
+        "container can reach Cloud Build's metadata server for ADC.",
     )
-    return flags
+    return out
 
 
 def run(
@@ -161,39 +168,38 @@ def run(
     Beam consumers are unaffected; pipe-events' compose service is named
     ``"pipeline"``.
 
-    **Cloud-auth mode (env-triggered, no parameter).** When the
-    ``DIT_CLOUD_AUTH_ADC`` env var is set (path to a readable short-lived ADC
-    file on the build host), the runner drops any caller-supplied volume
-    targeting ``/root/.config`` (or below) -- the laptop-mode ``gcp`` named
-    volume does not exist in Cloud Build -- and bind-mounts the ADC file
-    ``:ro`` at the standard path
-    (``/root/.config/gcloud/application_default_credentials.json``) inside the
-    container. The workflow's ``volumes=["gcp:/root/.config"]`` argument is
-    therefore left unchanged; the same workflow code runs identically on
-    laptop, prod (Workload Identity via metadata server, no mount), and the
-    ditbox cloud path (this mode). The trigger is intentionally an env var
-    rather than a parameter so workflows stay unaware of the execution
-    context.
+    **Cloud mode (env-triggered, no parameter).** When the ``DIT_CLOUD_MODE``
+    env var is set (any non-empty value), the runner adds ``--network=host``
+    to the docker invocation so the inner container can reach Cloud Build's
+    metadata server for ADC -- same mechanism prod uses via GKE Workload
+    Identity, no on-disk credential material. Laptop-mode mounts targeting
+    ``/root/.config`` (or below) are also dropped (the ``gcp`` named volume
+    does not exist in Cloud Build). The workflow's
+    ``volumes=["gcp:/root/.config"]`` argument is therefore left unchanged;
+    the same workflow code runs identically on laptop, prod (Workload
+    Identity), and the ditbox cloud path (this mode). The trigger is
+    intentionally an env var rather than a parameter so workflows stay
+    unaware of the execution context.
 
     Returns the docker subprocess exit code.
     """
     base = project_name or "dit-runner"
     unique_project = f"{base}-{uuid.uuid4().hex[:8]}"
 
-    volume_flags = _apply_cloud_auth_mode(volumes)
+    cloud_flags = _apply_cloud_mode(volumes)
 
     if build_from_source:
         _ensure_built(unique_project, service=service)
         cmd = ["docker", "compose", "-p", unique_project, "run", "--rm"]
         if entrypoint:
             cmd.extend(["--entrypoint", entrypoint])
-        cmd.extend(volume_flags)
+        cmd.extend(cloud_flags)
         cmd.extend([service, *args])
     else:
         cmd = ["docker", "run", "--rm", "--name", unique_project]
         if entrypoint:
             cmd.extend(["--entrypoint", entrypoint])
-        cmd.extend(volume_flags)
+        cmd.extend(cloud_flags)
         cmd.extend([image_tag, *args])
 
     proc_env = None

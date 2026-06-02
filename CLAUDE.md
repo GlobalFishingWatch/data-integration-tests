@@ -59,6 +59,27 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-02 — Cloud auth pivot: bind-mounted ADC file → `--network=host` (metadata-server access)
+
+First live cloud run (`make dit-cloud PIPELINE=pipe-events`, build `dab02540`) falsified the assumption underpinning PR #34's cloud-auth design. The placeholder-`authorized_user` ADC JSON we bind-mounted was rejected by the older `google-auth` in pipe-events' Python 3.8 image — it tries to refresh `authorized_user` credentials **before** the first API call, ignores the pre-issued `token` field, and the refresh against placeholder OAuth client material failed with `invalid_client`. The intended "refresh fails loudly after the ~60-min TTL" failure mode actually fires before the first API call.
+
+**Decision: pivot to `--network=host`** (Option C from the earlier auth-options exploration, previously declined for security reasons). dit's docker runner now adds `--network=host` to the inner container when cloud mode is on, so the container shares the build VM's network namespace and reaches Cloud Build's metadata server (`169.254.169.254`) for ADC. No on-disk credential material; the container never holds a long-lived secret — same shape as prod (which gets ADC via GKE's metadata server through Workload Identity).
+
+**Why the earlier "declined" decision now changes.** The argument against `--network=host` was that it "trades a cosmetic-JSON smell for a structural shared-network-namespace concession." That argument was theoretical; the failure of the file-mount approach is concrete. And the practical surface increase on an ephemeral per-build VM with no co-tenancy and only the build's own steps running is essentially zero. Reviewing the trade-off honestly with live evidence in hand: the cosmetic-JSON shape doesn't matter if it doesn't *work*.
+
+**Sections moved.**
+- `src/dit/runners/docker.py`: `_apply_cloud_auth_mode` → `_apply_cloud_mode`; helper now returns `["--network=host", ...kept volumes]` when active (no bind-mount); env var renamed `DIT_CLOUD_AUTH_ADC` → `DIT_CLOUD_MODE` (any non-empty value triggers); docstrings rewritten; references to the file-mount approach kept as historical context in the helper's docstring.
+- `cloudbuild-dit.yaml`: the `write-adc` step + its substantial comment block dropped entirely; the `dit-run` step's `DIT_CLOUD_AUTH_ADC=/workspace/dit-adc.json` env replaced with `DIT_CLOUD_MODE=1`; `waitFor: ['write-adc']` removed (dit-run is now the only step).
+- `tests/test_runners_docker.py`: 18 cloud-mode tests rewritten to assert `--network=host` presence (helper + both run-paths + laptop-mount-drop + log hygiene).
+- `tests/test_pipe_events_fishing.py`: the single `monkeypatch.delenv("DIT_CLOUD_AUTH_ADC", ...)` updated to `DIT_CLOUD_MODE`.
+- `docs/conventions.md` § "Auth in the cloud path (ditbox)": three-context table updated (ditbox row now describes `--network=host`); "Triggered by" paragraph updated for the new env var; "Why metadata-server" paragraph added recording the live-evidence pivot + the trade-off accepted; the "Hardening considered and declined" paragraph rewritten — the dedicated-runner-SA case stands, but the `--network=host`-was-also-declined claim is now stale (it's the path we just adopted).
+- `CHANGELOG.md` § `[Unreleased]` gains a top 2026-06-02 `#### Changed` bullet. The 279-test suite continues to pass.
+- `README.md` § "ditbox-for-pipe-events" paragraph rewritten to reflect `--network=host` mechanism.
+
+**Trade-off accepted.** Inner container shares the build VM's network namespace. Mitigated by Cloud Build's per-build-ephemeral VM model + no co-tenancy + sequential build steps. Worth re-evaluating if ditbox ever moves to a shared-runtime environment.
+
+**Future architectural upgrade (still on the table).** Migrating ditbox to GKE / Cloud Run Jobs would recover prod's literal keyless model: the inner workload gets metadata-server ADC via Workload Identity, scoped to its own KSA, without any host-network sharing. Reserved for when longer-term needs co-justify it. For now, `--network=host` matches the security profile we actually need.
+
 ### 2026-06-02 — `workflows/pipe_events/fishing.py` defaults: pipe3 → staging; one workflow covers all three bash variants
 
 After landing both halves of ditbox-for-pipe-events and being ready for the first live run, surfaced that pipe-events ships **three** bash integration scripts (`staging-bf_bfd_bftruncate_async.sh`, `pipe3-bf_bfd_bftruncate.sh`, `pipe3-bf_bfd_bftruncate_async.sh`) and `fishing.py`'s defaults were inherited from the most expensive of the three (pipe3 sync = full prod cohort over 2012). pipe-events' own `CLAUDE.md` says "Always run staging first" — the wrong shape to fire by default.

@@ -356,7 +356,7 @@ def test_main_rejects_end_before_start():
 
 
 def test_main_resolve_run_context_uses_docker_runner_no_digest(monkeypatch):
-    monkeypatch.delenv("DIT_CLOUD_AUTH_ADC", raising=False)
+    monkeypatch.delenv("DIT_CLOUD_MODE", raising=False)
     ctx = _patch_main()
     with (
         patch.object(mod, "resolve_run_context", return_value=ctx) as mock_ctx,
