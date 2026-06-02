@@ -59,6 +59,18 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-02 — `workflows/pipe_events/fishing.py` defaults: pipe3 → staging; one workflow covers all three bash variants
+
+After landing both halves of ditbox-for-pipe-events and being ready for the first live run, surfaced that pipe-events ships **three** bash integration scripts (`staging-bf_bfd_bftruncate_async.sh`, `pipe3-bf_bfd_bftruncate.sh`, `pipe3-bf_bfd_bftruncate_async.sh`) and `fishing.py`'s defaults were inherited from the most expensive of the three (pipe3 sync = full prod cohort over 2012). pipe-events' own `CLAUDE.md` says "Always run staging first" — the wrong shape to fire by default.
+
+Diffed the three scripts: they differ **only in defaults** — date window, tail days, source cohort, static-measures table. Same modes (`1_bf` / `2_bfd` / `3_bftruncate`), same 4-step docker chain, same comparison contract. So:
+
+**Decision: one workflow file with staging defaults; pipe3 reachable via CLI overrides.** A separate `pipe3_fishing.py` would be ~40 lines of duplicate boilerplate for different default values — not worth it. The module docstring records the exact override invocations for pipe3-sync and pipe3-async, so the production-scale capability is preserved without a duplicate file.
+
+**Sections moved.** `workflows/pipe_events/fishing.py`: module docstring rewritten (cite all three bash scripts; document the pipe3 override commands); `DEFAULT_START`/`DEFAULT_END` flipped (`2012-01-01`/`2013-01-01` → `2020-01-01`/`2021-01-01`); comment block above date constants rewritten to reference staging + cite the override path; the "Modes (...mirroring pipe3-...)" header generalised to "mirroring the staging/pipe3 bash scripts". `CHANGELOG.md` § [Unreleased] gains a top 2026-06-02 `#### Changed` bullet. Tests unchanged — they use explicit fixtures (`_args(start="2012-01-01", ...)`), not the new defaults — so the suite (279 tests) continues to pass.
+
+**Trade-off accepted.** A `dit run workflows/pipe_events/fishing.py` with no overrides now hits the AIS test cohort in 2020 (cheap, intended), not pipe_ais_v3 in 2012 (expensive, unintended-by-default). Anyone explicitly running pipe3 has to type the overrides — friction in proportion to cost. The reverse (pipe3 by default) had the opposite ergonomics: cheap-day-by-default and expensive-day-by-default were both options; chose the cheap-by-default.
+
 ### 2026-06-02 — Image-availability half of ditbox-for-pipe-events: M-pivot-4 generalised; symmetric trigger across both consumers
 
 Closes the second half of the ditbox-for-pipe-events story sketched in the 2026-06-01 planning entry (the auth half landed earlier the same day in PR #34). The existing M-pivot-4 kaniko auto-build (`src/dit/worker_image.py`, today produces Dataflow worker images for unreviewed Beam code) now serves dit's docker runner identically — same namespace (`gcr.io/world-fishing-827/dit/<pipeline>`), same kaniko machinery, same `:dit-<pipeline_commit>` tag scheme; only the consumer differs. With this PR `make dit-cloud PIPELINE=pipe-events` is image-side ready (live e2e is user-gated).

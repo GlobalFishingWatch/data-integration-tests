@@ -8,6 +8,9 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ### 2026-06-02
 
+#### Changed
+- **`workflows/pipe_events/fishing.py` defaults flipped from `pipe3` to `staging`.** Per pipe-events' own `CLAUDE.md` ("Always run staging first; only run pipe3 for final validation"), the dit workflow's defaults now mirror `staging-bf_bfd_bftruncate_async.sh` (2020 calendar year against the AIS test cohort, `--start 2020-01-01 --end 2021-01-01 --tail-days 3`) instead of `pipe3-bf_bfd_bftruncate.sh` (2012 + prod cohort). Production-scale runs are still reachable via explicit CLI overrides — documented in the module docstring — so no functionality is lost; expensive runs just don't happen by accident. A separate `pipe3` workflow file was considered and **declined**: the three bash variants (staging-async, pipe3-sync, pipe3-async) differ only in default values (date window, tail days, source cohort, static-measures table) — same modes, same 4-step chain, same comparison contract — so one workflow file with overridable defaults covers all three. Tests unchanged (they use explicit fixtures, not the new defaults); 279 tests pass.
+
 #### Added
 
 - **Image-availability half of ditbox-for-pipe-events: M-pivot-4 auto-build generalised to all consumers; pipe-events wired with a symmetric trigger.** Closes the second half of the ditbox-for-pipe-events gap (the auth half landed earlier the same day; see the cloud-auth entry below). The existing kaniko auto-build at `src/dit/worker_image.py` — previously scoped to Beam-worker consumers — now serves dit's docker runner identically. **`make dit-cloud PIPELINE=pipe-events` is image-side ready**; live e2e remains user-gated (same shape as M5 / Phase 3 limitations).
