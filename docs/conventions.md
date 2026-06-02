@@ -42,6 +42,24 @@ Examples:
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-1465-after` (cross-version, per-binding)
 - `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (planned — docker-runner auto-build)
 
+## Auth in the cloud path (ditbox)
+
+Three execution contexts for any docker-runner pipeline, all converging on the standard ADC path (`/root/.config/gcloud/application_default_credentials.json`) inside the container — workflow code is identical across them, only the runtime environment differs:
+
+| Context | How ADC reaches the container |
+|---|---|
+| Laptop | Workflow passes `volumes=["gcp:/root/.config"]`; docker runner mounts the user's named volume populated by `gcloud auth application-default login`. |
+| Production (Composer/GKE) | Pod runs in GKE with Workload Identity; container finds ADC via the GKE **metadata server**. **No file mount, no env var, no credential material on disk.** |
+| ditbox (Cloud Build) | Cloud Build step writes a **short-lived** ADC file to `/workspace`; docker runner bind-mounts it `:ro` at the standard path inside the inner container. The workflow-passed `gcp:/root/.config` mount is dropped (the named volume doesn't exist in Cloud Build). |
+
+**Triggered by `DIT_CLOUD_AUTH_ADC` env var, not a workflow parameter.** When the env var is set (path to a readable ADC file on the build host), `src/dit/runners/docker.py` drops any caller-supplied mount whose target is `/root/.config` (or below) and adds a `:ro` bind-mount of the ADC file at the standard ADC path. When unset (laptop), the workflow's `volumes=[...]` is used verbatim. Workflows stay unaware of the execution context.
+
+**Short-lived token, not an SA key.** The Cloud Build write-ADC step uses the build SA's metadata-server identity (`gcloud auth application-default print-access-token`) to produce an ~60-minute access token, written into an `authorized_user`-shaped JSON. `gcloud iam service-accounts keys create` is **not** an acceptable substitute — a permanent key on disk is exactly the failure mode this design avoids. If a build outlives the token TTL, the next BQ call gets a loud `invalid_grant` error (the refresh-related fields in the JSON are placeholders that fail the OAuth refresh endpoint by design); silent fallback to any other identity is not possible.
+
+**Future hardening (not yet implemented).** Spawn a dedicated **impersonation SA** with the narrowest set of permissions pipe-events needs, and have the write-ADC step impersonate that SA instead of issuing a token directly against the (broader-scoped) build SA. The current design re-uses the build SA's identity as a pragmatic first step; the impersonation hop is a cleaner long-term shape but does not change the on-disk credential model.
+
+This is testing-shaped infrastructure that respects the absolute [prod-infra boundary](#prod-infra-boundary): the build SA lives in `world-fishing-827`, no writes to `gfw-int-infrastructure`, no permanent credentials anywhere.
+
 ## Standard build-and-push workflow
 
 For per-binding pipeline images used by `--binding-worker-image`:
