@@ -49,11 +49,121 @@ substitutions:
   _BEAM_VERSION: ''
 
 steps:
+  # ----------------------------------------------------------------------
+  # write-adc: produce a short-lived ADC file at /workspace/dit-adc.json
+  # ----------------------------------------------------------------------
+  #
+  # Why a file mount at all?
+  #   pipe-events (and any other docker-runner pipeline) authenticates to
+  #   GCP via standard ADC (`google-cloud-bigquery` finds credentials at
+  #   /root/.config/gcloud/application_default_credentials.json). The three
+  #   execution contexts converge on that path:
+  #     - laptop : workflow mounts the user's `gcp` named volume populated by
+  #                `gcloud auth application-default login`.
+  #     - prod   : pod runs in GKE with Workload Identity; the container
+  #                reaches the metadata server -- no file mount.
+  #     - ditbox : Cloud Build is not GKE and the inner `docker run` does
+  #                not get a clean metadata-server route, so we write a
+  #                short-lived ADC file here and bind-mount it into the
+  #                inner container (`:ro`).
+  #
+  # Why short-lived, NOT a permanent SA key?
+  #   The build SA (`automated-testing@`) is already attached to this Cloud
+  #   Build VM via `serviceAccount:` below. `gcloud auth application-default
+  #   print-access-token` exchanges the SA's metadata-server identity for a
+  #   ~60-minute OAuth2 access token -- no permanent credential material is
+  #   generated and none is written to disk. `gcloud iam service-accounts
+  #   keys create` (forbidden here) would create a non-expiring secret; this
+  #   pattern explicitly does not.
+  #
+  # Where is the rule enforced?
+  #   This step generates ONLY a bearer access token. The `src/dit/runners/
+  #   docker.py` cloud-auth mode then bind-mounts the JSON `:ro` at the ADC
+  #   path inside the inner container. The `:ro` is also load-bearing
+  #   defense-in-depth: even if a downstream step tried to rewrite the file
+  #   inside the container, it cannot.
+  #
+  # ADC JSON shape chosen: `authorized_user` with the access token populated.
+  #   Researched alternatives:
+  #     - `service_account` (SA key)       -> FORBIDDEN (permanent key).
+  #     - `impersonated_service_account`   -> requires `source_credentials`
+  #         containing client_id + client_secret + refresh_token. The build
+  #         SA has none of those (metadata-server identity is not a
+  #         user-shaped OAuth grant), so producing one means generating an SA
+  #         key first -- back to forbidden.
+  #     - `external_account` (WIF)         -> Cloud Build does not use
+  #         Workload Identity Federation; the SA is directly attached.
+  #     - `authorized_user`-shaped JSON with `token` populated (chosen). The
+  #         `google.auth` library accepts this shape via
+  #         `from_authorized_user_info`. The active credential is the
+  #         pre-issued access token; the `refresh_token` field is a clearly-
+  #         marked placeholder string that the OAuth refresh endpoint would
+  #         reject. This is the intended failure mode: if the build runs
+  #         past the ~60-min token TTL, the next BQ call gets a loud
+  #         `invalid_grant` error rather than silently falling back to any
+  #         permanent identity. Typical pipe-events runs are minutes; the
+  #         token lifetime is comfortably longer than any single run.
+  #
+  # Logging hygiene:
+  #   The access token is written via `> /workspace/dit-adc.json` (direct
+  #   redirection), never `echo`'d, and this step deliberately does NOT use
+  #   `set -x`. The file's permissions are not relaxed: it sits at the
+  #   default 0644 under /workspace, accessible to subsequent build steps
+  #   that mount /workspace (which all run as the same Cloud Build user).
+  #
+  - id: write-adc
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -eu  # NOT -x: we are about to handle an access token
+        export DIT_ADC_TOKEN="$(gcloud auth application-default print-access-token)"
+        if [ -z "$DIT_ADC_TOKEN" ]; then
+            echo "ERROR: gcloud auth application-default print-access-token returned empty" >&2
+            exit 1
+        fi
+        # `authorized_user` ADC shape; `token` is the only active field --
+        # the refresh-related fields are placeholders that would fail loudly
+        # if the OAuth refresh endpoint ever sees them. That is the intended
+        # behaviour: if a build outlives the token's ~60-min TTL the next
+        # BQ call gets `invalid_grant` rather than silently regenerating
+        # credentials.
+        #
+        # The token is passed to python via env (NOT argv) so it never
+        # appears in the shell's command line / process listing, and python
+        # writes via direct file open (no shell redirection of the token
+        # value).
+        python3 -c '
+        import json, os
+        adc = {
+            "type": "authorized_user",
+            "client_id": "dit-cloud-auth-placeholder.apps.googleusercontent.com",
+            "client_secret": "PLACEHOLDER_dit_cloud_auth_short_lived_only",
+            "refresh_token": "NOT_A_REFRESH_TOKEN_dit_cloud_auth_short_lived_only",
+            "token": os.environ["DIT_ADC_TOKEN"],
+        }
+        with open("/workspace/dit-adc.json", "w") as fh:
+            json.dump(adc, fh)
+        '
+        unset DIT_ADC_TOKEN
+        echo ">>> Wrote short-lived ADC to /workspace/dit-adc.json (token contents NOT logged)"
+        # Sanity: confirm the file is non-empty and parseable JSON, again
+        # without logging the contents.
+        python3 -c "import json; json.load(open('/workspace/dit-adc.json'))"
+    env:
+      # `gcloud auth application-default print-access-token` reads no env
+      # vars from us here -- it picks up the build SA via metadata server.
+      # We are explicit about the empty env to make the absence of
+      # GOOGLE_APPLICATION_CREDENTIALS visible.
+      - 'CLOUDSDK_CORE_DISABLE_PROMPTS=1'
+
   - id: dit-run
     # ditbox lives under gcr.io/world-fishing-827/dit/* per the dit-image
     # convention (see docs/conventions.md and CLAUDE.md § Working agreements).
     name: gcr.io/world-fishing-827/dit/ditbox:latest
     entrypoint: bash
+    waitFor: ['write-adc']
     env:
       # Recorded by the workflow as pipeline_commit (see dit.snapshot). Empty
       # is fine: the workflow falls back to resolving git state itself.
@@ -61,6 +171,12 @@ steps:
       # Laptop-resolved unreviewed flag (the builder can't fetch origin/main to
       # compute it). Empty -> the workflow falls back to its own check.
       - 'DIT_UNREVIEWED=${_UNREVIEWED}'
+      # Cloud-auth mode for the inner docker runner (see
+      # src/dit/runners/docker.py): bind-mount the ADC file written above
+      # into the docker-runner pipeline container at the standard ADC path.
+      # When this env var is unset (laptop), the runner uses the workflow's
+      # caller-supplied named volume instead.
+      - 'DIT_CLOUD_AUTH_ADC=/workspace/dit-adc.json'
     args:
       - -c
       - |
