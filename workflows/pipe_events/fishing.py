@@ -17,11 +17,27 @@ consumers:
 * **No run cache** (deferred — the cache key's ``worker_image_digest`` is
   Dataflow-shaped; settle the docker-runner cache-key shape separately).
   ``resolve_run_context`` still runs for provenance (it records
-  ``pipeline_commit`` / ``unreviewed``; ``ensure_worker_image`` no-ops for
-  the docker runner).
+  ``pipeline_commit`` / ``unreviewed``).
 * Authenticates via a docker **named volume** ``gcp`` mounted at
   ``/root/.config`` (created out-of-band: ``docker volume create gcp`` +
-  ``gcloud auth login``). Threaded via the runner's ``volumes`` param.
+  ``gcloud auth application-default login`` -- the container reads ADC from
+  ``/root/.config/gcloud/application_default_credentials.json``, which only
+  ``application-default login`` populates; plain ``auth login`` won't). Threaded
+  via the runner's ``volumes`` param.
+
+**Image resolution (symmetric with Beam consumers).** Default ``--image-tag``
+is the canonical published pipe-events image
+(``us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/...:vX.Y.Z``,
+matching what composer-dags-production pins in prod; readable but not
+writable by dit per the absolute prod-infra boundary). For *reviewed* code at
+the default version the docker runner pulls that canonical image directly.
+For *unreviewed* code (snapshot / dirty / unmerged) the harness auto-builds
+a content-addressable ``gcr.io/world-fishing-827/dit/pipe-events:dit-<commit>``
+via the same M-pivot-4 kaniko machinery the Beam workflows use, and stamps
+the FQN onto ``args.image_tag``. An explicit ``--image-tag`` override is
+always respected. ``--build-from-source`` opts out entirely: the runner
+ignores ``args.image_tag`` and the compose ``pipeline`` service builds the
+image from the mounted working tree (laptop's natural inner-loop pattern).
 
 Each mode drives the same **4-step docker chain** per date slice
 (``docker compose run --entrypoint pipe pipeline <op> <args>``):
@@ -118,8 +134,16 @@ DEFAULT_START = "2012-01-01"   # inclusive
 DEFAULT_END = "2013-01-01"     # exclusive
 DEFAULT_TAIL_DAYS = 3
 
-# Local docker-compose image identifier (docker-compose.yaml: gfw/pipe-events).
-DEFAULT_IMAGE_TAG = "gfw/pipe-events"
+# Canonical published pipe-events image, pinned at the prod version that
+# composer-dags-production currently runs (``Versions.PIPE_EVENTS = "v4.2.17"``
+# in ``dags/core/ais/v3.py``). Read-only to dit by IAM per the absolute
+# prod-infra boundary; the docker runner pulls from here for reviewed code.
+# ``--build-from-source`` short-circuits this entirely (the runner builds the
+# compose ``pipeline`` service from the mounted working tree instead).
+DEFAULT_IMAGE_TAG = (
+    "us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/"
+    "github-globalfishingwatch-pipe-events:v4.2.17"
+)
 
 # The compose service + entrypoint the bash uses:
 #   docker compose run --entrypoint pipe pipeline <op> <args>
@@ -467,8 +491,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Resolve the committed ref + provenance via the shared harness. No run
     # cache for pipe-events (no Dataflow worker image to digest), so
-    # resolve_digest=False — skips the gcloud describe. ensure_worker_image
-    # no-ops for the docker runner; we still record pipeline_commit/unreviewed.
+    # resolve_digest=False — skips the gcloud describe. ensure_pipeline_image
+    # (called inside resolve_run_context) returns the canonical default tag
+    # for reviewed code, an auto-built dit/pipe-events:dit-<commit> for
+    # unreviewed code, or an explicit override unchanged. Same trigger as the
+    # Beam consumers; we still record pipeline_commit / unreviewed for
+    # provenance regardless.
     ctx = resolve_run_context(
         repo_dir=repo_dir,
         pipeline_name=PIPELINE_NAME,
@@ -478,11 +506,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_image=args.image_tag,
         default_worker_image=DEFAULT_IMAGE_TAG,
         resolve_digest=False,
+        build_from_source=args.build_from_source,
     )
     args.run_context = ctx
     args.commit_sha = ctx.pipeline_commit
     args.unreviewed = ctx.unreviewed
     args.run_id = ctx.run_id
+    # Stamp the harness-resolved image (canonical / auto-built / override) onto
+    # args.image_tag so _run_step's dit_docker.run pulls THAT image. Ignored
+    # by the docker runner when build_from_source=True (compose builds the
+    # pipeline service from the mounted working tree).
+    args.image_tag = ctx.worker_image
 
     suffix = _resolve_suffix(args)
 

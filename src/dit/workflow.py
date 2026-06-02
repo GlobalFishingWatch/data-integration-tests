@@ -45,7 +45,7 @@ from dit.cache import (
 )
 from dit.git_info import git_info
 from dit.snapshot import is_unreviewed, resolve_pipeline_commit, snapshot_parent
-from dit.worker_image import ensure_worker_image
+from dit.worker_image import ensure_pipeline_image
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +204,7 @@ def resolve_run_context(
     worker_image: str,
     default_worker_image: str,
     resolve_digest: bool = True,
+    build_from_source: bool = False,
 ) -> RunContext:
     """Resolve the committed ref, worker image, and per-run lineage context.
 
@@ -226,6 +227,14 @@ def resolve_run_context(
     warning). Set False for callers with no run-cache integration (e.g.
     port-visits) — the digest is unused there, so skipping the ~1-2s gcloud
     describe keeps the run-context resolution side-effect-free for them.
+
+    ``build_from_source`` (default False): the docker-runner caller is opting
+    out of registry-image consumption (the runner will build the container
+    from the working tree via ``docker compose``, ignoring ``image_tag``).
+    When True, :func:`ensure_pipeline_image` is bypassed entirely — no
+    unnecessary kaniko build is incurred for an image the runner won't pull.
+    Beam consumers don't pass this; default False keeps their behaviour
+    unchanged.
     """
     if suffix is not None:
         pipeline_commit, dirty = git_info(repo_dir)
@@ -239,21 +248,27 @@ def resolve_run_context(
     # from the snapshot commit message); None for real/main commits. M-pivot-3.
     pipeline_commit_parent = snapshot_parent(pipeline_commit, repo_dir)
 
-    # Close the submitter-vs-worker gap (M-pivot-4): if this run executes
-    # unreviewed code against the default worker image, the workers would run
-    # the stale published code. Auto-build a content-addressable worker image
-    # from the source so they actually run this code. No-op for reviewed code,
-    # an explicit --worker-image, or the docker runner. Done before the digest
-    # resolution so the cache key reflects the image actually used.
-    worker_image = ensure_worker_image(
-        pipeline=pipeline_name,
-        repo_dir=repo_dir,
-        commit=pipeline_commit,
-        runner=runner,
-        unreviewed=unreviewed,
-        worker_image=worker_image,
-        default_worker_image=default_worker_image,
-    )
+    # Ensure a registry-pullable pipeline image exists for whatever consumer
+    # will execute it. M-pivot-4 closes the submitter-vs-worker gap: if the
+    # run executes unreviewed code against the default canonical image, the
+    # consumer would otherwise run the stale published code, so we auto-build
+    # a content-addressable image from the source. Same trigger for both
+    # consumers (Beam workers + dit's docker runner). No-op for reviewed code
+    # or an explicit override. Done before the digest resolution so the cache
+    # key reflects the image actually used.
+    #
+    # ``build_from_source=True`` short-circuits the auto-build entirely: the
+    # docker runner will build the container from the working tree via
+    # compose and ignore ``image_tag``, so the kaniko submit would be wasted.
+    if not build_from_source:
+        worker_image = ensure_pipeline_image(
+            pipeline=pipeline_name,
+            repo_dir=repo_dir,
+            commit=pipeline_commit,
+            unreviewed=unreviewed,
+            worker_image=worker_image,
+            default_worker_image=default_worker_image,
+        )
 
     run_id = uuid.uuid4().hex[:12]
     dc = dit_commit()

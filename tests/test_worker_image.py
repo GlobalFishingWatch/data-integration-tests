@@ -1,7 +1,11 @@
-"""Unit tests for dit.worker_image.ensure_worker_image.
+"""Unit tests for ``dit.worker_image.ensure_pipeline_image``.
 
 The gcloud calls (image existence check + kaniko build submit) are mocked;
-these cover the trigger matrix and idempotency, not a real build.
+these cover the trigger matrix and idempotency, not a real build. Trigger is
+symmetric across both consumers (Beam workers + dit's docker runner): build
+when ALL of (a) ``worker_image == default_worker_image`` (no explicit
+override) and (b) ``unreviewed`` is True (published default doesn't have
+these changes). Otherwise pass through.
 """
 
 from __future__ import annotations
@@ -21,7 +25,6 @@ def _kwargs(**overrides):
         pipeline="pipe-gaps",
         repo_dir="/repo",
         commit="abc1234",
-        runner="dataflow",
         unreviewed=True,
         worker_image=DEFAULT,
         default_worker_image=DEFAULT,
@@ -30,59 +33,99 @@ def _kwargs(**overrides):
     return base
 
 
+# --------------------------------------------------------------------------
+# Tag helpers
+# --------------------------------------------------------------------------
+
 def test_tag_is_content_addressable() -> None:
     assert (
-        worker_image.worker_image_tag("pipe-gaps", "abc1234")
+        worker_image.pipeline_image_tag("pipe-gaps", "abc1234")
         == "gcr.io/world-fishing-827/dit/pipe-gaps:dit-abc1234"
     )
 
 
-def test_docker_runner_never_builds(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
-    monkeypatch.setattr(worker_image, "_image_exists", lambda t: pytest.fail("checked"))
-    out = worker_image.ensure_worker_image(**_kwargs(runner="docker"))
-    assert out == DEFAULT
+def test_tag_alias_preserves_old_name() -> None:
+    """Back-compat alias: ``worker_image_tag`` is the old name, still works."""
+    assert worker_image.worker_image_tag is worker_image.pipeline_image_tag
+    assert (
+        worker_image.worker_image_tag("pipe-events", "deadbee")
+        == "gcr.io/world-fishing-827/dit/pipe-events:dit-deadbee"
+    )
 
+
+def test_no_ensure_worker_image_back_compat_alias() -> None:
+    """The prior ``ensure_worker_image`` name is intentionally NOT aliased to
+    the renamed function -- the signature also changed (no more ``runner`` /
+    ``need_registry_image`` kwargs), so a back-compat alias would silently
+    accept the old call shape and crash at the kwarg-binding level instead of
+    giving a clear ``ImportError``."""
+    assert not hasattr(worker_image, "ensure_worker_image")
+
+
+# --------------------------------------------------------------------------
+# Trigger matrix (symmetric across both consumers)
+# --------------------------------------------------------------------------
 
 def test_explicit_worker_image_respected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit non-default ``worker_image`` is always respected, regardless
+    of ``unreviewed`` — the caller is in control."""
     monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
     custom = "gcr.io/world-fishing-827/dit/pipe-gaps:my-custom"
-    out = worker_image.ensure_worker_image(**_kwargs(worker_image=custom))
+    out = worker_image.ensure_pipeline_image(**_kwargs(worker_image=custom))
     assert out == custom
 
 
 def test_reviewed_code_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reviewed code at the pinned default: no build, return canonical."""
     monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("built"))
-    out = worker_image.ensure_worker_image(**_kwargs(unreviewed=False))
+    out = worker_image.ensure_pipeline_image(**_kwargs(unreviewed=False))
     assert out == DEFAULT
 
 
 def test_unreviewed_existing_image_skips_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unreviewed code + default + image already in dit/ registry: no rebuild."""
     monkeypatch.setattr(worker_image, "_image_exists", lambda t: True)
     monkeypatch.setattr(worker_image, "_build_and_push", lambda *a, **k: pytest.fail("rebuilt"))
-    out = worker_image.ensure_worker_image(**_kwargs())
+    out = worker_image.ensure_pipeline_image(**_kwargs())
     assert out == "gcr.io/world-fishing-827/dit/pipe-gaps:dit-abc1234"
 
 
 def test_unreviewed_missing_image_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unreviewed code + default + image missing: kaniko build under dit/."""
     monkeypatch.setattr(worker_image, "_image_exists", lambda t: False)
     built = []
     monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: built.append((repo, tag, commit)))
-    out = worker_image.ensure_worker_image(**_kwargs())
+    out = worker_image.ensure_pipeline_image(**_kwargs())
     tag = "gcr.io/world-fishing-827/dit/pipe-gaps:dit-abc1234"
     assert out == tag
     assert built == [("/repo", tag, "abc1234")]
 
 
 def test_pipeline_namespacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The produced tag is keyed on the pipeline name, not hardcoded."""
     monkeypatch.setattr(worker_image, "_image_exists", lambda t: False)
     captured = {}
     monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: captured.update(tag=tag))
-    worker_image.ensure_worker_image(
+    worker_image.ensure_pipeline_image(
         **_kwargs(pipeline="anchorages_pipeline", commit="def5678")
     )
     assert captured["tag"] == "gcr.io/world-fishing-827/dit/anchorages_pipeline:dit-def5678"
 
+
+def test_pipe_events_pipeline_namespacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pipe-events (the docker-runner consumer) uses the same machinery."""
+    monkeypatch.setattr(worker_image, "_image_exists", lambda t: False)
+    captured = {}
+    monkeypatch.setattr(worker_image, "_build_and_push", lambda repo, tag, commit: captured.update(tag=tag))
+    worker_image.ensure_pipeline_image(
+        **_kwargs(pipeline="pipe-events", commit="abc1234")
+    )
+    assert captured["tag"] == "gcr.io/world-fishing-827/dit/pipe-events:dit-abc1234"
+
+
+# --------------------------------------------------------------------------
+# Build-and-push internals
+# --------------------------------------------------------------------------
 
 def test_build_raises_without_config(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     # Point _dit_root at a dir lacking docker/worker-image/cloudbuild.yaml.
