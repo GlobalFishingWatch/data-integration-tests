@@ -121,8 +121,8 @@ steps:
       - -c
       - |
         set -eu  # NOT -x: we are about to handle an access token
-        export DIT_ADC_TOKEN="$(gcloud auth application-default print-access-token)"
-        if [ -z "$DIT_ADC_TOKEN" ]; then
+        export DIT_ADC_TOKEN="$$(gcloud auth application-default print-access-token)"
+        if [ -z "$$DIT_ADC_TOKEN" ]; then
             echo "ERROR: gcloud auth application-default print-access-token returned empty" >&2
             exit 1
         fi
