@@ -278,7 +278,13 @@ def _run_slice(
     prefix = _mode_prefix(suffix, mode)
     dest_ds = _dest_ds(args)
     end_shard = _date_shard(slice_end)
-    common = ["--project", args.pipeline_project, "--labels", args.labels]
+    # ``--project`` is a top-level pipe arg; ``-labels`` is per-operation
+    # (registered on each subparser in ``pipe_events/utils/parse.py``), so it
+    # must appear AFTER the operation name in each step's argv -- not in
+    # ``common``, where the top-level parser would either reject it or consume
+    # the JSON as the operation positional (real failure mode observed on the
+    # first live cloud run).
+    common = ["--project", args.pipeline_project]
     logger.info(
         "pipe-events chain mode=%s slice=[%s, %s) iter=%d/%d prefix=%s",
         mode, slice_start, slice_end, iteration, total_iterations, prefix,
@@ -298,6 +304,7 @@ def _run_slice(
                 "-sfield", sfield,
                 "-dest", dest_ds,
                 "-dest_tbl_prefix", f"{prefix}_{sfield}",
+                "-labels", args.labels,
             ],
             label=f"incremental_events sfield={sfield} mode={mode}",
         )
@@ -317,6 +324,7 @@ def _run_slice(
                 "-mtbl", f"{dest_ds}.{prefix}_{sfield}_merged",
                 "-dest", dest_ds,
                 "-dest_tbl_prefix", f"{prefix}_{sfield}",
+                "-labels", args.labels,
             ],
             label=f"incremental_filter_events sfield={sfield} mode={mode}",
         )
@@ -338,6 +346,7 @@ def _run_slice(
             "-dest", f"{dest_ds}.{prefix}_fishing_events_v",
             "-dest_view", f"{dest_ds}.{prefix}_fishing_events",
             "-rdate", slice_end.isoformat(),
+            "-labels", args.labels,
         ],
         label=f"auth_and_regions_fishing_events mode={mode} shard={end_shard}",
     )
@@ -353,6 +362,7 @@ def _run_slice(
             "-destrest", f"{dest_ds}.{prefix}_product_events_fishing_v",
             "-destrestview", f"{dest_ds}.{prefix}_product_events_fishing",
             "-rdate", slice_end.isoformat(),
+            "-labels", args.labels,
         ],
         label=f"fishing_restrictive mode={mode} shard={end_shard}",
     )
