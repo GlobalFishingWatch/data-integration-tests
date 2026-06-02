@@ -53,9 +53,13 @@ def test_tag_alias_preserves_old_name() -> None:
     )
 
 
-def test_ensure_alias_preserves_old_name() -> None:
-    """``ensure_worker_image`` remains importable for any out-of-tree callers."""
-    assert worker_image.ensure_worker_image is worker_image.ensure_pipeline_image
+def test_no_ensure_worker_image_back_compat_alias() -> None:
+    """The prior ``ensure_worker_image`` name is intentionally NOT aliased to
+    the renamed function -- the signature also changed (no more ``runner`` /
+    ``need_registry_image`` kwargs), so a back-compat alias would silently
+    accept the old call shape and crash at the kwarg-binding level instead of
+    giving a clear ``ImportError``."""
+    assert not hasattr(worker_image, "ensure_worker_image")
 
 
 # --------------------------------------------------------------------------

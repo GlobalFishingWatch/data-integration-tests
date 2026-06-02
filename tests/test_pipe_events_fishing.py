@@ -434,23 +434,19 @@ def test_main_explicit_image_tag_override_flows_through(monkeypatch):
     assert image_tag == custom
 
 
-def test_main_build_from_source_still_stamps(monkeypatch):
-    """--build-from-source doesn't alter the workflow's stamping logic; the
-    docker runner is what ignores image_tag when build_from_source=True. The
-    workflow remains uniform across modes."""
+def test_main_build_from_source_stamps_and_signals_harness_to_skip_auto_build(monkeypatch):
+    """--build-from-source pins TWO behaviours that must travel together:
+    (a) the workflow still stamps ``args.image_tag = ctx.worker_image`` (uniform
+    across modes), and (b) ``build_from_source=True`` is threaded into
+    ``resolve_run_context`` so the harness bypasses the kaniko auto-build path
+    (the runner ignores image_tag in build-from-source mode, so the build
+    would be wasted). Combined into one test so a future refactor can't drop
+    the kwargs check while keeping the stamping assertion green."""
     canonical = "ctx-worker-img"
-    image_tag, _ = _captured_image_tag(
+    image_tag, ctx_kwargs = _captured_image_tag(
         monkeypatch, build_from_source=True, ctx_worker_image=canonical,
     )
     assert image_tag == canonical
-
-
-def test_main_build_from_source_signals_harness_to_skip_auto_build(monkeypatch):
-    """--build-from-source must be threaded into resolve_run_context as
-    build_from_source=True so the harness bypasses the kaniko auto-build path
-    (the runner ignores image_tag in build-from-source mode, so the build
-    would be wasted)."""
-    _, ctx_kwargs = _captured_image_tag(monkeypatch, build_from_source=True)
     assert ctx_kwargs["build_from_source"] is True
 
 

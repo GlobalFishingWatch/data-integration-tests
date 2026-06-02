@@ -206,9 +206,11 @@ def ensure_pipeline_image(
     return tag
 
 
-# Backwards-compatible alias for the prior name. The function never produced
-# anything Dataflow-specific -- it produced "the pipeline's image" -- but the
-# original name was coined when only Beam-worker consumption existed. The new
-# name (``ensure_pipeline_image``) is preferred; the alias keeps any external
-# importer functional during the transition.
-ensure_worker_image = ensure_pipeline_image
+# Note on naming: the prior name was ``ensure_worker_image`` (when only
+# Beam-worker consumption existed). It was renamed to ``ensure_pipeline_image``
+# along with the symmetrisation. A back-compat alias was considered and
+# rejected: the function's signature also changed (the prior ``runner=`` and
+# ``need_registry_image=`` kwargs are gone), so an alias would crash any
+# external caller still using the old call shape -- a *false* promise of
+# back-compat is worse than no alias. There are no in-tree callers of the
+# old name; external callers should rename + drop the removed kwargs.
