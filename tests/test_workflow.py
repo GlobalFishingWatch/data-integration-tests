@@ -197,7 +197,7 @@ def test_resolve_run_context_normal_path() -> None:
         patch.object(dit_workflow, "git_info") as mock_git_info,
         patch.object(dit_workflow, "is_unreviewed") as mock_is_unreviewed,
         patch.object(dit_workflow, "snapshot_parent", return_value=None),
-        patch.object(dit_workflow, "ensure_worker_image",
+        patch.object(dit_workflow, "ensure_pipeline_image",
                      return_value="img:tag") as mock_ensure,
         patch.object(dit_workflow, "resolve_worker_image_to_digest",
                      return_value="img@sha256:dead"),
@@ -238,7 +238,7 @@ def test_resolve_run_context_suffix_escape_hatch() -> None:
         patch.object(dit_workflow, "is_unreviewed",
                      return_value=True) as mock_is_unreviewed,
         patch.object(dit_workflow, "snapshot_parent", return_value=None),
-        patch.object(dit_workflow, "ensure_worker_image", return_value="img:tag"),
+        patch.object(dit_workflow, "ensure_pipeline_image", return_value="img:tag"),
         patch.object(dit_workflow, "resolve_worker_image_to_digest",
                      return_value="img@sha256:dead"),
         patch.object(dit_workflow, "dit_commit", return_value="ditshaa"),
@@ -268,7 +268,7 @@ def test_resolve_run_context_suffix_dirty_short_circuits_is_unreviewed() -> None
         patch.object(dit_workflow, "git_info", return_value=("sha", True)),
         patch.object(dit_workflow, "is_unreviewed") as mock_is_unreviewed,
         patch.object(dit_workflow, "snapshot_parent", return_value=None),
-        patch.object(dit_workflow, "ensure_worker_image", return_value="img:tag"),
+        patch.object(dit_workflow, "ensure_pipeline_image", return_value="img:tag"),
         patch.object(dit_workflow, "resolve_worker_image_to_digest", return_value="d"),
         patch.object(dit_workflow, "dit_commit", return_value="x"),
     ):
@@ -293,7 +293,7 @@ def test_resolve_run_context_digest_fallback_on_runtimeerror() -> None:
         patch.object(dit_workflow, "resolve_pipeline_commit",
                      return_value=("abc1234", False)),
         patch.object(dit_workflow, "snapshot_parent", return_value=None),
-        patch.object(dit_workflow, "ensure_worker_image", return_value="img:tag"),
+        patch.object(dit_workflow, "ensure_pipeline_image", return_value="img:tag"),
         patch.object(dit_workflow, "resolve_worker_image_to_digest",
                      side_effect=RuntimeError("gcloud blew up")),
         patch.object(dit_workflow, "dit_commit", return_value="x"),
@@ -313,13 +313,13 @@ def test_resolve_run_context_digest_fallback_on_runtimeerror() -> None:
 
 
 def test_resolve_run_context_threads_worker_image_into_ensure() -> None:
-    """ensure_worker_image gets the resolved commit + the passed images, and
+    """ensure_pipeline_image gets the resolved commit + the passed images, and
     its return value becomes ctx.worker_image (feeding the digest resolve)."""
     with (
         patch.object(dit_workflow, "resolve_pipeline_commit",
                      return_value=("commit99", True)),
         patch.object(dit_workflow, "snapshot_parent", return_value="parent00"),
-        patch.object(dit_workflow, "ensure_worker_image",
+        patch.object(dit_workflow, "ensure_pipeline_image",
                      return_value="built:custom") as mock_ensure,
         patch.object(dit_workflow, "resolve_worker_image_to_digest",
                      return_value="built@sha256:beef") as mock_digest,
@@ -342,8 +342,9 @@ def test_resolve_run_context_threads_worker_image_into_ensure() -> None:
         unreviewed=True,
         worker_image="default:img",
         default_worker_image="default:img",
+        need_registry_image=False,
     )
-    # the digest is resolved against the image ensure_worker_image returned.
+    # the digest is resolved against the image ensure_pipeline_image returned.
     mock_digest.assert_called_once_with("built:custom")
     assert ctx.worker_image == "built:custom"
     assert ctx.worker_image_digest == "built@sha256:beef"
@@ -357,7 +358,7 @@ def test_resolve_run_context_resolve_digest_false_skips_gcloud() -> None:
         patch.object(dit_workflow, "resolve_pipeline_commit",
                      return_value=("abc1234", False)),
         patch.object(dit_workflow, "snapshot_parent", return_value=None),
-        patch.object(dit_workflow, "ensure_worker_image", return_value="img:tag"),
+        patch.object(dit_workflow, "ensure_pipeline_image", return_value="img:tag"),
         patch.object(dit_workflow, "resolve_worker_image_to_digest") as mock_digest,
         patch.object(dit_workflow, "dit_commit", return_value="x"),
     ):
