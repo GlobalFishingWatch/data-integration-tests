@@ -31,14 +31,14 @@ All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-wi
 | Per-binding pipeline image (cross-version) | `gcr.io/world-fishing-827/dit/<pipeline>` | `:<experiment-id>-<binding-name>` |
 | Smoke / push-test | `gcr.io/world-fishing-827/dit/pushtest` | `:<anything>` |
 
-The auto-built pipeline image row covers both **Dataflow worker images** (M-pivot-4, today's use — Beam workers pull the image) and **docker-runner pipeline images** (planned for ditbox-for-pipe-events — dit's docker runner pulls and runs the image directly). Same namespace, same kaniko build machinery, same `:dit-<commit>` tag scheme; what changes is the consumer. Canonical upstream publications (when they exist, e.g. `gfw-int-infrastructure/core/pipe-anchorages:v4.6.4`) are read-only to dit — never a write target.
+The auto-built pipeline image row covers both **Dataflow worker images** (M-pivot-4, today's use — Beam workers pull the image) and **docker-runner pipeline images** (planned for ditbox-for-pipe-events — dit's docker runner pulls and runs the image directly). Same namespace, same kaniko build machinery, same `:dit-<pipeline_commit>` tag scheme; what changes is the consumer. Canonical upstream publications (when they exist, e.g. `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4`) are read-only to dit — never a write target.
 
 Examples:
 
 - `gcr.io/world-fishing-827/dit/ditbox:latest`
-- `gcr.io/world-fishing-827/dit/pipe-gaps:dit-<commit>` (M-pivot-4 worker image)
+- `gcr.io/world-fishing-827/dit/pipe-gaps:dit-<pipeline_commit>` (M-pivot-4 worker image)
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-1465-after` (cross-version, per-binding)
-- `gcr.io/world-fishing-827/dit/pipe-events:dit-<commit>` (planned — docker-runner auto-build)
+- `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (planned — docker-runner auto-build)
 
 ## Standard build-and-push workflow
 
