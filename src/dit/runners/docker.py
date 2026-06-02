@@ -49,6 +49,17 @@ def _ensure_built(project_name: str, *, service: str = "dev") -> None:
 _CLOUD_MODE_ENV = "DIT_CLOUD_MODE"
 _LAPTOP_AUTH_PREFIX = "/root/.config"
 
+# Quota project for BigQuery (and other GCP) API calls in cloud mode. Cloud
+# Build's metadata server issues tokens whose default quota_project_id is the
+# build-host project (e.g. 1034185025654, a Google-managed Cloud Build pool
+# project), not the build SA's home project. Without this override, BQ calls
+# get 403'd with "API has not been used in project <build-host>" because the
+# API isn't enabled in that consumer project (and isn't ours to enable).
+# We pin to ``world-fishing-827`` -- where the build SA lives and where dit's
+# Beam workflows already write outputs (per [[prod-infra-boundary]], all dit
+# writes stay in wf827 namespaces; the quota project must match).
+_CLOUD_MODE_QUOTA_PROJECT = "world-fishing-827"
+
 
 def _is_laptop_auth_mount(volume_spec: str) -> bool:
     """True iff ``volume_spec`` mounts onto the laptop-mode ADC location.
@@ -81,6 +92,13 @@ def _apply_cloud_mode(volumes: Sequence[str]) -> list[str]:
       ``169.254.169.254`` -- google-auth's ADC discovery chain finds the
       metadata server and obtains a fresh OAuth token bound to the build SA,
       same mechanism prod uses via GKE Workload Identity.
+    * ``-e GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827`` is added so the
+      inner container's BQ (and other GCP) API calls send
+      ``X-Goog-User-Project: world-fishing-827`` -- without this, the
+      metadata-server-issued token defaults the quota project to the build
+      host (e.g. ``1034185025654``, a Cloud Build-managed pool project)
+      where BQ API isn't enabled, and calls 403 with "API has not been used
+      in project <build-host>".
     * any caller-supplied volume targeting ``/root/.config`` (or below) is
       dropped -- the laptop-mode ``gcp:/root/.config`` named volume doesn't
       exist in Cloud Build and would mount as an empty anonymous volume,
@@ -110,7 +128,10 @@ def _apply_cloud_mode(volumes: Sequence[str]) -> list[str]:
             flags.extend(["-v", vol])
         return flags
 
-    out: list[str] = ["--network=host"]
+    out: list[str] = [
+        "--network=host",
+        "-e", f"GOOGLE_CLOUD_QUOTA_PROJECT={_CLOUD_MODE_QUOTA_PROJECT}",
+    ]
     for vol in volumes:
         if _is_laptop_auth_mount(vol):
             logger.info(
