@@ -161,25 +161,32 @@ def test_apply_cloud_mode_unset_empty_volumes(monkeypatch):
     assert dit_docker._apply_cloud_mode(()) == []
 
 
-def test_apply_cloud_mode_set_adds_host_network(monkeypatch):
-    """Cloud mode on + no volumes: --network=host added, no -v flags."""
+_QUOTA_PROJECT_FLAGS = ["-e", "GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827"]
+
+
+def test_apply_cloud_mode_set_adds_host_network_and_quota_project(monkeypatch):
+    """Cloud mode on + no volumes: --network=host added AND quota-project env
+    var set (so the BQ client sends X-Goog-User-Project=world-fishing-827 --
+    without this the metadata-server token defaults to the build-host project
+    where BQ API isn't enabled, and calls 403)."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     flags = dit_docker._apply_cloud_mode(())
-    assert flags == ["--network=host"]
+    assert flags == ["--network=host", *_QUOTA_PROJECT_FLAGS]
 
 
 def test_apply_cloud_mode_set_drops_laptop_mount(monkeypatch):
-    """Cloud mode on + laptop mount: laptop mount dropped, only --network=host."""
+    """Cloud mode on + laptop mount: laptop mount dropped; the cloud-mode
+    flags (--network=host + quota-project env) are added."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     flags = dit_docker._apply_cloud_mode(["gcp:/root/.config"])
-    assert flags == ["--network=host"]
+    assert flags == ["--network=host", *_QUOTA_PROJECT_FLAGS]
 
 
 def test_apply_cloud_mode_drops_laptop_subdir_mount(monkeypatch):
     """A mount targeting /root/.config/gcloud (or below) is laptop-auth too."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     flags = dit_docker._apply_cloud_mode(["gcp:/root/.config/gcloud"])
-    assert flags == ["--network=host"]
+    assert flags == ["--network=host", *_QUOTA_PROJECT_FLAGS]
 
 
 def test_apply_cloud_mode_keeps_unrelated_volumes(monkeypatch):
@@ -192,6 +199,7 @@ def test_apply_cloud_mode_keeps_unrelated_volumes(monkeypatch):
     ])
     assert flags == [
         "--network=host",
+        *_QUOTA_PROJECT_FLAGS,
         "-v", "data:/opt/data",
         "-v", "/host/path:/container/path",
     ]
