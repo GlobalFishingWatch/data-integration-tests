@@ -33,14 +33,19 @@ All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-wi
 | Per-binding pipeline image (cross-version) | `gcr.io/world-fishing-827/dit/<pipeline>` | `:<experiment-id>-<binding-name>` |
 | Smoke / push-test | `gcr.io/world-fishing-827/dit/pushtest` | `:<anything>` |
 
-The auto-built pipeline image row covers both **Dataflow worker images** (M-pivot-4, today's use — Beam workers pull the image) and **docker-runner pipeline images** (planned for ditbox-for-pipe-events — dit's docker runner pulls and runs the image directly). Same namespace, same kaniko build machinery, same `:dit-<pipeline_commit>` tag scheme; what changes is the consumer. Canonical upstream publications (when they exist, e.g. `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4`) are read-only to dit — never a write target.
+The auto-built pipeline image row covers both **Dataflow worker images** (Beam workers pull the image) and **docker-runner pipeline images** (dit's docker runner pulls and runs the image directly). Same namespace, same kaniko build machinery, same `:dit-<pipeline_commit>` tag scheme; what changes is the consumer. **Trigger is symmetric across both consumers**: `dit.worker_image.ensure_pipeline_image` builds when ALL of (a) `worker_image == default_worker_image` (no explicit override) and (b) the run is `unreviewed`. Reviewed code at the pinned default is pulled from the canonical upstream registry (`us-central1-docker.pkg.dev/gfw-int-infrastructure/<repo>/<package>:vX.Y.Z`); only unreviewed code triggers a fresh build under the dit namespace. Canonical upstream publications are read-only to dit — never a write target.
 
 Examples:
 
 - `gcr.io/world-fishing-827/dit/ditbox:latest`
-- `gcr.io/world-fishing-827/dit/pipe-gaps:dit-<pipeline_commit>` (M-pivot-4 worker image)
+- `gcr.io/world-fishing-827/dit/pipe-gaps:dit-<pipeline_commit>` (auto-built for unreviewed Beam code)
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-1465-after` (cross-version, per-binding)
-- `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (planned — docker-runner auto-build)
+- `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (auto-built for unreviewed docker-runner code)
+
+Canonical upstream defaults the workflows pin (read-only to dit):
+
+- pipe-anchorages: `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4`
+- pipe-events: `us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/github-globalfishingwatch-pipe-events:v4.2.17`
 
 ## Auth in the cloud path (ditbox)
 
