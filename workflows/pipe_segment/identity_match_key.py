@@ -130,10 +130,14 @@ DEFAULT_IMAGE_TAG = (
     "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-segment:v5.0.3"
 )
 
-# Compose service + entrypoint pipe-segment's compose.yaml exposes:
-#   docker compose run --rm --entrypoint pipe dev segment <args>
+# Compose service + entrypoint pipe-segment v5.0.x exposes:
+#   docker compose run --rm --entrypoint pipe-segment dev segment <args>
+# (pyproject.toml's [project.scripts] = "pipe-segment". This differs from
+# pipe-events, which exposes "pipe" -- be careful not to mirror that one.
+# The original draft set CLI_ENTRYPOINT="pipe" by analogy with pipe-events
+# and surfaced as `executable file not found in $PATH` on the first smoke.)
 COMPOSE_SERVICE = "dev"
-CLI_ENTRYPOINT = "pipe"
+CLI_ENTRYPOINT = "pipe-segment"
 
 # GCP auth: shared named volume mounted into the container at /root/.config.
 # On laptop, populate via:  docker volume create gcp +
@@ -365,26 +369,42 @@ def _verify_refs(pipeline_dir: str, bindings: list[tuple[str, str]]) -> None:
 
 
 def _read_gpsdio_pin_at_ref(pipeline_dir: str, ref: str) -> str:
-    """Return the ``gpsdio-segment`` pin line from ``requirements/prod.in`` at ``ref``.
+    """Return the ``gpsdio-segment`` pin line from ``ref``'s deps file.
 
-    Uses ``git show <ref>:requirements/prod.in`` so we don't need to materialise
-    a worktree just to read one file. Cheap enough to call per binding at
-    preflight time before any expensive snapshot/run work begins.
+    Uses ``git show <ref>:<path>`` so we don't need to materialise a worktree
+    just to read one file. Cheap enough to call per binding at preflight time
+    before any expensive snapshot/run work begins.
+
+    Layout shifted between pipe-segment versions:
+    * v5.0.0 -- v5.0.2: deps in ``requirements/prod.in``.
+    * v5.0.3+: deps in ``pyproject.toml`` (PIPELINE-3363 "improve repository
+      structure" refactor folded everything into PEP 621). ``requirements.txt``
+      is the pip-compile output and also contains the pin but the line may be
+      a resolved SHA, not the canonical declared URL.
+
+    Probes paths in v5.0.3-first order so the common case (the workflow's
+    default ``DEFAULT_IMAGE_TAG`` = v5.0.3) is fast.
     """
-    result = subprocess.run(
-        ["git", "-C", pipeline_dir, "show", f"{ref}:requirements/prod.in"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise SystemExit(
-            f"could not read requirements/prod.in at {ref!r} in {pipeline_dir}: "
-            f"{result.stderr.strip()}"
+    for path in ("pyproject.toml", "requirements/prod.in", "requirements.txt"):
+        result = subprocess.run(
+            ["git", "-C", pipeline_dir, "show", f"{ref}:{path}"],
+            capture_output=True, text=True,
         )
-    for line in result.stdout.splitlines():
-        if line.strip().startswith("gpsdio-segment"):
-            return line.strip()
+        if result.returncode != 0:
+            continue  # path doesn't exist at this ref; try the next
+        for line in result.stdout.splitlines():
+            # prod.in / requirements.txt: ``gpsdio-segment @ <url>``
+            # pyproject.toml: ``    "gpsdio-segment @ <url>",`` (PEP 621 deps list).
+            # Strip the union of decorating chars from BOTH ends in a single
+            # call -- the multi-step ``.strip('"').strip("',")`` form left a
+            # trailing ``"`` on PEP 621 lines because the inner ``.strip('"')``
+            # ran while the comma was still trailing. (Copilot PR #49 comment.)
+            stripped = line.strip().strip('"\',')
+            if stripped.startswith("gpsdio-segment"):
+                return stripped
     raise SystemExit(
-        f"no gpsdio-segment pin found in requirements/prod.in at {ref!r}."
+        f"no gpsdio-segment pin found at {ref!r} in pyproject.toml, "
+        f"requirements/prod.in, or requirements.txt."
     )
 
 
@@ -594,6 +614,15 @@ def _segment_args(
         # Project + runner.
         f"--project={PROJECT}",
         f"--runner={runner}",
+        # temp_location + staging_location are required even for DirectRunner
+        # because Beam's ``ReadFromBigQuery`` path goes through a GCS export
+        # (``MapFilesToRemove`` raises ``ValueError: ReadFromBigQuery requires
+        # a GCS location to be provided`` if it can't find a temp_location to
+        # stage to). example_segment.sh sets the same gs://pipe-temp-us-
+        # central-ttl7 bucket for both runners. Moving this out of the
+        # ``runner == "dataflow"`` branch matches that.
+        "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
+        "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
     ]
     if include_satellite_offsets:
         args.extend([
@@ -608,8 +637,6 @@ def _segment_args(
         args.extend([
             "--setup_file=./setup.py",
             "--wait_for_job",
-            "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
-            "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
             "--region=us-central1",
             "--max_num_workers=50",
             "--worker_machine_type=e2-standard-4",
@@ -645,13 +672,14 @@ def _segment_identity_args(
         f"--dest_segment_identity={_output_prefix('segment_identity_daily', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--project={PROJECT}",
         f"--runner={runner}",
+        # See _segment_args for the temp_location/staging_location rationale.
+        "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
+        "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
     ]
     if runner == "dataflow":
         args.extend([
             "--setup_file=./setup.py",
             "--wait_for_job",
-            "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
-            "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
             "--region=us-central1",
             "--max_num_workers=50",
             "--no_use_public_ips",
@@ -687,13 +715,14 @@ def _segment_info_args(
         f"--destination={_output_prefix('segment_info', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--project={PROJECT}",
         f"--runner={runner}",
+        # See _segment_args for the temp_location/staging_location rationale.
+        "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
+        "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
     ]
     if runner == "dataflow":
         args.extend([
             "--setup_file=./setup.py",
             "--wait_for_job",
-            "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
-            "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
             "--region=us-central1",
             "--max_num_workers=20",
             "--no_use_public_ips",
@@ -731,20 +760,33 @@ def _run_pipe_subcommand(
     cli_args: list[str],
     build_from_source: bool,
 ) -> int:
-    """One ``pipe`` subcommand (segment / segment_identity / segment_info) via dit_docker.run.
+    """One ``pipe-segment`` subcommand (segment / segment_identity / segment_info) via dit_docker.run.
 
     Runs from ``worktree_dir`` (chdir context) so ``docker compose`` finds the
     worktree's ``compose.yaml``. ``dit_docker.run`` handles cloud-mode
-    (``--network=cloudbuild`` + ``GOOGLE_CLOUD_QUOTA_PROJECT``), per-call
-    compose project name uniquification, and ``--entrypoint`` injection.
+    (``--network=cloudbuild``), per-call compose project name
+    uniquification, and ``--entrypoint`` injection.
+
+    ``container_env={"GOOGLE_CLOUD_PROJECT": PROJECT}`` is set because
+    Beam's ``WriteToBigQuery`` (inside pipe-segment v5.0.x) constructs its
+    own ``google-cloud-bigquery`` client whose default-project resolution
+    walks ``GOOGLE_CLOUD_PROJECT`` env -> ADC metadata; the pipeline option
+    ``--project=...`` is read by Beam earlier in pipeline construction and
+    isn't forwarded to that internal client. Without the env, writes fail
+    with ``OSError: Project was not passed and could not be determined from
+    the environment``. ``examples/example_segment.sh`` already documents
+    this escape hatch (inline ``-e GOOGLE_CLOUD_PROJECT=...`` on docker
+    compose); see ``dit.runners.docker.run.__doc__`` for the env vs
+    container_env distinction.
     """
     project_name = f"dit-pipe-segment-{binding_name}"
-    logger.info("[%s] invoking pipe %s (image=%s)",
+    logger.info("[%s] invoking pipe-segment %s (image=%s)",
                 binding_name, cli_args[0] if cli_args else "<no-subcmd>", image_tag)
     with _chdir(worktree_dir):
         return dit_docker.run(
             image_tag,
             cli_args,
+            container_env={"GOOGLE_CLOUD_PROJECT": PROJECT},
             entrypoint=CLI_ENTRYPOINT,
             volumes=[GCP_VOLUME],
             service=COMPOSE_SERVICE,
@@ -756,21 +798,23 @@ def _run_pipe_subcommand(
 def _verify_gpsdio_segment(worktree_dir: str, *, binding_name: str) -> str:
     """Sanity check: confirm the worktree's pinned gpsdio-segment URL.
 
-    Reads the URL from requirements/prod.in (not requirements.txt — that's
-    pip-compiled and includes transitive deps). Returns the URL for logging
-    and pair-wise inequality assertion.
+    Layout-aware (see _read_gpsdio_pin_at_ref): probes pyproject.toml
+    (v5.0.3+), then requirements/prod.in (v5.0.0--v5.0.2), then
+    requirements.txt as a last resort.
     """
-    prod_in = Path(worktree_dir, "requirements", "prod.in")
-    if not prod_in.exists():
-        raise SystemExit(
-            f"binding {binding_name!r}: {prod_in} not found. "
-            f"Is the worktree pointing at a non-pipe-segment ref?"
-        )
-    for line in prod_in.read_text().splitlines():
-        if line.strip().startswith("gpsdio-segment"):
-            return line.strip()
+    for rel in ("pyproject.toml", "requirements/prod.in", "requirements.txt"):
+        path = Path(worktree_dir, rel)
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            # Combined char-class strip (see _read_gpsdio_pin_at_ref for why
+            # multi-step strip left a trailing ``"`` on PEP 621 lines).
+            stripped = line.strip().strip('"\',')
+            if stripped.startswith("gpsdio-segment"):
+                return stripped
     raise SystemExit(
-        f"binding {binding_name!r}: no gpsdio-segment pin found in {prod_in}."
+        f"binding {binding_name!r}: no gpsdio-segment pin found in {worktree_dir} "
+        f"(checked pyproject.toml, requirements/prod.in, requirements.txt)."
     )
 
 

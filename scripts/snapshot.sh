@@ -49,8 +49,15 @@ fi
 PIPELINE="$1"
 PROJECT_DIR="$2"
 
-if [ ! -d "$PROJECT_DIR/.git" ]; then
-    echo "error: $PROJECT_DIR is not a git repository" >&2
+if [ ! -e "$PROJECT_DIR/.git" ]; then
+    # `-e` (entry exists) instead of `-d` (directory) so worktrees are
+    # accepted too -- in a worktree, .git is a file pointing back at the
+    # main repo's .git/worktrees/<name> directory. git commands work
+    # identically against worktrees; the dir-only check was an over-strict
+    # heuristic that broke ``scripts/snapshot.sh <pipeline> <worktree>``
+    # for the pipe-segment workflow which builds a v5.0.3 worktree to
+    # isolate its repin edit from the user's main checkout.
+    echo "error: $PROJECT_DIR is not a git repository (no .git entry)" >&2
     exit 2
 fi
 
