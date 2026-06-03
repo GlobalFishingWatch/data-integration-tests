@@ -15,29 +15,41 @@ ON, never fires inside the mode-equivalence harness.
 
 This workflow simulates exactly that.
 
+Mechanism
+---------
+The two source-state pins are realised by **dit's BQ snapshot mechanism**
+(``dit.bq.snapshot_table``): the workflow clones ``research_messages``
+and ``segs_activity`` into two per-experiment snapshot datasets, one at
+``--pre-outage-pin-at`` and one at ``--post-outage-pin-at``, then points
+each stage's pipeline at the appropriate snapshot. The pipe-gaps detect
+pipeline reads the snapshot table exactly as if it were the live source
+-- no pipeline-side changes required. Compared to inline ``FOR
+SYSTEM_TIME AS OF`` in the detect query, snapshots are pipeline-agnostic,
+persist beyond BQ's 7-day time-travel window, and are cheap delta-billed
+(see ``src/dit/bq.py`` docstring for the rationale).
+
 Stages
 ------
-1. **Backfill** ``[start, end]`` with ``@pre_outage_snapshot``.
+1. **Backfill** ``[start, end]`` against the **pre-outage snapshot**.
    Standard cold-start. Source as it was at the start of the outage.
 
 2. **Late incremental at end + offset** (default offset = 3 days).
    One run, date range ``[end + offset - backfill_days, end + offset]``,
-   ``--as-of-timestamp = pre_outage_snapshot``. The source still doesn't
-   have the messages that landed during the outage window. For ssvids
-   whose last visible message is < threshold before a daily midnight that
-   the date-range crosses, ``eval_open_gap`` fires and emits an open-v1.
+   against the **pre-outage snapshot**. The source still doesn't have
+   the messages that landed during the outage window. For ssvids whose
+   last visible message is < threshold before a daily midnight that the
+   date-range crosses, ``eval_open_gap`` fires and emits an open-v1.
 
 3. **Catch-up incrementals** for days ``[end + 1, ..., end + offset]``.
-   Each daily run uses ``--as-of-timestamp = post_outage_snapshot``;
-   source now contains all the late-arrived messages. The
-   ``ProcessBoundaries`` close-recovery path fires on the open-v1 rows
-   written in stage 2; if ``first_message_inside_range`` returns a
-   late-arrived message within ``threshold`` of OFF, a sub-threshold
-   closed-v2 is emitted (the bug).
+   Each daily run reads the **post-outage snapshot**; source now
+   contains all the late-arrived messages. The ``ProcessBoundaries``
+   close-recovery path fires on the open-v1 rows written in stage 2; if
+   ``first_message_inside_range`` returns a late-arrived message within
+   ``threshold`` of OFF, a sub-threshold closed-v2 is emitted (the bug).
 
 The output of stage 3 is compared against a single-shot **oracle**:
 ``execute_outage_oracle`` runs one backfill ``[start, end + offset]``
-with ``@post_outage_snapshot`` (= the answer a redesigned pipeline
+against the **post-outage snapshot** (= the answer a redesigned pipeline
 should produce, since detect() over the full source has no need for
 side-input opens).
 
@@ -52,26 +64,31 @@ Expected results
 So this test is RED on current main and locks in the fix once the
 redesign lands.
 
-Requirements
-------------
-Requires the ``--as-of-timestamp`` plumbing in pipe-gaps' detect CLI
-(branch ``PIPELINE-3974/source_table_time_travel``). The source table
-must support BQ time-travel (must be a physical table, not a view, and
-within the 7-day retention window). For the production VMS source
-``gfw-int-vms-v3.pipe_vms_v3_internal.research_messages`` this is
-satisfied.
+Source-table requirements
+-------------------------
+The ``--source-messages`` / ``--source-segments`` tables must be
+**physical** tables (not views) within BQ's time-travel window at the
+moment ``--pre/post-outage-pin-at`` resolves to, because
+``CREATE SNAPSHOT TABLE ... CLONE ... FOR SYSTEM_TIME AS OF`` requires
+both. For the production VMS source
+``gfw-int-vms-v3.pipe_vms_v3_internal.{research_messages,segs_activity}``
+this is satisfied. The published view
+``pipe_vms_v4_published.segs_activity`` is NOT a valid choice.
 
-Choosing snapshots
-------------------
-* ``--pre-outage-snapshot``: a UTC timestamp at which the source was
+Choosing pin timestamps
+-----------------------
+* ``--pre-outage-pin-at``: a UTC timestamp at which the source was
   missing the messages whose late arrival triggers the bug. For
   reproducing the 9cc... case, use ``2026-05-27 18:00 UTC`` (around the
   daily-run time when only ``22:32`` / ``23:30`` were visible).
-* ``--post-outage-snapshot``: a UTC timestamp at which the source has
+* ``--post-outage-pin-at``: a UTC timestamp at which the source has
   the late-arrived messages. Use ``2026-06-01 18:00 UTC`` or later.
 
 The defaults below are calibrated for the 9cc... reproduction; override
-for other datasets.
+for other datasets. Both timestamps must be inside the source's BQ
+time-travel window AT THE MOMENT THE SNAPSHOTS ARE CREATED. Re-runs of
+the same ``--experiment-id`` reuse the existing snapshot tables until
+they expire (default ``--snapshot-expiration-days = 7``).
 """
 
 from __future__ import annotations
@@ -86,6 +103,7 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit import workflow as dit_workflow
 from dit.cache import CacheKey, sha1_of_workflow_file
@@ -119,8 +137,11 @@ from workflows.pipe_gaps.mode_equivalence import (
 PIPE_VMS_RESEARCH_MESSAGES = (
     "gfw-int-vms-v3.pipe_vms_v3_internal.research_messages"
 )
+# Note: must be a PHYSICAL table for ``CREATE SNAPSHOT TABLE`` to accept it.
+# The published view ``pipe_vms_v4_published.segs_activity`` cannot be
+# snapshotted via that DDL (CLONE requires a non-view source).
 PIPE_VMS_SEGS_ACTIVITY = (
-    "global-fishing-watch.pipe_vms_v4_published.segs_activity"
+    "gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity"
 )
 
 # Default source for this workflow is VMS production (the dataset where the
@@ -139,12 +160,18 @@ MODE_OUTAGE_ORACLE = "5_outage_oracle"
 # incremental that runs "during the outage" with the pre-outage snapshot).
 DEFAULT_OFFSET_DAYS = 3
 
-# Default snapshots calibrated for the 9cc... reproduction. Override via CLI
-# for any other production-data exercise. The pre-outage snapshot must be
-# old enough that the late-arrived messages were not yet in source; the
-# post-outage snapshot must be recent enough that they are.
-DEFAULT_PRE_OUTAGE_SNAPSHOT = "2026-05-27 18:00:00 UTC"
-DEFAULT_POST_OUTAGE_SNAPSHOT = "2026-06-01 18:00:00 UTC"
+# Default pin timestamps calibrated for the 9cc... reproduction. Override
+# via CLI for any other production-data exercise. ``pre`` must be a moment
+# when the late-arrived messages were not yet in source; ``post`` must be
+# a moment when they are.
+DEFAULT_PRE_OUTAGE_PIN_AT = "2026-05-27 18:00:00 UTC"
+DEFAULT_POST_OUTAGE_PIN_AT = "2026-06-01 18:00:00 UTC"
+
+# Default snapshot-dataset expiration. Matches cross_version_ais.py
+# (``DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7``): long enough for a typical
+# multi-day reproduction session, short enough to bound storage cost on
+# stale experiment-ids.
+DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
 
 # For the 9cc... case, the OFF lives on 2026-05-26 and the ON on 2026-05-27.
 # Default start/end target this two-week window so the test runs in <10 min
@@ -154,6 +181,13 @@ DEFAULT_OUTAGE_END = "2026-05-26"
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
+
+# Logical labels for the two snapshot pins. Used to derive snapshot dataset
+# suffixes (``dit_exp_<experiment_id>_outage_pre`` /
+# ``..._outage_post`` -- see :func:`_snapshot_dataset_name`) and to keep
+# the CLI consistent.
+SNAPSHOT_LABEL_PRE = "pre"
+SNAPSHOT_LABEL_POST = "post"
 
 # Cache buster for the dit-side run cache.
 WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
@@ -200,6 +234,127 @@ def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
     )
 
 
+# --------------------------------------------------------------------------
+# BQ snapshot helpers (dit-pattern, see workflows/port_visits/cross_version_ais.py)
+# --------------------------------------------------------------------------
+
+def _sanitize_for_dataset(s: str) -> str:
+    # BQ dataset names: letters, digits, underscore only; must start with
+    # letter or underscore. Mirrors cross_version_ais._sanitize_for_dataset.
+    return s.replace("-", "_")
+
+
+def _snapshot_dataset_name(experiment_id: str, label: str) -> str:
+    """Per-(experiment, label) snapshot dataset, fully qualified.
+
+    ``label`` is one of ``SNAPSHOT_LABEL_PRE`` / ``SNAPSHOT_LABEL_POST``;
+    these become disjoint datasets so the two pinned states never collide.
+    The dataset name is content-free with respect to the actual pin
+    timestamps -- those are encoded in the cache key, not the dataset
+    name. (Same convention as cross_version_ais.py; lets users re-snapshot
+    a fresh state by passing a new ``--experiment-id``.)
+    """
+    return (
+        f"{PROJECT}.dit_exp_"
+        f"{_sanitize_for_dataset(experiment_id)}_outage_{label}"
+    )
+
+
+def _ensure_snapshot_dataset(fq_name: str, *, expiration_days: int) -> None:
+    """Create the snapshot dataset if it doesn't exist, with TTL.
+
+    Mirrors cross_version_ais._ensure_dataset. ``default_table_expiration_ms``
+    auto-cleans stale experiments without manual ``bq rm``.
+    """
+    from google.cloud import bigquery
+    from google.cloud.exceptions import Conflict
+
+    client = bigquery.Client(project=PROJECT)
+    dataset = bigquery.Dataset(fq_name)
+    dataset.default_table_expiration_ms = expiration_days * 24 * 60 * 60 * 1000
+    try:
+        client.create_dataset(dataset, exists_ok=True)
+    except Conflict:
+        pass
+    logger.info("ensured dataset %s (expiration %dd)", fq_name, expiration_days)
+
+
+def _snapshot_table_into(
+    source_fqn: str, dest_dataset: str, *, as_of: datetime, table_name: str,
+) -> str:
+    """Snapshot ``source_fqn`` into ``<dest_dataset>.<table_name>`` at ``as_of``.
+
+    Idempotent: ``if_not_exists=True`` lets a re-run of the same
+    ``--experiment-id`` reuse the snapshot rather than failing on
+    Conflict. The TTL on the snapshot dataset is what eventually cleans
+    the snapshot up.
+    """
+    dst_fqn = f"{dest_dataset}.{table_name}"
+    dit_bq.snapshot_table(
+        source_fqn, dst_fqn,
+        as_of=as_of, project=PROJECT, if_not_exists=True,
+    )
+    logger.info(
+        "snapshotted %s -> %s (as_of=%s)",
+        source_fqn, dst_fqn, as_of.isoformat(),
+    )
+    return dst_fqn
+
+
+def _snapshot_table_names(
+    source_messages: str, source_segments: str,
+) -> tuple[str, str]:
+    """Compute the ``(messages, segments)`` snapshot table names from the
+    source FQNs.
+
+    The snapshot tables are named after the SOURCE table's basename (the
+    last dotted component) -- so a source ``proj.ds.research_messages``
+    becomes ``<snap_dataset>.research_messages``. This is so the pipeline
+    sees a familiar table name on the input side.
+
+    When both source basenames are identical (e.g. both called
+    ``messages_positions`` but in different datasets), we'd get a
+    collision in the snapshot dataset; the names get prefixed with
+    ``messages_`` / ``segments_`` to disambiguate. Defensive: the
+    production layout has distinct basenames.
+
+    Extracted as a helper so :func:`_snapshot_source_at` (which CREATES
+    the snapshots) and the ``--skip-snapshots`` path (which RECOMPUTES
+    the expected FQNs without re-creating) agree on the names.
+    """
+    msgs_name = source_messages.rsplit(".", 1)[-1]
+    segs_name = source_segments.rsplit(".", 1)[-1]
+    if msgs_name == segs_name:
+        msgs_name = f"messages_{msgs_name}"
+        segs_name = f"segments_{segs_name}"
+    return msgs_name, segs_name
+
+
+def _snapshot_source_at(
+    args: argparse.Namespace, *, pin_at: datetime, label: str,
+) -> tuple[str, str]:
+    """Create snapshots of ``--source-messages`` and ``--source-segments``
+    at ``pin_at`` into the per-experiment snapshot dataset for ``label``.
+
+    Returns ``(messages_snapshot_fqn, segments_snapshot_fqn)`` which the
+    stages then pass as their ``bq_input_messages`` / ``bq_input_segments``.
+    """
+    dst_dataset = _snapshot_dataset_name(args.experiment_id, label)
+    _ensure_snapshot_dataset(
+        dst_dataset, expiration_days=args.snapshot_expiration_days,
+    )
+    msgs_name, segs_name = _snapshot_table_names(
+        args.source_messages, args.source_segments,
+    )
+    msgs_fqn = _snapshot_table_into(
+        args.source_messages, dst_dataset, as_of=pin_at, table_name=msgs_name,
+    )
+    segs_fqn = _snapshot_table_into(
+        args.source_segments, dst_dataset, as_of=pin_at, table_name=segs_name,
+    )
+    return msgs_fqn, segs_fqn
+
+
 def _make_config(
     *,
     start: date,
@@ -213,7 +368,6 @@ def _make_config(
     window_period_d: int,
     filter_good_seg: bool,
     skip_open_gaps: bool,
-    as_of_timestamp: Optional[str] = None,
     service_account: Optional[str] = None,
     bq_temp_dataset: Optional[str] = None,
     dataflow_region: Optional[str] = None,
@@ -223,12 +377,15 @@ def _make_config(
     job_name: Optional[str] = None,
     labels: Optional[Sequence[str]] = None,
 ) -> SimpleNamespace:
-    """Variant of ``mode_equivalence._make_config`` that additionally
-    threads ``as_of_timestamp`` into the DetectGapsConfig namespace.
+    """Build a DetectGapsConfig-shaped namespace.
 
-    ``as_of_timestamp`` becomes ``--as-of-timestamp`` on the CLI side and
-    ``FOR SYSTEM_TIME AS OF TIMESTAMP(...)`` in the rendered source query
-    (see ``pipe_gaps/assets/queries/messages.sql.j2``).
+    Mirrors ``mode_equivalence._make_config``; the workflow-local copy
+    exists so we can iterate the source-table FQNs per stage without
+    drifting against mode_equivalence's signature. Source-state pinning
+    is handled OUTSIDE pipe-gaps via ``dit.bq.snapshot_table`` (see
+    :func:`_snapshot_source_at` below), so the pipe-gaps process
+    receives ordinary table FQNs and is none the wiser about the
+    snapshot layer.
     """
     unknown_parsed_args: dict[str, Any] = {"project": PROJECT}
     if labels:
@@ -244,7 +401,6 @@ def _make_config(
         window_period_d=window_period_d,
         filter_good_seg=filter_good_seg,
         skip_open_gaps=skip_open_gaps,
-        as_of_timestamp=as_of_timestamp,
         unknown_parsed_args=unknown_parsed_args,
         unknown_unparsed_args=[],
     )
@@ -280,17 +436,13 @@ def _cfg_to_cli_flags(cfg: SimpleNamespace) -> list[str]:
         _add("skip-open-gaps", "true")
     if cfg.ssvids:
         _add("ssvids", ",".join(cfg.ssvids))
-    if cfg.as_of_timestamp:
-        _add("as-of-timestamp", cfg.as_of_timestamp)
     return flags
 
 
 def _build_pipeline_for(cfg: SimpleNamespace):
     """Return a ``pipeline_builder`` closure for the dataflow runner.
 
-    Mirrors ``mode_equivalence._build_pipeline_for`` so that
-    DetectGapsConfig.from_namespace reads ``as_of_timestamp`` off the
-    cfg namespace and passes it through to MessagesQuery.
+    Mirrors ``mode_equivalence._build_pipeline_for``.
     """
     def _build(options: Mapping[str, Any]):
         from gfw.common.beam.pipeline.factory import PipelineFactory
@@ -333,14 +485,15 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
     """Submit one detect run via the chosen runner.
 
     Identical control flow to ``mode_equivalence._run_pipeline``; forked
-    here only to call our local ``_cfg_to_cli_flags`` (which knows about
-    ``--as-of-timestamp``) and ``_build_pipeline_for`` (which preserves
-    the cfg attribute).
+    here for two reasons: (1) so we can keep the workflow self-contained
+    and not import private helpers from a sibling workflow, and (2) so
+    the log line names the source table that's actually being read,
+    which differs per stage in this workflow.
     """
     logger.info(
-        "[%s] start=%s end=%s as_of=%s out=%s",
+        "[%s] start=%s end=%s msgs=%s out=%s",
         runner, cfg.date_range[0], cfg.date_range[1],
-        cfg.as_of_timestamp or "(unset)", cfg.bq_output_gaps,
+        cfg.bq_input_messages, cfg.bq_output_gaps,
     )
     if runner == "docker":
         flags = ["detect", *_cfg_to_cli_flags(cfg), "--project", PROJECT]
@@ -388,24 +541,30 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
 def execute_outage_recovery(
     runner: str,
     *,
-    base_cfg: dict,
+    pre_base_cfg: dict,
+    post_base_cfg: dict,
     start: date,
     end: date,
     offset_days: int,
     backfill_days_w: int,
-    pre_outage_snapshot: str,
-    post_outage_snapshot: str,
     output: str,
     experiment_id: str,
     image_tag: str,
 ) -> None:
     """Three-stage outage simulation writing to a single SCD-2 ``output`` table.
 
-    Stage 1 (backfill, pre-outage source): one big slice [start, end].
-    Stage 2 (late incremental, pre-outage source): one slice
+    ``pre_base_cfg`` and ``post_base_cfg`` are pre-built kwargs dicts
+    identical in every field EXCEPT ``bq_input_messages`` /
+    ``bq_input_segments`` -- the pre dict points at the pre-outage
+    snapshot tables, the post dict at the post-outage ones. The pipe-gaps
+    detect pipeline reads from those tables exactly as it would from the
+    live source.
+
+    Stage 1 (backfill, pre-outage snapshot): one big slice [start, end].
+    Stage 2 (late incremental, pre-outage snapshot): one slice
         [end + offset_days - backfill_days_w, end + offset_days].
-    Stage 3 (catch-up incrementals, post-outage source): one slice per day
-        in [end + 1, end + offset_days], each
+    Stage 3 (catch-up incrementals, post-outage snapshot): one slice per
+        day in [end + 1, end + offset_days], each
         [d - backfill_days_w, d].
     """
     if offset_days <= 0:
@@ -419,9 +578,8 @@ def execute_outage_recovery(
     # Stage 1: backfill, pre-outage snapshot.
     cfg = _make_config(
         start=start, end=end, bq_output_gaps=output,
-        as_of_timestamp=pre_outage_snapshot,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 1, total),
-        **base_cfg,
+        **pre_base_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
@@ -429,9 +587,8 @@ def execute_outage_recovery(
     late_start = late_d - timedelta(days=backfill_days_w)
     cfg = _make_config(
         start=late_start, end=late_d, bq_output_gaps=output,
-        as_of_timestamp=pre_outage_snapshot,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 2, total),
-        **base_cfg,
+        **pre_base_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
@@ -440,9 +597,8 @@ def execute_outage_recovery(
         day_start = day_end - timedelta(days=backfill_days_w)
         cfg = _make_config(
             start=day_start, end=day_end, bq_output_gaps=output,
-            as_of_timestamp=post_outage_snapshot,
             job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, i, total),
-            **base_cfg,
+            **post_base_cfg,
         )
         _run_pipeline(runner, cfg, image_tag)
 
@@ -450,25 +606,23 @@ def execute_outage_recovery(
 def execute_outage_oracle(
     runner: str,
     *,
-    base_cfg: dict,
+    post_base_cfg: dict,
     start: date,
     end: date,
     offset_days: int,
-    post_outage_snapshot: str,
     output: str,
     experiment_id: str,
     image_tag: str,
 ) -> None:
-    """Single-shot backfill [start, end + offset_days] with post-outage
-    source snapshot. This is the ground-truth answer the staged
-    ``execute_outage_recovery`` should match.
+    """Single-shot backfill [start, end + offset_days] against the post-outage
+    snapshot. The ground-truth answer the staged ``execute_outage_recovery``
+    should match.
     """
     full_end = end + timedelta(days=offset_days)
     cfg = _make_config(
         start=start, end=full_end, bq_output_gaps=output,
-        as_of_timestamp=post_outage_snapshot,
         job_name=_job_name(experiment_id, MODE_OUTAGE_ORACLE, 1, 1),
-        **base_cfg,
+        **post_base_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
@@ -479,7 +633,14 @@ def execute_outage_oracle(
 
 
 def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]:
-    """Output-affecting params for a pipe-gaps outage-recovery run."""
+    """Output-affecting params for a pipe-gaps outage-recovery run.
+
+    The pin timestamps are stored as their ISO-8601 strings (normalised by
+    ``_parse_pin_at``); the snapshot dataset / table names are NOT included
+    in the cache key, because two runs with the same ``--source-*`` +
+    pin-at timestamps produce the same snapshot CONTENT regardless of
+    where the snapshot tables live.
+    """
     params: dict[str, Any] = {
         "mode": mode,
         "start": args.start,
@@ -498,13 +659,13 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
         ),
         "source_messages": args.source_messages,
         "source_segments": args.source_segments,
-        "post_outage_snapshot": args.post_outage_snapshot,
+        "post_outage_pin_at": _parse_pin_at(args.post_outage_pin_at).isoformat(),
     }
-    # The staged mode's output depends on BOTH snapshots; the oracle's
-    # only on the post-outage one. Including the pre-outage snapshot in
-    # the oracle's cache key would needlessly invalidate it.
+    # The staged mode's output depends on BOTH pins; the oracle's only on
+    # the post-outage one. Including the pre-outage pin in the oracle's
+    # cache key would needlessly invalidate it.
     if mode == MODE_OUTAGE_RECOVERY:
-        params["pre_outage_snapshot"] = args.pre_outage_snapshot
+        params["pre_outage_pin_at"] = _parse_pin_at(args.pre_outage_pin_at).isoformat()
     return params
 
 
@@ -544,14 +705,15 @@ def _run_with_cache(
 # --------------------------------------------------------------------------
 
 
-def _parse_snapshot(value: str) -> datetime:
-    """Parse a snapshot string into a tz-aware datetime.
+def _parse_pin_at(value: str) -> datetime:
+    """Parse a pin-at string into a tz-aware datetime.
 
     Accepts ISO-8601 with explicit zone offset, trailing ``Z``, or trailing
-    ``UTC``. Rejects naive timestamps -- BQ ``FOR SYSTEM_TIME AS OF`` would
-    interpret these against the session's time zone, which is not the
-    user's intent for an outage-recovery reproduction (the test would
-    silently drift when run from a non-UTC session).
+    ``UTC``. Rejects naive timestamps -- BQ ``FOR SYSTEM_TIME AS OF`` (used
+    by ``snapshot_table`` under the hood) interprets naive against the
+    session zone, which is not the user's intent for an outage-recovery
+    reproduction (the test would silently drift when run from a non-UTC
+    session).
     """
     s = value.strip()
     if s.endswith("UTC"):
@@ -562,26 +724,29 @@ def _parse_snapshot(value: str) -> datetime:
         parsed = datetime.fromisoformat(candidate)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            f"snapshot timestamp {value!r} is not parseable as ISO-8601 "
+            f"pin-at timestamp {value!r} is not parseable as ISO-8601 "
             f"(expected e.g. '2026-05-27 18:00:00 UTC')"
         ) from exc
     if parsed.tzinfo is None:
         raise argparse.ArgumentTypeError(
-            f"snapshot timestamp {value!r} is missing an explicit time zone; "
+            f"pin-at timestamp {value!r} is missing an explicit time zone; "
             f"add ' UTC' (e.g. '2026-05-27 18:00:00 UTC') or an offset "
             f"(e.g. '+00:00')"
         )
     return parsed
 
 
-def _validate_snapshot(value: str) -> str:
-    """argparse type: parse + reject naive; return the original string.
+def _validate_pin_at(value: str) -> str:
+    """argparse type: parse + reject naive; return the (stripped) string.
 
-    The original string (not the parsed datetime) is preserved so the
-    pipeline receives a value BQ ``FOR SYSTEM_TIME AS OF`` accepts
-    verbatim.
+    The string form (not the parsed datetime) is what lives on ``args``
+    so a later ``_parse_pin_at`` re-parse hits the same validation path
+    (no need to special-case "already a datetime"). The cache key itself
+    normalises via ``_parse_pin_at(...).isoformat()``, so two equivalent
+    user-supplied forms (``'... UTC'`` vs ``'...+00:00'``) collapse to
+    one canonical key (see :func:`canonical_params_dict`).
     """
-    _parse_snapshot(value)
+    _parse_pin_at(value)
     return value.strip()
 
 
@@ -607,20 +772,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--backfill-days", type=int, default=DEFAULT_BACKFILL_DAYS_W)
     p.add_argument(
-        "--pre-outage-snapshot",
-        type=_validate_snapshot,
-        default=DEFAULT_PRE_OUTAGE_SNAPSHOT,
-        help=("UTC timestamp pinned via FOR SYSTEM_TIME AS OF for stages "
-              "1 and 2. Pick a moment when the late-arrived messages were "
-              f"NOT yet in source. Default: {DEFAULT_PRE_OUTAGE_SNAPSHOT}."),
+        "--pre-outage-pin-at",
+        type=_validate_pin_at,
+        default=DEFAULT_PRE_OUTAGE_PIN_AT,
+        help=("UTC timestamp for the pre-outage source-table snapshot "
+              "(used by stages 1 and 2). Pick a moment when the "
+              "late-arrived messages were NOT yet in source. "
+              f"Default: {DEFAULT_PRE_OUTAGE_PIN_AT}."),
     )
     p.add_argument(
-        "--post-outage-snapshot",
-        type=_validate_snapshot,
-        default=DEFAULT_POST_OUTAGE_SNAPSHOT,
-        help=("UTC timestamp pinned via FOR SYSTEM_TIME AS OF for stage 3 "
-              "and the oracle. Pick a moment when the late-arrived messages "
-              f"ARE in source. Default: {DEFAULT_POST_OUTAGE_SNAPSHOT}."),
+        "--post-outage-pin-at",
+        type=_validate_pin_at,
+        default=DEFAULT_POST_OUTAGE_PIN_AT,
+        help=("UTC timestamp for the post-outage source-table snapshot "
+              "(used by stage 3 and the oracle). Pick a moment when the "
+              "late-arrived messages ARE in source. "
+              f"Default: {DEFAULT_POST_OUTAGE_PIN_AT}."),
+    )
+    p.add_argument(
+        "--snapshot-expiration-days", type=int,
+        default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
+        help=("default_table_expiration on the per-experiment snapshot "
+              f"datasets, in days. Default: {DEFAULT_SNAPSHOT_EXPIRATION_DAYS}."),
     )
     p.add_argument("--ssvids", default="",
                    help="Comma-separated ssvids to restrict to; empty = all.")
@@ -635,6 +808,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--require-clean", action="store_true")
     p.add_argument("--skip-pipelines", action="store_true")
     p.add_argument("--skip-comparisons", action="store_true")
+    p.add_argument("--skip-snapshots", action="store_true",
+                   help=("Don't create snapshot tables; assume an earlier run "
+                         "of the same --experiment-id already did. Useful when "
+                         "iterating on the pipeline logic without re-snapshotting. "
+                         "NOTE: --pre/post-outage-pin-at are still parsed, "
+                         "validated and folded into the cache key, but the "
+                         "actual source-state pinning comes from the existing "
+                         "snapshot tables -- which were created with the "
+                         "earlier run's pin-at values, NOT the current run's. "
+                         "If you change pin-at while --skip-snapshots is set, "
+                         "drop the snapshot datasets (or use a fresh "
+                         "--experiment-id) to force re-creation."))
     add_infra_args(p)
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
@@ -642,17 +827,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     args = p.parse_args(argv)
 
-    # Cross-validate: post-outage snapshot must be strictly after pre-outage,
+    # Cross-validate: post-outage pin-at must be strictly after pre-outage,
     # otherwise stage 3 won't see "more data" than stages 1-2 and the test
-    # collapses to a vanilla bfd run. _parse_snapshot already guarantees
+    # collapses to a vanilla bfd run. _parse_pin_at already guarantees
     # tz-aware datetimes (it rejects naive at arg-parse time).
-    pre = _parse_snapshot(args.pre_outage_snapshot)
-    post = _parse_snapshot(args.post_outage_snapshot)
+    pre = _parse_pin_at(args.pre_outage_pin_at)
+    post = _parse_pin_at(args.post_outage_pin_at)
     if post <= pre:
         p.error(
-            "--post-outage-snapshot must be strictly later than "
-            "--pre-outage-snapshot; otherwise stage 3 sees no new data and "
+            "--post-outage-pin-at must be strictly later than "
+            "--pre-outage-pin-at; otherwise stage 3 sees no new data and "
             "the test reduces to a static-source bfd run."
+        )
+
+    # --snapshot-expiration-days = 0 / negative would compute an invalid
+    # ``default_table_expiration_ms`` (zero would be invalid, negative
+    # would underflow), surfacing later as a BQ-API error inside the dataset
+    # create. Fail early with an actionable message.
+    if args.snapshot_expiration_days < 1:
+        p.error(
+            f"--snapshot-expiration-days must be >= 1; got "
+            f"{args.snapshot_expiration_days}."
         )
 
     return args
@@ -693,17 +888,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
-    logger.info("Pre-outage snapshot:  %s", args.pre_outage_snapshot)
-    logger.info("Post-outage snapshot: %s", args.post_outage_snapshot)
+    logger.info("Pre-outage pin-at:  %s", args.pre_outage_pin_at)
+    logger.info("Post-outage pin-at: %s", args.post_outage_pin_at)
     logger.info("Outage window: %s + %d day(s) = simulated incomplete-source span",
                 args.end, args.offset_days)
 
     dit_labels = _dit_run_labels(args)
     logger.info("dit labels: %s", dit_labels)
 
-    base_cfg = dict(
-        bq_input_messages=args.source_messages,
-        bq_input_segments=args.source_segments,
+    # Source-state pinning: create two snapshot datasets (pre / post),
+    # each containing a clone of (research_messages, segs_activity) at
+    # the respective pin timestamp. Each stage reads the corresponding
+    # snapshot table; pipe-gaps doesn't know it's reading a snapshot.
+    if args.skip_snapshots:
+        # CAREFUL: this re-uses snapshot tables created by an earlier run
+        # of the same --experiment-id. The pin-at values you pass now are
+        # only used for cache-key composition (and validation) -- they are
+        # NOT compared against the snapshots' actual FOR SYSTEM_TIME AS OF
+        # creation timestamps. If those drift apart, the workflow reads a
+        # stale source state while logging the new pins, which would
+        # produce misleading results and cache pollution. Drop the
+        # snapshot datasets (or use a fresh --experiment-id) to refresh.
+        logger.warning(
+            "--skip-snapshots: re-using existing snapshot tables for "
+            "experiment-id=%r. pin-at values (pre=%s, post=%s) are NOT "
+            "verified against the snapshots' actual creation timestamps; "
+            "if you've changed pin-at since the snapshots were created, "
+            "drop dataset(s) %s, %s and re-run without --skip-snapshots.",
+            args.experiment_id,
+            args.pre_outage_pin_at, args.post_outage_pin_at,
+            _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE),
+            _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST),
+        )
+        # Reconstruct the same FQNs _snapshot_source_at would have produced,
+        # via the shared _snapshot_table_names helper -- otherwise a
+        # source-basename collision case (which _snapshot_source_at
+        # disambiguates via messages_/segments_ prefixes) would have the
+        # skip-snapshots path pointing at non-existent tables.
+        msgs_name, segs_name = _snapshot_table_names(
+            args.source_messages, args.source_segments,
+        )
+        pre_ds = _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE)
+        post_ds = _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST)
+        pre_msgs = f"{pre_ds}.{msgs_name}"
+        pre_segs = f"{pre_ds}.{segs_name}"
+        post_msgs = f"{post_ds}.{msgs_name}"
+        post_segs = f"{post_ds}.{segs_name}"
+    else:
+        pre_msgs, pre_segs = _snapshot_source_at(
+            args, pin_at=_parse_pin_at(args.pre_outage_pin_at),
+            label=SNAPSHOT_LABEL_PRE,
+        )
+        post_msgs, post_segs = _snapshot_source_at(
+            args, pin_at=_parse_pin_at(args.post_outage_pin_at),
+            label=SNAPSHOT_LABEL_POST,
+        )
+    logger.info("pre  snapshots: %s, %s", pre_msgs, pre_segs)
+    logger.info("post snapshots: %s, %s", post_msgs, post_segs)
+
+    # Two base_cfg variants: identical except for the source-table FQNs.
+    common_cfg = dict(
         ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
         min_gap_length=args.min_gap_length,
         n_hours_before=args.n_hours_before,
@@ -718,6 +962,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_image=args.worker_image or None,
         labels=dit_labels,
     )
+    pre_base_cfg = dict(
+        common_cfg,
+        bq_input_messages=pre_msgs,
+        bq_input_segments=pre_segs,
+    )
+    post_base_cfg = dict(
+        common_cfg,
+        bq_input_messages=post_msgs,
+        bq_input_segments=post_segs,
+    )
 
     base = f"{PROJECT}.{args.dest_dataset}.outage_{suffix}"
     recovery_table = f"{base}_{MODE_OUTAGE_RECOVERY}"
@@ -727,20 +981,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("  %s  (single-shot oracle)",       oracle_table)
 
     if not args.skip_pipelines:
-        common = dict(
-            runner=args.runner, base_cfg=base_cfg,
+        recovery_kwargs = dict(
+            runner=args.runner,
+            pre_base_cfg=pre_base_cfg,
+            post_base_cfg=post_base_cfg,
             start=start, end=end, offset_days=args.offset_days,
-            post_outage_snapshot=args.post_outage_snapshot,
+            backfill_days_w=args.backfill_days,
+            output=recovery_table,
             experiment_id=args.experiment_id,
             image_tag=args.image_tag,
         )
-        recovery_kwargs = dict(
-            common,
-            backfill_days_w=args.backfill_days,
-            pre_outage_snapshot=args.pre_outage_snapshot,
-            output=recovery_table,
+        oracle_kwargs = dict(
+            runner=args.runner,
+            post_base_cfg=post_base_cfg,
+            start=start, end=end, offset_days=args.offset_days,
+            output=oracle_table,
+            experiment_id=args.experiment_id,
+            image_tag=args.image_tag,
         )
-        oracle_kwargs = dict(common, output=oracle_table)
 
         recovery_table = _run_with_cache(
             execute_outage_recovery,
