@@ -811,7 +811,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--skip-snapshots", action="store_true",
                    help=("Don't create snapshot tables; assume an earlier run "
                          "of the same --experiment-id already did. Useful when "
-                         "iterating on the pipeline logic without re-snapshotting."))
+                         "iterating on the pipeline logic without re-snapshotting. "
+                         "NOTE: --pre/post-outage-pin-at are still parsed, "
+                         "validated and folded into the cache key, but the "
+                         "actual source-state pinning comes from the existing "
+                         "snapshot tables -- which were created with the "
+                         "earlier run's pin-at values, NOT the current run's. "
+                         "If you change pin-at while --skip-snapshots is set, "
+                         "drop the snapshot datasets (or use a fresh "
+                         "--experiment-id) to force re-creation."))
     add_infra_args(p)
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
@@ -893,7 +901,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the respective pin timestamp. Each stage reads the corresponding
     # snapshot table; pipe-gaps doesn't know it's reading a snapshot.
     if args.skip_snapshots:
-        logger.info("skipping snapshot creation (--skip-snapshots)")
+        # CAREFUL: this re-uses snapshot tables created by an earlier run
+        # of the same --experiment-id. The pin-at values you pass now are
+        # only used for cache-key composition (and validation) -- they are
+        # NOT compared against the snapshots' actual FOR SYSTEM_TIME AS OF
+        # creation timestamps. If those drift apart, the workflow reads a
+        # stale source state while logging the new pins, which would
+        # produce misleading results and cache pollution. Drop the
+        # snapshot datasets (or use a fresh --experiment-id) to refresh.
+        logger.warning(
+            "--skip-snapshots: re-using existing snapshot tables for "
+            "experiment-id=%r. pin-at values (pre=%s, post=%s) are NOT "
+            "verified against the snapshots' actual creation timestamps; "
+            "if you've changed pin-at since the snapshots were created, "
+            "drop dataset(s) %s, %s and re-run without --skip-snapshots.",
+            args.experiment_id,
+            args.pre_outage_pin_at, args.post_outage_pin_at,
+            _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE),
+            _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST),
+        )
         # Reconstruct the same FQNs _snapshot_source_at would have produced,
         # via the shared _snapshot_table_names helper -- otherwise a
         # source-basename collision case (which _snapshot_source_at
