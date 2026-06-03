@@ -79,6 +79,7 @@ import contextlib
 import itertools
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -363,12 +364,75 @@ def _verify_refs(pipeline_dir: str, bindings: list[tuple[str, str]]) -> None:
         logger.info("binding %s: ref %s -> %s", name, ref, result.stdout.strip())
 
 
+def _read_gpsdio_pin_at_ref(pipeline_dir: str, ref: str) -> str:
+    """Return the ``gpsdio-segment`` pin line from ``requirements/prod.in`` at ``ref``.
+
+    Uses ``git show <ref>:requirements/prod.in`` so we don't need to materialise
+    a worktree just to read one file. Cheap enough to call per binding at
+    preflight time before any expensive snapshot/run work begins.
+    """
+    result = subprocess.run(
+        ["git", "-C", pipeline_dir, "show", f"{ref}:requirements/prod.in"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"could not read requirements/prod.in at {ref!r} in {pipeline_dir}: "
+            f"{result.stderr.strip()}"
+        )
+    for line in result.stdout.splitlines():
+        if line.strip().startswith("gpsdio-segment"):
+            return line.strip()
+    raise SystemExit(
+        f"no gpsdio-segment pin found in requirements/prod.in at {ref!r}."
+    )
+
+
+def _verify_distinct_gpsdio_pins(
+    pipeline_dir: str,
+    bindings: list[tuple[str, str]],
+) -> dict[str, str]:
+    """Fail fast if every binding pins the same gpsdio-segment line.
+
+    A two-binding A/B with identical pins is a misconfiguration that would
+    otherwise silently produce an IDENTICAL diff — looking like "the change
+    has no effect" when in fact the change isn't under test at all. Reads
+    each ref's ``requirements/prod.in`` via ``git show`` (no worktree needed)
+    and aborts before snapshotting if all values collapse to one. Single-
+    binding runs are exempt (nothing to compare). (Copilot PR #44 round 2.)
+    """
+    pins = {name: _read_gpsdio_pin_at_ref(pipeline_dir, ref) for name, ref in bindings}
+    for name, pin in pins.items():
+        logger.info("binding %s: gpsdio-segment pin -> %s", name, pin)
+    if len(bindings) > 1 and len(set(pins.values())) == 1:
+        single = next(iter(set(pins.values())))
+        raise SystemExit(
+            f"All {len(bindings)} bindings pin the same gpsdio-segment "
+            f"({single!r}). The A/B is misconfigured -- there is no actual "
+            f"code difference under test. Did you forget to push the "
+            f"experiment branch with the repinned requirements/prod.in?"
+        )
+    return pins
+
+
 # --------------------------------------------------------------------------
 # Snapshot dataset
 # --------------------------------------------------------------------------
 
 def _sanitize_for_dataset(s: str) -> str:
     return s.replace("-", "_")
+
+
+# BQ labels are limited to ``[a-z0-9_-]{1,63}`` per the BQ docs; arbitrary
+# strings (experiment_id, binding name, commit sha) need coercing before they
+# can flow through ``--labels=k=v`` flags. Mirrors port_visits/ais.py's
+# ``_safe_label_value`` -- if a third workflow needs it, lift into dit.bq.
+_UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
+
+
+def _safe_label_value(value: str) -> str:
+    """Coerce ``value`` into ``[a-z0-9_-]{1,63}`` BQ-label form."""
+    return _UNSAFE_LABEL_CHAR_RE.sub("-", value.lower())[:63]
 
 
 def _snapshot_dataset_name(experiment_id: str) -> str:
@@ -494,10 +558,14 @@ def _segment_args(
         f"--out_segments_table={_output_prefix('segments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--fragments_table={_output_prefix('fragments', dest_dataset=dest_dataset, suffix=suffix)}",
         # Standard labels — make A/B-runs visibly distinct in Dataflow UI.
+        # experiment_id + binding are split + sanitised via _safe_label_value
+        # because BQ caps label values at 63 chars and the raw suffix can be
+        # up to 65 chars (`<exp32>_<binding32>`). (Copilot PR #44 round 2.)
         "--labels=environment=develop",
         "--labels=resource_creator=dit",
         "--labels=step=segment",
-        f"--labels=experiment_id={suffix}",
+        f"--labels=experiment_id={_safe_label_value(experiment_id)}",
+        f"--labels=binding={_safe_label_value(binding_name)}",
         # Project + runner.
         f"--project={PROJECT}",
         f"--runner={runner}",
@@ -898,6 +966,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("downstream:    SKIPPED (segment_identity, segment_info)")
 
     _verify_refs(args.pipeline_dir, args.bindings)
+    # Cheap preflight: fail before snapshotting if the A/B is misconfigured
+    # with identical gpsdio-segment pins (an IDENTICAL diff would otherwise
+    # look like "the change has no effect" when in fact nothing was tested).
+    _verify_distinct_gpsdio_pins(args.pipeline_dir, args.bindings)
     snap_dataset = _snapshot_source(args)
 
     suffix_by_binding = {name: f"{args.experiment_id}_{name}" for name, _ in args.bindings}
