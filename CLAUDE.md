@@ -59,6 +59,40 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-03 — ditbox-for-pipe-events live verification + pipe-events SQL non-determinism finding
+
+First successful end-to-end run of `make dit-cloud PIPELINE=pipe-events` against the AIS-staging cohort (build `e6f06a00-7a0e-4533-aede-e136f97301a4`, ~47 minutes). Closes the "user-gated validation" follow-up flagged across PR #34, #36, #39, #40, #42. Every layer of the stack now verified live: Cloud Build submission → ditbox step → canonical pipe-events image pull (read-only from `gfw-int-infrastructure/publication/...:v4.2.17`) → 12 nested `docker run` invocations under `--network=cloudbuild` → fake metadata server → `automated-testing@` ADC → BQ calls → 4-step incremental fishing-events chain × 3 modes × 2 score fields → output tables + views → `compare_all` verdict → exit code propagation.
+
+**Five-build debugging cascade got us there.** Each build's failure exposed a real bug or staging-data issue, fixed before the next iteration:
+1. `gcloud builds submit` rejected `$DIT_ADC_TOKEN` as a build substitution → escape with `$$` (PR #38).
+2. Pipe-events parser rejected `--labels` at the wrong nesting → move to per-operation block as `-labels` (also PR #38).
+3. google-auth `invalid_client` on refresh of placeholder-OAuth ADC JSON → pivot to `--network=host` (PR #39, later corrected).
+4. BQ 403 "API not used in project 1034185025654" → inject `GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827` (PR #40, later removed).
+5. BQ 403 `USER_PROJECT_DENIED` even after IAM grant → diagnosed via metadata-server probe that `--network=host` lands the sibling on the docker-daemon-host's network (Google-managed `cloudbuild-untrusted@argo-prod-*`), not the build step's. Pivot to `--network=cloudbuild` (PR #42).
+
+After PR #42 landed and the user fixed two staging-cohort data issues (stale PVIS schema; broken `identity_core`/`identity_authorization` views pointing at a non-existent `pipe_ais_v3_published` dataset), the run completed cleanly.
+
+**Pipe-events SQL non-determinism finding (real, upstream, low-priority).** The successful run reported 92-97% of rows "differing" across modes, but inspection of 500+ rows showed **zero semantic differences**. The signal traces to two `STRING` columns where pipe-events serialises structured data via `TO_JSON_STRING(...)` inside its SQL:
+
+- `event_info`: float-precision drift from non-associative `SUM`/`AVG` across different partition boundaries (`bf` = full year window; `bfd`/`bftruncate` = day-by-day). Values agree to ~15 significant digits; last-bit drift only.
+- `event_vessels.public_authorizations`: `ARRAY_AGG(STRUCT(rfmo, has_publicly_listed_authorization))` without `ORDER BY` (line 358 of `assets/bigquery/fishing-events-4-authorization.sql.j2`). Same multiset of authorisations, different element order per partition shape.
+
+These are byte-level diffs in JSON-encoded strings, so `table_identical_checks`'s native-ARRAY canonicalisation (`_array_canonical_sql` in `backend/query_builder.py`) doesn't apply — the columns reach table-check as opaque `STRING` and get byte-compared.
+
+**Recommendation for pipe-events** (out of dit's scope): add `ORDER BY` to the `ARRAY_AGG` — eliminates ~50% of the noise, zero risk. Float noise harder to chase; possible to ROUND() before serialising if bit-perfect matching is desired.
+
+**Decision on the dit / `table_identical_checks` side: DEFERRED.** A detailed feature spec for "JSON-aware comparison for STRING columns containing serialised JSON" was drafted in-session (parse + recursive key sort + opt-in deep array sort + opt-in float tolerance on nested numerics; Python-side post-process for the diff set). The spec is filed as institutional context but **not pursued** — this is a pipe-events SQL non-determinism issue, not a comparison-tool gap. Reopen the feature only if another pipeline starts pushing structures through JSON-string columns.
+
+**Sections moved.**
+- `CHANGELOG.md` § `[Unreleased]` gains a 2026-06-03 `#### Verified` block above the existing `#### Fixed` (the PR #42 entry).
+- This Plan changelog gains the entry you're reading.
+- `README.md` § "Roadmap" Phase 3 row updated: status flips from "Code complete + pending live e2e" to "Verified live 2026-06-03".
+- Memory updates: new [[cloudbuild-metadata-server-topology]] (architectural lesson + the two-metadata-server topology + which network to attach siblings to); new [[dit-pipe-events-cloud-verified]] (milestone record with the five-build cascade + pipe-events finding); [[next-stages-m5-pipe-events]] rewritten — auth section reflects final `--network=cloudbuild` (not the falsified `file-mount` or `--network=host`); "remaining work" updated.
+
+**Operational follow-up.** The PR #40-era `roles/serviceusage.serviceUsageConsumer` binding on `automated-testing@` can be revoked — it addressed nothing real (the actual caller under `--network=host` was a Google-managed SA we couldn't have granted anything to anyway).
+
+**Method note.** Both prior pivots (PR #34 file-mount, PR #39 `--network=host`) were theoretical decisions falsified by live evidence; the corrected understanding came from a targeted metadata-server probe + a focused web-research pass on Cloud Build's nested-docker auth patterns. Worth remembering: **when a design touches Cloud Build's runtime topology, probe the actual identity the runtime delivers before committing to the design** — the documentation lags reality, and "looks like it should work" is not "works." The probe is a self-contained yaml that runs in ~30 seconds.
+
 ### 2026-06-03 — Cloud auth re-pivot: `--network=host` → `--network=cloudbuild` (build-step's fake metadata server, not the daemon-host's real one)
 
 The 2026-06-02 `--network=host` pivot was based on an incomplete model of Cloud Build's runtime topology. Live evidence from build #4 (`USER_PROJECT_DENIED` even after granting `roles/serviceusage.serviceUsageConsumer` to `automated-testing@`) and a focused metadata-server probe revealed that **two metadata servers coexist on the build VM**:
