@@ -89,8 +89,13 @@ from typing import Iterator, Optional, Sequence
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
+from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
-from dit.workflow import resolve_run_context
+from dit.workflow import (
+    EXPERIMENT_ID_RE,
+    add_experiment_id_arg,
+    resolve_run_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,13 +212,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Cross-version A/B for pipe-segment, varying the gpsdio-segment dep.",
     )
-    p.add_argument("--experiment-id", required=True,
-                   help="Slug; appears in snapshot dataset name and output-table suffixes. "
-                        "Lowercase letters, digits, underscore, hyphen. Max 32 chars.")
+    # Wires --experiment-id with the standard validator (regex
+    # ^[a-z0-9][a-z0-9_-]{0,31}$, BQ-table-name safe, max 32 chars) and the
+    # auto-default solo_<6-hex>. Workflows must keep this consistent so the
+    # output-table suffix shape is portable across them. (Copilot PR #44
+    # comment.)
+    add_experiment_id_arg(p)
     p.add_argument("--pin-source-at", required=True,
                    help="ISO 8601 timestamp for the source-data snapshot (e.g. 2026-06-03T10:00:00Z).")
     p.add_argument("--binding", action="append", required=True, dest="bindings",
-                   help="`name=ref` pair, repeatable. Each ref must resolve in --pipeline-dir.")
+                   help="`name=ref` pair, repeatable. `name` must satisfy the experiment-id "
+                        "regex (lowercase / digits / _ / -, max 32 chars) since it is embedded "
+                        "into BQ table names and the docker compose project name. Each ref "
+                        "must resolve in --pipeline-dir.")
     p.add_argument("--date-range", required=True,
                    help="YYYY-MM-DD,YYYY-MM-DD. Forwarded to `segment` and used to derive "
                         "the date-shard list snapshotted from the source dataset.")
@@ -284,6 +295,16 @@ def _parse_binding(spec: str) -> tuple[str, str]:
     name, value = spec.split("=", 1)
     if not name or not value:
         raise SystemExit(f"both parts of name=ref must be non-empty; got {spec!r}")
+    # `name` is embedded into BQ table names (via the per-binding suffix
+    # `<experiment_id>_<name>`) and the docker compose project name; reuse
+    # the experiment-id regex so an invalid name fails fast here instead of
+    # producing opaque BQ / docker errors later. (Copilot PR #44 comment.)
+    if not EXPERIMENT_ID_RE.match(name):
+        raise SystemExit(
+            f"--binding name {name!r} must match {EXPERIMENT_ID_RE.pattern} "
+            f"(lowercase letters / digits / _ / -, max 32 chars). "
+            f"Got: {spec!r}."
+        )
     return name, value
 
 
@@ -438,6 +459,8 @@ def _segment_args(
     snap_normalized_name: str,
     dest_dataset: str,
     suffix: str,
+    experiment_id: str,
+    binding_name: str,
     date_range: tuple[date, date],
     runner: str,
     worker_image: Optional[str],
@@ -455,6 +478,12 @@ def _segment_args(
     set; the satellite-offset branch isn't needed to exercise the identity-
     match-key change under test, and its inputs are date-sharded in prod
     (not mirrored to the staging cohort).
+
+    Dataflow ``--job_name`` is built via ``dit.job_names.make_job_name``
+    (Copilot PR #44 comment): the shared helper enforces Dataflow's
+    ``[a-z0-9-]`` alphabet (underscores are rejected) and the 63-char cap,
+    truncating ``experiment_id`` from the right when overlong while
+    preserving ``binding`` / ``step`` (load-bearing for triage).
     """
     start, end = date_range
     args = [
@@ -497,7 +526,7 @@ def _segment_args(
             "--network=gfw-internal-network",
             "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
             f"--service_account_email={service_account}",
-            f"--job_name=dit-pipe-segment-{_sanitize_for_dataset(suffix)}-{start.strftime('%Y%m%d')}",
+            f"--job_name={make_job_name(repo=PIPELINE_NAME, step='segment', experiment_id=experiment_id, binding=binding_name)}",
         ])
         if worker_image is not None:
             args.append(f"--sdk_container_image={worker_image}")
@@ -704,6 +733,8 @@ def _run_binding(
             snap_normalized_name=snap_normalized_name,
             dest_dataset=args.dest_dataset,
             suffix=suffix,
+            experiment_id=args.experiment_id,
+            binding_name=name,
             date_range=args.date_range,
             runner=args.runner,
             worker_image=image_tag,
