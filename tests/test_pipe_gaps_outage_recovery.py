@@ -1,16 +1,17 @@
 """Tests for ``workflows/pipe_gaps/outage_recovery.py``.
 
-Mirrors the style of ``test_pipe_gaps_mode_equivalence.py``: focused on
-the workflow-local helpers (``canonical_params_dict``, the snapshot
-validator, the post-vs-pre cross-validation in ``parse_args``). The
-3-stage execute functions and the dataflow runner are exercised by the
-mode_equivalence tests' equivalents and by the live ``dit run`` command;
-they're not unit-tested here.
+Focused on workflow-local helpers: pin-at validation, the post-vs-pre
+cross-validation in ``parse_args``, ``canonical_params_dict`` cache-key
+composition, and the snapshot-dataset naming. The 3-stage execute
+functions, the snapshot creation, and the dataflow runner are exercised
+by live ``dit run`` invocations against real BQ; they're not unit-tested
+here.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from workflows.pipe_gaps import outage_recovery as mod
 
 def _args(**overrides: Any) -> argparse.Namespace:
     base = dict(
+        experiment_id="exp01",
         start="2026-05-12",
         end="2026-05-26",
         offset_days=3,
@@ -33,31 +35,48 @@ def _args(**overrides: Any) -> argparse.Namespace:
         ssvids="",
         source_messages="proj.ds.research_messages",
         source_segments="proj.ds.segs_activity",
-        pre_outage_snapshot="2026-05-27 18:00:00 UTC",
-        post_outage_snapshot="2026-06-01 18:00:00 UTC",
+        pre_outage_pin_at="2026-05-27 18:00:00 UTC",
+        post_outage_pin_at="2026-06-01 18:00:00 UTC",
+        snapshot_expiration_days=7,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
 # --------------------------------------------------------------------------
-# _validate_snapshot
+# _parse_pin_at / _validate_pin_at
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("value", [
     "2026-05-27 18:00:00 UTC",
     "2026-05-27T18:00:00Z",
     "2026-05-27T18:00:00+00:00",
-    "  2026-05-27 18:00:00 UTC  ",  # whitespace tolerated
+    "  2026-05-27 18:00:00 UTC  ",
 ])
-def test_validate_snapshot_accepts_iso(value: str) -> None:
-    assert mod._validate_snapshot(value).strip() == value.strip()
+def test_validate_pin_at_accepts_iso(value: str) -> None:
+    assert mod._validate_pin_at(value).strip() == value.strip()
 
 
 @pytest.mark.parametrize("value", ["", "not-a-date", "2026-13-99"])
-def test_validate_snapshot_rejects_garbage(value: str) -> None:
+def test_validate_pin_at_rejects_garbage(value: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
-        mod._validate_snapshot(value)
+        mod._validate_pin_at(value)
+
+
+def test_validate_pin_at_rejects_naive() -> None:
+    # The snapshot mechanism (CREATE SNAPSHOT TABLE ... FOR SYSTEM_TIME AS OF)
+    # interprets naive timestamps against the session zone, which would silently
+    # drift if run from non-UTC. Reject at arg-parse time.
+    with pytest.raises(argparse.ArgumentTypeError):
+        mod._validate_pin_at("2026-05-27 18:00:00")
+    with pytest.raises(argparse.ArgumentTypeError):
+        mod._validate_pin_at("2026-05-27T18:00:00")
+
+
+def test_parse_pin_at_returns_tz_aware() -> None:
+    parsed = mod._parse_pin_at("2026-05-27 18:00:00 UTC")
+    assert parsed.tzinfo is not None
+    assert parsed == datetime(2026, 5, 27, 18, 0, 0, tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------------------
@@ -65,11 +84,10 @@ def test_validate_snapshot_rejects_garbage(value: str) -> None:
 # --------------------------------------------------------------------------
 
 def test_parse_args_rejects_post_at_or_before_pre() -> None:
-    # post equal to pre is rejected (test reduces to bfd with identical source)
     with pytest.raises(SystemExit):
         mod.parse_args([
-            "--pre-outage-snapshot", "2026-06-01 00:00:00 UTC",
-            "--post-outage-snapshot", "2026-06-01 00:00:00 UTC",
+            "--pre-outage-pin-at", "2026-06-01 00:00:00 UTC",
+            "--post-outage-pin-at", "2026-06-01 00:00:00 UTC",
             "--experiment-id", "test",
         ])
 
@@ -77,20 +95,20 @@ def test_parse_args_rejects_post_at_or_before_pre() -> None:
 def test_parse_args_rejects_post_before_pre() -> None:
     with pytest.raises(SystemExit):
         mod.parse_args([
-            "--pre-outage-snapshot", "2026-06-01 00:00:00 UTC",
-            "--post-outage-snapshot", "2026-05-01 00:00:00 UTC",
+            "--pre-outage-pin-at", "2026-06-01 00:00:00 UTC",
+            "--post-outage-pin-at", "2026-05-01 00:00:00 UTC",
             "--experiment-id", "test",
         ])
 
 
 def test_parse_args_accepts_post_strictly_after_pre() -> None:
     args = mod.parse_args([
-        "--pre-outage-snapshot", "2026-05-27 18:00:00 UTC",
-        "--post-outage-snapshot", "2026-06-01 18:00:00 UTC",
+        "--pre-outage-pin-at", "2026-05-27 18:00:00 UTC",
+        "--post-outage-pin-at", "2026-06-01 18:00:00 UTC",
         "--experiment-id", "test",
     ])
-    assert args.pre_outage_snapshot.startswith("2026-05-27")
-    assert args.post_outage_snapshot.startswith("2026-06-01")
+    assert args.pre_outage_pin_at.startswith("2026-05-27")
+    assert args.post_outage_pin_at.startswith("2026-06-01")
 
 
 # --------------------------------------------------------------------------
@@ -102,22 +120,35 @@ def test_canonical_params_includes_mode() -> None:
     assert p["mode"] == mod.MODE_OUTAGE_RECOVERY
 
 
-def test_canonical_params_includes_post_snapshot_for_both_modes() -> None:
-    # Both modes depend on the post-outage snapshot.
+def test_canonical_params_pin_at_normalised_to_iso() -> None:
+    # The cache key stores the parsed-and-re-emitted ISO form so two
+    # equivalent strings (one with " UTC", one with "+00:00") produce
+    # identical cache keys.
+    a = mod.canonical_params_dict(
+        _args(post_outage_pin_at="2026-06-01 18:00:00 UTC"),
+        mod.MODE_OUTAGE_ORACLE,
+    )
+    b = mod.canonical_params_dict(
+        _args(post_outage_pin_at="2026-06-01T18:00:00+00:00"),
+        mod.MODE_OUTAGE_ORACLE,
+    )
+    assert a["post_outage_pin_at"] == b["post_outage_pin_at"]
+
+
+def test_canonical_params_includes_post_pin_for_both_modes() -> None:
     for mode in (mod.MODE_OUTAGE_RECOVERY, mod.MODE_OUTAGE_ORACLE):
         p = mod.canonical_params_dict(_args(), mode)
-        assert p["post_outage_snapshot"] == "2026-06-01 18:00:00 UTC"
+        assert p["post_outage_pin_at"] == "2026-06-01T18:00:00+00:00"
 
 
-def test_canonical_params_includes_pre_snapshot_for_recovery_only() -> None:
-    # The oracle is a single-shot backfill that only reads post; including
-    # the pre-outage snapshot in its cache key would invalidate it every
-    # time the pre-outage snapshot moves, dropping the hit rate for no
-    # behavioural reason.
+def test_canonical_params_includes_pre_pin_for_recovery_only() -> None:
+    # The oracle is a single-shot backfill against post; including the
+    # pre-outage pin in its cache key would invalidate it every time the
+    # pre-outage pin moves, dropping the hit rate for no behavioural reason.
     rec = mod.canonical_params_dict(_args(), mod.MODE_OUTAGE_RECOVERY)
     ora = mod.canonical_params_dict(_args(), mod.MODE_OUTAGE_ORACLE)
-    assert rec["pre_outage_snapshot"] == "2026-05-27 18:00:00 UTC"
-    assert "pre_outage_snapshot" not in ora
+    assert rec["pre_outage_pin_at"] == "2026-05-27T18:00:00+00:00"
+    assert "pre_outage_pin_at" not in ora
 
 
 def test_canonical_params_recovery_depends_on_offset_days() -> None:
@@ -137,17 +168,11 @@ def test_canonical_params_changes_with_source_messages() -> None:
 
 
 def test_canonical_params_ssvids_default_empty_list() -> None:
-    # An empty CLI ssvids string (the default) should normalise to [], not
-    # something falsy-but-string like "" -- so the cache key shape is stable
-    # whether the user passed --ssvids '' or omitted it.
     p = mod.canonical_params_dict(_args(ssvids=""), mod.MODE_OUTAGE_RECOVERY)
     assert p["ssvids"] == []
 
 
 def test_canonical_params_changes_with_ssvids() -> None:
-    # An unrestricted run and a restricted run must produce different cache
-    # keys -- otherwise a restricted-ssvid run could erroneously hit an
-    # unrestricted cached table (or vice versa).
     a = mod.canonical_params_dict(_args(ssvids=""), mod.MODE_OUTAGE_RECOVERY)
     b = mod.canonical_params_dict(
         _args(ssvids="ssvid_a,ssvid_b"), mod.MODE_OUTAGE_RECOVERY,
@@ -157,8 +182,6 @@ def test_canonical_params_changes_with_ssvids() -> None:
 
 
 def test_canonical_params_ssvids_normalised_by_sort() -> None:
-    # CLI order shouldn't affect the cache key. Two equivalent ssvid sets
-    # presented in different orders must produce identical params.
     a = mod.canonical_params_dict(
         _args(ssvids="zeta,alpha,mike"), mod.MODE_OUTAGE_RECOVERY,
     )
@@ -168,11 +191,23 @@ def test_canonical_params_ssvids_normalised_by_sort() -> None:
     assert a["ssvids"] == b["ssvids"] == ["alpha", "mike", "zeta"]
 
 
-def test_validate_snapshot_rejects_naive() -> None:
-    # BQ FOR SYSTEM_TIME AS OF interprets naive timestamps against the
-    # session zone, which would silently drift if run from non-UTC. Reject
-    # at arg-parse time.
-    with pytest.raises(argparse.ArgumentTypeError):
-        mod._validate_snapshot("2026-05-27 18:00:00")
-    with pytest.raises(argparse.ArgumentTypeError):
-        mod._validate_snapshot("2026-05-27T18:00:00")
+# --------------------------------------------------------------------------
+# Snapshot naming helpers
+# --------------------------------------------------------------------------
+
+def test_snapshot_dataset_name_distinct_pre_post() -> None:
+    pre = mod._snapshot_dataset_name("exp01", mod.SNAPSHOT_LABEL_PRE)
+    post = mod._snapshot_dataset_name("exp01", mod.SNAPSHOT_LABEL_POST)
+    assert pre != post
+    assert pre.endswith("_outage_pre")
+    assert post.endswith("_outage_post")
+    # Both share the project + experiment-id stem.
+    assert pre.startswith(f"{mod.PROJECT}.dit_exp_exp01_")
+    assert post.startswith(f"{mod.PROJECT}.dit_exp_exp01_")
+
+
+def test_snapshot_dataset_name_sanitises_hyphens() -> None:
+    # BQ dataset names can't contain hyphens; experiment-ids commonly do.
+    name = mod._snapshot_dataset_name("my-exp-2026", mod.SNAPSHOT_LABEL_PRE)
+    assert "-" not in name.split(".", 1)[1]
+    assert "my_exp_2026" in name
