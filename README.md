@@ -90,6 +90,24 @@ The workflow authenticates by mounting that `gcp` named volume at `/root/.config
 
 When the same workflow runs **inside Cloud Build** (`make dit-cloud`), there is no `gcp` named volume to mount; instead the docker runner picks up `DIT_CLOUD_MODE=1` (set by `cloudbuild-dit.yaml`) and adds `--network=cloudbuild` so the inner container attaches to Cloud Build's per-build `cloudbuild` docker network, where a fake metadata server returns OAuth tokens for the build SA (`automated-testing@`). google-auth's ADC chain finds the metadata server and gets a fresh token — same mechanism prod uses via GKE Workload Identity, no on-disk credentials. The workflow code is unchanged across laptop / cloud — see [`docs/conventions.md`](docs/conventions.md) § "Auth in the cloud path (ditbox)" for the three-context table.
 
+## Staging data sources
+
+Workflows default to the **`pipe_ais_test_202408290000`** staging cohort — a synthetic AIS-staging dataset hosted in `world-fishing-827` that mirrors a representative slice of the prod pipeline. Convention: every workflow points at this cohort by default; ad-hoc runs against prod or other cohorts go through explicit per-workflow CLI overrides (e.g. `--source-dataset-stem`, `--source-normalized-table`).
+
+| Table FQN | Consumed by | Shape |
+|---|---|---|
+| `pipe_ais_test_202408290000_internal.normalized_messages` | `workflows/pipe_segment/identity_match_key.py` (`--source-normalized-table`) | Date-partitioned (`timestamp`), clustered on `ssvid`. The normalized AIS source — input to pipe-segment. |
+| `pipe_ais_test_202408290000_internal.messages_positions` | `workflows/pipe_gaps/mode_equivalence.py` | Output of pipe-segment, input to pipe-gaps. |
+| `pipe_ais_test_202408290000_published.segs_activity` | `workflows/pipe_gaps/mode_equivalence.py` | Segment activity stream, input to pipe-gaps. |
+| `pipe_ais_test_202408290000_internal.messages_positions` / `pipe_ais_test_202408290000_published.segment_info` / `segs_activity` | `workflows/port_visits/ais.py` (`--source-dataset-stem`) | port-visits' three input tables. |
+| `pipe_ais_test_202408290000_internal` / `_published` (full datasets) | `workflows/pipe_events/fishing.py` | Fishing-events BQ-SQL inputs. |
+
+**Why a staging cohort and not prod.** Prod inputs are massive, slow, and a moving target; staging is small (~3.8 GB for `normalized_messages`), pinned to a known shape, safe to query freely, and avoids accidental cost when a smoke test goes wide. The cohort is regenerated upstream when prod's schema or data shape changes — workflows shouldn't pin to a specific snapshot of the cohort.
+
+**Adding a new table to the cohort.** If you generate a new staging table for a workflow under development, document it in this section in the same commit that lands the workflow. The README is the discoverability surface for "where do I point my workflow's source flag?" — if it's not here, the next person re-derives it from scratch (or worse, points at prod by default).
+
+**Satellite-offsets and similar prod-only inputs.** Tables not mirrored to the staging cohort (e.g. `satellite_positions_one_second_resolution_*`, `norad_to_receiver_v20230510`) should be opt-in via a workflow flag (e.g. `--include-satellite-offsets`), default off, with the flag's help text noting that enabling it snapshots from prod instead. Keeps the default-staging contract clean while still allowing prod-only paths to be exercised when relevant.
+
 ## Usage scenarios
 
 dit covers a small set of orthogonal axes, summarised first, then walked through as concrete scenarios. **Best-practice paths are flagged ⭐.**
