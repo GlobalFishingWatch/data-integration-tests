@@ -14,6 +14,7 @@ PIP ?= pip
 PIPE_GAPS_DIR    = $(PROJECTS)/pipe-gaps
 PORT_VISITS_DIR  = $(PROJECTS)/anchorages_pipeline
 PIPE_EVENTS_DIR  = $(PROJECTS)/pipe-events
+PIPE_SEGMENT_DIR = $(PROJECTS)/pipe-segment
 
 # Default --no-deps on -ref / snapshot installs (assumes pipeline's transitive
 # deps haven't changed). Set FULLDEPS=1 to drop the flag and let pip reinstall
@@ -21,9 +22,9 @@ PIPE_EVENTS_DIR  = $(PROJECTS)/pipe-events
 DEPS_FLAG = $(if $(FULLDEPS),,--no-deps)
 
 .PHONY: install \
-    install-pipe-gaps install-port-visits install-pipe-events install-all \
-    install-pipe-gaps-ref install-port-visits-ref install-pipe-events-ref \
-    snapshot-pipe-gaps snapshot-port-visits snapshot-pipe-events \
+    install-pipe-gaps install-port-visits install-pipe-events install-pipe-segment install-all \
+    install-pipe-gaps-ref install-port-visits-ref install-pipe-events-ref install-pipe-segment-ref \
+    snapshot-pipe-gaps snapshot-port-visits snapshot-pipe-events snapshot-pipe-segment \
     clean-snapshot clean-snapshots \
     publish-ditbox dit-cloud dit-cancel
 
@@ -43,11 +44,15 @@ install-port-visits:
 install-pipe-events:
 	$(PIP) install -e ".[dev]" -e "$(PIPE_EVENTS_DIR)"
 
+install-pipe-segment:
+	$(PIP) install -e ".[dev]" -e "$(PIPE_SEGMENT_DIR)"
+
 install-all:
 	$(PIP) install -e ".[dev]" \
 	    -e "$(PIPE_GAPS_DIR)" \
 	    -e "$(PORT_VISITS_DIR)" \
-	    -e "$(PIPE_EVENTS_DIR)"
+	    -e "$(PIPE_EVENTS_DIR)" \
+	    -e "$(PIPE_SEGMENT_DIR)"
 
 # === Specific-ref installs (reproducible, non-editable) ===
 
@@ -62,6 +67,10 @@ install-port-visits-ref:
 install-pipe-events-ref:
 	@test -n "$(REF)" || { echo "REF is required: make $@ REF=<sha-or-branch>"; exit 1; }
 	$(PIP) install --force-reinstall $(DEPS_FLAG) "git+file://$(PIPE_EVENTS_DIR)@$(REF)"
+
+install-pipe-segment-ref:
+	@test -n "$(REF)" || { echo "REF is required: make $@ REF=<sha-or-branch>"; exit 1; }
+	$(PIP) install --force-reinstall $(DEPS_FLAG) "git+file://$(PIPE_SEGMENT_DIR)@$(REF)"
 
 # === Snapshot + install ===
 #
@@ -79,6 +88,9 @@ snapshot-port-visits:
 snapshot-pipe-events:
 	scripts/snapshot-install.sh pipe-events "$(PIPE_EVENTS_DIR)" $(DEPS_FLAG)
 
+snapshot-pipe-segment:
+	scripts/snapshot-install.sh pipe-segment "$(PIPE_SEGMENT_DIR)" $(DEPS_FLAG)
+
 # === Cleanup ===
 #
 # Snapshots live forever by design (bytes-scale, hidden namespace). The
@@ -88,7 +100,7 @@ snapshot-pipe-events:
 #   make clean-snapshot PIPELINE=pipe-gaps REF=<sha-or-full-ref>
 
 clean-snapshot:
-	@test -n "$(PIPELINE)" || { echo "PIPELINE required: PIPELINE=pipe-gaps | anchorages_pipeline | pipe-events" >&2; exit 1; }
+	@test -n "$(PIPELINE)" || { echo "PIPELINE required: PIPELINE=pipe-gaps | anchorages_pipeline | pipe-events | pipe-segment" >&2; exit 1; }
 	@test -n "$(REF)" || { echo "REF required: REF=<sha> or REF=refs/dit-snapshots/<pipeline>/<sha>" >&2; exit 1; }
 	@test -d "$(PROJECTS)/$(PIPELINE)" || { echo "pipeline dir not found: $(PROJECTS)/$(PIPELINE)" >&2; exit 1; }
 	scripts/clean-snapshot.sh "$(PROJECTS)/$(PIPELINE)" "$(REF)"
@@ -120,13 +132,14 @@ publish-ditbox:
 #
 # Required:
 #   WORKFLOW=workflows/<pipeline>/<name>.py
-#   PIPELINE=pipe-gaps | anchorages_pipeline | pipe-events
+#   PIPELINE=pipe-gaps | anchorages_pipeline | pipe-events | pipe-segment
 # Optional:
 #   ARGS="..."        # appended verbatim to `dit run <workflow>`
 #   REF=<sha-or-tag>  # pipeline ref to install non-editably; empty = editable from source upload
 #   DIT_REF=<ref>     # dit ref to clone (default main)
 #   BEAM_VERSION=<x.y.z>  # pin apache-beam to match the worker image's beam version
-#                          # (pipe-gaps:v0.9.6 = 2.71.0; pipe-anchorages:v4.6.4 = 2.69.0).
+#                          # (pipe-gaps:v0.9.6 = 2.71.0; pipe-anchorages:v4.6.4 = 2.69.0;
+#                          # pipe-segment:v5.0.3 = 2.56.0).
 #                          # Auto-defaulted below by PIPELINE when unset.
 #
 # Example:
@@ -143,6 +156,9 @@ ifeq ($(PIPELINE),pipe-gaps)
 endif
 ifeq ($(PIPELINE),anchorages_pipeline)
   BEAM_VERSION ?= 2.69.0
+endif
+ifeq ($(PIPELINE),pipe-segment)
+  BEAM_VERSION ?= 2.56.0
 endif
 
 # Resolve the pipeline_commit on the laptop (where git-push creds live) and
@@ -174,7 +190,7 @@ ASYNC_FLAG = $(if $(WAIT),,--async)
 
 dit-cloud:
 	@test -n "$(WORKFLOW)" || { echo "WORKFLOW required: WORKFLOW=workflows/..." >&2; exit 1; }
-	@test -n "$(PIPELINE)" || { echo "PIPELINE required: anchorages_pipeline | pipe-gaps | pipe-events" >&2; exit 1; }
+	@test -n "$(PIPELINE)" || { echo "PIPELINE required: anchorages_pipeline | pipe-gaps | pipe-events | pipe-segment" >&2; exit 1; }
 	@test -d "$(PROJECTS)/$(PIPELINE)" || { echo "pipeline dir not found: $(PROJECTS)/$(PIPELINE)" >&2; exit 1; }
 	@PIPELINE_COMMIT=""; \
 	if [ -n "$(REF)" ]; then \
