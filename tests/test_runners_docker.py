@@ -138,7 +138,8 @@ def test_build_from_source_builds_named_service():
 
 
 # --------------------------------------------------------------------------
-# Cloud mode (DIT_CLOUD_MODE env-triggered) — --network=host for metadata-server ADC
+# Cloud mode (DIT_CLOUD_MODE env-triggered) — --network=cloudbuild for the
+# fake-metadata-server ADC path
 # --------------------------------------------------------------------------
 
 
@@ -161,32 +162,28 @@ def test_apply_cloud_mode_unset_empty_volumes(monkeypatch):
     assert dit_docker._apply_cloud_mode(()) == []
 
 
-_QUOTA_PROJECT_FLAGS = ["-e", "GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827"]
-
-
-def test_apply_cloud_mode_set_adds_host_network_and_quota_project(monkeypatch):
-    """Cloud mode on + no volumes: --network=host added AND quota-project env
-    var set (so the BQ client sends X-Goog-User-Project=world-fishing-827 --
-    without this the metadata-server token defaults to the build-host project
-    where BQ API isn't enabled, and calls 403)."""
+def test_apply_cloud_mode_set_adds_cloudbuild_network(monkeypatch):
+    """Cloud mode on + no volumes: --network=cloudbuild added (the docker
+    network where Cloud Build's fake metadata server lives, returning tokens
+    for the build SA `automated-testing@`)."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     flags = dit_docker._apply_cloud_mode(())
-    assert flags == ["--network=host", *_QUOTA_PROJECT_FLAGS]
+    assert flags == ["--network=cloudbuild"]
 
 
 def test_apply_cloud_mode_set_drops_laptop_mount(monkeypatch):
-    """Cloud mode on + laptop mount: laptop mount dropped; the cloud-mode
-    flags (--network=host + quota-project env) are added."""
+    """Cloud mode on + laptop mount: laptop mount dropped;
+    --network=cloudbuild is added."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     flags = dit_docker._apply_cloud_mode(["gcp:/root/.config"])
-    assert flags == ["--network=host", *_QUOTA_PROJECT_FLAGS]
+    assert flags == ["--network=cloudbuild"]
 
 
 def test_apply_cloud_mode_drops_laptop_subdir_mount(monkeypatch):
     """A mount targeting /root/.config/gcloud (or below) is laptop-auth too."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     flags = dit_docker._apply_cloud_mode(["gcp:/root/.config/gcloud"])
-    assert flags == ["--network=host", *_QUOTA_PROJECT_FLAGS]
+    assert flags == ["--network=cloudbuild"]
 
 
 def test_apply_cloud_mode_keeps_unrelated_volumes(monkeypatch):
@@ -198,19 +195,31 @@ def test_apply_cloud_mode_keeps_unrelated_volumes(monkeypatch):
         "/host/path:/container/path",
     ])
     assert flags == [
-        "--network=host",
-        *_QUOTA_PROJECT_FLAGS,
+        "--network=cloudbuild",
         "-v", "data:/opt/data",
         "-v", "/host/path:/container/path",
     ]
 
 
-def test_apply_cloud_mode_network_host_precedes_volumes(monkeypatch):
-    """--network=host comes first so it lands before the image positional and
-    is unambiguously a docker flag, not a -v target."""
+def test_apply_cloud_mode_network_precedes_volumes(monkeypatch):
+    """--network=cloudbuild comes first so it lands before the image
+    positional and is unambiguously a docker flag, not a -v target."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     flags = dit_docker._apply_cloud_mode(["data:/opt/data"])
-    assert flags[0] == "--network=host"
+    assert flags[0] == "--network=cloudbuild"
+
+
+def test_apply_cloud_mode_no_quota_project_env(monkeypatch):
+    """Cloud mode no longer injects GOOGLE_CLOUD_QUOTA_PROJECT. The previous
+    --network=host design needed it because the host-network metadata server
+    returns the Google-managed `cloudbuild-untrusted@` identity whose default
+    quota project isn't world-fishing-827. With --network=cloudbuild the
+    inner container hits the build's fake metadata server which already
+    returns world-fishing-827 tokens, so no quota override is needed."""
+    monkeypatch.setenv("DIT_CLOUD_MODE", "1")
+    flags = dit_docker._apply_cloud_mode(())
+    assert "GOOGLE_CLOUD_QUOTA_PROJECT" not in " ".join(flags)
+    assert "-e" not in flags
 
 
 def test_apply_cloud_mode_drop_is_logged(monkeypatch, caplog):
@@ -223,30 +232,31 @@ def test_apply_cloud_mode_drop_is_logged(monkeypatch, caplog):
     assert "gcp:/root/.config" in msgs
 
 
-def test_apply_cloud_mode_logs_host_network_activation(monkeypatch, caplog):
+def test_apply_cloud_mode_logs_network_activation(monkeypatch, caplog):
     """Cloud mode activation is logged so the override is visible."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     with caplog.at_level("INFO", logger="dit.runners.docker"):
         dit_docker._apply_cloud_mode(())
     msgs = " | ".join(r.message for r in caplog.records)
-    assert "--network=host" in msgs
+    assert "--network=cloudbuild" in msgs
 
 
 # ----- end-to-end through run() — docker run path -------------------------
 
-def test_run_published_cloud_mode_adds_host_network(monkeypatch):
-    """Cloud mode on + docker run path: cmd contains --network=host."""
+def test_run_published_cloud_mode_adds_cloudbuild_network(monkeypatch):
+    """Cloud mode on + docker run path: cmd contains --network=cloudbuild."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     with patch.object(dit_docker.subprocess, "run",
                       return_value=MagicMock(returncode=0)) as mock_run:
         dit_docker.run("gfw/pipe-events", ["incremental_events"])
     cmd = _captured_cmd(mock_run)
-    assert "--network=host" in cmd
+    assert "--network=cloudbuild" in cmd
+    assert "--network=host" not in cmd
 
 
-def test_run_published_cloud_mode_drops_laptop_keeps_network_host(monkeypatch):
+def test_run_published_cloud_mode_drops_laptop_keeps_cloudbuild_network(monkeypatch):
     """When the workflow passes the laptop named-volume AND cloud mode is on,
-    the laptop mount is dropped and --network=host is added."""
+    the laptop mount is dropped and --network=cloudbuild is added."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     with patch.object(dit_docker.subprocess, "run",
                       return_value=MagicMock(returncode=0)) as mock_run:
@@ -259,7 +269,7 @@ def test_run_published_cloud_mode_drops_laptop_keeps_network_host(monkeypatch):
     cmd = _captured_cmd(mock_run)
     specs = _captured_v_specs(cmd)
     assert "gcp:/root/.config" not in specs
-    assert "--network=host" in cmd
+    assert "--network=cloudbuild" in cmd
 
 
 def test_run_published_cloud_mode_unset_byte_identical(monkeypatch):
@@ -276,7 +286,7 @@ def test_run_published_cloud_mode_unset_byte_identical(monkeypatch):
     cmd = _captured_cmd(mock_run)
     specs = _captured_v_specs(cmd)
     assert specs == ["gcp:/root/.config"]
-    assert "--network=host" not in cmd
+    assert "--network=cloudbuild" not in cmd
 
 
 def test_run_published_cloud_mode_drop_logged(monkeypatch, caplog):
@@ -293,8 +303,9 @@ def test_run_published_cloud_mode_drop_logged(monkeypatch, caplog):
 
 # ----- end-to-end through run() — docker compose run path -----------------
 
-def test_build_from_source_cloud_mode_adds_host_network(monkeypatch):
-    """Cloud mode on + build_from_source path: cmd contains --network=host."""
+def test_build_from_source_cloud_mode_adds_cloudbuild_network(monkeypatch):
+    """Cloud mode on + build_from_source path: cmd contains
+    --network=cloudbuild."""
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     dit_docker._BUILT_PROJECTS.clear()
     with (
@@ -304,10 +315,10 @@ def test_build_from_source_cloud_mode_adds_host_network(monkeypatch):
     ):
         dit_docker.run("img", ["op"], build_from_source=True)
     cmd = _captured_cmd(mock_run)
-    assert "--network=host" in cmd
+    assert "--network=cloudbuild" in cmd
 
 
-def test_build_from_source_cloud_mode_drops_laptop_keeps_network_host(monkeypatch):
+def test_build_from_source_cloud_mode_drops_laptop_keeps_cloudbuild_network(monkeypatch):
     monkeypatch.setenv("DIT_CLOUD_MODE", "1")
     dit_docker._BUILT_PROJECTS.clear()
     with (
@@ -326,7 +337,7 @@ def test_build_from_source_cloud_mode_drops_laptop_keeps_network_host(monkeypatc
     cmd = _captured_cmd(mock_run)
     specs = _captured_v_specs(cmd)
     assert "gcp:/root/.config" not in specs
-    assert "--network=host" in cmd
+    assert "--network=cloudbuild" in cmd
     # service positional still threaded correctly
     assert "pipeline" in cmd
     assert cmd.index("pipeline") < cmd.index("op")
@@ -350,4 +361,4 @@ def test_build_from_source_cloud_mode_unset_byte_identical(monkeypatch):
     cmd = _captured_cmd(mock_run)
     specs = _captured_v_specs(cmd)
     assert specs == ["gcp:/root/.config"]
-    assert "--network=host" not in cmd
+    assert "--network=cloudbuild" not in cmd

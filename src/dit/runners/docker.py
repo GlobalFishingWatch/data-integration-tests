@@ -49,16 +49,17 @@ def _ensure_built(project_name: str, *, service: str = "dev") -> None:
 _CLOUD_MODE_ENV = "DIT_CLOUD_MODE"
 _LAPTOP_AUTH_PREFIX = "/root/.config"
 
-# Quota project for BigQuery (and other GCP) API calls in cloud mode. Cloud
-# Build's metadata server issues tokens whose default quota_project_id is the
-# build-host project (e.g. 1034185025654, a Google-managed Cloud Build pool
-# project), not the build SA's home project. Without this override, BQ calls
-# get 403'd with "API has not been used in project <build-host>" because the
-# API isn't enabled in that consumer project (and isn't ours to enable).
-# We pin to ``world-fishing-827`` -- where the build SA lives and where dit's
-# Beam workflows already write outputs (per [[prod-infra-boundary]], all dit
-# writes stay in wf827 namespaces; the quota project must match).
-_CLOUD_MODE_QUOTA_PROJECT = "world-fishing-827"
+# The docker network Cloud Build attaches build-step containers to. A sidecar
+# "fake" metadata server lives on this network and returns OAuth tokens for
+# the user-configured ``serviceAccount:`` (``automated-testing@`` for dit) --
+# distinct from the build VM's real metadata server, which returns the
+# Google-managed ``cloudbuild-untrusted@argo-prod-*`` identity (the docker
+# daemon host). Sibling containers launched via ``docker run`` are attached
+# to the daemon's default network, NOT ``cloudbuild``; ``--network=cloudbuild``
+# explicitly re-attaches them so they see the same fake metadata server the
+# build step does. Reference: cloud-build-local's open-source metadata.go +
+# earthly/earthly#1628.
+_CLOUDBUILD_NETWORK = "cloudbuild"
 
 
 def _is_laptop_auth_mount(volume_spec: str) -> bool:
@@ -67,7 +68,7 @@ def _is_laptop_auth_mount(volume_spec: str) -> bool:
     Laptop mode mounts the ``gcp`` named volume at ``/root/.config`` (or any
     subdirectory of it). In cloud mode those mounts are dropped because the
     named volume does not exist in Cloud Build; the inner container reaches
-    ADC via the metadata server (over ``--network=host``) instead.
+    ADC via the fake metadata server (over ``--network=cloudbuild``) instead.
 
     A docker ``-v`` spec is ``<source>:<target>[:<mode>]``. We classify by
     ``target`` (the second colon-separated field): if it equals
@@ -87,18 +88,13 @@ def _apply_cloud_mode(volumes: Sequence[str]) -> list[str]:
     Triggered solely by the ``DIT_CLOUD_MODE`` env var (any non-empty value).
     When set ("we are running inside ditbox / Cloud Build"):
 
-    * ``--network=host`` is added so the inner container shares the build
-      VM's network namespace and can reach Cloud Build's metadata server at
-      ``169.254.169.254`` -- google-auth's ADC discovery chain finds the
-      metadata server and obtains a fresh OAuth token bound to the build SA,
-      same mechanism prod uses via GKE Workload Identity.
-    * ``-e GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827`` is added so the
-      inner container's BQ (and other GCP) API calls send
-      ``X-Goog-User-Project: world-fishing-827`` -- without this, the
-      metadata-server-issued token defaults the quota project to the build
-      host (e.g. ``1034185025654``, a Cloud Build-managed pool project)
-      where BQ API isn't enabled, and calls 403 with "API has not been used
-      in project <build-host>".
+    * ``--network=cloudbuild`` is added so the inner container attaches to
+      the ``cloudbuild`` docker network Cloud Build creates per build, where
+      a fake metadata server returns OAuth tokens bound to the build SA
+      (``automated-testing@``). google-auth's ADC discovery chain finds the
+      fake metadata server at ``metadata.google.internal`` and obtains a
+      fresh token; same mechanism prod uses via GKE Workload Identity, just
+      a different metadata-server provider.
     * any caller-supplied volume targeting ``/root/.config`` (or below) is
       dropped -- the laptop-mode ``gcp:/root/.config`` named volume doesn't
       exist in Cloud Build and would mount as an empty anonymous volume,
@@ -109,14 +105,21 @@ def _apply_cloud_mode(volumes: Sequence[str]) -> list[str]:
     When the env var is unset (laptop), returns the laptop-mode ``-v`` flags
     unchanged: behaviour is byte-identical to pre-cloud-mode callers.
 
-    Earlier the cloud path bind-mounted a short-lived ADC JSON file at the
-    standard ADC location. That approach was abandoned after live testing:
-    the older ``google-auth`` baked into pipe-events' Python 3.8 image tries
-    to refresh ``authorized_user`` credentials before the first API call,
-    ignoring the pre-issued ``token`` field, and a refresh with placeholder
-    OAuth client material fails with ``invalid_client``. Metadata-server
-    access via ``--network=host`` sidesteps the issue entirely -- the
-    container never holds long-lived material, just like prod.
+    **History (two prior designs falsified by live evidence).** First, an
+    ADC-file bind-mount approach was tried; older ``google-auth`` in
+    pipe-events' Python 3.8 image refreshes ``authorized_user`` credentials
+    before the first API call (ignoring the pre-issued ``token`` field), and
+    refresh against placeholder OAuth client material fails with
+    ``invalid_client``. Second, ``--network=host`` was tried; that attaches
+    the inner container to the docker daemon's host network namespace, NOT
+    the build step's, so the metadata server returns the Google-managed
+    ``cloudbuild-untrusted@argo-prod-*`` identity instead of the build SA --
+    causing ``USER_PROJECT_DENIED`` failures even when explicit quota-project
+    overrides are applied (the caller identity is wrong, not the quota
+    project). ``--network=cloudbuild`` is the documented sibling-container
+    pattern that resolves both: the inner container sees the same fake
+    metadata server the build step does, no credential material on disk,
+    no IAM grants to Google-managed accounts.
 
     Pure function over the env var + ``volumes``; safe to unit-test directly.
     """
@@ -128,10 +131,7 @@ def _apply_cloud_mode(volumes: Sequence[str]) -> list[str]:
             flags.extend(["-v", vol])
         return flags
 
-    out: list[str] = [
-        "--network=host",
-        "-e", f"GOOGLE_CLOUD_QUOTA_PROJECT={_CLOUD_MODE_QUOTA_PROJECT}",
-    ]
+    out: list[str] = [f"--network={_CLOUDBUILD_NETWORK}"]
     for vol in volumes:
         if _is_laptop_auth_mount(vol):
             logger.info(
@@ -141,8 +141,9 @@ def _apply_cloud_mode(volumes: Sequence[str]) -> list[str]:
             continue
         out.extend(["-v", vol])
     logger.info(
-        "docker: cloud mode active; adding --network=host so the inner "
-        "container can reach Cloud Build's metadata server for ADC.",
+        "docker: cloud mode active; adding --network=%s so the inner "
+        "container can reach Cloud Build's fake metadata server for ADC.",
+        _CLOUDBUILD_NETWORK,
     )
     return out
 
@@ -190,10 +191,14 @@ def run(
     ``"pipeline"``.
 
     **Cloud mode (env-triggered, no parameter).** When the ``DIT_CLOUD_MODE``
-    env var is set (any non-empty value), the runner adds ``--network=host``
-    to the docker invocation so the inner container can reach Cloud Build's
-    metadata server for ADC -- same mechanism prod uses via GKE Workload
-    Identity, no on-disk credential material. Laptop-mode mounts targeting
+    env var is set (any non-empty value), the runner adds
+    ``--network=cloudbuild`` to the docker invocation so the inner container
+    attaches to Cloud Build's per-build docker network where a fake metadata
+    server returns OAuth tokens for the build SA (``automated-testing@``).
+    google-auth's ADC discovery finds the fake metadata server at
+    ``metadata.google.internal`` -- same mechanism prod uses via GKE
+    Workload Identity, just a different metadata-server provider, and no
+    on-disk credential material. Laptop-mode mounts targeting
     ``/root/.config`` (or below) are also dropped (the ``gcp`` named volume
     does not exist in Cloud Build). The workflow's
     ``volumes=["gcp:/root/.config"]`` argument is therefore left unchanged;
