@@ -11,7 +11,7 @@ here.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -22,8 +22,8 @@ from workflows.pipe_gaps import outage_recovery as mod
 def _args(**overrides: Any) -> argparse.Namespace:
     base = dict(
         experiment_id="exp01",
-        start="2026-05-12",
-        end="2026-05-26",
+        start="2024-08-22",
+        end="2024-08-29",
         offset_days=3,
         backfill_days=4,
         min_gap_length=1.0,
@@ -33,11 +33,19 @@ def _args(**overrides: Any) -> argparse.Namespace:
         skip_open_gaps=False,
         # CLI form: empty string = no ssvid restriction (the default).
         ssvids="",
-        source_messages="proj.ds.research_messages",
-        source_segments="proj.ds.segs_activity",
+        # Default sources point at the AIS staging cohort per CLAUDE.md.
+        source_messages=(
+            "world-fishing-827.pipe_ais_test_202408290000_internal."
+            "messages_positions"
+        ),
+        source_segments=(
+            "world-fishing-827.pipe_ais_test_202408290000_published."
+            "segs_activity"
+        ),
         pre_outage_pin_at="2026-05-27 18:00:00 UTC",
         post_outage_pin_at="2026-06-01 18:00:00 UTC",
         snapshot_expiration_days=7,
+        snapshot_dest_project="world-fishing-827",
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -211,6 +219,74 @@ def test_snapshot_dataset_name_sanitises_hyphens() -> None:
     name = mod._snapshot_dataset_name("my-exp-2026", mod.SNAPSHOT_LABEL_PRE)
     assert "-" not in name.split(".", 1)[1]
     assert "my_exp_2026" in name
+
+
+def test_snapshot_dataset_name_honours_dest_project() -> None:
+    # Cross-org opt-in: when running against prod-VMS sources, the dest
+    # project must match the source's (gfw-int-vms-v3) to avoid the
+    # cross-org snapshot block. The helper has to forward dest_project
+    # into the FQN.
+    name = mod._snapshot_dataset_name(
+        "exp01", mod.SNAPSHOT_LABEL_PRE, dest_project="gfw-int-vms-v3",
+    )
+    assert name.startswith("gfw-int-vms-v3.dit_exp_exp01_")
+    assert name.endswith("_outage_pre")
+
+
+# --------------------------------------------------------------------------
+# Staging-by-default contract (CLAUDE.md rule)
+# --------------------------------------------------------------------------
+
+def test_default_source_messages_is_staging_cohort() -> None:
+    # Binding per CLAUDE.md: no source-data flag's default may resolve to
+    # a prod FQN. The default must point at the pipe_ais_test_*
+    # staging cohort in world-fishing-827.
+    assert "pipe_ais_test_202408290000" in mod.DEFAULT_SOURCE_MESSAGES
+    assert mod.DEFAULT_SOURCE_MESSAGES.startswith("world-fishing-827.")
+    # Defensive: make sure no prod-VMS leaks into the default.
+    assert "gfw-int-vms-v3" not in mod.DEFAULT_SOURCE_MESSAGES
+    assert "pipe_vms_v" not in mod.DEFAULT_SOURCE_MESSAGES
+
+
+def test_default_source_segments_is_staging_cohort() -> None:
+    assert "pipe_ais_test_202408290000" in mod.DEFAULT_SOURCE_SEGMENTS
+    assert mod.DEFAULT_SOURCE_SEGMENTS.startswith("world-fishing-827.")
+    assert "gfw-int-vms-v3" not in mod.DEFAULT_SOURCE_SEGMENTS
+    assert "pipe_vms_v" not in mod.DEFAULT_SOURCE_SEGMENTS
+
+
+def test_default_snapshot_dest_project_matches_dit() -> None:
+    # Default dest project is dit's; same-project snapshot works against
+    # the staging default. Cross-project (e.g. against prod-VMS) requires
+    # the user to explicitly pass --snapshot-dest-project.
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.snapshot_dest_project == "world-fishing-827"
+
+
+# --------------------------------------------------------------------------
+# Today-relative pin-at defaults
+# --------------------------------------------------------------------------
+
+def test_default_pin_at_inside_time_travel_window() -> None:
+    # Today-relative defaults: pre = today UTC - 6d, post = today UTC - 1d.
+    # Both must be inside BQ's 7-day time-travel window so a default run
+    # always succeeds against staging.
+    args = mod.parse_args(["--experiment-id", "test"])
+    pre = mod._parse_pin_at(args.pre_outage_pin_at)
+    post = mod._parse_pin_at(args.post_outage_pin_at)
+    now = datetime.now(timezone.utc)
+    assert (now - pre) < timedelta(days=7)
+    assert (now - post) < timedelta(days=7)
+    assert pre < post
+
+
+def test_utc_floor_days_ago_is_midnight_utc() -> None:
+    d = mod._utc_floor_days_ago(3)
+    assert d.tzinfo == timezone.utc
+    assert d.hour == 0 and d.minute == 0 and d.second == 0
+    # Sanity: 3 days ago is between 2-4 days ago (give wall-clock slack).
+    delta = datetime.now(timezone.utc) - d
+    assert timedelta(days=2) < delta < timedelta(days=4)
 
 
 def test_snapshot_table_names_distinct_basenames() -> None:

@@ -64,31 +64,55 @@ Expected results
 So this test is RED on current main and locks in the fix once the
 redesign lands.
 
+Defaults
+--------
+Per the binding ``CLAUDE.md`` rule, the workflow defaults to the
+``pipe_ais_test_202408290000`` staging cohort -- same project as the
+snapshot dest (``world-fishing-827``), so no cross-org snapshot block.
+
+Running with defaults exercises the MACHINERY (snapshot creation, the
+3-stage execution, the per-stage source switching, the oracle compare).
+It does NOT exercise the actual sub-threshold-close bug surface,
+because the staging cohort is AIS-shaped (12h threshold, different
+cadence) and doesn't naturally produce the trigger geometry.
+
+To exercise the prod-VMS bug surface, the user opts in explicitly with::
+
+    --source-messages gfw-int-vms-v3.pipe_vms_v3_internal.research_messages
+    --source-segments gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity
+
+and per ``CLAUDE.md``, the LLM confirms in chat that the target is
+prod and gets explicit "yes proceed" before launching. Note that with
+prod-VMS sources the snapshot dest must also be in the source's project
+(otherwise the cross-org block fires) -- see the
+``--snapshot-dest-project`` flag.
+
 Source-table requirements
 -------------------------
 The ``--source-messages`` / ``--source-segments`` tables must be
 **physical** tables (not views) within BQ's time-travel window at the
 moment ``--pre/post-outage-pin-at`` resolves to, because
 ``CREATE SNAPSHOT TABLE ... CLONE ... FOR SYSTEM_TIME AS OF`` requires
-both. For the production VMS source
-``gfw-int-vms-v3.pipe_vms_v3_internal.{research_messages,segs_activity}``
-this is satisfied. The published view
+both. Both the staging defaults and the prod-VMS opt-in
+(``gfw-int-vms-v3.pipe_vms_v3_internal.{research_messages,segs_activity}``)
+satisfy this. The published view
 ``pipe_vms_v4_published.segs_activity`` is NOT a valid choice.
 
 Choosing pin timestamps
 -----------------------
 * ``--pre-outage-pin-at``: a UTC timestamp at which the source was
-  missing the messages whose late arrival triggers the bug. For
-  reproducing the 9cc... case, use ``2026-05-27 18:00 UTC`` (around the
+  missing the messages whose late arrival triggers the bug. For the
+  9cc... reproduction, use ``2026-05-27 18:00 UTC`` (around the
   daily-run time when only ``22:32`` / ``23:30`` were visible).
 * ``--post-outage-pin-at``: a UTC timestamp at which the source has
-  the late-arrived messages. Use ``2026-06-01 18:00 UTC`` or later.
+  the late-arrived messages. For 9cc... use ``2026-06-01 18:00 UTC`` or
+  later.
 
-The defaults below are calibrated for the 9cc... reproduction; override
-for other datasets. Both timestamps must be inside the source's BQ
-time-travel window AT THE MOMENT THE SNAPSHOTS ARE CREATED. Re-runs of
-the same ``--experiment-id`` reuse the existing snapshot tables until
-they expire (default ``--snapshot-expiration-days = 7``).
+Defaults are today-relative (6 days ago, 1 day ago) so a default run
+on the staging cohort always lands inside BQ's time-travel window.
+Override for any specific reproduction. Re-runs of the same
+``--experiment-id`` reuse the existing snapshot tables until they
+expire (default ``--snapshot-expiration-days = 7``).
 """
 
 from __future__ import annotations
@@ -99,7 +123,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -134,21 +158,20 @@ from workflows.pipe_gaps.mode_equivalence import (
     STEP_NAME,
 )
 
-PIPE_VMS_RESEARCH_MESSAGES = (
-    "gfw-int-vms-v3.pipe_vms_v3_internal.research_messages"
+# Defaults point at the dit staging cohort (same project as the snapshot
+# destination -- world-fishing-827 -- so no cross-org block on
+# ``CREATE SNAPSHOT TABLE``). This is the binding convention; see
+# ``CLAUDE.md`` § "Workflows default to the ... staging cohort". To
+# exercise the actual prod-VMS bug shape (e.g. the 9cc... case), override
+# explicitly with ``--source-messages gfw-int-vms-v3.pipe_vms_v3_internal.research_messages``
+# and ``--source-segments gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity`` --
+# but per CLAUDE.md the LLM does NOT default-invoke against prod.
+DEFAULT_SOURCE_MESSAGES = (
+    f"{PROJECT}.pipe_ais_test_202408290000_internal.messages_positions"
 )
-# Note: must be a PHYSICAL table for ``CREATE SNAPSHOT TABLE`` to accept it.
-# The published view ``pipe_vms_v4_published.segs_activity`` cannot be
-# snapshotted via that DDL (CLONE requires a non-view source).
-PIPE_VMS_SEGS_ACTIVITY = (
-    "gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity"
+DEFAULT_SOURCE_SEGMENTS = (
+    f"{PROJECT}.pipe_ais_test_202408290000_published.segs_activity"
 )
-
-# Default source for this workflow is VMS production (the dataset where the
-# bug actually manifests). AIS lacks the ~58-min cadence and 1h threshold
-# combination that makes the trigger fire reliably.
-DEFAULT_SOURCE_MESSAGES = PIPE_VMS_RESEARCH_MESSAGES
-DEFAULT_SOURCE_SEGMENTS = PIPE_VMS_SEGS_ACTIVITY
 
 # Mode labels. Single workflow, two output tables (the staged run and the
 # oracle); modes follow the ``5_*`` namespace so they sort after the
@@ -160,12 +183,20 @@ MODE_OUTAGE_ORACLE = "5_outage_oracle"
 # incremental that runs "during the outage" with the pre-outage snapshot).
 DEFAULT_OFFSET_DAYS = 3
 
-# Default pin timestamps calibrated for the 9cc... reproduction. Override
-# via CLI for any other production-data exercise. ``pre`` must be a moment
-# when the late-arrived messages were not yet in source; ``post`` must be
-# a moment when they are.
-DEFAULT_PRE_OUTAGE_PIN_AT = "2026-05-27 18:00:00 UTC"
-DEFAULT_POST_OUTAGE_PIN_AT = "2026-06-01 18:00:00 UTC"
+# Default pin timestamps. Computed today-relative at parse_args time so a
+# default run always lands inside BQ's 7-day time-travel window (defaults
+# go stale immediately if hardcoded).
+#
+# For specific reproductions (e.g. the 9cc... case where pre needs to be
+# at a moment when only 22:32/23:30 were visible and post at a moment
+# 00:28 was visible), override both flags explicitly.
+def _default_pre_outage_pin_at() -> str:
+    return _utc_floor_days_ago(6).isoformat().replace("+00:00", " UTC")
+
+
+def _default_post_outage_pin_at() -> str:
+    return _utc_floor_days_ago(1).isoformat().replace("+00:00", " UTC")
+
 
 # Default snapshot-dataset expiration. Matches cross_version_ais.py
 # (``DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7``): long enough for a typical
@@ -173,11 +204,11 @@ DEFAULT_POST_OUTAGE_PIN_AT = "2026-06-01 18:00:00 UTC"
 # stale experiment-ids.
 DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
 
-# For the 9cc... case, the OFF lives on 2026-05-26 and the ON on 2026-05-27.
-# Default start/end target this two-week window so the test runs in <10 min
-# on a single Dataflow worker.
-DEFAULT_OUTAGE_START = "2026-05-12"
-DEFAULT_OUTAGE_END = "2026-05-26"
+# Default start/end target a small window so a default run finishes in
+# <10 min on a single Dataflow worker. For the 9cc... case override to
+# --start 2026-05-12 --end 2026-05-26 (the bug's OFF lives on 2026-05-26).
+DEFAULT_OUTAGE_START = "2024-08-22"  # 7 days inside the AIS staging cohort
+DEFAULT_OUTAGE_END = "2024-08-29"    # = the cohort's frozen snapshot date
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
@@ -194,6 +225,16 @@ WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
 WORKFLOW_NAME = "workflows/pipe_gaps/outage_recovery.py"
 
 logger = logging.getLogger(__name__)
+
+
+def _utc_floor_days_ago(days: int) -> datetime:
+    """Today UTC at 00:00:00, minus ``days`` days. Used for time-travel-
+    window-friendly default pin-at values.
+    """
+    return (datetime.now(tz=timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    ) - timedelta(days=days))
+
 
 _UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
 _DIGEST_RE = re.compile(r"@sha\d{3}:[0-9a-f]+$", re.IGNORECASE)
@@ -244,32 +285,39 @@ def _sanitize_for_dataset(s: str) -> str:
     return s.replace("-", "_")
 
 
-def _snapshot_dataset_name(experiment_id: str, label: str) -> str:
+def _snapshot_dataset_name(
+    experiment_id: str, label: str, *, dest_project: str = PROJECT,
+) -> str:
     """Per-(experiment, label) snapshot dataset, fully qualified.
 
     ``label`` is one of ``SNAPSHOT_LABEL_PRE`` / ``SNAPSHOT_LABEL_POST``;
     these become disjoint datasets so the two pinned states never collide.
-    The dataset name is content-free with respect to the actual pin
-    timestamps -- those are encoded in the cache key, not the dataset
-    name. (Same convention as cross_version_ais.py; lets users re-snapshot
-    a fresh state by passing a new ``--experiment-id``.)
+    ``dest_project`` defaults to dit's project; pass the source's project
+    when running against a source in a different GCP org (``CREATE
+    SNAPSHOT TABLE`` refuses cross-org). The dataset name is content-free
+    with respect to the actual pin timestamps -- those are encoded in the
+    cache key, not the dataset name.
     """
     return (
-        f"{PROJECT}.dit_exp_"
+        f"{dest_project}.dit_exp_"
         f"{_sanitize_for_dataset(experiment_id)}_outage_{label}"
     )
 
 
-def _ensure_snapshot_dataset(fq_name: str, *, expiration_days: int) -> None:
+def _ensure_snapshot_dataset(
+    fq_name: str, *, expiration_days: int, project: str = PROJECT,
+) -> None:
     """Create the snapshot dataset if it doesn't exist, with TTL.
 
     Mirrors cross_version_ais._ensure_dataset. ``default_table_expiration_ms``
-    auto-cleans stale experiments without manual ``bq rm``.
+    auto-cleans stale experiments without manual ``bq rm``. ``project`` is
+    where the BQ client runs; for a same-project dest this is dit's
+    project, for a cross-org dest it must be the dest's project.
     """
     from google.cloud import bigquery
     from google.cloud.exceptions import Conflict
 
-    client = bigquery.Client(project=PROJECT)
+    client = bigquery.Client(project=project)
     dataset = bigquery.Dataset(fq_name)
     dataset.default_table_expiration_ms = expiration_days * 24 * 60 * 60 * 1000
     try:
@@ -281,18 +329,20 @@ def _ensure_snapshot_dataset(fq_name: str, *, expiration_days: int) -> None:
 
 def _snapshot_table_into(
     source_fqn: str, dest_dataset: str, *, as_of: datetime, table_name: str,
+    project: str = PROJECT,
 ) -> str:
     """Snapshot ``source_fqn`` into ``<dest_dataset>.<table_name>`` at ``as_of``.
 
     Idempotent: ``if_not_exists=True`` lets a re-run of the same
     ``--experiment-id`` reuse the snapshot rather than failing on
     Conflict. The TTL on the snapshot dataset is what eventually cleans
-    the snapshot up.
+    the snapshot up. ``project`` is the BQ client's project -- the BQ
+    job runs under it and bills there.
     """
     dst_fqn = f"{dest_dataset}.{table_name}"
     dit_bq.snapshot_table(
         source_fqn, dst_fqn,
-        as_of=as_of, project=PROJECT, if_not_exists=True,
+        as_of=as_of, project=project, if_not_exists=True,
     )
     logger.info(
         "snapshotted %s -> %s (as_of=%s)",
@@ -338,19 +388,30 @@ def _snapshot_source_at(
 
     Returns ``(messages_snapshot_fqn, segments_snapshot_fqn)`` which the
     stages then pass as their ``bq_input_messages`` / ``bq_input_segments``.
+
+    Honours ``args.snapshot_dest_project`` so a prod-VMS opt-in run
+    (where the sources live in ``gfw-int-vms-v3``, a different GCP org
+    from ``world-fishing-827``) can target the same-project dest and
+    dodge the cross-org snapshot block.
     """
-    dst_dataset = _snapshot_dataset_name(args.experiment_id, label)
+    dest_project = args.snapshot_dest_project
+    dst_dataset = _snapshot_dataset_name(
+        args.experiment_id, label, dest_project=dest_project,
+    )
     _ensure_snapshot_dataset(
         dst_dataset, expiration_days=args.snapshot_expiration_days,
+        project=dest_project,
     )
     msgs_name, segs_name = _snapshot_table_names(
         args.source_messages, args.source_segments,
     )
     msgs_fqn = _snapshot_table_into(
         args.source_messages, dst_dataset, as_of=pin_at, table_name=msgs_name,
+        project=dest_project,
     )
     segs_fqn = _snapshot_table_into(
         args.source_segments, dst_dataset, as_of=pin_at, table_name=segs_name,
+        project=dest_project,
     )
     return msgs_fqn, segs_fqn
 
@@ -774,26 +835,36 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--pre-outage-pin-at",
         type=_validate_pin_at,
-        default=DEFAULT_PRE_OUTAGE_PIN_AT,
+        default=_default_pre_outage_pin_at(),
         help=("UTC timestamp for the pre-outage source-table snapshot "
               "(used by stages 1 and 2). Pick a moment when the "
               "late-arrived messages were NOT yet in source. "
-              f"Default: {DEFAULT_PRE_OUTAGE_PIN_AT}."),
+              "Default: today UTC midnight minus 6 days (always inside BQ's "
+              "time-travel window)."),
     )
     p.add_argument(
         "--post-outage-pin-at",
         type=_validate_pin_at,
-        default=DEFAULT_POST_OUTAGE_PIN_AT,
+        default=_default_post_outage_pin_at(),
         help=("UTC timestamp for the post-outage source-table snapshot "
               "(used by stage 3 and the oracle). Pick a moment when the "
               "late-arrived messages ARE in source. "
-              f"Default: {DEFAULT_POST_OUTAGE_PIN_AT}."),
+              "Default: today UTC midnight minus 1 day."),
     )
     p.add_argument(
         "--snapshot-expiration-days", type=int,
         default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
         help=("default_table_expiration on the per-experiment snapshot "
               f"datasets, in days. Default: {DEFAULT_SNAPSHOT_EXPIRATION_DAYS}."),
+    )
+    p.add_argument(
+        "--snapshot-dest-project", default=PROJECT,
+        help=(f"Project that hosts the snapshot datasets. Default: {PROJECT}. "
+              "Override to the source's project when running against a source "
+              "that lives in a different GCP org (e.g. "
+              "``--snapshot-dest-project gfw-int-vms-v3`` when --source-* "
+              "points at the prod VMS tables) -- "
+              "``CREATE SNAPSHOT TABLE`` refuses cross-org sources."),
     )
     p.add_argument("--ssvids", default="",
                    help="Comma-separated ssvids to restrict to; empty = all.")
@@ -917,8 +988,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "drop dataset(s) %s, %s and re-run without --skip-snapshots.",
             args.experiment_id,
             args.pre_outage_pin_at, args.post_outage_pin_at,
-            _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE),
-            _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST),
+            _snapshot_dataset_name(
+                args.experiment_id, SNAPSHOT_LABEL_PRE,
+                dest_project=args.snapshot_dest_project,
+            ),
+            _snapshot_dataset_name(
+                args.experiment_id, SNAPSHOT_LABEL_POST,
+                dest_project=args.snapshot_dest_project,
+            ),
         )
         # Reconstruct the same FQNs _snapshot_source_at would have produced,
         # via the shared _snapshot_table_names helper -- otherwise a
@@ -928,8 +1005,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         msgs_name, segs_name = _snapshot_table_names(
             args.source_messages, args.source_segments,
         )
-        pre_ds = _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE)
-        post_ds = _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST)
+        pre_ds = _snapshot_dataset_name(
+            args.experiment_id, SNAPSHOT_LABEL_PRE,
+            dest_project=args.snapshot_dest_project,
+        )
+        post_ds = _snapshot_dataset_name(
+            args.experiment_id, SNAPSHOT_LABEL_POST,
+            dest_project=args.snapshot_dest_project,
+        )
         pre_msgs = f"{pre_ds}.{msgs_name}"
         pre_segs = f"{pre_ds}.{segs_name}"
         post_msgs = f"{post_ds}.{msgs_name}"
