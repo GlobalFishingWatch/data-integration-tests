@@ -55,22 +55,31 @@ steps:
   #
   # Auth model for any docker-runner pipeline (pipe-events today) that the
   # workflow may invoke via dit.runners.docker: the inner container reaches
-  # ADC via the **Cloud Build metadata server**, NOT a credential file.
+  # ADC via Cloud Build's **fake metadata server**, NOT a credential file.
   # `DIT_CLOUD_MODE=1` below tells dit's docker runner to add
-  # `--network=host` so the nested container shares this build VM's network
-  # namespace and can reach 169.254.169.254 -- google-cloud-bigquery's ADC
-  # chain then finds the metadata server and gets a fresh OAuth token bound
-  # to the build SA (`automated-testing@`). This mirrors prod's pattern
-  # exactly (GKE Workload Identity → metadata server). No credential file
-  # is generated, mounted, or written to /workspace.
+  # `--network=cloudbuild` to the inner container so it attaches to the
+  # per-build `cloudbuild` docker network where the fake metadata server
+  # lives, returning OAuth tokens for the build SA (`automated-testing@`).
+  # google-auth's ADC chain finds the fake metadata server at
+  # `metadata.google.internal` and obtains a fresh token. This mirrors
+  # prod's pattern (GKE Workload Identity → metadata server), just with a
+  # different metadata-server provider. No credential file is generated,
+  # mounted, or written to /workspace.
   #
-  # Earlier this step bind-mounted a short-lived `authorized_user`-shaped
-  # ADC JSON. That approach was abandoned after live testing: the older
-  # `google-auth` baked into pipe-events' Python 3.8 image always tries to
-  # refresh `authorized_user` credentials before the first API call,
-  # ignoring the pre-issued `token` field, and the refresh failed with
-  # `invalid_client` against placeholder OAuth client material. The
-  # metadata-server path sidesteps the issue entirely.
+  # Two earlier designs were falsified by live evidence. (1) Bind-mounting a
+  # short-lived `authorized_user`-shaped ADC JSON: the older `google-auth`
+  # baked into pipe-events' Python 3.8 image refreshes `authorized_user`
+  # credentials before the first API call (ignoring the pre-issued `token`
+  # field), and refresh against placeholder OAuth client material fails
+  # with `invalid_client`. (2) `--network=host`: attaches the inner
+  # container to the docker daemon's host network namespace, NOT the build
+  # step's, so the metadata server returns the Google-managed
+  # `cloudbuild-untrusted@argo-prod-*` identity instead of the build SA --
+  # causing `USER_PROJECT_DENIED` failures even with explicit quota-project
+  # overrides (the caller identity is wrong, not the quota project).
+  # `--network=cloudbuild` is the documented sibling-container pattern that
+  # resolves both: same fake metadata server the build step sees, no
+  # credential material on disk, no IAM grants to Google-managed accounts.
   #
   - id: dit-run
     # ditbox lives under gcr.io/world-fishing-827/dit/* per the dit-image
@@ -85,11 +94,11 @@ steps:
       # compute it). Empty -> the workflow falls back to its own check.
       - 'DIT_UNREVIEWED=${_UNREVIEWED}'
       # Cloud mode for dit's docker runner (see src/dit/runners/docker.py):
-      # adds --network=host to the inner container so it can reach Cloud
-      # Build's metadata server for ADC. When this env var is unset (laptop),
-      # the runner uses the workflow's caller-supplied named volume (`gcp`)
-      # instead, populated locally via `gcloud auth application-default
-      # login`.
+      # adds --network=cloudbuild to the inner container so it attaches to
+      # Cloud Build's fake metadata server (which returns the build SA's
+      # tokens). When this env var is unset (laptop), the runner uses the
+      # workflow's caller-supplied named volume (`gcp`) instead, populated
+      # locally via `gcloud auth application-default login`.
       - 'DIT_CLOUD_MODE=1'
     args:
       - -c

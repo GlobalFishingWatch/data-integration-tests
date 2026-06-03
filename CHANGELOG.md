@@ -6,6 +6,17 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-03
+
+#### Fixed
+- **Cloud-mode network: `--network=host` → `--network=cloudbuild` (the documented sibling-container pattern).** The PR #39 `--network=host` pivot was based on an incomplete model of Cloud Build's runtime topology. Cloud Build runs each build step on a VM where **two metadata servers coexist on different docker networks**: a fake metadata server on the `cloudbuild` network returning tokens for the user-configured `serviceAccount:` (`automated-testing@`), and the VM's real metadata server on the default network returning the Google-managed `cloudbuild-untrusted@argo-prod-*` identity (the docker daemon host). Every build-step container is auto-attached to the `cloudbuild` network — which is why the build step itself sees `automated-testing@`. `docker run --network=host` puts the sibling container on the daemon's host network, so it sees the Google-managed identity, NOT the build SA. This caused `USER_PROJECT_DENIED` failures even after granting `roles/serviceusage.serviceUsageConsumer` to `automated-testing@` (the grant was applied to a principal that wasn't the actual caller). The fix is `--network=cloudbuild`, which re-attaches the sibling to the fake metadata server.
+  - **Runner changes (`src/dit/runners/docker.py`).** `_apply_cloud_mode` now emits `["--network=cloudbuild", ...kept volumes]` when active. The `GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827` env injection from PR #40 is **removed** — it was treating a symptom of the wrong-identity bug, not a real issue (the fake metadata server already returns tokens whose default quota project is `world-fishing-827`).
+  - **18 cloud-mode tests in `tests/test_runners_docker.py` updated** to assert `--network=cloudbuild` and the absence of the quota-project env. Full suite: 299 passing.
+  - **`cloudbuild-dit.yaml` comments rewritten** to describe the fake-vs-real metadata server architecture and reference both falsified prior designs (bind-mounted ADC, `--network=host`) as institutional memory.
+  - **Confirmed empirically** by a metadata-server probe: under `--network=host` the sibling returns `cloudbuild-untrusted@argo-prod-us-west1`; under `--network=cloudbuild` it returns `automated-testing@world-fishing-827`. Reference: `cloud-build-local`'s open-source `metadata.go`, [earthly/earthly#1628](https://github.com/earthly/earthly/issues/1628), Imre Rad's "Google Cloud Build — under the hood".
+  - **Operational follow-up.** The PR #40-era `roles/serviceusage.serviceUsageConsumer` IAM binding on `automated-testing@` can be revoked — it addressed nothing real (the actual caller under `--network=host` was a Google-managed SA we couldn't have granted anything to anyway).
+  - See [`docs/conventions.md`](docs/conventions.md) § "Auth in the cloud path (ditbox)" for the corrected three-context table + history of falsified designs.
+
 ### 2026-06-02
 
 #### Changed

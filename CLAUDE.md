@@ -59,6 +59,41 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-03 — Cloud auth re-pivot: `--network=host` → `--network=cloudbuild` (build-step's fake metadata server, not the daemon-host's real one)
+
+The 2026-06-02 `--network=host` pivot was based on an incomplete model of Cloud Build's runtime topology. Live evidence from build #4 (`USER_PROJECT_DENIED` even after granting `roles/serviceusage.serviceUsageConsumer` to `automated-testing@`) and a focused metadata-server probe revealed that **two metadata servers coexist on the build VM**:
+
+- A **fake metadata server** on the docker network literally named `cloudbuild`, returning OAuth tokens for the user-configured `serviceAccount:` (`automated-testing@`). Every build-step container is auto-attached to this network — which is why the build step itself sees `automated-testing@`.
+- The **real metadata server** on the VM's default network namespace, returning the Google-managed `cloudbuild-untrusted@argo-prod-*` identity (the docker daemon host).
+
+`docker run --network=host` puts the sibling container on the daemon's host network — i.e. the real metadata server — so it sees the Google-managed identity, NOT the build SA. We confirmed this empirically with two probes:
+
+```
+host build step:                automated-testing@world-fishing-827        ✓
+nested w/ --network=host:       cloudbuild-untrusted@argo-prod-us-west1    ✗
+nested w/ --network=cloudbuild: automated-testing@world-fishing-827        ✓
+```
+
+`--network=cloudbuild` is the documented sibling-container pattern (see `cloud-build-local`'s open-source `metadata.go`, [earthly/earthly#1628](https://github.com/earthly/earthly/issues/1628), Imre Rad's "Google Cloud Build under the hood") that re-attaches the sibling to the fake metadata server. This is the architectural fix the previous two pivots (file-mount ADC → `--network=host` → `--network=cloudbuild`) were converging on; we got there by elimination + targeted research after the second falsification.
+
+**Decision: pivot to `--network=cloudbuild`.** Same shape of design — no on-disk credential material, the inner workload identifies as the build SA via standard ADC discovery — but using the docker network where the build SA's tokens are actually served. The PR #40 `GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827` env injection is also **removed**: it was treating a symptom of the wrong-identity bug (the host-network metadata server returns a Google-managed SA whose default quota project isn't ours), not a real issue. The fake metadata server returns tokens whose default quota project is already `world-fishing-827`.
+
+**Sections moved.**
+- `src/dit/runners/docker.py`: `_apply_cloud_mode` now emits `["--network=cloudbuild", ...kept volumes]` (no quota-project env); constants renamed (`_CLOUD_MODE_QUOTA_PROJECT` → `_CLOUDBUILD_NETWORK`); module + function docstrings rewritten with the corrected fake-vs-real metadata-server model + both prior designs (file-mount, `--network=host`) preserved as institutional memory.
+- `tests/test_runners_docker.py`: 18 cloud-mode tests updated — assertions flipped from `--network=host` to `--network=cloudbuild`; the `_QUOTA_PROJECT_FLAGS` constant + every reference to it removed; new `test_apply_cloud_mode_no_quota_project_env` test pins the removal so it doesn't sneak back; assertion names updated. Full suite: 299 passing.
+- `cloudbuild-dit.yaml`: comments rewritten to describe the fake-vs-real architecture and reference both falsified prior designs.
+- `docs/conventions.md` § "Auth in the cloud path (ditbox)": three-context table updated (ditbox row now describes `--network=cloudbuild`); "Why" paragraph rewritten to explain the fake-vs-real metadata server distinction; two falsified designs preserved as institutional memory with date+PR references.
+- `README.md` § ditbox auth paragraph rewritten.
+- `CHANGELOG.md` § `[Unreleased]` gains a top 2026-06-03 `#### Fixed` block.
+
+**Operational follow-up.** The PR #40-era `roles/serviceusage.serviceUsageConsumer` IAM binding on `automated-testing@` can be revoked — it addressed nothing real (the actual caller under `--network=host` was a Google-managed SA we couldn't have granted anything to anyway).
+
+**Trade-off accepted.** None new — the surface area is smaller than `--network=host`'s was: the sibling container shares only a docker network with the build's fake metadata server, not the VM's network namespace. Live-evidence-confirmed, documented, and matches Cloud Build's intended sibling-container contract.
+
+**Future architectural upgrade (unchanged).** Migrating ditbox to GKE / Cloud Run Jobs would recover prod's literal keyless model (Workload Identity scoped to a KSA). Reserved for when longer-term needs co-justify the architectural shift. For now `--network=cloudbuild` is the right answer.
+
+**Method note.** Both prior pivots (PR #34, PR #39) were theoretical decisions falsified by live evidence; the corrected understanding came from a targeted metadata-server probe + a focused web-research pass on Cloud Build's nested-docker auth patterns. Worth remembering: when a design touches Cloud Build's runtime topology, probe the actual identity the runtime delivers before committing to the design — the documentation lags reality, and "looks like it should work" is not "works."
+
 ### 2026-06-02 — Cloud auth pivot: bind-mounted ADC file → `--network=host` (metadata-server access)
 
 First live cloud run (`make dit-cloud PIPELINE=pipe-events`, build `dab02540`) falsified the assumption underpinning PR #34's cloud-auth design. The placeholder-`authorized_user` ADC JSON we bind-mounted was rejected by the older `google-auth` in pipe-events' Python 3.8 image — it tries to refresh `authorized_user` credentials **before** the first API call, ignores the pre-issued `token` field, and the refresh against placeholder OAuth client material failed with `invalid_client`. The intended "refresh fails loudly after the ~60-min TTL" failure mode actually fires before the first API call.
