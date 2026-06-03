@@ -82,7 +82,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -103,13 +103,10 @@ from dit.workflow import (
 from workflows.pipe_gaps.mode_equivalence import (
     DEFAULT_BACKFILL_DAYS_W,
     DEFAULT_BQ_TEMP_DATASET,
-    DEFAULT_END,
     DEFAULT_FILTER_GOOD_SEG,
     DEFAULT_IMAGE_TAG,
     DEFAULT_MIN_GAP_LENGTH,
     DEFAULT_N_HOURS_BEFORE,
-    DEFAULT_START,
-    DEFAULT_TAIL_DAYS,
     DEFAULT_WINDOW_PERIOD_D,
     DEFAULT_WORKER_IMAGE,
     PIPELINE_NAME,
@@ -494,6 +491,11 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
         "window_period_d": args.window_period_d,
         "filter_good_seg": (args.filter_good_seg == "True"),
         "skip_open_gaps": bool(args.skip_open_gaps),
+        # Normalised so order-of-CLI-input doesn't dent the hit rate.
+        # An empty string -> empty list (no ssvid filter, the default).
+        "ssvids": sorted(
+            s.strip() for s in (args.ssvids or "").split(",") if s.strip()
+        ),
         "source_messages": args.source_messages,
         "source_segments": args.source_segments,
         "post_outage_snapshot": args.post_outage_snapshot,
@@ -542,24 +544,45 @@ def _run_with_cache(
 # --------------------------------------------------------------------------
 
 
-def _validate_snapshot(value: str) -> str:
-    """Reject snapshot strings BQ won't accept in ``FOR SYSTEM_TIME AS OF``.
+def _parse_snapshot(value: str) -> datetime:
+    """Parse a snapshot string into a tz-aware datetime.
 
-    BQ accepts ISO-8601 timestamps with explicit zone offset (or trailing
-    ``UTC``). We're permissive on whitespace but require a parseable
-    timestamp. Fail fast at arg-parse time rather than at run time inside
-    a Dataflow worker.
+    Accepts ISO-8601 with explicit zone offset, trailing ``Z``, or trailing
+    ``UTC``. Rejects naive timestamps -- BQ ``FOR SYSTEM_TIME AS OF`` would
+    interpret these against the session's time zone, which is not the
+    user's intent for an outage-recovery reproduction (the test would
+    silently drift when run from a non-UTC session).
     """
     s = value.strip()
-    candidate = s.replace("UTC", "+00:00") if s.endswith("UTC") else s
+    if s.endswith("UTC"):
+        candidate = s[:-3].rstrip() + "+00:00"
+    else:
+        candidate = s.replace("Z", "+00:00")
     try:
-        datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(candidate)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
             f"snapshot timestamp {value!r} is not parseable as ISO-8601 "
             f"(expected e.g. '2026-05-27 18:00:00 UTC')"
         ) from exc
-    return s
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError(
+            f"snapshot timestamp {value!r} is missing an explicit time zone; "
+            f"add ' UTC' (e.g. '2026-05-27 18:00:00 UTC') or an offset "
+            f"(e.g. '+00:00')"
+        )
+    return parsed
+
+
+def _validate_snapshot(value: str) -> str:
+    """argparse type: parse + reject naive; return the original string.
+
+    The original string (not the parsed datetime) is preserved so the
+    pipeline receives a value BQ ``FOR SYSTEM_TIME AS OF`` accepts
+    verbatim.
+    """
+    _parse_snapshot(value)
+    return value.strip()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -621,17 +644,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     # Cross-validate: post-outage snapshot must be strictly after pre-outage,
     # otherwise stage 3 won't see "more data" than stages 1-2 and the test
-    # collapses to a vanilla bfd run.
-    pre = datetime.fromisoformat(
-        args.pre_outage_snapshot.strip().replace("UTC", "+00:00").replace("Z", "+00:00")
-    )
-    post = datetime.fromisoformat(
-        args.post_outage_snapshot.strip().replace("UTC", "+00:00").replace("Z", "+00:00")
-    )
-    if pre.tzinfo is None:
-        pre = pre.replace(tzinfo=timezone.utc)
-    if post.tzinfo is None:
-        post = post.replace(tzinfo=timezone.utc)
+    # collapses to a vanilla bfd run. _parse_snapshot already guarantees
+    # tz-aware datetimes (it rejects naive at arg-parse time).
+    pre = _parse_snapshot(args.pre_outage_snapshot)
+    post = _parse_snapshot(args.post_outage_snapshot)
     if post <= pre:
         p.error(
             "--post-outage-snapshot must be strictly later than "
@@ -650,6 +666,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     end = date.fromisoformat(args.end)
     repo_dir = os.getcwd()
 
+    # The docker runner always builds from the working tree (see
+    # ``_run_pipeline``'s ``build_from_source=True`` arg to ``dit_docker.run``),
+    # so it never pulls the registry worker image. Skip the kaniko auto-build
+    # in that case -- it'd be wasted work, especially noticeable on unreviewed
+    # (dirty-tree) docker runs. Beam/dataflow runs still need the image.
     ctx = resolve_run_context(
         repo_dir=repo_dir,
         pipeline_name=PIPELINE_NAME,
@@ -658,6 +679,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         suffix=args.suffix,
         worker_image=args.worker_image,
         default_worker_image=DEFAULT_WORKER_IMAGE,
+        build_from_source=(args.runner == "docker"),
     )
     args.run_context = ctx
     args.pipeline_commit = ctx.pipeline_commit

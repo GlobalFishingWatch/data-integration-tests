@@ -29,6 +29,8 @@ def _args(**overrides: Any) -> argparse.Namespace:
         window_period_d=2,
         filter_good_seg="True",
         skip_open_gaps=False,
+        # CLI form: empty string = no ssvid restriction (the default).
+        ssvids="",
         source_messages="proj.ds.research_messages",
         source_segments="proj.ds.segs_activity",
         pre_outage_snapshot="2026-05-27 18:00:00 UTC",
@@ -132,3 +134,45 @@ def test_canonical_params_changes_with_source_messages() -> None:
         _args(source_messages="proj.ds.messages_b"), mod.MODE_OUTAGE_RECOVERY,
     )
     assert a["source_messages"] != b["source_messages"]
+
+
+def test_canonical_params_ssvids_default_empty_list() -> None:
+    # An empty CLI ssvids string (the default) should normalise to [], not
+    # something falsy-but-string like "" -- so the cache key shape is stable
+    # whether the user passed --ssvids '' or omitted it.
+    p = mod.canonical_params_dict(_args(ssvids=""), mod.MODE_OUTAGE_RECOVERY)
+    assert p["ssvids"] == []
+
+
+def test_canonical_params_changes_with_ssvids() -> None:
+    # An unrestricted run and a restricted run must produce different cache
+    # keys -- otherwise a restricted-ssvid run could erroneously hit an
+    # unrestricted cached table (or vice versa).
+    a = mod.canonical_params_dict(_args(ssvids=""), mod.MODE_OUTAGE_RECOVERY)
+    b = mod.canonical_params_dict(
+        _args(ssvids="ssvid_a,ssvid_b"), mod.MODE_OUTAGE_RECOVERY,
+    )
+    assert a["ssvids"] != b["ssvids"]
+    assert b["ssvids"] == ["ssvid_a", "ssvid_b"]
+
+
+def test_canonical_params_ssvids_normalised_by_sort() -> None:
+    # CLI order shouldn't affect the cache key. Two equivalent ssvid sets
+    # presented in different orders must produce identical params.
+    a = mod.canonical_params_dict(
+        _args(ssvids="zeta,alpha,mike"), mod.MODE_OUTAGE_RECOVERY,
+    )
+    b = mod.canonical_params_dict(
+        _args(ssvids="alpha,mike,zeta"), mod.MODE_OUTAGE_RECOVERY,
+    )
+    assert a["ssvids"] == b["ssvids"] == ["alpha", "mike", "zeta"]
+
+
+def test_validate_snapshot_rejects_naive() -> None:
+    # BQ FOR SYSTEM_TIME AS OF interprets naive timestamps against the
+    # session zone, which would silently drift if run from non-UTC. Reject
+    # at arg-parse time.
+    with pytest.raises(argparse.ArgumentTypeError):
+        mod._validate_snapshot("2026-05-27 18:00:00")
+    with pytest.raises(argparse.ArgumentTypeError):
+        mod._validate_snapshot("2026-05-27T18:00:00")
