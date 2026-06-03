@@ -144,6 +144,39 @@ def snapshot_table(
     time-travel window). ``expiration`` auto-deletes the snapshot at that
     timestamp; ``None`` persists indefinitely. ``if_not_exists`` emits
     ``CREATE SNAPSHOT TABLE IF NOT EXISTS`` for idempotent re-runs.
+
+    KNOWN FOOTGUN -- ``if_not_exists=True`` ignores ``as_of`` mismatches.
+        If ``dest_table`` already exists from a prior call that pinned at a
+        DIFFERENT ``as_of``, ``IF NOT EXISTS`` makes the second call a silent
+        no-op rather than raising a conflict. Callers re-running with the
+        same destination name but a different pin time (e.g. a workflow with
+        a re-used ``--experiment-id`` but a fresh ``--pin-source-at``) get
+        an A/B run reading from the WRONG baseline with no warning.
+        Mitigated in practice by callers using one-shot identifiers in the
+        destination name (e.g. ``solo_<6-hex>`` auto-generated
+        ``--experiment-id`` defaults + 7-day TTL on snapshot datasets), but
+        the trap is real for any caller that reuses an explicit name.
+
+        Affected callers: ``workflows/pipe_segment/identity_match_key.py``
+        ``_snapshot_source`` (passes ``if_not_exists=True`` per the matching
+        block-comment there). ``workflows/port_visits/cross_version_ais.py``
+        ``_snapshot_source`` goes through ``snapshot_dataset`` below which
+        applies the same skip-existing rule at the table level. The explicit
+        fail-fast path is ``snapshot_table(..., if_not_exists=False)`` (the
+        function default), used by ``port_visits/cross_version_ais.py``
+        ``_snapshot_thinned_table`` for user-supplied tables.
+
+        RECOMMENDED RESOLUTION (deferred): replace ``if_not_exists: bool``
+        with ``if_existing: Literal["skip", "fail", "verify_as_of"]`` (or
+        the equivalent overload). ``"skip"`` keeps current
+        ``if_not_exists=True`` behaviour for back-compat; ``"fail"`` is the
+        current default; ``"verify_as_of"`` reads the existing snapshot's
+        ``snapshot_definition.snapshot_time`` and (a) skips when it matches
+        ``as_of`` (true idempotence on legitimate retry); (b) raises naming
+        both timestamps when it differs (closes the silent-reuse bug).
+        ``snapshot_dataset`` would thread the same parameter and apply per
+        table. Then cross-version workflows flip to ``"verify_as_of"`` for
+        safety while retaining clean retries.
     """
     from google.cloud import bigquery
 
@@ -180,6 +213,14 @@ def snapshot_dataset(
     Tables already present in ``dest_dataset`` are skipped, so re-runs are
     idempotent. Raises if ``dest_dataset`` does not exist. Returns the list
     of created snapshot table-ids (fully-qualified).
+
+    KNOWN FOOTGUN -- the table-level skip-existing rule (``if table_id in
+    existing: continue``) is the same shape as ``snapshot_table``'s
+    ``if_not_exists=True`` and shares its trap: a re-run with the same
+    ``dest_dataset`` but a different ``as_of`` silently keeps the prior
+    snapshots, so the caller's "pinned at the new timestamp" claim is wrong
+    with no error surfaced. See ``snapshot_table.__doc__`` for the full
+    write-up and the recommended ``if_existing="verify_as_of"`` resolution.
     """
     from google.cloud import bigquery
     from google.cloud.exceptions import NotFound

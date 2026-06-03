@@ -465,6 +465,31 @@ def _snapshot_source(args: argparse.Namespace) -> str:
     snap_dataset = _snapshot_dataset_name(args.experiment_id)
     _ensure_dataset(snap_dataset, expiration_days=args.snapshot_expiration_days)
 
+    # KNOWN FOOTGUN -- `if_not_exists=True` on every snapshot_table call below
+    # makes the snapshot-creation step idempotent at the table level: a re-run
+    # with the SAME --experiment-id but a DIFFERENT --pin-source-at silently
+    # reuses the prior snapshot (created at the original pin time) and ignores
+    # the new pin. The A/B run then reads from the wrong baseline without any
+    # warning, invalidating the diff verdict. Same trade-off port_visits/
+    # cross_version_ais.py's main `_snapshot_source` path accepts via
+    # dit_bq.snapshot_dataset's table-level skip-existing semantics (see
+    # `dit.bq.snapshot_dataset.__doc__` and the matching note in port_visits).
+    # Mitigated in practice by `--experiment-id` defaulting to `solo_<6-hex>`
+    # (unique per invocation) and the snapshot dataset's 7-day TTL, but real
+    # if the user reuses an explicit `--experiment-id`.
+    #
+    # RECOMMENDED RESOLUTION (deferred; tracked as a dit-library concern, not
+    # a per-workflow fix): add an `if_existing="skip" | "fail" |
+    # "verify_as_of"` parameter to dit.bq.snapshot_table (and threaded into
+    # snapshot_dataset). "verify_as_of" reads the existing snapshot's
+    # `snapshot_definition.snapshot_time` from the BQ table metadata and (a)
+    # skips if it matches `as_of` (true idempotence on legitimate retry); (b)
+    # raises SystemExit naming both timestamps if it differs (closes the
+    # silent-reuse bug). The current `if_not_exists` parameter would map to
+    # "skip" for backward compatibility; workflows flip to "verify_as_of" for
+    # safety. Lifts the fix into the shared library so both cross-version
+    # workflows (port_visits + pipe_segment) get it together.
+    #
     # Normalized messages: single date-partitioned table -> single snapshot.
     # The unqualified table name (last dot-segment) becomes the snapshot's
     # name in the snapshot dataset; both bindings will read it via the
@@ -478,7 +503,7 @@ def _snapshot_source(args: argparse.Namespace) -> str:
         f"{snap_dataset}.{snap_normalized_name}",
         as_of=args.pin_source_at,
         project=PROJECT,
-        if_not_exists=True,
+        if_not_exists=True,  # FOOTGUN -- see block comment above
     )
 
     if args.include_satellite_offsets:
@@ -493,7 +518,7 @@ def _snapshot_source(args: argparse.Namespace) -> str:
                 f"{snap_dataset}.{PROD_SAT_POS_STEM}{sfx}",
                 as_of=args.pin_source_at,
                 project=PROJECT,
-                if_not_exists=True,
+                if_not_exists=True,  # FOOTGUN -- see block comment above
             )
         # Single static aux table: norad_to_receiver.
         dit_bq.snapshot_table(
@@ -501,7 +526,7 @@ def _snapshot_source(args: argparse.Namespace) -> str:
             f"{snap_dataset}.norad_to_receiver_v20230510",
             as_of=args.pin_source_at,
             project=PROJECT,
-            if_not_exists=True,
+            if_not_exists=True,  # FOOTGUN -- see block comment above
         )
 
     logger.info("snapshot dataset: %s", snap_dataset)

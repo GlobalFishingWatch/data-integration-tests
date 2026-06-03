@@ -221,6 +221,18 @@ def _ensure_dataset(fq_name: str, *, expiration_days: int) -> None:
 
 
 def _snapshot_source(args: argparse.Namespace) -> str:
+    # KNOWN FOOTGUN -- dit_bq.snapshot_dataset's table-level skip-existing
+    # semantics make this idempotent at the table level: a re-run with the
+    # same --experiment-id but a DIFFERENT --pin-source-at silently keeps
+    # the prior snapshots and ignores the new pin, so the A/B reads from
+    # the wrong baseline with no warning. Same trade-off
+    # workflows/pipe_segment/identity_match_key.py::_snapshot_source
+    # accepts via if_not_exists=True. Full write-up + recommended
+    # if_existing="verify_as_of" resolution in dit.bq.snapshot_table's
+    # docstring; the explicit fail-fast path is _snapshot_thinned_table
+    # below (used for the user-supplied --thinned-message-table).
+    # Mitigated in practice by the auto-generated solo_<6-hex>
+    # --experiment-id default + 7-day TTL on snapshot datasets.
     snap_stem = _snapshot_stem(args.experiment_id)
     for half, tables in SOURCE_TABLES.items():
         src_dataset = f"{PROJECT}.{args.source_dataset_stem}{half}"
