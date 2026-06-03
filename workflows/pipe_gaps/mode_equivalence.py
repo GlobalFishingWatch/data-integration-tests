@@ -97,7 +97,7 @@ DEFAULT_IMAGE_TAG = "gfw/pipe-gaps:dev"
 # runner builds + runs for the submission process). Override via --worker-image
 # when you've published a custom build (e.g. cross-version testing).
 DEFAULT_WORKER_IMAGE = (
-    "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.9.6"
+    "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.10.0"
 )
 
 RUNNERS = ("docker", "dataflow")
