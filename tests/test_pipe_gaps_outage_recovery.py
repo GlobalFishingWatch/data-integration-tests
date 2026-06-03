@@ -33,7 +33,8 @@ def _args(**overrides: Any) -> argparse.Namespace:
         skip_open_gaps=False,
         # CLI form: empty string = no ssvid restriction (the default).
         ssvids="",
-        # Default sources point at the AIS staging cohort per CLAUDE.md.
+        # Default sources point at the AIS staging cohort -- same
+        # staging-by-default precedent as mode_equivalence.py uses.
         source_messages=(
             "world-fishing-827.pipe_ais_test_202408290000_internal."
             "messages_positions"
@@ -234,13 +235,13 @@ def test_snapshot_dataset_name_honours_dest_project() -> None:
 
 
 # --------------------------------------------------------------------------
-# Staging-by-default contract (CLAUDE.md rule)
+# Staging-by-default contract
 # --------------------------------------------------------------------------
 
 def test_default_source_messages_is_staging_cohort() -> None:
-    # Binding per CLAUDE.md: no source-data flag's default may resolve to
-    # a prod FQN. The default must point at the pipe_ais_test_*
-    # staging cohort in world-fishing-827.
+    # Matches mode_equivalence.py's staging-by-default precedent: no
+    # source-data flag's default may resolve to a prod FQN. The default
+    # must point at the pipe_ais_test_* staging cohort in world-fishing-827.
     assert "pipe_ais_test_202408290000" in mod.DEFAULT_SOURCE_MESSAGES
     assert mod.DEFAULT_SOURCE_MESSAGES.startswith("world-fishing-827.")
     # Defensive: make sure no prod-VMS leaks into the default.

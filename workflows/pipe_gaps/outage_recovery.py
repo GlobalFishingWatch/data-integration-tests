@@ -84,11 +84,12 @@ To exercise the prod-VMS bug surface, the user opts in explicitly with::
     --source-messages gfw-int-vms-v3.pipe_vms_v3_internal.research_messages
     --source-segments gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity
 
-and per ``CLAUDE.md``, the LLM confirms in chat that the target is
-prod and gets explicit "yes proceed" before launching. Note that with
-prod-VMS sources the snapshot dest must also be in the source's project
-(otherwise the cross-org block fires) -- see the
-``--snapshot-dest-project`` flag.
+and -- consistent with the staging-by-default precedent set in
+``workflows/pipe_gaps/mode_equivalence.py`` -- the LLM confirms in chat
+that the target is prod and gets explicit "yes proceed" before
+launching. Note that with prod-VMS sources the snapshot dest must also
+be in the source's project (otherwise the cross-org block fires) -- see
+the ``--snapshot-dest-project`` flag.
 
 Source-table requirements
 -------------------------
