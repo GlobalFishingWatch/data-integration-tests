@@ -66,7 +66,10 @@ redesign lands.
 
 Defaults
 --------
-Per the binding ``CLAUDE.md`` rule, the workflow defaults to the
+Following dit's staging-by-default convention (see
+``workflows/pipe_gaps/mode_equivalence.py`` for the established
+precedent, and the ``README.md`` "Staging data sources" section for
+the canonical table inventory), the workflow defaults to the
 ``pipe_ais_test_202408290000`` staging cohort -- same project as the
 snapshot dest (``world-fishing-827``), so no cross-org snapshot block.
 
@@ -159,13 +162,15 @@ from workflows.pipe_gaps.mode_equivalence import (
 )
 
 # Defaults point at the dit staging cohort (same project as the snapshot
-# destination -- world-fishing-827 -- so no cross-org block on
-# ``CREATE SNAPSHOT TABLE``). This is the binding convention; see
-# ``CLAUDE.md`` § "Workflows default to the ... staging cohort". To
-# exercise the actual prod-VMS bug shape (e.g. the 9cc... case), override
+# destination -- world-fishing-827 -- so no cross-org block on ``CREATE
+# SNAPSHOT TABLE``). Matches the staging-by-default precedent set by
+# ``workflows/pipe_gaps/mode_equivalence.py``; see also the README's
+# "Staging data sources" section for the table inventory. To exercise
+# the actual prod-VMS bug shape (e.g. the 9cc... case), override
 # explicitly with ``--source-messages gfw-int-vms-v3.pipe_vms_v3_internal.research_messages``
-# and ``--source-segments gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity`` --
-# but per CLAUDE.md the LLM does NOT default-invoke against prod.
+# and ``--source-segments gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity``
+# plus ``--snapshot-dest-project gfw-int-vms-v3`` (to dodge the cross-
+# org block, since the dest must live in the source's project).
 DEFAULT_SOURCE_MESSAGES = (
     f"{PROJECT}.pipe_ais_test_202408290000_internal.messages_positions"
 )
@@ -191,11 +196,15 @@ DEFAULT_OFFSET_DAYS = 3
 # at a moment when only 22:32/23:30 were visible and post at a moment
 # 00:28 was visible), override both flags explicitly.
 def _default_pre_outage_pin_at() -> str:
-    return _utc_floor_days_ago(6).isoformat().replace("+00:00", " UTC")
+    # ``isoformat(sep=" ")`` matches the space-separated form the CLI help /
+    # error messages document (``YYYY-MM-DD HH:MM:SS UTC``); leaving the
+    # default-T separator from ``isoformat()`` would surface as a confusing
+    # inconsistency in ``--help`` output.
+    return _utc_floor_days_ago(6).isoformat(sep=" ").replace("+00:00", " UTC")
 
 
 def _default_post_outage_pin_at() -> str:
-    return _utc_floor_days_ago(1).isoformat().replace("+00:00", " UTC")
+    return _utc_floor_days_ago(1).isoformat(sep=" ").replace("+00:00", " UTC")
 
 
 # Default snapshot-dataset expiration. Matches cross_version_ais.py
