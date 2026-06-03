@@ -211,3 +211,50 @@ def test_snapshot_dataset_name_sanitises_hyphens() -> None:
     name = mod._snapshot_dataset_name("my-exp-2026", mod.SNAPSHOT_LABEL_PRE)
     assert "-" not in name.split(".", 1)[1]
     assert "my_exp_2026" in name
+
+
+def test_snapshot_table_names_distinct_basenames() -> None:
+    msgs, segs = mod._snapshot_table_names(
+        "proj.ds.research_messages", "proj.ds.segs_activity",
+    )
+    assert msgs == "research_messages"
+    assert segs == "segs_activity"
+
+
+def test_snapshot_table_names_disambiguates_basename_collision() -> None:
+    # If both sources have the same basename (rare in production but
+    # possible across datasets), the helper must disambiguate or the
+    # snapshot dataset has a collision. Both _snapshot_source_at (which
+    # creates) and the --skip-snapshots path (which reconstructs) MUST
+    # agree on this mapping -- that's the whole reason this helper exists.
+    msgs, segs = mod._snapshot_table_names(
+        "proj.a.messages_positions", "proj.b.messages_positions",
+    )
+    assert msgs == "messages_messages_positions"
+    assert segs == "segments_messages_positions"
+    assert msgs != segs
+
+
+# --------------------------------------------------------------------------
+# --snapshot-expiration-days validation
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["0", "-1", "-100"])
+def test_parse_args_rejects_nonpositive_snapshot_expiration(value: str) -> None:
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--pre-outage-pin-at", "2026-05-27 18:00:00 UTC",
+            "--post-outage-pin-at", "2026-06-01 18:00:00 UTC",
+            "--experiment-id", "test",
+            "--snapshot-expiration-days", value,
+        ])
+
+
+def test_parse_args_accepts_positive_snapshot_expiration() -> None:
+    args = mod.parse_args([
+        "--pre-outage-pin-at", "2026-05-27 18:00:00 UTC",
+        "--post-outage-pin-at", "2026-06-01 18:00:00 UTC",
+        "--experiment-id", "test",
+        "--snapshot-expiration-days", "30",
+    ])
+    assert args.snapshot_expiration_days == 30

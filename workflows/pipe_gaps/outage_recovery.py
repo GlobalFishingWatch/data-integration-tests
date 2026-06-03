@@ -183,8 +183,9 @@ COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
 
 # Logical labels for the two snapshot pins. Used to derive snapshot dataset
-# suffixes (``dit_exp_<experiment_id>_pre`` / ``..._post``) and to keep the
-# CLI consistent.
+# suffixes (``dit_exp_<experiment_id>_outage_pre`` /
+# ``..._outage_post`` -- see :func:`_snapshot_dataset_name`) and to keep
+# the CLI consistent.
 SNAPSHOT_LABEL_PRE = "pre"
 SNAPSHOT_LABEL_POST = "post"
 
@@ -300,6 +301,35 @@ def _snapshot_table_into(
     return dst_fqn
 
 
+def _snapshot_table_names(
+    source_messages: str, source_segments: str,
+) -> tuple[str, str]:
+    """Compute the ``(messages, segments)`` snapshot table names from the
+    source FQNs.
+
+    The snapshot tables are named after the SOURCE table's basename (the
+    last dotted component) -- so a source ``proj.ds.research_messages``
+    becomes ``<snap_dataset>.research_messages``. This is so the pipeline
+    sees a familiar table name on the input side.
+
+    When both source basenames are identical (e.g. both called
+    ``messages_positions`` but in different datasets), we'd get a
+    collision in the snapshot dataset; the names get prefixed with
+    ``messages_`` / ``segments_`` to disambiguate. Defensive: the
+    production layout has distinct basenames.
+
+    Extracted as a helper so :func:`_snapshot_source_at` (which CREATES
+    the snapshots) and the ``--skip-snapshots`` path (which RECOMPUTES
+    the expected FQNs without re-creating) agree on the names.
+    """
+    msgs_name = source_messages.rsplit(".", 1)[-1]
+    segs_name = source_segments.rsplit(".", 1)[-1]
+    if msgs_name == segs_name:
+        msgs_name = f"messages_{msgs_name}"
+        segs_name = f"segments_{segs_name}"
+    return msgs_name, segs_name
+
+
 def _snapshot_source_at(
     args: argparse.Namespace, *, pin_at: datetime, label: str,
 ) -> tuple[str, str]:
@@ -308,25 +338,14 @@ def _snapshot_source_at(
 
     Returns ``(messages_snapshot_fqn, segments_snapshot_fqn)`` which the
     stages then pass as their ``bq_input_messages`` / ``bq_input_segments``.
-
-    The snapshot tables are named after the SOURCE table's basename (the
-    last dotted component) -- so a source ``proj.ds.research_messages``
-    becomes ``<snap_dataset>.research_messages``. This is so the pipeline
-    sees a familiar table name on the input side (the SQL template still
-    addresses it as ``research_messages`` when log-grepping).
     """
     dst_dataset = _snapshot_dataset_name(args.experiment_id, label)
     _ensure_snapshot_dataset(
         dst_dataset, expiration_days=args.snapshot_expiration_days,
     )
-    msgs_name = args.source_messages.rsplit(".", 1)[-1]
-    segs_name = args.source_segments.rsplit(".", 1)[-1]
-    if msgs_name == segs_name:
-        # Same basename in different source datasets -> would collide in the
-        # snapshot dataset. Disambiguate by prefixing with the snapshot label.
-        # This is defensive; the production layout has distinct basenames.
-        msgs_name = f"messages_{msgs_name}"
-        segs_name = f"segments_{segs_name}"
+    msgs_name, segs_name = _snapshot_table_names(
+        args.source_messages, args.source_segments,
+    )
     msgs_fqn = _snapshot_table_into(
         args.source_messages, dst_dataset, as_of=pin_at, table_name=msgs_name,
     )
@@ -364,8 +383,9 @@ def _make_config(
     exists so we can iterate the source-table FQNs per stage without
     drifting against mode_equivalence's signature. Source-state pinning
     is handled OUTSIDE pipe-gaps via ``dit.bq.snapshot_table`` (see
-    ``_snapshot_source`` below), so the pipe-gaps process receives
-    ordinary table FQNs and is none the wiser about the snapshot layer.
+    :func:`_snapshot_source_at` below), so the pipe-gaps process
+    receives ordinary table FQNs and is none the wiser about the
+    snapshot layer.
     """
     unknown_parsed_args: dict[str, Any] = {"project": PROJECT}
     if labels:
@@ -717,11 +737,14 @@ def _parse_pin_at(value: str) -> datetime:
 
 
 def _validate_pin_at(value: str) -> str:
-    """argparse type: parse + reject naive; return the original string.
+    """argparse type: parse + reject naive; return the (stripped) string.
 
-    The original string (not the parsed datetime) is preserved on
-    ``args`` so we can re-parse later (consistent error surface) and so
-    the cache key snapshots the user-supplied form.
+    The string form (not the parsed datetime) is what lives on ``args``
+    so a later ``_parse_pin_at`` re-parse hits the same validation path
+    (no need to special-case "already a datetime"). The cache key itself
+    normalises via ``_parse_pin_at(...).isoformat()``, so two equivalent
+    user-supplied forms (``'... UTC'`` vs ``'...+00:00'``) collapse to
+    one canonical key (see :func:`canonical_params_dict`).
     """
     _parse_pin_at(value)
     return value.strip()
@@ -809,6 +832,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "the test reduces to a static-source bfd run."
         )
 
+    # --snapshot-expiration-days = 0 / negative would compute an invalid
+    # ``default_table_expiration_ms`` (zero would be invalid, negative
+    # would underflow), surfacing later as a BQ-API error inside the dataset
+    # create. Fail early with an actionable message.
+    if args.snapshot_expiration_days < 1:
+        p.error(
+            f"--snapshot-expiration-days must be >= 1; got "
+            f"{args.snapshot_expiration_days}."
+        )
+
     return args
 
 
@@ -861,10 +894,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # snapshot table; pipe-gaps doesn't know it's reading a snapshot.
     if args.skip_snapshots:
         logger.info("skipping snapshot creation (--skip-snapshots)")
-        pre_msgs = f"{_snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE)}.{args.source_messages.rsplit('.', 1)[-1]}"
-        pre_segs = f"{_snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE)}.{args.source_segments.rsplit('.', 1)[-1]}"
-        post_msgs = f"{_snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST)}.{args.source_messages.rsplit('.', 1)[-1]}"
-        post_segs = f"{_snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST)}.{args.source_segments.rsplit('.', 1)[-1]}"
+        # Reconstruct the same FQNs _snapshot_source_at would have produced,
+        # via the shared _snapshot_table_names helper -- otherwise a
+        # source-basename collision case (which _snapshot_source_at
+        # disambiguates via messages_/segments_ prefixes) would have the
+        # skip-snapshots path pointing at non-existent tables.
+        msgs_name, segs_name = _snapshot_table_names(
+            args.source_messages, args.source_segments,
+        )
+        pre_ds = _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_PRE)
+        post_ds = _snapshot_dataset_name(args.experiment_id, SNAPSHOT_LABEL_POST)
+        pre_msgs = f"{pre_ds}.{msgs_name}"
+        pre_segs = f"{pre_ds}.{segs_name}"
+        post_msgs = f"{post_ds}.{msgs_name}"
+        post_segs = f"{post_ds}.{segs_name}"
     else:
         pre_msgs, pre_segs = _snapshot_source_at(
             args, pin_at=_parse_pin_at(args.pre_outage_pin_at),
