@@ -394,8 +394,12 @@ def _read_gpsdio_pin_at_ref(pipeline_dir: str, ref: str) -> str:
             continue  # path doesn't exist at this ref; try the next
         for line in result.stdout.splitlines():
             # prod.in / requirements.txt: ``gpsdio-segment @ <url>``
-            # pyproject.toml: ``    "gpsdio-segment @ <url>",`` (PEP 621 deps list)
-            stripped = line.strip().strip('"').strip("',")
+            # pyproject.toml: ``    "gpsdio-segment @ <url>",`` (PEP 621 deps list).
+            # Strip the union of decorating chars from BOTH ends in a single
+            # call -- the multi-step ``.strip('"').strip("',")`` form left a
+            # trailing ``"`` on PEP 621 lines because the inner ``.strip('"')``
+            # ran while the comma was still trailing. (Copilot PR #49 comment.)
+            stripped = line.strip().strip('"\',')
             if stripped.startswith("gpsdio-segment"):
                 return stripped
     raise SystemExit(
@@ -756,7 +760,7 @@ def _run_pipe_subcommand(
     cli_args: list[str],
     build_from_source: bool,
 ) -> int:
-    """One ``pipe`` subcommand (segment / segment_identity / segment_info) via dit_docker.run.
+    """One ``pipe-segment`` subcommand (segment / segment_identity / segment_info) via dit_docker.run.
 
     Runs from ``worktree_dir`` (chdir context) so ``docker compose`` finds the
     worktree's ``compose.yaml``. ``dit_docker.run`` handles cloud-mode
@@ -803,7 +807,9 @@ def _verify_gpsdio_segment(worktree_dir: str, *, binding_name: str) -> str:
         if not path.exists():
             continue
         for line in path.read_text().splitlines():
-            stripped = line.strip().strip('"').strip("',")
+            # Combined char-class strip (see _read_gpsdio_pin_at_ref for why
+            # multi-step strip left a trailing ``"`` on PEP 621 lines).
+            stripped = line.strip().strip('"\',')
             if stripped.startswith("gpsdio-segment"):
                 return stripped
     raise SystemExit(
