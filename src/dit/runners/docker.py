@@ -153,6 +153,7 @@ def run(
     args: list[str],
     *,
     env: dict | None = None,
+    container_env: dict | None = None,
     project_name: str | None = None,
     build_from_source: bool = False,
     entrypoint: str | None = None,
@@ -190,6 +191,26 @@ def run(
     Beam consumers are unaffected; pipe-events' compose service is named
     ``"pipeline"``.
 
+    ``env`` sets env vars on the HOST subprocess (the ``docker`` / ``docker
+    compose`` process itself). It does NOT set env vars inside the inner
+    container; for that, see ``container_env``.
+
+    ``container_env`` injects ``-e KEY=VALUE`` flags into the docker /
+    docker compose invocation so the named env vars are visible inside the
+    inner container. Concretely needed when a workflow's CLI relies on env-
+    var-driven defaults that the ``--<flag>`` arg surface doesn't reach.
+    For example, pipe-segment v5.0.x's Beam ``WriteToBigQuery`` constructs
+    its own ``google-cloud-bigquery`` client whose default-project resolution
+    walks ``GOOGLE_CLOUD_PROJECT`` env -> ADC project metadata; the Beam
+    pipeline option ``--project=...`` is read earlier in the pipeline
+    construction and isn't forwarded to this internal client. Setting
+    ``container_env={"GOOGLE_CLOUD_PROJECT": "world-fishing-827"}`` closes
+    that gap. ``examples/example_segment.sh`` does the same via ``-e``
+    inline on the docker compose command, so this parameter is just lifting
+    that documented escape hatch into the harness. The default ``None``
+    means no ``-e`` flags are emitted, byte-identical to existing callers
+    (pipe-gaps, port-visits, pipe-events).
+
     **Cloud mode (env-triggered, no parameter).** When the ``DIT_CLOUD_MODE``
     env var is set (any non-empty value), the runner adds
     ``--network=cloudbuild`` to the docker invocation so the inner container
@@ -214,17 +235,28 @@ def run(
 
     cloud_flags = _apply_cloud_mode(volumes)
 
+    # ``-e KEY=VALUE`` flags emitted between ``run --rm`` and the
+    # image/service positional. Ordering matters: docker rejects ``-e``
+    # after the positional. Sorted for deterministic output (helps tests +
+    # human log scanning).
+    container_env_flags: list[str] = []
+    if container_env:
+        for key in sorted(container_env):
+            container_env_flags.extend(["-e", f"{key}={container_env[key]}"])
+
     if build_from_source:
         _ensure_built(unique_project, service=service)
         cmd = ["docker", "compose", "-p", unique_project, "run", "--rm"]
         if entrypoint:
             cmd.extend(["--entrypoint", entrypoint])
+        cmd.extend(container_env_flags)
         cmd.extend(cloud_flags)
         cmd.extend([service, *args])
     else:
         cmd = ["docker", "run", "--rm", "--name", unique_project]
         if entrypoint:
             cmd.extend(["--entrypoint", entrypoint])
+        cmd.extend(container_env_flags)
         cmd.extend(cloud_flags)
         cmd.extend([image_tag, *args])
 

@@ -72,6 +72,17 @@ The chain reveals two recurring lessons: live evidence trumps theoretical reason
 
 This is testing-shaped infrastructure that respects the absolute [prod-infra boundary](#prod-infra-boundary): the build SA lives in `world-fishing-827`, no writes to `gfw-int-infrastructure`, no permanent credentials anywhere.
 
+## Container env vars (workflow-driven, via `container_env=...`)
+
+Distinct from the env-triggered cloud-mode plumbing above, workflows can also pass arbitrary env vars *into* the inner container via `dit_docker.run(container_env={"KEY": "VALUE", ...})`. The runner emits `-e KEY=VALUE` flags into the docker / docker compose invocation. Two parameters with similar names live on `dit_docker.run` — easy to conflate:
+
+| Param | Reaches | Use case |
+|---|---|---|
+| `env={...}` | The HOST `docker` / `docker compose` subprocess | Tweak docker's own behaviour (rare; e.g. `DOCKER_BUILDKIT=0`). Does NOT reach the inner container. |
+| `container_env={...}` | The inner container's process env | What workflows want when the pipeline's CLI relies on env-var defaults the `--flag` surface doesn't cover. |
+
+Concrete case (pipe-segment v5.0.x smoke, 2026-06-03): Beam's `WriteToBigQuery` constructs its own `google-cloud-bigquery` client whose default-project resolution walks `GOOGLE_CLOUD_PROJECT` env → ADC metadata; the pipeline option `--project=...` is read earlier by Beam and never forwarded to that internal client. `examples/example_segment.sh` documents the same escape hatch via inline `-e GOOGLE_CLOUD_PROJECT=...` on the docker compose command — `container_env` lifts that into the harness so workflows that go through `dit_docker.run` get it cleanly. Default `None` means no `-e` flags are emitted, byte-identical to existing callers.
+
 ## Standard build-and-push workflow
 
 For per-binding pipeline images used by `--binding-worker-image`:

@@ -362,3 +362,120 @@ def test_build_from_source_cloud_mode_unset_byte_identical(monkeypatch):
     specs = _captured_v_specs(cmd)
     assert specs == ["gcp:/root/.config"]
     assert "--network=cloudbuild" not in cmd
+
+
+# --------------------------------------------------------------------------
+# container_env: -e KEY=VAL flags into the inner container
+# --------------------------------------------------------------------------
+
+def _captured_e_pairs(cmd: list[str]) -> list[str]:
+    """Return the ``-e`` spec list in order (each entry is ``KEY=VALUE``)."""
+    return [cmd[i + 1] for i, t in enumerate(cmd) if t == "-e"]
+
+
+def test_container_env_default_no_e_flags():
+    """No container_env -> no ``-e`` flags emitted. Byte-identical to pre-feature."""
+    with patch.object(dit_docker.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as mock_run:
+        dit_docker.run("gfw/pipe-segment", ["segment"])
+    cmd = _captured_cmd(mock_run)
+    assert "-e" not in cmd
+
+
+def test_container_env_published_emits_e_flags():
+    """container_env=dict -> ``-e KEY=VAL`` per entry on the docker run path."""
+    with patch.object(dit_docker.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as mock_run:
+        dit_docker.run(
+            "gfw/pipe-segment",
+            ["segment"],
+            container_env={"GOOGLE_CLOUD_PROJECT": "world-fishing-827"},
+        )
+    cmd = _captured_cmd(mock_run)
+    assert _captured_e_pairs(cmd) == ["GOOGLE_CLOUD_PROJECT=world-fishing-827"]
+
+
+def test_container_env_build_from_source_emits_e_flags():
+    """Same on the build_from_source / docker compose path."""
+    dit_docker._BUILT_PROJECTS.clear()
+    with (
+        patch.object(dit_docker.subprocess, "run",
+                     return_value=MagicMock(returncode=0)) as mock_run,
+        patch.object(dit_docker, "_teardown_compose_network"),
+    ):
+        dit_docker.run(
+            "img",
+            ["segment"],
+            container_env={"GOOGLE_CLOUD_PROJECT": "world-fishing-827"},
+            build_from_source=True,
+        )
+    cmd = _captured_cmd(mock_run)
+    assert _captured_e_pairs(cmd) == ["GOOGLE_CLOUD_PROJECT=world-fishing-827"]
+
+
+def test_container_env_precedes_image_positional():
+    """``-e`` flags MUST come before the image name (docker rejects them after)."""
+    with patch.object(dit_docker.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as mock_run:
+        dit_docker.run(
+            "gfw/pipe-segment",
+            ["op"],
+            container_env={"FOO": "bar"},
+        )
+    cmd = _captured_cmd(mock_run)
+    assert cmd.index("-e") < cmd.index("gfw/pipe-segment")
+
+
+def test_container_env_precedes_service_positional_build_from_source():
+    """Same ordering rule on the docker compose path."""
+    dit_docker._BUILT_PROJECTS.clear()
+    with (
+        patch.object(dit_docker.subprocess, "run",
+                     return_value=MagicMock(returncode=0)) as mock_run,
+        patch.object(dit_docker, "_teardown_compose_network"),
+    ):
+        dit_docker.run(
+            "img",
+            ["op"],
+            container_env={"FOO": "bar"},
+            service="pipeline",
+            build_from_source=True,
+        )
+    cmd = _captured_cmd(mock_run)
+    assert cmd.index("-e") < cmd.index("pipeline")
+
+
+def test_container_env_multiple_keys_sorted():
+    """Multiple keys are emitted in sorted order (deterministic logs + tests)."""
+    with patch.object(dit_docker.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as mock_run:
+        dit_docker.run(
+            "img",
+            ["op"],
+            container_env={"ZED": "z", "ALPHA": "a", "MIDDLE": "m"},
+        )
+    cmd = _captured_cmd(mock_run)
+    assert _captured_e_pairs(cmd) == ["ALPHA=a", "MIDDLE=m", "ZED=z"]
+
+
+def test_container_env_does_not_set_host_env():
+    """container_env != env. host subprocess env is the ``env`` param's domain."""
+    with patch.object(dit_docker.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as mock_run:
+        dit_docker.run(
+            "img",
+            ["op"],
+            env={"HOST_VAR": "1"},
+            container_env={"CONTAINER_VAR": "2"},
+        )
+    # host env: passed to subprocess.run as the env= kwarg
+    call = mock_run.call_args_list[0]
+    proc_env = call.kwargs.get("env") or {}
+    assert proc_env.get("HOST_VAR") == "1"
+    assert proc_env.get("CONTAINER_VAR") is None
+    # container env: -e flag in the command vector
+    cmd = call.args[0]
+    assert "-e" in cmd
+    assert "CONTAINER_VAR=2" in cmd
+    assert "HOST_VAR=1" not in cmd  # NOT in -e flags
+
