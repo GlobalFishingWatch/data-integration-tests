@@ -264,13 +264,41 @@ def run(
     if env is not None:
         proc_env = {**os.environ, **env}
 
-    logger.info("docker: %s", " ".join(cmd))
+    logger.info("docker: %s", _redact_e_flags(cmd))
     try:
         result = subprocess.run(cmd, check=False, env=proc_env)
         return result.returncode
     finally:
         if build_from_source:
             _teardown_compose_network(unique_project)
+
+
+def _redact_e_flags(cmd: list[str]) -> str:
+    """Join ``cmd`` for logging, with every ``-e KEY=VALUE`` -> ``-e KEY=<redacted>``.
+
+    The runner emits INFO-level docker command logs for human + CI scanning;
+    ``container_env`` values (and the cloud-mode quota-project env, when
+    re-introduced in the future) could in principle hold credentials. Today's
+    sole consumer is ``GOOGLE_CLOUD_PROJECT=world-fishing-827`` (non-sensitive
+    project id), but logging the values uncritically makes the runner a
+    silent leak vector if a future workflow ever wires a token-shaped value.
+
+    Redaction is structural ("any ``-e`` flag's value"), not key-allowlist
+    based, so the runner stays safe by default rather than relying on every
+    new caller to remember to opt out. The real ``cmd`` is still passed to
+    ``subprocess.run`` unchanged. (Copilot PR #48 comment.)
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(cmd):
+        if cmd[i] == "-e" and i + 1 < len(cmd) and "=" in cmd[i + 1]:
+            key, _value = cmd[i + 1].split("=", 1)
+            out.extend([cmd[i], f"{key}=<redacted>"])
+            i += 2
+        else:
+            out.append(cmd[i])
+            i += 1
+    return " ".join(out)
 
 
 def _teardown_compose_network(project_name: str) -> None:

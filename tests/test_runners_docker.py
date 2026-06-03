@@ -479,3 +479,32 @@ def test_container_env_does_not_set_host_env():
     assert "CONTAINER_VAR=2" in cmd
     assert "HOST_VAR=1" not in cmd  # NOT in -e flags
 
+
+def test_container_env_value_redacted_in_log(caplog):
+    """``-e KEY=VALUE`` values must NOT appear in INFO logs (sensitivity hygiene).
+
+    container_env values can in principle hold credentials. The runner stays
+    safe by default: structural redaction at log time replaces every ``-e``
+    value with ``<redacted>``, while subprocess.run still receives the real
+    cmd. (Copilot PR #48 comment.)
+    """
+    caplog.set_level("INFO", logger="dit.runners.docker")
+    with patch.object(dit_docker.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as mock_run:
+        dit_docker.run(
+            "img",
+            ["op"],
+            container_env={"SECRET_TOKEN": "hunter2", "GOOGLE_CLOUD_PROJECT": "world-fishing-827"},
+        )
+    log_text = " ".join(rec.getMessage() for rec in caplog.records if rec.name == "dit.runners.docker")
+    # values not leaked
+    assert "hunter2" not in log_text
+    assert "world-fishing-827" not in log_text
+    # keys + redaction marker still present (useful for debugging)
+    assert "SECRET_TOKEN=<redacted>" in log_text
+    assert "GOOGLE_CLOUD_PROJECT=<redacted>" in log_text
+    # real subprocess call still got the real values (NOT redacted)
+    real_cmd = mock_run.call_args_list[0].args[0]
+    assert "SECRET_TOKEN=hunter2" in real_cmd
+    assert "GOOGLE_CLOUD_PROJECT=world-fishing-827" in real_cmd
+
