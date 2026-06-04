@@ -6,6 +6,14 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-04
+
+#### Fixed
+- **`workflows/pipe_gaps/outage_recovery.py` default date range.** `DEFAULT_OUTAGE_START` / `DEFAULT_OUTAGE_END` flipped from `2024-08-22` / `2024-08-29` to `2020-08-22` / `2020-08-29`. The previous values came from reading the staging cohort's name (`pipe_ais_test_202408290000`) as a 2024 dataset — but the suffix is the **upstream snapshot date**, not the data date. The actual data is **2020 AIS** (12 monthly partitions, `2020-01` to `2020-12`); a default-no-flag run with the 2024 dates processed zero rows. `workflows/pipe_gaps/mode_equivalence.py` already encoded the right window (`2020-01-01` → `2021-01-01`); outage_recovery now mirrors the same data year with a 7-day slice. The leading comment block was rewritten to state the snapshot-date-vs-data-date distinction explicitly and cite `mode_equivalence.py` + `INFORMATION_SCHEMA.PARTITIONS` as the verification path.
+
+#### Changed
+- **`README.md` § "Staging data sources" gains a "Cohort name vs. data window" paragraph**, and `CLAUDE.md` § Working agreements' staging-by-default bullet gains a sub-bullet on date-range defaults. Both capture the lesson: the cohort name carries the snapshot date by convention; the data year does not travel with it. New workflows must mirror an existing sibling's `--start` / `--end` defaults and verify the data window against `INFORMATION_SCHEMA.PARTITIONS` before committing dates.
+
 ### 2026-06-03
 
 #### Fixed

@@ -217,8 +217,14 @@ DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
 # Default start/end target a small window so a default run finishes in
 # <10 min on a single Dataflow worker. For the 9cc... case override to
 # --start 2026-05-12 --end 2026-05-26 (the bug's OFF lives on 2026-05-26).
-DEFAULT_OUTAGE_START = "2024-08-22"  # 7 days inside the AIS staging cohort
-DEFAULT_OUTAGE_END = "2024-08-29"    # = the cohort's frozen snapshot date
+#
+# Window lives inside the AIS staging cohort's actual data range (2020 --
+# the cohort NAME ``pipe_ais_test_202408290000`` is the snapshot date,
+# NOT the data date). Mirrors ``mode_equivalence.py``'s ``DEFAULT_START
+# = "2020-01-01"`` / ``DEFAULT_END = "2021-01-01"`` family; verified via
+# ``INFORMATION_SCHEMA.PARTITIONS`` on ``messages_positions``.
+DEFAULT_OUTAGE_START = "2020-08-22"  # 7 days inside the 2020 AIS staging cohort
+DEFAULT_OUTAGE_END = "2020-08-29"
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
