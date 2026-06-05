@@ -62,6 +62,22 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-05 — Workflow reconciliation review + snapshot-mechanism edge-case audit (point-in-time analyses)
+
+Two new docs filed under `docs/` as point-in-time design analyses (the kind we'd otherwise lose to chat transcripts):
+
+- [`docs/workflow-reconciliation-2026-06.md`](docs/workflow-reconciliation-2026-06.md) — holistic review of the six workflows, what's shared, what diverges by necessity vs by accident, and where the staging/AIS/VMS defaults should live (in-tree `dit.cohorts` recommended; composer-derived defaults declined as premature).
+- [`docs/snapshot-edge-cases-2026-06.md`](docs/snapshot-edge-cases-2026-06.md) — empirical audit of `dit.bq.snapshot_*` against views (fail-fast with a clear BQ error — safe) and cross-project / cross-org snapshots (same-org works correctly; cross-org fails fast). Surfaces one **latent bug**: `workflows/pipe_segment/identity_match_key.py --include-satellite-offsets` snapshots from `gfw-int-pipe-v3` (org `115316357079`) into `world-fishing-827` (org `433637338589`); has never worked. Fix is a `--snapshot-dest-project` flag mirroring `outage_recovery.py`.
+
+Both docs are dated point-in-time (2026-06; revisit when a fourth workflow lands or composer-dags configs become a more frequent moving target). They cross-reference each other (the reconciliation doc's snapshot-consolidation candidate is the audit doc's `if_existing="verify_as_of"` mode + Guard B; the same code touch reasonably ships them together).
+
+**Sections moved.** Two new `docs/` files; one entry in this Plan changelog. No code changes.
+
+**Highest-leverage takeaways** (so the body doesn't have to be re-read each time):
+- The biggest correctness risk in tree is `_make_config` / `_cfg_to_cli_flags` / `_build_pipeline_for` / `_run_pipeline` duplicated between `pipe_gaps/mode_equivalence.py` and `pipe_gaps/outage_recovery.py` (~200 LOC). Sibling-level `workflows/pipe_gaps/_detect.py` is the proposed fix.
+- The most surprising operational fact: "GFW" colloquially spans **two GCP organizations** (`gfw-int-vms-v3` + `gfw-int-pipe-v3` in org `115316357079`; `world-fishing-827` + `gfw-research` + `gfw-int-infrastructure` in org `433637338589`). Cross-org snapshots fail fast — this is the root of PR #45's incident and the pipe-segment satellite-offsets latent bug.
+- `dit.cohorts` (in-tree cohort dataclass with distinct `data_start` / `data_end` / `snapshot_date` fields) is the recommended structural fix for the cohort-name-vs-data-window confusion that bit twice in 2026 (PR #37 pipe-events flip; PR #45 outage-recovery flip).
+
 ### 2026-06-04 — Laptop apache-beam pin symmetry with the cloud path (fix the Makefile, not the runner)
 
 Live smoke of `workflows/pipe_gaps/outage_recovery.py` from a laptop venv failed Dataflow submission with `"Pipeline construction environment and pipeline runtime environment are not compatible. Submission environment: beam:version:sdk_base:apache/beam_python3.12_sdk:2.73.0. Runtime environment: beam:version:sdk_base:apache/beam_python3.12_sdk:2.71.0."`. The laptop venv had `apache-beam==2.73.0` (pip resolved pipe-gaps' permissive `apache-beam[gcp]~=2.71` to the newest 2.x at install time); the canonical `pipe-gaps:v0.10.0` worker image was built when 2.71 was current and is frozen at 2.71.0. The cloud path doesn't hit this because `cloudbuild-dit.yaml`'s `_BEAM_VERSION` substitution + per-pipeline default in `Makefile` (formerly the `ifeq ($(PIPELINE),pipe-gaps) BEAM_VERSION ?= 2.71.0`) is threaded into a uv `--constraint` at install time. The laptop install targets (`install-pipe-gaps` / `-ref` / `snapshot-pipe-gaps`) had no equivalent — pip resolved beam freely against `~=2.71` and drifted.
