@@ -138,7 +138,7 @@ publish-ditbox:
 #   REF=<sha-or-tag>  # pipeline ref to install non-editably; empty = editable from source upload
 #   DIT_REF=<ref>     # dit ref to clone (default main)
 #   BEAM_VERSION=<x.y.z>  # pin apache-beam to match the worker image's beam version
-#                          # (pipe-gaps:v0.9.6 = 2.71.0; pipe-anchorages:v4.6.4 = 2.69.0;
+#                          # (pipe-gaps:v0.10.0 = 2.71.0; pipe-anchorages:v4.6.4 = 2.69.0;
 #                          # pipe-segment:v5.0.3 = 2.56.0).
 #                          # Auto-defaulted below by PIPELINE when unset.
 #

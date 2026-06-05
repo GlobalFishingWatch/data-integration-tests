@@ -17,7 +17,7 @@ import pytest
 
 from dit import worker_image
 
-DEFAULT = "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.9.6"
+DEFAULT = "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.10.0"
 
 
 def _kwargs(**overrides):

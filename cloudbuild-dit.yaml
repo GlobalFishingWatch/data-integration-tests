@@ -43,7 +43,7 @@ substitutions:
   # worker image's beam version; otherwise workers fail with "Pipeline
   # construction environment and pipeline runtime environment are not
   # compatible". The right value depends on which worker image the workflow
-  # uses (pipe-gaps:v0.9.6 -> 2.71.0; pipe-anchorages:v4.6.4 -> 2.69.0). When
+  # uses (pipe-gaps:v0.10.0 -> 2.71.0; pipe-anchorages:v4.6.4 -> 2.69.0). When
   # non-empty, this is passed to uv as a --constraint so any fresh resolution
   # is held to the right version; empty disables the constraint.
   _BEAM_VERSION: ''
