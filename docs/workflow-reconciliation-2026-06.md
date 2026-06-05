@@ -20,7 +20,7 @@ Point-in-time review of dit's workflow inventory, the trajectory that produced i
 **Non-obvious knobs by file** (the easy-to-miss configuration surface):
 
 - **`mode_equivalence.py`**: `--enable-pipeline-4` gates the mutate-recover mode; `--auto-restrict` randomly samples ssvids via `dit.bq.query_for_restricted_ssvids`; in-process Beam threads labels via `unknown_parsed_args["labels"]` (not CLI flags).
-- **`outage_recovery.py`**: `--pre-outage-pin-at` / `--post-outage-pin-at` (tz-aware required); `--offset-days`, `--snapshot-dest-project`, `--snapshot-expiration-days`, `--skip-snapshots`. Implements its own snapshot dataset/table helpers (parallel to cross_version_ais.py's — see [§3-a](#a-snapshot-dataset-machinery-is-duplicated-three-times)).
+- **`outage_recovery.py`**: `--pre-outage-pin-at` / `--post-outage-pin-at` (tz-aware required); `--offset-days`, `--snapshot-dest-project`, `--snapshot-expiration-days`, `--skip-snapshots`. Implements its own snapshot dataset/table helpers (parallel to `cross_version_ais.py`'s — see [§3-a](#a-snapshot-dataset-machinery-is-duplicated-three-times)).
 - **`port_visits/ais.py`**: `--thinned-message-table` (skip step 1, point step 2 at external table); `--binding-name` (so cross-version can pass through); both submitter image AND worker image identity in cache key.
 - **`port_visits/cross_version_ais.py`**: `--binding-worker-image NAME=IMAGE` for per-binding sdk_container_image; `--thinned-message-table` snapshotted (not idempotent — fail-fast).
 - **`pipe_events/fishing.py`**: no `_run_with_cache` (deferred); calls `add_dataset_args` only (no Dataflow knobs); `GCP_VOLUME = "gcp:/root/.config"` named volume; runs `pipe` CLI inside `pipeline` compose service.
