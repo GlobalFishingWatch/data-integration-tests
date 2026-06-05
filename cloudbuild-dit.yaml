@@ -43,9 +43,20 @@ substitutions:
   # worker image's beam version; otherwise workers fail with "Pipeline
   # construction environment and pipeline runtime environment are not
   # compatible". The right value depends on which worker image the workflow
-  # uses (pipe-gaps:v0.10.0 -> 2.71.0; pipe-anchorages:v4.6.4 -> 2.69.0). When
-  # non-empty, this is passed to uv as a --constraint so any fresh resolution
-  # is held to the right version; empty disables the constraint.
+  # uses (pipe-gaps:v0.10.0 -> 2.71.0; pipe-anchorages:v4.6.4 -> 2.69.0;
+  # pipe-segment:v5.0.3 -> 2.56.0). When non-empty, this is passed to uv as
+  # a --constraint so any fresh resolution is held to the right version;
+  # empty disables the constraint.
+  #
+  # Default is intentionally empty here: the Makefile is the single source
+  # of truth (see the PIPE_GAPS_BEAM_VERSION / ANCHORAGES_PIPELINE_BEAM_VERSION
+  # / PIPE_SEGMENT_BEAM_VERSION constants at the top of the Makefile, fed
+  # into the ifeq($(PIPELINE),...) block lower down). `make dit-cloud`
+  # passes --substitutions=_BEAM_VERSION=$(BEAM_VERSION) so the value here
+  # ends up identical to what the laptop install targets pin via the
+  # WITH_BEAM_CONSTRAINT macro. Bumping a pipeline's worker image to a
+  # version with a different beam pin is a one-place constant update in
+  # the Makefile -- both paths move together.
   _BEAM_VERSION: ''
 
 steps:
