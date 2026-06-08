@@ -15,10 +15,15 @@ goes through ``dit.runners.docker.run`` + ``dit.workflow.resolve_run_context``).
 Steps:
 
 1. Verify every binding's git ref exists in ``--pipeline-dir``.
-2. Create snapshot dataset ``dit_exp_<sanitized_exp_id>_pipe_segment`` (default
-   7-day expiration) and snapshot the source data (``normalized_messages``
-   single partitioned table; if ``--include-satellite-offsets`` also
-   ``satellite_positions_*`` shards + ``norad_to_receiver_*``).
+2. Snapshot the source data into the canonical
+   ``<project>.tech_great_expectations`` dataset (per-table
+   ``expiration_timestamp``, default 7 days; ``--snapshot-dest-project``
+   overrides for the cross-org dodge path -- see below). Sources:
+   ``normalized_messages`` (single partitioned table); when
+   ``--include-satellite-offsets`` is set, also ``satellite_positions_*``
+   shards + ``norad_to_receiver_*``. Snapshots land as
+   ``dit_exp_<sanitised(experiment_id)>_pipe_segment_<source_basename>``
+   tables via ``dit.bq.snapshot_into_experiment``.
 3. For each binding (sequential -- chdir for ``dit_docker.run`` isn't
    thread-safe; with 2 bindings the cost is negligible):
 
@@ -76,6 +81,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import itertools
 import logging
 import os
@@ -163,9 +169,18 @@ DEFAULT_SRC_NORMALIZED_TABLE = (
 # identity-match-key change under test, satellite offsets are not relevant,
 # so the default is OFF.
 #
-# Note the cross-project source for satellite positions: the v3-era prod
-# table lives in `gfw-int-pipe-v3` (the prod-v3 AIS project), not in
-# `world-fishing-827`. dit reads cross-project from the snapshot job.
+# Cross-org caveat for the opt-in: the satellite-positions source lives in
+# `gfw-int-pipe-v3` (org `115316357079`), which is a DIFFERENT GCP org from
+# `world-fishing-827` (org `433637338589`). BQ refuses cross-org snapshots,
+# so a default `--include-satellite-offsets` run that lets the dest project
+# default to `world-fishing-827` fails fast with "Cannot snapshot tables
+# across projects that are in different orgs". The escape hatch is
+# `--snapshot-dest-project gfw-int-pipe-v3` (matching `outage_recovery.py`'s
+# shape): all snapshots then land in `gfw-int-pipe-v3.tech_great_expectations`
+# and BQ accepts the same-org clone. The caller is responsible for ensuring
+# `--source-normalized-table` is ALSO in `gfw-int-pipe-v3`'s org when
+# `--include-satellite-offsets` is set, otherwise the normalized-messages
+# snapshot hits the same cross-org block.
 PROD_NORAD_TABLE = f"{PROJECT}.pipe_static.norad_to_receiver_v20230510"
 PROD_SAT_POS_DATASET = "gfw-int-pipe-v3.satellite_positions"
 PROD_SAT_POS_STEM = "satellite_positions_one_second_resolution_"  # date-sharded
@@ -242,7 +257,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                    help="BQ dataset holding the output tables produced by each binding's run.")
     p.add_argument("--snapshot-expiration-days", type=int, default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
-                   help="default_table_expiration for the snapshot dataset, in days.")
+                   help="Per-table expiration_timestamp for the source snapshots, in days.")
+    p.add_argument("--snapshot-dest-project", default=PROJECT,
+                   help=f"Project that owns the snapshot tables (in `<project>.tech_great_expectations`). "
+                        f"Default: {PROJECT}. Override for the cross-org dodge path: BQ refuses to "
+                        f"snapshot across projects in different orgs, so when running with "
+                        f"--include-satellite-offsets (sources in `gfw-int-pipe-v3`, org "
+                        f"`115316357079`), set this to `gfw-int-pipe-v3` so source and dest live "
+                        f"in the same org. Mirrors workflows/pipe_gaps/outage_recovery.py.")
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
                    help=f"Pipeline image to run pipe-segment in. Default: {DEFAULT_IMAGE_TAG} "
                         f"(canonical published v5.0.3). For reviewed code at this default, the "
@@ -455,102 +477,111 @@ def _safe_label_value(value: str) -> str:
     return _UNSAFE_LABEL_CHAR_RE.sub("-", value.lower())[:63]
 
 
-def _snapshot_dataset_name(experiment_id: str) -> str:
-    """Single snapshot dataset; pipe-segment doesn't use the _internal/_published split."""
-    return f"{PROJECT}.dit_exp_{_sanitize_for_dataset(experiment_id)}_pipe_segment"
+@dataclasses.dataclass(frozen=True)
+class _PipeSegmentSnapshotFQNs:
+    """Dest FQNs produced by :func:`_snapshot_source`.
+
+    All fields point at tables in ``<project>.tech_great_expectations``
+    (``project`` = ``--snapshot-dest-project``, defaulting to
+    ``world-fishing-827``) following the canonical-dataset shape
+    ``dit_exp_<sanitised(experiment_id)>_pipe_segment_<source_basename>``.
+
+    ``sat_positions_stem`` is a FQN-prefix ending in ``_`` to which
+    pipe-segment appends ``<YYYYMMDD>`` per shard at read time -- this
+    matches how pipe-segment's CLI consumes the satellite-positions arg.
+    The two satellite-offsets fields are ``None`` when
+    ``--include-satellite-offsets`` is not set.
+    """
+    normalized_messages: str
+    sat_positions_stem: Optional[str] = None
+    norad: Optional[str] = None
 
 
-def _ensure_dataset(fq_name: str, *, expiration_days: int) -> None:
-    from google.cloud import bigquery
-    from google.cloud.exceptions import Conflict
-
-    client = bigquery.Client(project=PROJECT)
-    dataset = bigquery.Dataset(fq_name)
-    dataset.default_table_expiration_ms = expiration_days * 24 * 60 * 60 * 1000
-    try:
-        client.create_dataset(dataset, exists_ok=True)
-    except Conflict:
-        pass
-    logger.info("ensured dataset %s (expiration %dd)", fq_name, expiration_days)
-
-
-def _snapshot_source(args: argparse.Namespace) -> str:
-    """Snapshot the input tables and return the destination dataset FQN.
+def _snapshot_source(args: argparse.Namespace) -> _PipeSegmentSnapshotFQNs:
+    """Snapshot the input tables into ``<project>.tech_great_expectations``
+    and return the resulting dest FQNs.
 
     Always snapshots ``args.source_normalized_table`` (single date-partitioned
     table). If ``--include-satellite-offsets`` is set, also snapshots the
     date-sharded prod satellite-positions table and the static norad table
-    that the segment offsets branch needs.
-    """
-    snap_dataset = _snapshot_dataset_name(args.experiment_id)
-    _ensure_dataset(snap_dataset, expiration_days=args.snapshot_expiration_days)
+    that the segment offsets branch needs. ``args.snapshot_dest_project``
+    controls the dest project (cross-org dodge path).
 
-    # KNOWN FOOTGUN -- `if_not_exists=True` on every snapshot_table call below
-    # makes the snapshot-creation step idempotent at the table level: a re-run
-    # with the SAME --experiment-id but a DIFFERENT --pin-source-at silently
-    # reuses the prior snapshot (created at the original pin time) and ignores
-    # the new pin. The A/B run then reads from the wrong baseline without any
-    # warning, invalidating the diff verdict. Same trade-off port_visits/
-    # cross_version_ais.py's main `_snapshot_source` path accepts via
-    # dit_bq.snapshot_dataset's table-level skip-existing semantics (see
-    # `dit.bq.snapshot_dataset.__doc__` and the matching note in port_visits).
-    # Mitigated in practice by `--experiment-id` defaulting to `solo_<6-hex>`
-    # (unique per invocation) and the snapshot dataset's 7-day TTL, but real
-    # if the user reuses an explicit `--experiment-id`.
-    #
-    # RECOMMENDED RESOLUTION (deferred; tracked as a dit-library concern, not
-    # a per-workflow fix): add an `if_existing="skip" | "fail" |
-    # "verify_as_of"` parameter to dit.bq.snapshot_table (and threaded into
-    # snapshot_dataset). "verify_as_of" reads the existing snapshot's
-    # `snapshot_definition.snapshot_time` from the BQ table metadata and (a)
-    # skips if it matches `as_of` (true idempotence on legitimate retry); (b)
-    # raises SystemExit naming both timestamps if it differs (closes the
-    # silent-reuse bug). The current `if_not_exists` parameter would map to
-    # "skip" for backward compatibility; workflows flip to "verify_as_of" for
-    # safety. Lifts the fix into the shared library so both cross-version
-    # workflows (port_visits + pipe_segment) get it together.
-    #
+    KNOWN FOOTGUN -- ``if_existing="skip"`` (the default on
+    ``snapshot_into_experiment``) makes re-runs idempotent at the table
+    level: a re-run with the SAME ``--experiment-id`` but a DIFFERENT
+    ``--pin-source-at`` silently reuses the prior snapshot. Mitigated in
+    practice by ``--experiment-id`` defaulting to ``solo_<6-hex>`` (unique
+    per invocation) and the per-table TTL, but real for an explicit re-used
+    ``--experiment-id``. The deferred ``if_existing="verify_as_of"`` mode
+    (see ``snapshot_table.__doc__``) is the recommended resolution; tracked
+    in ``docs/snapshot-dataset-migration-2026-06.md`` as a follow-up after
+    the migration completes.
+    """
+    role = "pipe_segment"
+    dest_project = args.snapshot_dest_project
+
     # Normalized messages: single date-partitioned table -> single snapshot.
-    # The unqualified table name (last dot-segment) becomes the snapshot's
-    # name in the snapshot dataset; both bindings will read it via the
-    # FQN computed in _segment_args.
-    src_normalized = args.source_normalized_table
-    snap_normalized_name = src_normalized.rsplit(".", 1)[-1]
-    logger.info("snapshotting normalized messages: %s -> %s.%s",
-                src_normalized, snap_dataset, snap_normalized_name)
-    dit_bq.snapshot_table(
-        src_normalized,
-        f"{snap_dataset}.{snap_normalized_name}",
+    normalized_fqn = dit_bq.snapshot_into_experiment(
+        args.source_normalized_table,
+        experiment_id=args.experiment_id,
+        role=role,
+        expiration_days=args.snapshot_expiration_days,
         as_of=args.pin_source_at,
-        project=PROJECT,
-        if_not_exists=True,  # FOOTGUN -- see block comment above
+        project=dest_project,
+    )
+    logger.info(
+        "snapshotted normalized messages: %s -> %s (as_of=%s)",
+        args.source_normalized_table, normalized_fqn,
+        args.pin_source_at.isoformat(),
     )
 
-    if args.include_satellite_offsets:
-        start, end = args.date_range
-        shard_dates = _shard_dates(start, end)
-        logger.info("snapshotting %d date shard(s) of %s (satellite offsets opt-in)",
-                    len(shard_dates), PROD_SAT_POS_STEM)
-        for d in shard_dates:
-            sfx = _shard_suffix(d)
-            dit_bq.snapshot_table(
-                f"{PROD_SAT_POS_DATASET}.{PROD_SAT_POS_STEM}{sfx}",
-                f"{snap_dataset}.{PROD_SAT_POS_STEM}{sfx}",
-                as_of=args.pin_source_at,
-                project=PROJECT,
-                if_not_exists=True,  # FOOTGUN -- see block comment above
-            )
-        # Single static aux table: norad_to_receiver.
-        dit_bq.snapshot_table(
-            PROD_NORAD_TABLE,
-            f"{snap_dataset}.norad_to_receiver_v20230510",
-            as_of=args.pin_source_at,
-            project=PROJECT,
-            if_not_exists=True,  # FOOTGUN -- see block comment above
-        )
+    if not args.include_satellite_offsets:
+        return _PipeSegmentSnapshotFQNs(normalized_messages=normalized_fqn)
 
-    logger.info("snapshot dataset: %s", snap_dataset)
-    return snap_dataset
+    # Satellite-positions: one snapshot per date shard. The dest table
+    # names follow snapshot_into_experiment's convention; the CLI flag
+    # for pipe-segment is the FQN STEM (everything before <YYYYMMDD>)
+    # that pipe-segment appends per shard at read time.
+    start, end = args.date_range
+    shard_dates = _shard_dates(start, end)
+    logger.info(
+        "snapshotting %d date shard(s) of %s (satellite offsets opt-in)",
+        len(shard_dates), PROD_SAT_POS_STEM,
+    )
+    sat_dest_fqns: list[str] = []
+    for d in shard_dates:
+        sfx = _shard_suffix(d)
+        sat_dest_fqns.append(dit_bq.snapshot_into_experiment(
+            f"{PROD_SAT_POS_DATASET}.{PROD_SAT_POS_STEM}{sfx}",
+            experiment_id=args.experiment_id,
+            role=role,
+            expiration_days=args.snapshot_expiration_days,
+            as_of=args.pin_source_at,
+            project=dest_project,
+        ))
+    # Stem: strip the trailing date suffix from any one shard's dest FQN
+    # (they all share the same prefix; the date is the last
+    # `len(sfx)` chars of the table name).
+    sample_dest = sat_dest_fqns[0]
+    sat_stem = sample_dest[:-len(_shard_suffix(shard_dates[0]))]
+
+    # Single static aux table: norad_to_receiver.
+    norad_fqn = dit_bq.snapshot_into_experiment(
+        PROD_NORAD_TABLE,
+        experiment_id=args.experiment_id,
+        role=role,
+        expiration_days=args.snapshot_expiration_days,
+        as_of=args.pin_source_at,
+        project=dest_project,
+    )
+    logger.info("snapshotted norad: %s -> %s", PROD_NORAD_TABLE, norad_fqn)
+
+    return _PipeSegmentSnapshotFQNs(
+        normalized_messages=normalized_fqn,
+        sat_positions_stem=sat_stem,
+        norad=norad_fqn,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -564,8 +595,7 @@ def _output_prefix(table: str, *, dest_dataset: str, suffix: str) -> str:
 
 def _segment_args(
     *,
-    snap_dataset: str,
-    snap_normalized_name: str,
+    snapshot_fqns: _PipeSegmentSnapshotFQNs,
     dest_dataset: str,
     suffix: str,
     experiment_id: str,
@@ -579,9 +609,14 @@ def _segment_args(
 ) -> list[str]:
     """CLI args for `pipe-segment segment`.
 
-    Normalized messages table is the snapshot of ``--source-normalized-table``
-    (a single date-partitioned table); pipe-segment's BigQuerySource auto-
-    detects partitioning vs sharding and filters by DATE(timestamp).
+    Source-table FQNs come from ``snapshot_fqns`` (produced by
+    :func:`_snapshot_source`): the normalized-messages snapshot lives in
+    ``snapshot_fqns.normalized_messages``; when
+    ``include_satellite_offsets`` is set, ``sat_positions_stem`` is the
+    FQN-prefix pipe-segment appends per-shard date suffixes to, and
+    ``norad`` is the static norad_to_receiver snapshot. pipe-segment's
+    BigQuerySource auto-detects partitioning vs sharding and filters by
+    DATE(timestamp).
 
     Satellite-offset args only appear when ``include_satellite_offsets`` is
     set; the satellite-offset branch isn't needed to exercise the identity-
@@ -598,7 +633,7 @@ def _segment_args(
     args = [
         "segment",
         f"--date_range={start.isoformat()},{end.isoformat()}",
-        f"--in_normalized_messages_table={snap_dataset}.{snap_normalized_name}",
+        f"--in_normalized_messages_table={snapshot_fqns.normalized_messages}",
         f"--out_segmented_messages_table={_output_prefix('messages_segmented', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--out_segments_table={_output_prefix('segments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--fragments_table={_output_prefix('fragments', dest_dataset=dest_dataset, suffix=suffix)}",
@@ -625,11 +660,21 @@ def _segment_args(
         "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
     ]
     if include_satellite_offsets:
+        # Pre-condition: _snapshot_source populated both satellite fields when
+        # include_satellite_offsets was set; assert for the type narrower.
+        assert snapshot_fqns.sat_positions_stem is not None, (
+            "include_satellite_offsets=True but sat_positions_stem is None; "
+            "_snapshot_source contract violated."
+        )
+        assert snapshot_fqns.norad is not None, (
+            "include_satellite_offsets=True but norad is None; "
+            "_snapshot_source contract violated."
+        )
         args.extend([
-            f"--in_normalized_sat_offset_messages_table={snap_dataset}.{snap_normalized_name}",
+            f"--in_normalized_sat_offset_messages_table={snapshot_fqns.normalized_messages}",
             f"--out_sat_offsets_table={_output_prefix('satellite_timing_offsets', dest_dataset=dest_dataset, suffix=suffix)}",
-            f"--in_norad_to_receiver_table={snap_dataset}.norad_to_receiver_v20230510",
-            f"--in_sat_positions_table={snap_dataset}.{PROD_SAT_POS_STEM}",
+            f"--in_norad_to_receiver_table={snapshot_fqns.norad}",
+            f"--in_sat_positions_table={snapshot_fqns.sat_positions_stem}",
         ])
     if ssvid_filter_query is not None:
         args.append(f"--ssvid_filter_query={ssvid_filter_query}")
@@ -823,7 +868,7 @@ def _run_binding(
     name: str,
     ref: str,
     args: argparse.Namespace,
-    snap_dataset: str,
+    snapshot_fqns: _PipeSegmentSnapshotFQNs,
     suffix: str,
 ) -> int:
     worktree_dir = tempfile.mkdtemp(prefix=f"dit-pipe-segment-{name}-")
@@ -864,10 +909,8 @@ def _run_binding(
             logger.info("[%s] --dry-run set; skipping pipe-segment invocations.", name)
             return 0
 
-        snap_normalized_name = args.source_normalized_table.rsplit(".", 1)[-1]
         seg_args = _segment_args(
-            snap_dataset=snap_dataset,
-            snap_normalized_name=snap_normalized_name,
+            snapshot_fqns=snapshot_fqns,
             dest_dataset=args.dest_dataset,
             suffix=suffix,
             experiment_id=args.experiment_id,
@@ -1039,7 +1082,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # with identical gpsdio-segment pins (an IDENTICAL diff would otherwise
     # look like "the change has no effect" when in fact nothing was tested).
     _verify_distinct_gpsdio_pins(args.pipeline_dir, args.bindings)
-    snap_dataset = _snapshot_source(args)
+    snapshot_fqns = _snapshot_source(args)
 
     suffix_by_binding = {name: f"{args.experiment_id}_{name}" for name, _ in args.bindings}
 
@@ -1051,7 +1094,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for name, ref in args.bindings:
         rc = _run_binding(
             name=name, ref=ref, args=args,
-            snap_dataset=snap_dataset,
+            snapshot_fqns=snapshot_fqns,
             suffix=suffix_by_binding[name],
         )
         rc_by_binding[name] = rc
