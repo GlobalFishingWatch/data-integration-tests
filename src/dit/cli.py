@@ -19,6 +19,26 @@ def main() -> None:
     """Run cross-pipeline integration tests."""
 
 
+def _ensure_workflows_root_on_path(workflow_path: Path) -> None:
+    """Put the directory containing the ``workflows/`` tree on ``sys.path``.
+
+    Workflows are loaded via ``spec_from_file_location``, which creates a
+    standalone module not bound to any package. Cross-workflow imports like
+    ``from workflows.pipe_gaps.mode_equivalence import ...`` only resolve
+    if the directory containing ``workflows/`` is discoverable, which it
+    isn't by default in cloud runs (the laptop relies on ``PYTHONPATH=.``;
+    Cloud Build doesn't set it). Walk up from the workflow file until we
+    find a ``workflows/`` ancestor and prepend its parent to ``sys.path``.
+    Idempotent: no-op if the entry is already present.
+    """
+    for parent in workflow_path.resolve().parents:
+        if parent.name == "workflows":
+            root = str(parent.parent)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            return
+
+
 @main.command(
     "run",
     context_settings={
@@ -33,6 +53,7 @@ def main() -> None:
 @click.argument("workflow_args", nargs=-1, type=click.UNPROCESSED)
 def run(workflow_path: Path, workflow_args: tuple[str, ...]) -> None:
     """Load WORKFLOW_PATH and invoke its main() with the remaining args."""
+    _ensure_workflows_root_on_path(workflow_path)
     spec = importlib.util.spec_from_file_location(workflow_path.stem, workflow_path)
     if spec is None or spec.loader is None:
         click.echo(f"could not load workflow at {workflow_path}", err=True)
