@@ -286,6 +286,24 @@ def test_snapshot_into_experiment_sanitises_hyphenated_experiment_id() -> None:
     assert "pipeline-1465" not in dest  # hyphen must be sanitised
 
 
+def test_snapshot_into_experiment_sanitises_hyphenated_role() -> None:
+    """``role`` is sanitised the same way as ``experiment_id`` so a
+    caller-supplied label containing hyphens doesn't produce a dest
+    table id that needs special quoting."""
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        dest = snapshot_into_experiment(
+            "world-fishing-827.src_ds.tbl",
+            experiment_id="exp1",
+            role="cross-version",  # hyphenated
+        )
+    assert "dit_exp_exp1_cross_version_tbl" in dest
+    assert "cross-version" not in dest  # hyphen must be sanitised
+
+
 def test_snapshot_into_experiment_strips_source_fqn_to_table_name() -> None:
     """source_table_name is the last `.`-separated component."""
     client = _make_client_mock()

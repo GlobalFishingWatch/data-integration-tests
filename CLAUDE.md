@@ -76,12 +76,13 @@ First migration PR off the audit recorded in the entry just below. Pure addition
 **Locked design decisions** (per [`docs/snapshot-dataset-migration-2026-06.md`](docs/snapshot-dataset-migration-2026-06.md)):
 - Single-table helper; callers loop themselves (defer `snapshot_many_into_experiment` until a 4th consumer wants it — duplicate-until-3).
 - `if_existing` modes are `"skip"` (default, idempotent) and `"fail"` only in M1. The `"verify_as_of"` mode documented in `snapshot_table.__doc__` is deferred until after M5 so the helper's API surface stays small across the migration.
-- Sanitisation rule: `-` → `_` (matches the legacy `_sanitize_for_dataset` shape in the three workflow files).
+- Sanitisation rule: `-` → `_` applied to BOTH `experiment_id` AND `role` (matches the legacy `_sanitize_for_dataset` shape in the three workflow files; also prevents a freeform `role` from producing a BQ table id that needs special quoting — Copilot review catch on PR #56).
 - Returns the dest FQN string.
+- `project` defaults to `world-fishing-827` but is overridable (the cross-org dodge path: when both source and dest must live in the same org, callers route through e.g. `gfw-int-vms-v3`). Docstring describes the canonical home as `<project>.tech_great_expectations` so the override path isn't misleading — Copilot review catch on PR #56.
 
 **Sections moved.**
 - `src/dit/bq.py`: added `CANONICAL_DATASET = "tech_great_expectations"` constant; `_utc_now()` indirection for test mocking; `snapshot_into_experiment(...)`.
-- `tests/test_bq.py`: 8 new mock-based tests (default dest + 7-day expiration, hyphen sanitisation, source FQN → table-name extraction, `as_of` plumbed into `FOR SYSTEM_TIME AS OF`, `if_existing="fail"` drops `IF NOT EXISTS`, explicit `if_existing="skip"` includes it, custom `expiration_days`, custom `project` threads through both the BQ client and the dest FQN). Full suite: 331 passing.
+- `tests/test_bq.py`: 9 new mock-based tests (default dest + 7-day expiration, hyphen sanitisation on `experiment_id`, hyphen sanitisation on `role`, source FQN → table-name extraction, `as_of` plumbed into `FOR SYSTEM_TIME AS OF`, `if_existing="fail"` drops `IF NOT EXISTS`, explicit `if_existing="skip"` includes it, custom `expiration_days`, custom `project` threads through both the BQ client and the dest FQN). Full suite: 332 passing.
 - `CHANGELOG.md` § `[Unreleased]` gains a 2026-06-08 `#### Added` entry.
 
 **Sections NOT moved.** No consumer changes — the three workflows still create per-experiment datasets. M2 (outage_recovery), M3 (identity_match_key, folds in the satellite-offsets tactical fix), and M4 (port-visits ais.py per-table FQN flags) can ship in parallel after this lands. M5 (cross_version_ais) waits for M4.

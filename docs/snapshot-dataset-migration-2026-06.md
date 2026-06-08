@@ -66,10 +66,11 @@ def snapshot_into_experiment(
     dataset with a per-table TTL. Returns the destination FQN."""
 ```
 
-**Naming convention** (also locked): dest FQN is `<project>.tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table_name>` where:
-- `sanitized(experiment_id)` replaces `-` with `_` (matches the existing `_sanitize_for_dataset` shape).
-- `role` is a freeform caller-supplied string (e.g. `cross_version`, `outage_pre`, `outage_post`, `pipe_segment`); caller responsibility to keep roles disjoint per workflow.
+**Naming convention** (also locked): dest FQN is `<project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>` where:
+- `sanitised(experiment_id)` and `sanitised(role)` both replace `-` with `_` (matches the existing `_sanitize_for_dataset` shape; also prevents a freeform `role` from producing a BQ table id that needs special quoting — Copilot review catch on PR #56).
+- `role` is a caller-supplied label (e.g. `cross_version`, `outage_pre`, `outage_post`, `pipe_segment`); caller responsibility to keep roles disjoint per workflow.
 - `source_table_name` is the last `.`-separated component of the `source_table` FQN. Helper splits internally.
+- `project` defaults to `world-fishing-827` but is overridable (cross-org dodge path). The docstring describes the canonical home as `<project>.tech_great_expectations` accordingly.
 
 **Tests** (mock BQ client like the existing `tests/test_bq.py`):
 - DDL shape correct (CREATE SNAPSHOT TABLE … CLONE … OPTIONS(expiration_timestamp=…)).

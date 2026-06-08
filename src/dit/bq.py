@@ -278,31 +278,38 @@ def snapshot_into_experiment(
     if_existing: Literal["fail", "skip"] = "skip",
     project: str = DEFAULT_PROJECT,
 ) -> str:
-    """Snapshot ``source_table`` into the canonical ``tech_great_expectations``
-    dataset with a per-table TTL. Returns the destination FQN.
+    """Snapshot ``source_table`` into ``<project>.tech_great_expectations``
+    (the canonical dit BQ artifact dataset, defaulting to
+    ``world-fishing-827.tech_great_expectations``) with a per-table TTL.
+    Returns the destination FQN.
 
     Dest FQN shape::
 
-        <project>.tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table_name>
+        <project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>
 
     where:
 
-    * ``sanitized(experiment_id)`` replaces ``-`` with ``_`` (matches the
-      legacy ``_sanitize_for_dataset`` shape that the per-workflow helpers
-      used; lets old and new artifact names share a prefix during migration).
+    * ``sanitised(experiment_id)`` and ``sanitised(role)`` both replace
+      ``-`` with ``_`` (matches the legacy ``_sanitize_for_dataset`` shape
+      that the per-workflow helpers used; lets old and new artifact names
+      share a prefix during migration, and prevents a freeform ``role``
+      from producing a BQ table id that needs special quoting).
     * ``source_table_name`` is the last ``.``-separated component of
       ``source_table`` (so ``proj.ds.tbl`` → ``tbl``).
-    * ``role`` is a freeform caller-supplied string (e.g. ``cross_version``,
-      ``outage_pre``, ``outage_post``, ``pipe_segment``). Caller is responsible
-      for keeping roles disjoint per workflow so concurrent experiments don't
-      collide on a table name.
+    * ``role`` is a caller-supplied label (e.g. ``cross_version``,
+      ``outage_pre``, ``outage_post``, ``pipe_segment``). Caller is
+      responsible for keeping roles disjoint per workflow so concurrent
+      experiments don't collide on a table name.
 
     Implements the canonical-dataset policy from ``CLAUDE.md`` § Working
-    agreements: all dit BQ artifacts in ``world-fishing-827.tech_great_expectations``,
-    no per-experiment dataset creation. The expiration is set per-table via
-    ``OPTIONS(expiration_timestamp=...)``, computed as ``_utc_now() +
-    timedelta(days=expiration_days)``; BQ deletes the snapshot at that
-    timestamp automatically.
+    agreements: dit BQ artifacts belong in ``tech_great_expectations``, no
+    per-experiment dataset creation. ``project`` defaults to
+    ``world-fishing-827`` but is overridable for the cross-org dodge path
+    (e.g. when both source and dest must live in ``gfw-int-vms-v3`` to
+    satisfy BQ's same-org snapshot constraint). The expiration is set
+    per-table via ``OPTIONS(expiration_timestamp=...)``, computed as
+    ``_utc_now() + timedelta(days=expiration_days)``; BQ deletes the
+    snapshot at that timestamp automatically.
 
     ``if_existing="skip"`` (the default) translates to ``CREATE SNAPSHOT
     TABLE IF NOT EXISTS`` for idempotent re-runs. ``if_existing="fail"``
@@ -311,11 +318,12 @@ def snapshot_into_experiment(
     deferred — see ``docs/snapshot-dataset-migration-2026-06.md`` (it's
     a follow-up PR after the migration completes).
     """
-    sanitized_experiment_id = experiment_id.replace("-", "_")
+    sanitised_experiment_id = experiment_id.replace("-", "_")
+    sanitised_role = role.replace("-", "_")
     source_table_name = source_table.rsplit(".", 1)[-1]
     dest_table = (
         f"{project}.{CANONICAL_DATASET}."
-        f"dit_exp_{sanitized_experiment_id}_{role}_{source_table_name}"
+        f"dit_exp_{sanitised_experiment_id}_{sanitised_role}_{source_table_name}"
     )
     expiration = _utc_now() + timedelta(days=expiration_days)
 
