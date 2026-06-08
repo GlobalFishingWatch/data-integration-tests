@@ -204,34 +204,94 @@ def test_canonical_params_ssvids_normalised_by_sort() -> None:
 # Snapshot naming helpers
 # --------------------------------------------------------------------------
 
-def test_snapshot_dataset_name_distinct_pre_post() -> None:
-    pre = mod._snapshot_dataset_name("exp01", mod.SNAPSHOT_LABEL_PRE)
-    post = mod._snapshot_dataset_name("exp01", mod.SNAPSHOT_LABEL_POST)
+def test_outage_snapshot_dest_fqn_distinct_pre_post() -> None:
+    pre = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_PRE,
+        source_table="world-fishing-827.ds.research_messages",
+        project=mod.PROJECT,
+    )
+    post = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_POST,
+        source_table="world-fishing-827.ds.research_messages",
+        project=mod.PROJECT,
+    )
     assert pre != post
-    assert pre.endswith("_outage_pre")
-    assert post.endswith("_outage_post")
-    # Both share the project + experiment-id stem.
-    assert pre.startswith(f"{mod.PROJECT}.dit_exp_exp01_")
-    assert post.startswith(f"{mod.PROJECT}.dit_exp_exp01_")
+    # Canonical-dataset shape: <project>.tech_great_expectations.dit_exp_<exp>_outage_<label>_<source>
+    assert pre.startswith(f"{mod.PROJECT}.tech_great_expectations.dit_exp_exp01_outage_pre_")
+    assert post.startswith(f"{mod.PROJECT}.tech_great_expectations.dit_exp_exp01_outage_post_")
+    # Source basename suffix preserved
+    assert pre.endswith("_research_messages")
+    assert post.endswith("_research_messages")
 
 
-def test_snapshot_dataset_name_sanitises_hyphens() -> None:
+def test_outage_snapshot_dest_fqn_sanitises_hyphens_in_experiment_id() -> None:
     # BQ dataset names can't contain hyphens; experiment-ids commonly do.
-    name = mod._snapshot_dataset_name("my-exp-2026", mod.SNAPSHOT_LABEL_PRE)
-    assert "-" not in name.split(".", 1)[1]
-    assert "my_exp_2026" in name
+    # The helper mirrors dit.bq.snapshot_into_experiment's - -> _ rule.
+    fqn = mod._outage_snapshot_dest_fqn(
+        experiment_id="my-exp-2026", label=mod.SNAPSHOT_LABEL_PRE,
+        source_table="world-fishing-827.ds.research_messages",
+        project=mod.PROJECT,
+    )
+    # No hyphen in the dit_exp_... portion (project itself can contain
+    # hyphens, so check only the table-id portion after the second dot).
+    table_id_part = fqn.rsplit(".", 1)[-1]
+    assert "-" not in table_id_part
+    assert "my_exp_2026" in fqn
 
 
-def test_snapshot_dataset_name_honours_dest_project() -> None:
+def test_outage_snapshot_dest_fqn_honours_project() -> None:
     # Cross-org opt-in: when running against prod-VMS sources, the dest
     # project must match the source's (gfw-int-vms-v3) to avoid the
-    # cross-org snapshot block. The helper has to forward dest_project
-    # into the FQN.
-    name = mod._snapshot_dataset_name(
-        "exp01", mod.SNAPSHOT_LABEL_PRE, dest_project="gfw-int-vms-v3",
+    # cross-org snapshot block.
+    fqn = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_PRE,
+        source_table="gfw-int-vms-v3.pipe_vms_v3_internal.research_messages",
+        project="gfw-int-vms-v3",
     )
-    assert name.startswith("gfw-int-vms-v3.dit_exp_exp01_")
-    assert name.endswith("_outage_pre")
+    assert fqn.startswith("gfw-int-vms-v3.tech_great_expectations.dit_exp_exp01_outage_pre_")
+
+
+def test_outage_snapshot_dest_fqn_matches_snapshot_into_experiment() -> None:
+    """Synchronisation test: the local FQN reconstruction must agree with
+    what ``dit.bq.snapshot_into_experiment`` would produce. Otherwise the
+    ``--skip-snapshots`` path points at the wrong tables."""
+    from dit import bq as dit_bq
+    from unittest.mock import MagicMock, patch
+
+    client = MagicMock()
+    client.query.return_value.result.return_value = None
+    with patch("google.cloud.bigquery.Client", return_value=client):
+        canonical = dit_bq.snapshot_into_experiment(
+            "world-fishing-827.ds.research_messages",
+            experiment_id="exp01",
+            role="outage_pre",
+            project=mod.PROJECT,
+        )
+    local = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_PRE,
+        source_table="world-fishing-827.ds.research_messages",
+        project=mod.PROJECT,
+    )
+    assert local == canonical, (
+        f"reconstruction drift: local={local!r} canonical={canonical!r}"
+    )
+
+
+def test_snapshot_source_at_rejects_basename_collision() -> None:
+    """When --source-messages and --source-segments have the same basename,
+    the canonical-dataset shape would produce a single dest table name and
+    collide. _snapshot_source_at must raise ValueError before touching BQ.
+    """
+    args = argparse.Namespace(
+        experiment_id="exp01",
+        source_messages="world-fishing-827.a.messages_positions",
+        source_segments="world-fishing-827.b.messages_positions",
+        snapshot_dest_project=mod.PROJECT,
+        snapshot_expiration_days=7,
+    )
+    with pytest.raises(ValueError, match="identical basenames"):
+        mod._snapshot_source_at(args, pin_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                                label=mod.SNAPSHOT_LABEL_PRE)
 
 
 # --------------------------------------------------------------------------
@@ -288,28 +348,6 @@ def test_utc_floor_days_ago_is_midnight_utc() -> None:
     # Sanity: 3 days ago is between 2-4 days ago (give wall-clock slack).
     delta = datetime.now(timezone.utc) - d
     assert timedelta(days=2) < delta < timedelta(days=4)
-
-
-def test_snapshot_table_names_distinct_basenames() -> None:
-    msgs, segs = mod._snapshot_table_names(
-        "proj.ds.research_messages", "proj.ds.segs_activity",
-    )
-    assert msgs == "research_messages"
-    assert segs == "segs_activity"
-
-
-def test_snapshot_table_names_disambiguates_basename_collision() -> None:
-    # If both sources have the same basename (rare in production but
-    # possible across datasets), the helper must disambiguate or the
-    # snapshot dataset has a collision. Both _snapshot_source_at (which
-    # creates) and the --skip-snapshots path (which reconstructs) MUST
-    # agree on this mapping -- that's the whole reason this helper exists.
-    msgs, segs = mod._snapshot_table_names(
-        "proj.a.messages_positions", "proj.b.messages_positions",
-    )
-    assert msgs == "messages_messages_positions"
-    assert segs == "segments_messages_positions"
-    assert msgs != segs
 
 
 # --------------------------------------------------------------------------

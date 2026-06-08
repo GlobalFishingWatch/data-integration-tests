@@ -18,15 +18,19 @@ This workflow simulates exactly that.
 Mechanism
 ---------
 The two source-state pins are realised by **dit's BQ snapshot mechanism**
-(``dit.bq.snapshot_table``): the workflow clones ``research_messages``
-and ``segs_activity`` into two per-experiment snapshot datasets, one at
-``--pre-outage-pin-at`` and one at ``--post-outage-pin-at``, then points
-each stage's pipeline at the appropriate snapshot. The pipe-gaps detect
-pipeline reads the snapshot table exactly as if it were the live source
--- no pipeline-side changes required. Compared to inline ``FOR
-SYSTEM_TIME AS OF`` in the detect query, snapshots are pipeline-agnostic,
-persist beyond BQ's 7-day time-travel window, and are cheap delta-billed
-(see ``src/dit/bq.py`` docstring for the rationale).
+(``dit.bq.snapshot_into_experiment``): the workflow clones
+``research_messages`` and ``segs_activity`` into the canonical
+``world-fishing-827.tech_great_expectations`` dataset under per-experiment
+table names (``dit_exp_<sanitised(experiment_id)>_outage_<pre|post>_<source_table_name>``),
+one snapshot per ``(source, label)`` pair pinned at the matching
+``--pre-outage-pin-at`` / ``--post-outage-pin-at``. Each stage's pipeline
+reads the appropriate snapshot table; the pipe-gaps detect pipeline reads
+it exactly as if it were the live source -- no pipeline-side changes
+required. Compared to inline ``FOR SYSTEM_TIME AS OF`` in the detect
+query, snapshots are pipeline-agnostic, persist beyond BQ's 7-day
+time-travel window, and are cheap delta-billed (see ``src/dit/bq.py``
+docstring for the rationale). Per-table ``expiration_timestamp`` is set
+at snapshot creation (``--snapshot-expiration-days``); BQ self-cleans.
 
 Stages
 ------
@@ -229,10 +233,11 @@ DEFAULT_OUTAGE_END = "2020-08-29"
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
 
-# Logical labels for the two snapshot pins. Used to derive snapshot dataset
-# suffixes (``dit_exp_<experiment_id>_outage_pre`` /
-# ``..._outage_post`` -- see :func:`_snapshot_dataset_name`) and to keep
-# the CLI consistent.
+# Logical labels for the two snapshot pins. Compose into ``snapshot_into_experiment``'s
+# ``role`` parameter as ``f"outage_{label}"``, producing per-experiment dest
+# table names ``dit_exp_<sanitised(experiment_id)>_outage_pre_<source_basename>`` /
+# ``dit_exp_<sanitised(experiment_id)>_outage_post_<source_basename>`` in the
+# canonical ``tech_great_expectations`` dataset.
 SNAPSHOT_LABEL_PRE = "pre"
 SNAPSHOT_LABEL_POST = "post"
 
@@ -295,139 +300,86 @@ def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
 # BQ snapshot helpers (dit-pattern, see workflows/port_visits/cross_version_ais.py)
 # --------------------------------------------------------------------------
 
-def _sanitize_for_dataset(s: str) -> str:
-    # BQ dataset names: letters, digits, underscore only; must start with
-    # letter or underscore. Mirrors cross_version_ais._sanitize_for_dataset.
-    return s.replace("-", "_")
-
-
-def _snapshot_dataset_name(
-    experiment_id: str, label: str, *, dest_project: str = PROJECT,
+def _outage_snapshot_dest_fqn(
+    *, experiment_id: str, label: str, source_table: str, project: str,
 ) -> str:
-    """Per-(experiment, label) snapshot dataset, fully qualified.
+    """The dest FQN that :func:`dit.bq.snapshot_into_experiment` would
+    produce for an outage-snapshot of ``source_table`` at ``label``.
 
-    ``label`` is one of ``SNAPSHOT_LABEL_PRE`` / ``SNAPSHOT_LABEL_POST``;
-    these become disjoint datasets so the two pinned states never collide.
-    ``dest_project`` defaults to dit's project; pass the source's project
-    when running against a source in a different GCP org (``CREATE
-    SNAPSHOT TABLE`` refuses cross-org). The dataset name is content-free
-    with respect to the actual pin timestamps -- those are encoded in the
-    cache key, not the dataset name.
+    Pure function; no BQ call. Used by both :func:`_snapshot_source_at`
+    (which creates the snapshot) and the ``--skip-snapshots`` path
+    (which reconstructs the FQN without re-creating it).
+
+    Mirrors ``dit.bq.snapshot_into_experiment``'s canonical naming
+    convention by construction: same ``-`` → ``_`` sanitisation rule on
+    ``experiment_id``, same ``dit_exp_<sanitised(experiment_id)>_<role>_<source_table_name>``
+    shape under ``<project>.tech_great_expectations``. Role here is
+    ``f"outage_{label}"`` (already underscore-safe; no sanitisation needed).
     """
+    sanitised_experiment_id = experiment_id.replace("-", "_")
+    source_table_name = source_table.rsplit(".", 1)[-1]
     return (
-        f"{dest_project}.dit_exp_"
-        f"{_sanitize_for_dataset(experiment_id)}_outage_{label}"
+        f"{project}.{dit_bq.CANONICAL_DATASET}."
+        f"dit_exp_{sanitised_experiment_id}_outage_{label}_{source_table_name}"
     )
-
-
-def _ensure_snapshot_dataset(
-    fq_name: str, *, expiration_days: int, project: str = PROJECT,
-) -> None:
-    """Create the snapshot dataset if it doesn't exist, with TTL.
-
-    Mirrors cross_version_ais._ensure_dataset. ``default_table_expiration_ms``
-    auto-cleans stale experiments without manual ``bq rm``. ``project`` is
-    where the BQ client runs; for a same-project dest this is dit's
-    project, for a cross-org dest it must be the dest's project.
-    """
-    from google.cloud import bigquery
-    from google.cloud.exceptions import Conflict
-
-    client = bigquery.Client(project=project)
-    dataset = bigquery.Dataset(fq_name)
-    dataset.default_table_expiration_ms = expiration_days * 24 * 60 * 60 * 1000
-    try:
-        client.create_dataset(dataset, exists_ok=True)
-    except Conflict:
-        pass
-    logger.info("ensured dataset %s (expiration %dd)", fq_name, expiration_days)
-
-
-def _snapshot_table_into(
-    source_fqn: str, dest_dataset: str, *, as_of: datetime, table_name: str,
-    project: str = PROJECT,
-) -> str:
-    """Snapshot ``source_fqn`` into ``<dest_dataset>.<table_name>`` at ``as_of``.
-
-    Idempotent: ``if_not_exists=True`` lets a re-run of the same
-    ``--experiment-id`` reuse the snapshot rather than failing on
-    Conflict. The TTL on the snapshot dataset is what eventually cleans
-    the snapshot up. ``project`` is the BQ client's project -- the BQ
-    job runs under it and bills there.
-    """
-    dst_fqn = f"{dest_dataset}.{table_name}"
-    dit_bq.snapshot_table(
-        source_fqn, dst_fqn,
-        as_of=as_of, project=project, if_not_exists=True,
-    )
-    logger.info(
-        "snapshotted %s -> %s (as_of=%s)",
-        source_fqn, dst_fqn, as_of.isoformat(),
-    )
-    return dst_fqn
-
-
-def _snapshot_table_names(
-    source_messages: str, source_segments: str,
-) -> tuple[str, str]:
-    """Compute the ``(messages, segments)`` snapshot table names from the
-    source FQNs.
-
-    The snapshot tables are named after the SOURCE table's basename (the
-    last dotted component) -- so a source ``proj.ds.research_messages``
-    becomes ``<snap_dataset>.research_messages``. This is so the pipeline
-    sees a familiar table name on the input side.
-
-    When both source basenames are identical (e.g. both called
-    ``messages_positions`` but in different datasets), we'd get a
-    collision in the snapshot dataset; the names get prefixed with
-    ``messages_`` / ``segments_`` to disambiguate. Defensive: the
-    production layout has distinct basenames.
-
-    Extracted as a helper so :func:`_snapshot_source_at` (which CREATES
-    the snapshots) and the ``--skip-snapshots`` path (which RECOMPUTES
-    the expected FQNs without re-creating) agree on the names.
-    """
-    msgs_name = source_messages.rsplit(".", 1)[-1]
-    segs_name = source_segments.rsplit(".", 1)[-1]
-    if msgs_name == segs_name:
-        msgs_name = f"messages_{msgs_name}"
-        segs_name = f"segments_{segs_name}"
-    return msgs_name, segs_name
 
 
 def _snapshot_source_at(
     args: argparse.Namespace, *, pin_at: datetime, label: str,
 ) -> tuple[str, str]:
     """Create snapshots of ``--source-messages`` and ``--source-segments``
-    at ``pin_at`` into the per-experiment snapshot dataset for ``label``.
+    at ``pin_at`` for the outage-``label`` (pre/post) checkpoint.
 
     Returns ``(messages_snapshot_fqn, segments_snapshot_fqn)`` which the
     stages then pass as their ``bq_input_messages`` / ``bq_input_segments``.
 
-    Honours ``args.snapshot_dest_project`` so a prod-VMS opt-in run
-    (where the sources live in ``gfw-int-vms-v3``, a different GCP org
-    from ``world-fishing-827``) can target the same-project dest and
-    dodge the cross-org snapshot block.
+    Snapshots land in ``<project>.tech_great_expectations`` per the
+    canonical-dataset policy (see CLAUDE.md § Working agreements).
+    ``args.snapshot_dest_project`` controls the dest project; a prod-VMS
+    opt-in run (sources in ``gfw-int-vms-v3``, a different GCP org from
+    ``world-fishing-827``) must pass it so both sides live in the same
+    org and dodge BQ's cross-org snapshot block.
+
+    Raises ``ValueError`` if ``--source-messages`` and ``--source-segments``
+    have the same basename: under the canonical-dataset shape the two
+    snapshots would collide on a single dest table name. Production has
+    distinct basenames (``research_messages`` vs ``segs_activity``); this
+    only fires on a misconfigured CLI invocation.
     """
-    dest_project = args.snapshot_dest_project
-    dst_dataset = _snapshot_dataset_name(
-        args.experiment_id, label, dest_project=dest_project,
+    msgs_basename = args.source_messages.rsplit(".", 1)[-1]
+    segs_basename = args.source_segments.rsplit(".", 1)[-1]
+    if msgs_basename == segs_basename:
+        raise ValueError(
+            "--source-messages and --source-segments have identical basenames "
+            f"({msgs_basename!r}); under the canonical-dataset snapshot shape "
+            "they would produce a single dest table name and collide. "
+            "Distinct basenames are required."
+        )
+
+    role = f"outage_{label}"
+    msgs_fqn = dit_bq.snapshot_into_experiment(
+        args.source_messages,
+        experiment_id=args.experiment_id,
+        role=role,
+        expiration_days=args.snapshot_expiration_days,
+        as_of=pin_at,
+        project=args.snapshot_dest_project,
     )
-    _ensure_snapshot_dataset(
-        dst_dataset, expiration_days=args.snapshot_expiration_days,
-        project=dest_project,
+    segs_fqn = dit_bq.snapshot_into_experiment(
+        args.source_segments,
+        experiment_id=args.experiment_id,
+        role=role,
+        expiration_days=args.snapshot_expiration_days,
+        as_of=pin_at,
+        project=args.snapshot_dest_project,
     )
-    msgs_name, segs_name = _snapshot_table_names(
-        args.source_messages, args.source_segments,
+    logger.info(
+        "snapshotted %s -> %s (as_of=%s)",
+        args.source_messages, msgs_fqn, pin_at.isoformat(),
     )
-    msgs_fqn = _snapshot_table_into(
-        args.source_messages, dst_dataset, as_of=pin_at, table_name=msgs_name,
-        project=dest_project,
-    )
-    segs_fqn = _snapshot_table_into(
-        args.source_segments, dst_dataset, as_of=pin_at, table_name=segs_name,
-        project=dest_project,
+    logger.info(
+        "snapshotted %s -> %s (as_of=%s)",
+        args.source_segments, segs_fqn, pin_at.isoformat(),
     )
     return msgs_fqn, segs_fqn
 
@@ -459,8 +411,8 @@ def _make_config(
     Mirrors ``mode_equivalence._make_config``; the workflow-local copy
     exists so we can iterate the source-table FQNs per stage without
     drifting against mode_equivalence's signature. Source-state pinning
-    is handled OUTSIDE pipe-gaps via ``dit.bq.snapshot_table`` (see
-    :func:`_snapshot_source_at` below), so the pipe-gaps process
+    is handled OUTSIDE pipe-gaps via ``dit.bq.snapshot_into_experiment``
+    (see :func:`_snapshot_source_at` above), so the pipe-gaps process
     receives ordinary table FQNs and is none the wiser about the
     snapshot layer.
     """
@@ -983,10 +935,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dit_labels = _dit_run_labels(args)
     logger.info("dit labels: %s", dit_labels)
 
-    # Source-state pinning: create two snapshot datasets (pre / post),
-    # each containing a clone of (research_messages, segs_activity) at
-    # the respective pin timestamp. Each stage reads the corresponding
-    # snapshot table; pipe-gaps doesn't know it's reading a snapshot.
+    # Source-state pinning: create per-experiment snapshot tables of
+    # (research_messages, segs_activity) at the pre/post pin timestamps
+    # inside the canonical world-fishing-827.tech_great_expectations
+    # dataset (no per-experiment dataset creation -- see
+    # docs/snapshot-dataset-migration-2026-06.md). Each stage reads the
+    # corresponding snapshot table; pipe-gaps doesn't know it's reading a
+    # snapshot.
     if args.skip_snapshots:
         # CAREFUL: this re-uses snapshot tables created by an earlier run
         # of the same --experiment-id. The pin-at values you pass now are
@@ -995,44 +950,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # creation timestamps. If those drift apart, the workflow reads a
         # stale source state while logging the new pins, which would
         # produce misleading results and cache pollution. Drop the
-        # snapshot datasets (or use a fresh --experiment-id) to refresh.
+        # snapshot tables (or use a fresh --experiment-id) to refresh.
+        pre_msgs = _outage_snapshot_dest_fqn(
+            experiment_id=args.experiment_id, label=SNAPSHOT_LABEL_PRE,
+            source_table=args.source_messages, project=args.snapshot_dest_project,
+        )
+        pre_segs = _outage_snapshot_dest_fqn(
+            experiment_id=args.experiment_id, label=SNAPSHOT_LABEL_PRE,
+            source_table=args.source_segments, project=args.snapshot_dest_project,
+        )
+        post_msgs = _outage_snapshot_dest_fqn(
+            experiment_id=args.experiment_id, label=SNAPSHOT_LABEL_POST,
+            source_table=args.source_messages, project=args.snapshot_dest_project,
+        )
+        post_segs = _outage_snapshot_dest_fqn(
+            experiment_id=args.experiment_id, label=SNAPSHOT_LABEL_POST,
+            source_table=args.source_segments, project=args.snapshot_dest_project,
+        )
         logger.warning(
             "--skip-snapshots: re-using existing snapshot tables for "
             "experiment-id=%r. pin-at values (pre=%s, post=%s) are NOT "
             "verified against the snapshots' actual creation timestamps; "
             "if you've changed pin-at since the snapshots were created, "
-            "drop dataset(s) %s, %s and re-run without --skip-snapshots.",
+            "drop tables %s, %s, %s, %s and re-run without --skip-snapshots.",
             args.experiment_id,
             args.pre_outage_pin_at, args.post_outage_pin_at,
-            _snapshot_dataset_name(
-                args.experiment_id, SNAPSHOT_LABEL_PRE,
-                dest_project=args.snapshot_dest_project,
-            ),
-            _snapshot_dataset_name(
-                args.experiment_id, SNAPSHOT_LABEL_POST,
-                dest_project=args.snapshot_dest_project,
-            ),
+            pre_msgs, pre_segs, post_msgs, post_segs,
         )
-        # Reconstruct the same FQNs _snapshot_source_at would have produced,
-        # via the shared _snapshot_table_names helper -- otherwise a
-        # source-basename collision case (which _snapshot_source_at
-        # disambiguates via messages_/segments_ prefixes) would have the
-        # skip-snapshots path pointing at non-existent tables.
-        msgs_name, segs_name = _snapshot_table_names(
-            args.source_messages, args.source_segments,
-        )
-        pre_ds = _snapshot_dataset_name(
-            args.experiment_id, SNAPSHOT_LABEL_PRE,
-            dest_project=args.snapshot_dest_project,
-        )
-        post_ds = _snapshot_dataset_name(
-            args.experiment_id, SNAPSHOT_LABEL_POST,
-            dest_project=args.snapshot_dest_project,
-        )
-        pre_msgs = f"{pre_ds}.{msgs_name}"
-        pre_segs = f"{pre_ds}.{segs_name}"
-        post_msgs = f"{post_ds}.{msgs_name}"
-        post_segs = f"{post_ds}.{segs_name}"
     else:
         pre_msgs, pre_segs = _snapshot_source_at(
             args, pin_at=_parse_pin_at(args.pre_outage_pin_at),

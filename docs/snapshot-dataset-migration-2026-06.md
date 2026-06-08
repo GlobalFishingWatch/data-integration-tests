@@ -2,7 +2,7 @@
 
 Tracking doc for the migration of dit's BQ snapshot/dataset machinery onto the canonical-dataset policy locked 2026-06-08 (PR #54). Companion to [`snapshot-edge-cases-2026-06.md`](snapshot-edge-cases-2026-06.md) (the empirical audit) and [`workflow-reconciliation-2026-06.md`](workflow-reconciliation-2026-06.md) (the broader workflow review). Update as PRs land.
 
-**Status (2026-06-08)**: policy landed (PR #54); **M1 landed in PR** (this commit) — `dit.bq.snapshot_into_experiment(...)` helper available; M2–M5 not yet started. Two adjacent items (cross-org Guard, pipe-segment satellite-offsets tactical fix) are tracked separately as they don't depend on the migration.
+**Status (2026-06-08)**: policy landed (PR #54); **M1 landed** (PR #56) — `dit.bq.snapshot_into_experiment(...)` helper available; **M2 landed** (this commit) — `workflows/pipe_gaps/outage_recovery.py` migrated to the canonical-dataset shape, first consumer of the helper; M3, M4, M5 not yet started. M3 and M4 can ship in parallel after M2; M5 waits for M4. Two adjacent items (cross-org Guard, pipe-segment satellite-offsets tactical fix) are tracked separately as they don't depend on the migration.
 
 ## What we're fixing
 
@@ -38,7 +38,7 @@ M2, M3, M4 can ship in parallel after M1; M5 must come last (it depends on M4's 
 | # | Title | Tier | LOC | Pre-merge check | Status |
 |---|---|---|---|---|---|
 | M1 | `dit.bq.snapshot_into_experiment(...)` library helper | A (additive library) | ~+30 LOC + tests | Unit tests only — pure addition, no consumer yet | **Landed 2026-06-08** |
-| M2 | Convert `workflows/pipe_gaps/outage_recovery.py` | B (workflow file) | ~-50 LOC net | Optional cloud smoke against staging cohort | Not started |
+| M2 | Convert `workflows/pipe_gaps/outage_recovery.py` | B (workflow file) | ~-56 LOC net | Synchronisation test pins `_outage_snapshot_dest_fqn` to match `snapshot_into_experiment`; optional cloud smoke deferred | **Landed 2026-06-08** |
 | M3 | Convert `workflows/pipe_segment/identity_match_key.py` | B | ~-30 LOC net | Optional cloud smoke; **fold in** the `--snapshot-dest-project` tactical fix (see Adjacent items) | Not started |
 | M4 | Add per-table FQN flags to `workflows/port_visits/ais.py` | B (additive workflow change) | ~+30 LOC | Cloud smoke of `ais.py` standalone — backward compat critical | Not started |
 | M5 | Convert `workflows/port_visits/cross_version_ais.py` | B | ~-60 LOC net | Cloud smoke of a real cross-version run | Not started |

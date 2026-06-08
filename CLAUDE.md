@@ -69,6 +69,24 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-08 — M2 landed: `workflows/pipe_gaps/outage_recovery.py` migrated to canonical-dataset shape (step 2 of 5)
+
+First consumer of `dit.bq.snapshot_into_experiment` (the M1 helper). Drops `outage_recovery.py`'s file-local snapshot/dataset machinery (~130 LOC of `_sanitize_for_dataset` / `_snapshot_dataset_name` / `_ensure_snapshot_dataset` / `_snapshot_table_into` / `_snapshot_table_names` + the `bigquery.Client.create_dataset` call inside `_ensure_snapshot_dataset`). All snapshots now land in `<project>.tech_great_expectations` as `dit_exp_<sanitised(experiment_id)>_outage_<pre|post>_<source_basename>` tables with per-table `expiration_timestamp` (set by `snapshot_into_experiment` via `--snapshot-expiration-days`); no per-experiment dataset creation, no IAM friction from the Cloud Build SA's missing `bigquery.datasets.create`.
+
+**Two design points worth noting.**
+
+1. **A small private `_outage_snapshot_dest_fqn(...)` helper** reconstructs the canonical FQN by mirroring `snapshot_into_experiment`'s naming convention. Used by the `--skip-snapshots` reconstruction path — that path needs to compute the four expected dest FQNs (pre+messages, pre+segments, post+messages, post+segments) WITHOUT a BQ round-trip per source. A synchronisation test (`test_outage_snapshot_dest_fqn_matches_snapshot_into_experiment`) pins the two paths to agree; if they ever drift, the test catches it. If M3/M4/M5 need the same reconstruction pattern, the helper graduates to a public `dit.bq.experiment_snapshot_fqn(...)` (deferred — duplicate-until-3).
+2. **Legacy basename-collision defence dropped** in favour of fail-fast. The legacy `_snapshot_table_names` helper prefixed `messages_` / `segments_` when both source FQNs had the same basename, defending against a configuration where someone passed e.g. two `messages_positions` tables in different datasets. Under the canonical-dataset shape that same case produces a single dest table name → collision. Production sources have distinct basenames (`research_messages` vs `segs_activity`); rather than carrying a defensive prefix that's never load-bearing, `_snapshot_source_at` now raises `ValueError` with a clear message when called with a colliding pair.
+
+**Sections moved (this commit).**
+- `workflows/pipe_gaps/outage_recovery.py`: module docstring § Mechanism rewritten to describe the canonical-dataset shape; SNAPSHOT_LABEL_* comment updated; the 130-LOC snapshot helpers block replaced with `_outage_snapshot_dest_fqn` + the new `_snapshot_source_at` wrapping `snapshot_into_experiment`; `--skip-snapshots` reconstruction path uses `_outage_snapshot_dest_fqn` directly; warning log updated to mention tables-to-drop rather than datasets-to-drop. 1136 → 1080 LOC (-56 net).
+- `tests/test_pipe_gaps_outage_recovery.py`: 5 obsolete tests removed (`_snapshot_dataset_name_*` × 3, `_snapshot_table_names_*` × 2); 5 new tests added (`_outage_snapshot_dest_fqn_*` × 3, `_matches_snapshot_into_experiment` synchronisation test, `_snapshot_source_at_rejects_basename_collision`). Full suite: 332 passing.
+- `CHANGELOG.md` § `[Unreleased]` gains a 2026-06-08 `#### Changed` entry above the M1 `#### Added`.
+- This Plan changelog entry.
+- `docs/snapshot-dataset-migration-2026-06.md`: M2 row in the migration table flipped from "Not started" to "Landed 2026-06-08"; status header updated.
+
+**Sections NOT moved.** No live cloud smoke run in this commit (Tier B pre-merge check is optional per the refactor-discipline working agreement; unit tests + the synchronisation test cover the mechanical correctness). The first real user of `--skip-snapshots` after this lands will exercise the FQN-reconstruction path live; the synchronisation test is the structural guarantee that it'll match what's actually on disk.
+
 ### 2026-06-08 — M1 landed: `dit.bq.snapshot_into_experiment(...)` helper (canonical-dataset migration step 1 of 5)
 
 First migration PR off the audit recorded in the entry just below. Pure addition under `src/dit/bq.py`: `snapshot_into_experiment(source_table, *, experiment_id, role, expiration_days=7, as_of=None, if_existing="skip", project=DEFAULT_PROJECT) -> str`. Constructs the canonical dest FQN (`<project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>`) and delegates to the existing `snapshot_table` with the right `expiration` (computed as `_utc_now() + timedelta(days=expiration_days)`). Returns the dest FQN so callers can use it directly for downstream pipeline args.
