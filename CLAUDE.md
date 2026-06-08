@@ -82,12 +82,12 @@ Operational issue surfaced: three workflows (`workflows/port_visits/cross_versio
 
 **Alternatives considered.** Pre-creating a small fixed set of datasets via Terraform (e.g. `dit_exp_port_visits_internal` etc.) was on the table — preserves ais.py's `--source-dataset-stem` contract unchanged. Declined: adds 4+ permanent dit-owned datasets, requires admin coordination, and doesn't realize the canonical-dataset principle. A hybrid where only `cross_version_ais.py` was left alone was also declined: ais.py's per-table FQN flags are independently well-motivated (the workflow-reconciliation review already flagged the stem indirection as inconsistent with the per-table flag shape used by pipe-gaps and pipe-events).
 
-**Migration sequence (each PR independently shippable).**
+**Migration sequence (each PR independently shippable).** Full plan with locked design decisions, dependency graph, per-PR pre-merge checks, and acceptance criteria lives in [`docs/snapshot-dataset-migration-2026-06.md`](docs/snapshot-dataset-migration-2026-06.md). Summary:
 1. **`dit.bq.snapshot_into_experiment(source_table, *, experiment_id, role, expiration_days=7, project=PROJECT)`** — new helper. Constructs `<project>.tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table>` and calls `snapshot_table` with the right `expiration` parameter. Pure addition. ~30 LOC + tests.
 2. **Convert `pipe_gaps/outage_recovery.py`** — drop `_ensure_snapshot_dataset` + `_snapshot_dataset_name`; use `snapshot_into_experiment(role="outage_pre" | "outage_post", ...)`. ~50-80 LOC net reduction.
-3. **Convert `pipe_segment/identity_match_key.py`** — same shape, `role="pipe_segment"`. ~30 LOC net reduction.
+3. **Convert `pipe_segment/identity_match_key.py`** — same shape, `role="pipe_segment"`. Folds in the `--snapshot-dest-project` tactical fix for the `--include-satellite-offsets` latent cross-org bug. ~30 LOC net reduction.
 4. **Add per-table FQN flags to `port_visits/ais.py`** — `--source-messages-fqn`, `--source-segment-info-fqn`, `--source-segs-activity-fqn`. Keep `--source-dataset-stem` working when those are absent (additive, backward-compat). ~30 LOC.
-5. **Convert `port_visits/cross_version_ais.py`** — drop `_ensure_dataset` + `_snapshot_stem`; use `snapshot_into_experiment(role="cross_version", ...)`; pass per-table FQN overrides through to ais.py. ~60 LOC net reduction.
+5. **Convert `port_visits/cross_version_ais.py`** — drop `_ensure_dataset` + `_snapshot_stem`; use `snapshot_into_experiment(role="cross_version", ...)`; pass per-table FQN overrides through to ais.py. ~60 LOC net reduction. **Removes the transitional legacy-dataset protection rule from `CLAUDE.md` § Working agreements when it lands.**
 
 **Sections moved (this commit).**
 - `CLAUDE.md` § Working agreements — the "Don't manually delete shared `dit_exp_*` datasets" bullet rewritten to lead with the canonical-dataset principle. The legacy-dataset protection rule kept as a transitional note until the migration finishes; will be removed when PR sequence step 5 lands.
