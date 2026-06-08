@@ -2,7 +2,7 @@
 
 Tracking doc for the migration of dit's BQ snapshot/dataset machinery onto the canonical-dataset policy locked 2026-06-08 (PR #54). Companion to [`snapshot-edge-cases-2026-06.md`](snapshot-edge-cases-2026-06.md) (the empirical audit) and [`workflow-reconciliation-2026-06.md`](workflow-reconciliation-2026-06.md) (the broader workflow review). Update as PRs land.
 
-**Status (2026-06-08)**: policy landed; migration sequence M1–M5 not yet started. Two adjacent items (cross-org Guard, pipe-segment satellite-offsets tactical fix) are tracked separately as they don't depend on the migration.
+**Status (2026-06-08)**: policy landed (PR #54); **M1 landed in PR** (this commit) — `dit.bq.snapshot_into_experiment(...)` helper available; M2–M5 not yet started. Two adjacent items (cross-org Guard, pipe-segment satellite-offsets tactical fix) are tracked separately as they don't depend on the migration.
 
 ## What we're fixing
 
@@ -37,7 +37,7 @@ M2, M3, M4 can ship in parallel after M1; M5 must come last (it depends on M4's 
 
 | # | Title | Tier | LOC | Pre-merge check | Status |
 |---|---|---|---|---|---|
-| M1 | `dit.bq.snapshot_into_experiment(...)` library helper | A (additive library) | ~+30 LOC + tests | Unit tests only — pure addition, no consumer yet | Not started |
+| M1 | `dit.bq.snapshot_into_experiment(...)` library helper | A (additive library) | ~+30 LOC + tests | Unit tests only — pure addition, no consumer yet | **Landed 2026-06-08** |
 | M2 | Convert `workflows/pipe_gaps/outage_recovery.py` | B (workflow file) | ~-50 LOC net | Optional cloud smoke against staging cohort | Not started |
 | M3 | Convert `workflows/pipe_segment/identity_match_key.py` | B | ~-30 LOC net | Optional cloud smoke; **fold in** the `--snapshot-dest-project` tactical fix (see Adjacent items) | Not started |
 | M4 | Add per-table FQN flags to `workflows/port_visits/ais.py` | B (additive workflow change) | ~+30 LOC | Cloud smoke of `ais.py` standalone — backward compat critical | Not started |
@@ -66,10 +66,11 @@ def snapshot_into_experiment(
     dataset with a per-table TTL. Returns the destination FQN."""
 ```
 
-**Naming convention** (also locked): dest FQN is `<project>.tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table_name>` where:
-- `sanitized(experiment_id)` replaces `-` with `_` (matches the existing `_sanitize_for_dataset` shape).
-- `role` is a freeform caller-supplied string (e.g. `cross_version`, `outage_pre`, `outage_post`, `pipe_segment`); caller responsibility to keep roles disjoint per workflow.
+**Naming convention** (also locked): dest FQN is `<project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>` where:
+- `sanitised(experiment_id)` and `sanitised(role)` both replace `-` with `_` (matches the existing `_sanitize_for_dataset` shape; also prevents a freeform `role` from producing a BQ table id that needs special quoting — Copilot review catch on PR #56).
+- `role` is a caller-supplied label (e.g. `cross_version`, `outage_pre`, `outage_post`, `pipe_segment`); caller responsibility to keep roles disjoint per workflow.
 - `source_table_name` is the last `.`-separated component of the `source_table` FQN. Helper splits internally.
+- `project` defaults to `world-fishing-827` but is overridable (cross-org dodge path). The docstring describes the canonical home as `<project>.tech_great_expectations` accordingly.
 
 **Tests** (mock BQ client like the existing `tests/test_bq.py`):
 - DDL shape correct (CREATE SNAPSHOT TABLE … CLONE … OPTIONS(expiration_timestamp=…)).

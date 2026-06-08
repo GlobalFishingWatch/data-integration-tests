@@ -69,6 +69,24 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-08 — M1 landed: `dit.bq.snapshot_into_experiment(...)` helper (canonical-dataset migration step 1 of 5)
+
+First migration PR off the audit recorded in the entry just below. Pure addition under `src/dit/bq.py`: `snapshot_into_experiment(source_table, *, experiment_id, role, expiration_days=7, as_of=None, if_existing="skip", project=DEFAULT_PROJECT) -> str`. Constructs the canonical dest FQN (`<project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>`) and delegates to the existing `snapshot_table` with the right `expiration` (computed as `_utc_now() + timedelta(days=expiration_days)`). Returns the dest FQN so callers can use it directly for downstream pipeline args.
+
+**Locked design decisions** (per [`docs/snapshot-dataset-migration-2026-06.md`](docs/snapshot-dataset-migration-2026-06.md)):
+- Single-table helper; callers loop themselves (defer `snapshot_many_into_experiment` until a 4th consumer wants it — duplicate-until-3).
+- `if_existing` modes are `"skip"` (default, idempotent) and `"fail"` only in M1. The `"verify_as_of"` mode documented in `snapshot_table.__doc__` is deferred until after M5 so the helper's API surface stays small across the migration.
+- Sanitisation rule: `-` → `_` applied to BOTH `experiment_id` AND `role` (matches the legacy `_sanitize_for_dataset` shape in the three workflow files; also prevents a freeform `role` from producing a BQ table id that needs special quoting — Copilot review catch on PR #56).
+- Returns the dest FQN string.
+- `project` defaults to `world-fishing-827` but is overridable (the cross-org dodge path: when both source and dest must live in the same org, callers route through e.g. `gfw-int-vms-v3`). Docstring describes the canonical home as `<project>.tech_great_expectations` so the override path isn't misleading — Copilot review catch on PR #56.
+
+**Sections moved.**
+- `src/dit/bq.py`: added `CANONICAL_DATASET = "tech_great_expectations"` constant; `_utc_now()` indirection for test mocking; `snapshot_into_experiment(...)`.
+- `tests/test_bq.py`: 9 new mock-based tests (default dest + 7-day expiration, hyphen sanitisation on `experiment_id`, hyphen sanitisation on `role`, source FQN → table-name extraction, `as_of` plumbed into `FOR SYSTEM_TIME AS OF`, `if_existing="fail"` drops `IF NOT EXISTS`, explicit `if_existing="skip"` includes it, custom `expiration_days`, custom `project` threads through both the BQ client and the dest FQN). Full suite: 332 passing.
+- `CHANGELOG.md` § `[Unreleased]` gains a 2026-06-08 `#### Added` entry.
+
+**Sections NOT moved.** No consumer changes — the three workflows still create per-experiment datasets. M2 (outage_recovery), M3 (identity_match_key, folds in the satellite-offsets tactical fix), and M4 (port-visits ais.py per-table FQN flags) can ship in parallel after this lands. M5 (cross_version_ais) waits for M4.
+
 ### 2026-06-08 — Snapshot mechanism creates BQ datasets (footgun); migrate to single canonical dataset
 
 Operational issue surfaced: three workflows (`workflows/port_visits/cross_version_ais.py`, `workflows/pipe_gaps/outage_recovery.py`, `workflows/pipe_segment/identity_match_key.py`) call `bigquery.Client.create_dataset(...)` to produce `dit_exp_<experiment_id>_*` snapshot datasets. Two real problems:
@@ -83,7 +101,7 @@ Operational issue surfaced: three workflows (`workflows/port_visits/cross_versio
 **Alternatives considered.** Pre-creating a small fixed set of datasets via Terraform (e.g. `dit_exp_port_visits_internal` etc.) was on the table — preserves ais.py's `--source-dataset-stem` contract unchanged. Declined: adds 4+ permanent dit-owned datasets, requires admin coordination, and doesn't realize the canonical-dataset principle. A hybrid where only `cross_version_ais.py` was left alone was also declined: ais.py's per-table FQN flags are independently well-motivated (the workflow-reconciliation review already flagged the stem indirection as inconsistent with the per-table flag shape used by pipe-gaps and pipe-events).
 
 **Migration sequence (each PR independently shippable).** Full plan with locked design decisions, dependency graph, per-PR pre-merge checks, and acceptance criteria lives in [`docs/snapshot-dataset-migration-2026-06.md`](docs/snapshot-dataset-migration-2026-06.md). Summary:
-1. **`dit.bq.snapshot_into_experiment(source_table, *, experiment_id, role, expiration_days=7, project=PROJECT)`** — new helper. Constructs `<project>.tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table>` and calls `snapshot_table` with the right `expiration` parameter. Pure addition. ~30 LOC + tests.
+1. **`dit.bq.snapshot_into_experiment(source_table, *, experiment_id, role, expiration_days=7, project=PROJECT)`** — new helper. Constructs `<project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table>` and calls `snapshot_table` with the right `expiration` parameter. Pure addition. ~30 LOC + tests.
 2. **Convert `pipe_gaps/outage_recovery.py`** — drop `_ensure_snapshot_dataset` + `_snapshot_dataset_name`; use `snapshot_into_experiment(role="outage_pre" | "outage_post", ...)`. ~50-80 LOC net reduction.
 3. **Convert `pipe_segment/identity_match_key.py`** — same shape, `role="pipe_segment"`. Folds in the `--snapshot-dest-project` tactical fix for the `--include-satellite-offsets` latent cross-org bug. ~30 LOC net reduction.
 4. **Add per-table FQN flags to `port_visits/ais.py`** — `--source-messages-fqn`, `--source-segment-info-fqn`, `--source-segs-activity-fqn`. Keep `--source-dataset-stem` working when those are absent (additive, backward-compat). ~30 LOC.
