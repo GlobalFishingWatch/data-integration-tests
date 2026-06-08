@@ -140,15 +140,22 @@ def test_snapshot_source_with_satellite_offsets_calls_helper_for_each_source() -
 def test_snapshot_source_sat_positions_stem_strips_date_suffix() -> None:
     """The satellite-positions stem must equal a per-shard dest FQN with
     the trailing ``<YYYYMMDD>`` stripped; pipe-segment appends the date at
-    read time so the stem must end exactly where the date begins."""
+    read time so the stem must end exactly where the date begins. Verify
+    by capturing every dest FQN ``_snapshot_source`` produced and asserting
+    that re-appending each shard's date to the stem reproduces a
+    captured dest FQN — that's the load-bearing guarantee."""
     args = _snapshot_args(
         include_satellite_offsets=True,
-        date_range=(date(2020, 1, 1), date(2020, 1, 1)),
+        date_range=(date(2020, 1, 1), date(2020, 1, 3)),  # 3 shards
     )
+
+    produced: list[str] = []
 
     def fake_return(source_table: str, *, experiment_id: str, role: str, **_: Any) -> str:
         basename = source_table.rsplit(".", 1)[-1]
-        return f"world-fishing-827.tech_great_expectations.dit_exp_{experiment_id}_{role}_{basename}"
+        dest = f"world-fishing-827.tech_great_expectations.dit_exp_{experiment_id}_{role}_{basename}"
+        produced.append(dest)
+        return dest
 
     with patch.object(
         mod.dit_bq, "snapshot_into_experiment", side_effect=fake_return,
@@ -158,11 +165,17 @@ def test_snapshot_source_sat_positions_stem_strips_date_suffix() -> None:
     assert fqns.sat_positions_stem is not None
     # The stem must end with the PROD_SAT_POS_STEM (trailing underscore).
     assert fqns.sat_positions_stem.endswith(f"_{mod.PROD_SAT_POS_STEM}")
-    # And re-appending the date suffix must reproduce a real shard dest.
-    expected_shard = f"{fqns.sat_positions_stem}20200101"
-    # _shard_suffix(date(2020,1,1)) returns "20200101".
+    # Sanity: the shard-suffix helper still produces what we expect.
     assert mod._shard_suffix(date(2020, 1, 1)) == "20200101"
-    assert expected_shard.endswith("_20200101")
+    # Load-bearing: re-appending each shard's date to the stem reproduces a
+    # dest FQN that was actually created. This is what pipe-segment will do
+    # at read time, so the stem MUST round-trip through this construction.
+    for d in (date(2020, 1, 1), date(2020, 1, 2), date(2020, 1, 3)):
+        reconstructed_shard = f"{fqns.sat_positions_stem}{mod._shard_suffix(d)}"
+        assert reconstructed_shard in produced, (
+            f"shard reconstruction failed for {d}: "
+            f"{reconstructed_shard!r} not in produced dests {produced!r}"
+        )
 
 
 def test_snapshot_source_threads_snapshot_dest_project() -> None:
