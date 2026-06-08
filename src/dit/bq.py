@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import logging
 import random
-from datetime import date, datetime, timedelta
-from typing import Sequence
+from datetime import date, datetime, timedelta, timezone
+from typing import Literal, Sequence
 
 from google.cloud import bigquery
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROJECT = "world-fishing-827"
+CANONICAL_DATASET = "tech_great_expectations"
+
+
+def _utc_now() -> datetime:
+    """Indirection over ``datetime.now(timezone.utc)`` for testability.
+
+    ``snapshot_into_experiment`` reads this to compute the snapshot's
+    ``expiration_timestamp``; tests patch ``dit.bq._utc_now`` to make the
+    emitted DDL deterministic.
+    """
+    return datetime.now(timezone.utc)
 
 
 def drop_tables(prefix: str, *, project: str = DEFAULT_PROJECT) -> None:
@@ -255,3 +266,65 @@ def snapshot_dataset(
         created.append(dst)
 
     return created
+
+
+def snapshot_into_experiment(
+    source_table: str,
+    *,
+    experiment_id: str,
+    role: str,
+    expiration_days: int = 7,
+    as_of: datetime | None = None,
+    if_existing: Literal["fail", "skip"] = "skip",
+    project: str = DEFAULT_PROJECT,
+) -> str:
+    """Snapshot ``source_table`` into the canonical ``tech_great_expectations``
+    dataset with a per-table TTL. Returns the destination FQN.
+
+    Dest FQN shape::
+
+        <project>.tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table_name>
+
+    where:
+
+    * ``sanitized(experiment_id)`` replaces ``-`` with ``_`` (matches the
+      legacy ``_sanitize_for_dataset`` shape that the per-workflow helpers
+      used; lets old and new artifact names share a prefix during migration).
+    * ``source_table_name`` is the last ``.``-separated component of
+      ``source_table`` (so ``proj.ds.tbl`` → ``tbl``).
+    * ``role`` is a freeform caller-supplied string (e.g. ``cross_version``,
+      ``outage_pre``, ``outage_post``, ``pipe_segment``). Caller is responsible
+      for keeping roles disjoint per workflow so concurrent experiments don't
+      collide on a table name.
+
+    Implements the canonical-dataset policy from ``CLAUDE.md`` § Working
+    agreements: all dit BQ artifacts in ``world-fishing-827.tech_great_expectations``,
+    no per-experiment dataset creation. The expiration is set per-table via
+    ``OPTIONS(expiration_timestamp=...)``, computed as ``_utc_now() +
+    timedelta(days=expiration_days)``; BQ deletes the snapshot at that
+    timestamp automatically.
+
+    ``if_existing="skip"`` (the default) translates to ``CREATE SNAPSHOT
+    TABLE IF NOT EXISTS`` for idempotent re-runs. ``if_existing="fail"``
+    drops the ``IF NOT EXISTS`` and lets a name collision raise. The
+    ``"verify_as_of"`` mode documented in ``snapshot_table.__doc__`` is
+    deferred — see ``docs/snapshot-dataset-migration-2026-06.md`` (it's
+    a follow-up PR after the migration completes).
+    """
+    sanitized_experiment_id = experiment_id.replace("-", "_")
+    source_table_name = source_table.rsplit(".", 1)[-1]
+    dest_table = (
+        f"{project}.{CANONICAL_DATASET}."
+        f"dit_exp_{sanitized_experiment_id}_{role}_{source_table_name}"
+    )
+    expiration = _utc_now() + timedelta(days=expiration_days)
+
+    snapshot_table(
+        source_table,
+        dest_table,
+        as_of=as_of,
+        expiration=expiration,
+        project=project,
+        if_not_exists=(if_existing == "skip"),
+    )
+    return dest_table

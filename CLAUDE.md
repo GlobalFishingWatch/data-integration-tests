@@ -69,6 +69,23 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-08 — M1 landed: `dit.bq.snapshot_into_experiment(...)` helper (canonical-dataset migration step 1 of 5)
+
+First migration PR off the audit recorded in the entry just below. Pure addition under `src/dit/bq.py`: `snapshot_into_experiment(source_table, *, experiment_id, role, expiration_days=7, as_of=None, if_existing="skip", project=DEFAULT_PROJECT) -> str`. Constructs the canonical dest FQN (`<project>.tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table_name>`) and delegates to the existing `snapshot_table` with the right `expiration` (computed as `_utc_now() + timedelta(days=expiration_days)`). Returns the dest FQN so callers can use it directly for downstream pipeline args.
+
+**Locked design decisions** (per [`docs/snapshot-dataset-migration-2026-06.md`](docs/snapshot-dataset-migration-2026-06.md)):
+- Single-table helper; callers loop themselves (defer `snapshot_many_into_experiment` until a 4th consumer wants it — duplicate-until-3).
+- `if_existing` modes are `"skip"` (default, idempotent) and `"fail"` only in M1. The `"verify_as_of"` mode documented in `snapshot_table.__doc__` is deferred until after M5 so the helper's API surface stays small across the migration.
+- Sanitisation rule: `-` → `_` (matches the legacy `_sanitize_for_dataset` shape in the three workflow files).
+- Returns the dest FQN string.
+
+**Sections moved.**
+- `src/dit/bq.py`: added `CANONICAL_DATASET = "tech_great_expectations"` constant; `_utc_now()` indirection for test mocking; `snapshot_into_experiment(...)`.
+- `tests/test_bq.py`: 8 new mock-based tests (default dest + 7-day expiration, hyphen sanitisation, source FQN → table-name extraction, `as_of` plumbed into `FOR SYSTEM_TIME AS OF`, `if_existing="fail"` drops `IF NOT EXISTS`, explicit `if_existing="skip"` includes it, custom `expiration_days`, custom `project` threads through both the BQ client and the dest FQN). Full suite: 331 passing.
+- `CHANGELOG.md` § `[Unreleased]` gains a 2026-06-08 `#### Added` entry.
+
+**Sections NOT moved.** No consumer changes — the three workflows still create per-experiment datasets. M2 (outage_recovery), M3 (identity_match_key, folds in the satellite-offsets tactical fix), and M4 (port-visits ais.py per-table FQN flags) can ship in parallel after this lands. M5 (cross_version_ais) waits for M4.
+
 ### 2026-06-08 — Snapshot mechanism creates BQ datasets (footgun); migrate to single canonical dataset
 
 Operational issue surfaced: three workflows (`workflows/port_visits/cross_version_ais.py`, `workflows/pipe_gaps/outage_recovery.py`, `workflows/pipe_segment/identity_match_key.py`) call `bigquery.Client.create_dataset(...)` to produce `dit_exp_<experiment_id>_*` snapshot datasets. Two real problems:
