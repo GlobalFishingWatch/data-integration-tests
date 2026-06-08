@@ -6,6 +6,11 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-08
+
+#### Changed
+- **Canonical-dataset principle for dit BQ artifacts: all in `world-fishing-827.tech_great_expectations`.** Operational issue surfaced today: three workflows (`workflows/port_visits/cross_version_ais.py`, `workflows/pipe_gaps/outage_recovery.py`, `workflows/pipe_segment/identity_match_key.py`) create per-experiment `dit_exp_*` datasets via `bigquery.Client.create_dataset`. The Cloud Build SA `automated-testing@` lacks `bigquery.datasets.create` on `world-fishing-827` (intentional — narrow IAM, no dataset spam), so the cloud path fails any time these workflows try to provision a fresh snapshot dataset; only laptop users with broader perms succeed today. The fix shape is to migrate all snapshots into the canonical `tech_great_expectations` dataset with per-table `expiration_timestamp` for TTL (BQ supports it natively on `CREATE SNAPSHOT TABLE OPTIONS`). The migration is staged as five independently shippable PRs (new `dit.bq.snapshot_into_experiment` helper → convert `outage_recovery.py` → convert `identity_match_key.py` → add per-table FQN flags to `port_visits/ais.py` → convert `cross_version_ais.py`); none of them ship in **this** entry. This entry records the policy: `CLAUDE.md` § Working agreements rewritten to lead with the canonical-dataset principle; `README.md` cancel-run bullet rephrased to put the principle front-and-centre; `docs/workflow-reconciliation-2026-06.md` § 3-a re-scoped from "consolidate the dataset helpers" to "the consolidation IS the migration"; `docs/snapshot-edge-cases-2026-06.md` § 4 gains a forward note. Behaviour unchanged in this commit — workflows still create datasets — so workflow docstrings and `docs/architecture.md` Mermaid stay accurate-to-current and will update with the migration PRs. The legacy-dataset protection rule ("don't `bq rm dit_exp_*` datasets manually — TTL cleans up; concurrent runs sharing experiment-ids can be broken mid-flight") is preserved as a transitional note until step 5 lands.
+
 ### 2026-06-04
 
 #### Fixed

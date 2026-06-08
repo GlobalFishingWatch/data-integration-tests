@@ -60,6 +60,8 @@ Both `gfw-research` and `world-fishing-827` sit in organization `433637338589` (
 
 ## 4. Real impact today
 
+**Forward note (2026-06-08).** Each of the three call sites also creates per-experiment BQ datasets (`dit_exp_<experiment_id>_*`) via `bigquery.Client.create_dataset` — separate from the view / cross-org concerns audited in this doc. That dataset-creation pattern is being migrated to a single canonical dataset (`world-fishing-827.tech_great_expectations`) with per-table TTL; the migration sequence is recorded in `CLAUDE.md` Plan changelog 2026-06-08. The view-source and cross-org findings below are independent of that migration — they remain accurate guidance for any future call site that takes a source FQN and snapshots it, regardless of where the snapshot lands.
+
 Walking the three call sites, with each source FQN's `type:` verified today.
 
 ### `workflows/port_visits/cross_version_ais.py`

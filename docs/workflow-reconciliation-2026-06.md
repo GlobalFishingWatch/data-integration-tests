@@ -74,13 +74,13 @@ This is a healthy amount of shared scaffolding for six files / ~5k LOC. The 2026
 
 These are the highest-leverage candidates.
 
-#### (a) Snapshot dataset machinery is duplicated three times
+#### (a) Snapshot dataset machinery is duplicated three times — superseded 2026-06-08 by the canonical-dataset migration
 
 `port_visits/cross_version_ais.py`, `pipe_gaps/outage_recovery.py`, and `pipe_segment/identity_match_key.py` all carry the same `_sanitize_for_dataset` / `_ensure_dataset` / `_snapshot_source` helpers. All three also carry the same FOOTGUN comment ("`if_not_exists=True` silently reuses snapshot when `--pin-source-at` changes").
 
-**Reconciliation**: lift `ensure_experiment_dataset(experiment_id, *, label=None, project=PROJECT, expiration_days=7) → fqn` and a `snapshot_into_experiment(...)` wrapper into `dit.bq` (or a new `dit.snapshots`). **~80 LOC consolidated → ~40 LOC in `dit.bq`, ~5 LOC removed from each consumer (~100 LOC net reduction) and one shared FOOTGUN solved.**
+This candidate was originally framed as "consolidate the three dataset-creation helpers into `dit.bq`". The 2026-06-08 audit (see `CLAUDE.md` Plan changelog) re-scoped it: the per-experiment dataset-creation is itself the problem — the Cloud Build SA lacks `bigquery.datasets.create`, and per-experiment datasets spam the BQ project. The corrected consolidation is **migrate to `world-fishing-827.tech_great_expectations` with per-table `expiration_timestamp`** rather than lift a dataset-creating helper. New library helper: `dit.bq.snapshot_into_experiment(source_table, *, experiment_id, role, expiration_days=7)` constructs `tech_great_expectations.dit_exp_<sanitized(experiment_id)>_<role>_<source_table>` and calls `snapshot_table` with the right `expiration`. ~100-200 LOC net reduction across the three consumers (the dataset-creation helpers go away entirely), plus a small additive CLI change to `port_visits/ais.py` to accept per-table FQN flags so cross_version_ais can pass explicit overrides instead of a stem-with-halves.
 
-Pairs naturally with the snapshot-mechanism work in [`snapshot-edge-cases-2026-06.md`](snapshot-edge-cases-2026-06.md) (cross-org guard, `if_existing="verify_as_of"` mode).
+Pairs naturally with the snapshot-mechanism work in [`snapshot-edge-cases-2026-06.md`](snapshot-edge-cases-2026-06.md) (cross-org guard, `if_existing="verify_as_of"` mode). The five-PR migration sequence is recorded in the `CLAUDE.md` 2026-06-08 Plan changelog entry.
 
 #### (b) Cross-version orchestrator is now a pattern, not a one-off
 
