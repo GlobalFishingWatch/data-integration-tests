@@ -19,9 +19,11 @@ Mechanism
 ---------
 The two source-state pins are realised by **dit's BQ snapshot mechanism**
 (``dit.bq.snapshot_into_experiment``): the workflow clones
-``research_messages`` and ``segs_activity`` into the canonical
-``world-fishing-827.tech_great_expectations`` dataset under per-experiment
-table names (``dit_exp_<sanitised(experiment_id)>_outage_<pre|post>_<source_table_name>``),
+``research_messages`` and ``segs_activity`` into ``<project>.tech_great_expectations``
+(the canonical dit BQ artifact dataset, defaulting to
+``world-fishing-827.tech_great_expectations``; ``--snapshot-dest-project``
+overrides for the cross-org dodge path) under per-experiment table names
+(``dit_exp_<sanitised(experiment_id)>_outage_<pre|post>_<source_table_name>``),
 one snapshot per ``(source, label)`` pair pinned at the matching
 ``--pre-outage-pin-at`` / ``--post-outage-pin-at``. Each stage's pipeline
 reads the appropriate snapshot table; the pipe-gaps detect pipeline reads
@@ -300,6 +302,30 @@ def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
 # BQ snapshot helpers (dit-pattern, see workflows/port_visits/cross_version_ais.py)
 # --------------------------------------------------------------------------
 
+def _validate_distinct_source_basenames(args: argparse.Namespace) -> None:
+    """Raise ``ValueError`` if ``--source-messages`` and ``--source-segments``
+    have the same basename. Under the canonical-dataset shape they would
+    produce identical snapshot dest table names and collide.
+
+    Called once in :func:`main` so BOTH the snapshot-create path
+    (:func:`_snapshot_source_at`) AND the ``--skip-snapshots`` reconstruction
+    path inherit the protection -- otherwise the skip-snapshots path
+    silently computes colliding FQNs that point at non-existent / wrong
+    tables. Production sources have distinct basenames
+    (``research_messages`` vs ``segs_activity``); this only fires on
+    misconfigured CLI input.
+    """
+    msgs_basename = args.source_messages.rsplit(".", 1)[-1]
+    segs_basename = args.source_segments.rsplit(".", 1)[-1]
+    if msgs_basename == segs_basename:
+        raise ValueError(
+            "--source-messages and --source-segments have identical basenames "
+            f"({msgs_basename!r}); under the canonical-dataset snapshot shape "
+            "they would produce a single dest table name and collide. "
+            "Distinct basenames are required."
+        )
+
+
 def _outage_snapshot_dest_fqn(
     *, experiment_id: str, label: str, source_table: str, project: str,
 ) -> str:
@@ -340,22 +366,11 @@ def _snapshot_source_at(
     ``world-fishing-827``) must pass it so both sides live in the same
     org and dodge BQ's cross-org snapshot block.
 
-    Raises ``ValueError`` if ``--source-messages`` and ``--source-segments``
-    have the same basename: under the canonical-dataset shape the two
-    snapshots would collide on a single dest table name. Production has
-    distinct basenames (``research_messages`` vs ``segs_activity``); this
-    only fires on a misconfigured CLI invocation.
+    Precondition: callers must invoke
+    :func:`_validate_distinct_source_basenames` first (done at the top of
+    :func:`main`). Without distinct basenames the two snapshots collide
+    on a single dest table name.
     """
-    msgs_basename = args.source_messages.rsplit(".", 1)[-1]
-    segs_basename = args.source_segments.rsplit(".", 1)[-1]
-    if msgs_basename == segs_basename:
-        raise ValueError(
-            "--source-messages and --source-segments have identical basenames "
-            f"({msgs_basename!r}); under the canonical-dataset snapshot shape "
-            "they would produce a single dest table name and collide. "
-            "Distinct basenames are required."
-        )
-
     role = f"outage_{label}"
     msgs_fqn = dit_bq.snapshot_into_experiment(
         args.source_messages,
@@ -935,11 +950,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dit_labels = _dit_run_labels(args)
     logger.info("dit labels: %s", dit_labels)
 
+    # Validate the basename precondition for the canonical-dataset snapshot
+    # shape BEFORE either snapshot path runs. Both _snapshot_source_at (create)
+    # and the --skip-snapshots reconstruction path assume distinct basenames.
+    _validate_distinct_source_basenames(args)
+
     # Source-state pinning: create per-experiment snapshot tables of
     # (research_messages, segs_activity) at the pre/post pin timestamps
-    # inside the canonical world-fishing-827.tech_great_expectations
-    # dataset (no per-experiment dataset creation -- see
-    # docs/snapshot-dataset-migration-2026-06.md). Each stage reads the
+    # inside <project>.tech_great_expectations (dest project controlled
+    # by --snapshot-dest-project; defaults to world-fishing-827; cross-org
+    # dodge for prod-VMS sources sets it to e.g. gfw-int-vms-v3). No
+    # per-experiment dataset creation -- see
+    # docs/snapshot-dataset-migration-2026-06.md. Each stage reads the
     # corresponding snapshot table; pipe-gaps doesn't know it's reading a
     # snapshot.
     if args.skip_snapshots:

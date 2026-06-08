@@ -277,21 +277,29 @@ def test_outage_snapshot_dest_fqn_matches_snapshot_into_experiment() -> None:
     )
 
 
-def test_snapshot_source_at_rejects_basename_collision() -> None:
+def test_validate_distinct_source_basenames_rejects_collision() -> None:
     """When --source-messages and --source-segments have the same basename,
     the canonical-dataset shape would produce a single dest table name and
-    collide. _snapshot_source_at must raise ValueError before touching BQ.
+    collide. ``_validate_distinct_source_basenames`` is called once in
+    ``main()`` so both the create path AND the ``--skip-snapshots``
+    reconstruction path inherit the protection.
     """
     args = argparse.Namespace(
-        experiment_id="exp01",
         source_messages="world-fishing-827.a.messages_positions",
         source_segments="world-fishing-827.b.messages_positions",
-        snapshot_dest_project=mod.PROJECT,
-        snapshot_expiration_days=7,
     )
     with pytest.raises(ValueError, match="identical basenames"):
-        mod._snapshot_source_at(args, pin_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
-                                label=mod.SNAPSHOT_LABEL_PRE)
+        mod._validate_distinct_source_basenames(args)
+
+
+def test_validate_distinct_source_basenames_accepts_distinct() -> None:
+    """The production layout (research_messages vs segs_activity) must
+    pass — sanity check that the validator isn't over-eager."""
+    args = argparse.Namespace(
+        source_messages="world-fishing-827.ds.research_messages",
+        source_segments="world-fishing-827.ds.segs_activity",
+    )
+    mod._validate_distinct_source_basenames(args)  # no raise
 
 
 # --------------------------------------------------------------------------
