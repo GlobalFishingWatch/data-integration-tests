@@ -562,9 +562,19 @@ def _snapshot_source(args: argparse.Namespace) -> _PipeSegmentSnapshotFQNs:
         ))
     # Stem: strip the trailing date suffix from any one shard's dest FQN
     # (they all share the same prefix; the date is the last
-    # `len(sfx)` chars of the table name).
+    # `len(sample_suffix)` chars of the table name). Assert the contract
+    # explicitly before slicing -- silently producing a wrong stem if
+    # snapshot_into_experiment's naming ever changes is worse than failing
+    # loudly here. (Copilot review on PR #58.)
     sample_dest = sat_dest_fqns[0]
-    sat_stem = sample_dest[:-len(_shard_suffix(shard_dates[0]))]
+    sample_suffix = _shard_suffix(shard_dates[0])
+    assert sample_dest.endswith(sample_suffix), (
+        f"snapshot_into_experiment produced dest {sample_dest!r} that doesn't "
+        f"end with the shard date suffix {sample_suffix!r}; cannot strip it "
+        "safely to compute the satellite-positions stem. Did the naming "
+        "convention in dit.bq.snapshot_into_experiment change?"
+    )
+    sat_stem = sample_dest[:-len(sample_suffix)]
 
     # Single static aux table: norad_to_receiver.
     norad_fqn = dit_bq.snapshot_into_experiment(
