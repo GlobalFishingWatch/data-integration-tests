@@ -21,19 +21,23 @@ Example: validate PIPELINE-1465 by comparing v4.6.4 against the fix branch::
 Steps:
 
 1. Verify every binding's git ref exists in ``$PROJECTS/anchorages_pipeline``.
-2. Create snapshot datasets ``dit_exp_<sanitized_exp_id>_{internal,published}``
-   (idempotent; default 7-day expiration).
-3. ``dit.bq.snapshot_dataset`` the three workflow input tables
+2. ``dit.bq.snapshot_into_experiment`` the three workflow input tables
    (``messages_positions``, ``segment_info``, ``segs_activity``) from the source
-   stem into the snapshot datasets at ``--pin-source-at``.
-4. For each binding (in parallel by default; ``--sequential-bindings`` opts out):
+   stem at ``--pin-source-at`` into the canonical
+   ``<project>.tech_great_expectations`` dataset as
+   ``dit_exp_<sanitised(exp)>_cross_version_<source_basename>`` tables with
+   per-table ``expiration_timestamp`` (default 7-day TTL). M5 of
+   canonical-dataset migration: no per-experiment dataset creation; all
+   snapshots live in ``tech_great_expectations``.
+3. For each binding (in parallel by default; ``--sequential-bindings`` opts out):
    ``git worktree add`` a temp dir at the ref, invoke ``ais.py`` from that
-   worktree with overridden ``--source-dataset-stem``, a binding-scoped
-   ``--suffix``, and optionally a per-binding ``--worker-image`` (from
-   ``--binding-worker-image NAME=IMAGE``), then tear down the worktree.
+   worktree with M4's per-table FQN flags (``--source-messages-fqn``,
+   ``--source-segment-info-fqn``, ``--source-segs-activity-fqn``) pointing
+   at the canonical snapshots; a binding-scoped ``--suffix``; and optionally
+   a per-binding ``--worker-image`` (from ``--binding-worker-image NAME=IMAGE``).
    Each subprocess's stdout/stderr is line-prefixed ``[<binding>] `` so
    parallel runs interleave readably.
-5. For each mode in ``--modes`` and each pair of bindings, compare the
+4. For each mode in ``--modes`` and each pair of bindings, compare the
    corresponding ``port_visits_<exp>-<binding>_<mode>`` tables on ``visit_id``.
    Pairs touching a binding that failed (rc != 0) are SKIPPED, not diffed.
 
@@ -41,7 +45,7 @@ The overall exit code is non-zero iff any binding failed; an individual
 binding failure does not abort siblings.
 
 ``--dry-run`` skips the ``ais.py`` invocations and the diff phase but still
-performs dataset creation, snapshotting, and worktree setup/teardown — useful
+performs snapshotting and worktree setup/teardown — useful
 for validating the orchestration without burning Dataflow cost.
 
 Note on cross-version semantics: ``ais.py``'s default ``--worker-image`` is a
@@ -57,6 +61,7 @@ access (e.g. ``gcr.io/world-fishing-827/...``) and pass it here.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import itertools
 import logging
 import os
@@ -84,12 +89,6 @@ DEFAULT_MODES = "1_bf,2_bfd,3_bftruncate"
 DEFAULT_PROJECTS_DIR = os.environ.get("PROJECTS") or str(Path(__file__).resolve().parents[2].parent)
 DEFAULT_PIPELINE_DIR = os.path.join(DEFAULT_PROJECTS_DIR, "anchorages_pipeline")
 DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
-
-# Required tables in each half of the source dataset.
-SOURCE_TABLES = {
-    "_internal": ("messages_positions",),
-    "_published": ("segment_info", "segs_activity"),
-}
 
 AIS_WORKFLOW = Path(__file__).with_name("ais.py")
 
@@ -194,88 +193,129 @@ def _verify_refs(pipeline_dir: str, bindings: list[tuple[str, str]]) -> None:
 
 
 # --------------------------------------------------------------------------
-# Snapshot datasets
+# Snapshot tables (canonical-dataset shape, M5 of canonical-dataset migration)
 # --------------------------------------------------------------------------
 
-def _sanitize_for_dataset(s: str) -> str:
-    # BQ dataset names: letters, digits, underscore only; must start with letter or underscore.
-    return s.replace("-", "_")
+# Roles used by dit.bq.snapshot_into_experiment. The naming convention
+# `dit_exp_<sanitised(experiment_id)>_<role>_<source_table_name>` produces
+# distinct FQNs per source table; keeping the source snapshots and the
+# optional thinned snapshot in DIFFERENT roles also prevents name
+# collisions when a caller supplies a --thinned-message-table whose
+# basename happens to match one of the three source basenames.
+_SOURCE_SNAPSHOT_ROLE = "cross_version"
+_THINNED_SNAPSHOT_ROLE = "cross_version_thinned"
 
 
-def _snapshot_stem(experiment_id: str) -> str:
-    return f"dit_exp_{_sanitize_for_dataset(experiment_id)}"
+@dataclasses.dataclass(frozen=True)
+class _CrossVersionSnapshotFQNs:
+    """The four (or three, when no `--thinned-message-table` is supplied)
+    canonical snapshot FQNs that `_snapshot_source` produces, threaded
+    through `_run_binding` -> `_ais_args_for_binding` so each binding's
+    `ais.py` invocation reads from the canonical-dataset snapshots
+    instead of from the stem-derived source.
+
+    Frozen so callers can't accidentally mutate the FQNs between snapshot
+    creation and `ais.py` invocation. M5 of canonical-dataset migration.
+    """
+    messages_positions: str
+    segment_info: str
+    segs_activity: str
+    thinned: Optional[str] = None
 
 
-def _ensure_dataset(fq_name: str, *, expiration_days: int) -> None:
-    from google.cloud import bigquery
-    from google.cloud.exceptions import Conflict
+def _snapshot_source(args: argparse.Namespace) -> _CrossVersionSnapshotFQNs:
+    """Snapshot the three port-visits source tables (and the optional
+    `--thinned-message-table`) at `--pin-source-at` into the canonical
+    `tech_great_expectations` dataset via `dit.bq.snapshot_into_experiment`.
+    Returns the dest FQNs as a frozen dataclass for threading downstream.
 
-    client = bigquery.Client(project=PROJECT)
-    dataset = bigquery.Dataset(fq_name)
-    dataset.default_table_expiration_ms = expiration_days * 24 * 60 * 60 * 1000
-    try:
-        client.create_dataset(dataset, exists_ok=True)
-    except Conflict:
-        pass  # exists_ok=True should swallow this, but defend against version drift
-    logger.info("ensured dataset %s (expiration %dd)", fq_name, expiration_days)
+    M5 of canonical-dataset migration: replaces the prior per-experiment
+    `dit_exp_<exp>_{internal,published}` dataset-creation path. All
+    snapshots now land as tables in `<project>.tech_great_expectations`
+    with per-table `expiration_timestamp` (set by `snapshot_into_experiment`
+    via `expiration_days`). No `bigquery.Client.create_dataset` call,
+    no IAM friction with the narrowly-scoped Cloud Build SA.
 
+    KNOWN FOOTGUN inherited from M1's `snapshot_into_experiment`:
+    `if_existing="skip"` (the helper's default) makes per-source-table
+    re-runs idempotent BUT silently keeps the prior snapshot if the
+    same `--experiment-id` is re-run with a different `--pin-source-at`.
+    Mitigated by the auto-generated `solo_<6-hex>` `--experiment-id`
+    default + 7-day TTL on each snapshot table. The explicit fail-fast
+    path remains `--thinned-message-table` (uses
+    `if_existing="fail"` so a colliding name raises rather than reads
+    the wrong pin). Full write-up + recommended `if_existing="verify_as_of"`
+    resolution in `dit.bq.snapshot_table`'s docstring.
+    """
+    # Source FQNs derived from the source-dataset stem: stays as the
+    # cross_version_ais.py CLI surface (workflow author still picks a
+    # cohort to snapshot FROM). What changes is the DEST shape -- canonical
+    # tech_great_expectations tables, not per-experiment datasets.
+    src_messages = (
+        f"{PROJECT}.{args.source_dataset_stem}_internal.messages_positions"
+    )
+    src_segment_info = (
+        f"{PROJECT}.{args.source_dataset_stem}_published.segment_info"
+    )
+    src_segs_activity = (
+        f"{PROJECT}.{args.source_dataset_stem}_published.segs_activity"
+    )
 
-def _snapshot_source(args: argparse.Namespace) -> str:
-    # KNOWN FOOTGUN -- dit_bq.snapshot_dataset's table-level skip-existing
-    # semantics make this idempotent at the table level: a re-run with the
-    # same --experiment-id but a DIFFERENT --pin-source-at silently keeps
-    # the prior snapshots and ignores the new pin, so the A/B reads from
-    # the wrong baseline with no warning. Same trade-off
-    # workflows/pipe_segment/identity_match_key.py::_snapshot_source
-    # accepts via if_not_exists=True. Full write-up + recommended
-    # if_existing="verify_as_of" resolution in dit.bq.snapshot_table's
-    # docstring; the explicit fail-fast path is _snapshot_thinned_table
-    # below (used for the user-supplied --thinned-message-table).
-    # Mitigated in practice by the auto-generated solo_<6-hex>
-    # --experiment-id default + 7-day TTL on snapshot datasets.
-    snap_stem = _snapshot_stem(args.experiment_id)
-    for half, tables in SOURCE_TABLES.items():
-        src_dataset = f"{PROJECT}.{args.source_dataset_stem}{half}"
-        dst_dataset = f"{PROJECT}.{snap_stem}{half}"
-        _ensure_dataset(dst_dataset, expiration_days=args.snapshot_expiration_days)
-        created = dit_bq.snapshot_dataset(
-            src_dataset, dst_dataset,
-            tables=list(tables),
-            as_of=args.pin_source_at,
-            project=PROJECT,
-        )
-        logger.info("snapshotted %d table(s) from %s into %s (as_of=%s): %s",
-                    len(created), src_dataset, dst_dataset, args.pin_source_at.isoformat(),
-                    [t.split('.')[-1] for t in created])
-    return snap_stem
-
-
-# Fixed table name we snapshot the external thinned-messages source into.
-# Lives in the same _internal half as messages_positions (it's intermediate,
-# not published downstream data).
-_THINNED_SNAPSHOT_TABLE = "port_events_external"
-
-
-def _snapshot_thinned_table(args: argparse.Namespace, snap_stem: str) -> str:
-    """Snapshot the user-supplied --thinned-message-table into the experiment's
-    snapshot dataset at --pin-source-at, return the snapshot FQN. The snapshot
-    dataset is created by ``_snapshot_source`` first.
-
-    Deliberately NOT idempotent: ``snapshot_table`` is called without
-    ``if_not_exists=True``, so a re-run of the same experiment-id with a
-    different ``--thinned-message-table`` (or a different ``--pin-source-at``)
-    fails fast with a BQ Conflict rather than silently keeping the prior
-    snapshot. Re-running cleanly requires either a fresh experiment-id or
-    explicit deletion of the existing snapshot table."""
-    dst_fqn = f"{PROJECT}.{snap_stem}_internal.{_THINNED_SNAPSHOT_TABLE}"
-    dit_bq.snapshot_table(
-        args.thinned_message_table, dst_fqn,
+    dst_messages = dit_bq.snapshot_into_experiment(
+        src_messages,
+        experiment_id=args.experiment_id,
+        role=_SOURCE_SNAPSHOT_ROLE,
         as_of=args.pin_source_at,
+        expiration_days=args.snapshot_expiration_days,
         project=PROJECT,
     )
-    logger.info("snapshotted external thinned table %s -> %s (as_of=%s)",
-                args.thinned_message_table, dst_fqn, args.pin_source_at.isoformat())
-    return dst_fqn
+    dst_segment_info = dit_bq.snapshot_into_experiment(
+        src_segment_info,
+        experiment_id=args.experiment_id,
+        role=_SOURCE_SNAPSHOT_ROLE,
+        as_of=args.pin_source_at,
+        expiration_days=args.snapshot_expiration_days,
+        project=PROJECT,
+    )
+    dst_segs_activity = dit_bq.snapshot_into_experiment(
+        src_segs_activity,
+        experiment_id=args.experiment_id,
+        role=_SOURCE_SNAPSHOT_ROLE,
+        as_of=args.pin_source_at,
+        expiration_days=args.snapshot_expiration_days,
+        project=PROJECT,
+    )
+
+    # Optional --thinned-message-table snapshot. Distinct role so the dest
+    # name can't collide with a source-table snapshot even if the user's
+    # thinned-table basename happens to match (e.g. "messages_positions").
+    # if_existing="fail" preserves the fail-fast contract from the prior
+    # _snapshot_thinned_table -- a re-run with the same --experiment-id
+    # but a different --pin-source-at raises rather than silently reading
+    # the prior snapshot's pin.
+    thinned_fqn: Optional[str] = None
+    if args.thinned_message_table:
+        thinned_fqn = dit_bq.snapshot_into_experiment(
+            args.thinned_message_table,
+            experiment_id=args.experiment_id,
+            role=_THINNED_SNAPSHOT_ROLE,
+            as_of=args.pin_source_at,
+            expiration_days=args.snapshot_expiration_days,
+            if_existing="fail",
+            project=PROJECT,
+        )
+        logger.info(
+            "snapshotted external thinned table %s -> %s (as_of=%s)",
+            args.thinned_message_table, thinned_fqn,
+            args.pin_source_at.isoformat(),
+        )
+
+    return _CrossVersionSnapshotFQNs(
+        messages_positions=dst_messages,
+        segment_info=dst_segment_info,
+        segs_activity=dst_segs_activity,
+        thinned=thinned_fqn,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -285,24 +325,42 @@ def _snapshot_thinned_table(args: argparse.Namespace, snap_stem: str) -> str:
 def _ais_args_for_binding(
     extra_args: list[str],
     *,
-    snap_stem: str,
+    snapshot_fqns: _CrossVersionSnapshotFQNs,
     suffix: str,
     experiment_id: str,
     binding_name: str,
     worker_image: Optional[str] = None,
-    thinned_message_table: Optional[str] = None,
 ) -> list[str]:
     """Strip user-supplied overrides for fields the wrapper owns, then
-    re-inject the wrapper's values. ``--suffix`` controls table names;
-    ``--experiment-id`` + ``--binding-name`` flow into Dataflow job names
-    and BQ labels. ``--worker-image`` and ``--thinned-message-table`` are
-    dropped from extra_args only when a wrapper-supplied value is present
-    -- otherwise ais.py's default wins (no override, no drop)."""
-    # --thinned-message-table is always dropped in cross-version runs (whether or
-    # not the wrapper supplies its own snapshot FQN). The wrapper exclusively owns
-    # this knob -- user-supplied extras can never inject an unpinned table.
-    drop_kvs = {"--source-dataset-stem", "--suffix", "--experiment-id", "--binding-name",
-                "--thinned-message-table"}
+    re-inject the wrapper's values.
+
+    M5 of canonical-dataset migration: replaces the prior
+    ``--source-dataset-stem snap_stem`` pass-through with M4's per-table
+    FQN flags (``--source-messages-fqn`` / ``--source-segment-info-fqn``
+    / ``--source-segs-activity-fqn``). The snapshots live in
+    ``tech_great_expectations`` (not in a ``<stem>_internal`` /
+    ``<stem>_published`` shape that ``--source-dataset-stem`` could
+    address), so per-table FQNs are the only way to route ais.py at them.
+
+    ``--suffix`` controls table names; ``--experiment-id`` +
+    ``--binding-name`` flow into Dataflow job names and BQ labels.
+    ``--worker-image`` is dropped only when a wrapper-supplied value is
+    present -- otherwise ais.py's default wins (no override, no drop).
+    """
+    # --thinned-message-table and --source-* are ALWAYS dropped in
+    # cross-version runs -- the wrapper exclusively owns these knobs (it
+    # snapshotted the inputs and knows the canonical dest FQNs). A
+    # user-supplied --source-messages-fqn (etc.) in extra_args could
+    # otherwise leak an unpinned table into one binding, defeating the
+    # cross-version pin.
+    drop_kvs = {
+        "--source-dataset-stem",
+        "--source-messages-fqn",
+        "--source-segment-info-fqn",
+        "--source-segs-activity-fqn",
+        "--suffix", "--experiment-id", "--binding-name",
+        "--thinned-message-table",
+    }
     if worker_image is not None:
         drop_kvs = drop_kvs | {"--worker-image"}
     out: list[str] = []
@@ -318,7 +376,14 @@ def _ais_args_for_binding(
             continue
         out.append(arg)
     out.extend([
-        "--source-dataset-stem", snap_stem,
+        # Per-table FQN overrides (M4 of canonical-dataset migration) point
+        # ais.py at the M1-helper-produced snapshots in
+        # tech_great_expectations. Each binding reads from the SAME
+        # snapshots so any output divergence is attributable to pipeline
+        # code, not source-data drift.
+        "--source-messages-fqn", snapshot_fqns.messages_positions,
+        "--source-segment-info-fqn", snapshot_fqns.segment_info,
+        "--source-segs-activity-fqn", snapshot_fqns.segs_activity,
         "--suffix", suffix,
         "--experiment-id", experiment_id,
         "--binding-name", binding_name,
@@ -327,8 +392,8 @@ def _ais_args_for_binding(
     ])
     if worker_image is not None:
         out.extend(["--worker-image", worker_image])
-    if thinned_message_table is not None:
-        out.extend(["--thinned-message-table", thinned_message_table])
+    if snapshot_fqns.thinned is not None:
+        out.extend(["--thinned-message-table", snapshot_fqns.thinned])
     return out
 
 
@@ -350,13 +415,12 @@ def _run_binding(
     name: str,
     ref: str,
     experiment_id: str,
-    snap_stem: str,
+    snapshot_fqns: _CrossVersionSnapshotFQNs,
     suffix: str,
     pipeline_dir: str,
     ais_extra_args: list[str],
     dry_run: bool,
     worker_image: Optional[str] = None,
-    thinned_message_table: Optional[str] = None,
 ) -> int:
     worktree_dir = tempfile.mkdtemp(prefix=f"dit-xv-{name}-")
     try:
@@ -368,10 +432,9 @@ def _run_binding(
 
         argv = _ais_args_for_binding(
             ais_extra_args,
-            snap_stem=snap_stem, suffix=suffix,
+            snapshot_fqns=snapshot_fqns, suffix=suffix,
             experiment_id=experiment_id, binding_name=name,
             worker_image=worker_image,
-            thinned_message_table=thinned_message_table,
         )
         cmd = [sys.executable, str(AIS_WORKFLOW), *argv]
         logger.info("binding %s: invoking %s", name, " ".join(shlex.quote(c) for c in cmd))
@@ -489,19 +552,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("bindings: %s", args.bindings)
     logger.info("modes: %s", args.modes)
     logger.info("pipeline_dir: %s", args.pipeline_dir)
-    logger.info("source stem -> snapshot stem: %s -> %s",
-                args.source_dataset_stem, _snapshot_stem(args.experiment_id))
+    logger.info("source stem: %s (canonical dest: %s.tech_great_expectations)",
+                args.source_dataset_stem, PROJECT)
 
     _verify_refs(args.pipeline_dir, args.bindings)
-    snap_stem = _snapshot_source(args)
-
-    # Optional: snapshot an externally-supplied thinned-messages table so that
-    # step 1 (thin_port_messages) can be skipped on every binding. Done after
-    # _snapshot_source so the _internal snapshot dataset already exists.
-    thinned_snapshot_fqn = (
-        _snapshot_thinned_table(args, snap_stem)
-        if args.thinned_message_table else None
-    )
+    # M5 of canonical-dataset migration: _snapshot_source now returns a
+    # frozen dataclass of per-table canonical FQNs in tech_great_expectations
+    # (including the optional --thinned-message-table snapshot as a
+    # None-able field), replacing the prior `snap_stem` string + the
+    # separate `_snapshot_thinned_table` call. The dataclass threads
+    # through _run_binding -> _ais_args_for_binding which emits the M4
+    # per-table FQN flags on each ais.py invocation.
+    snapshot_fqns = _snapshot_source(args)
 
     # Each binding gets a deterministic suffix the diff step can address.
     suffix_by_binding = {
@@ -512,13 +574,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rc = _run_binding(
             name=name, ref=ref,
             experiment_id=args.experiment_id,
-            snap_stem=snap_stem,
+            snapshot_fqns=snapshot_fqns,
             suffix=suffix_by_binding[name],
             pipeline_dir=args.pipeline_dir,
             ais_extra_args=ais_extra_args,
             dry_run=args.dry_run,
             worker_image=args.binding_worker_images.get(name),
-            thinned_message_table=thinned_snapshot_fqn,
         )
         return name, rc
 
