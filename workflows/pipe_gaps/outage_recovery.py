@@ -685,6 +685,11 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
         "source_messages": args.source_messages,
         "source_segments": args.source_segments,
         "pin_at": _parse_pin_at(args.pin_at).isoformat(),
+        # When set, the workflow reads live source tables instead of
+        # snapshots; pin_at is ignored but kept in the key for shape
+        # stability. The boolean differentiates live-source runs from
+        # snapshot runs that happen to share a pin_at.
+        "no_snapshot": bool(args.no_snapshot),
     }
     if mode == MODE_OUTAGE_ORACLE:
         for k in _RECOVERY_ONLY_KEYS:
@@ -869,6 +874,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                          "the current run's. If you change pin-at while "
                          "--skip-snapshots is set, drop the snapshot tables "
                          "(or use a fresh --experiment-id) to force re-creation."))
+    p.add_argument("--no-snapshot", action="store_true",
+                   help=("Bypass snapshotting entirely: every stage reads the "
+                         "live --source-messages / --source-segments tables "
+                         "directly, no FOR SYSTEM_TIME AS OF pin. Use ONLY when "
+                         "the source is frozen for the duration of the run -- "
+                         "the staging cohort (`pipe_ais_test_*`) is the canonical "
+                         "case (2020 AIS data, never changes). For prod-VMS or "
+                         "any live-ingest source this would silently sample "
+                         "different states across the 17+1 stages -- DO NOT USE. "
+                         "When set, --pin-at and --snapshot-* flags are ignored "
+                         "(but still parsed for argparse coherence); the cache "
+                         "key includes a `no_snapshot=true` marker so runs with "
+                         "and without snapshotting don't conflate."))
     add_infra_args(p)
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
@@ -976,16 +994,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dit_labels = _dit_run_labels(args)
     logger.info("dit labels: %s", dit_labels)
 
-    # Validate the basename precondition for the canonical-dataset snapshot
-    # shape BEFORE either snapshot path runs. Both _snapshot_source_at (create)
-    # and the --skip-snapshots reconstruction path assume distinct basenames.
-    _validate_distinct_source_basenames(args)
-
-    # Source-state pinning: one snapshot of (research_messages, segs_activity)
-    # at the pin timestamp inside <project>.tech_great_expectations. All
-    # stages read this same snapshot; the outage is simulated by skipping
-    # daily runs, not by mutating source data, so a single snapshot suffices.
-    if args.skip_snapshots:
+    # Source-state pinning. Three paths:
+    #   1. --no-snapshot: read live source tables directly, no snapshot.
+    #      ONLY safe for frozen-source cases (staging cohort); for live
+    #      sources every stage would sample a different point in time.
+    #   2. --skip-snapshots: reuse existing snapshot tables from an earlier
+    #      same-experiment-id run (no creation).
+    #   3. Default: create one snapshot via snapshot_into_experiment.
+    if args.no_snapshot:
+        logger.warning(
+            "--no-snapshot: every stage reads live %s / %s directly. "
+            "Safe only when the source is frozen; for prod-VMS or live "
+            "sources this would silently sample different states across "
+            "stages. --pin-at (%s) is ignored.",
+            args.source_messages, args.source_segments, args.pin_at,
+        )
+        src_msgs = args.source_messages
+        src_segs = args.source_segments
+    elif args.skip_snapshots:
+        # The basename precondition only matters on snapshot paths --
+        # snapshot dest FQNs collide if both sources share a basename.
+        _validate_distinct_source_basenames(args)
         # CAREFUL: this re-uses snapshot tables created by an earlier run
         # of the same --experiment-id. The pin-at value you pass now is
         # only used for cache-key composition (and validation) -- it is
@@ -1011,10 +1040,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.experiment_id, args.pin_at, src_msgs, src_segs,
         )
     else:
+        # Same basename-collision precondition as the skip-snapshots branch.
+        _validate_distinct_source_basenames(args)
         src_msgs, src_segs = _snapshot_source_at(
             args, pin_at=_parse_pin_at(args.pin_at),
         )
-    logger.info("snapshot: %s, %s", src_msgs, src_segs)
+    logger.info("source tables: %s, %s", src_msgs, src_segs)
 
     base_cfg = dict(
         bq_input_messages=src_msgs,

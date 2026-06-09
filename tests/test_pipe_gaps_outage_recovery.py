@@ -49,6 +49,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         pin_at="2026-06-01 18:00:00 UTC",
         snapshot_expiration_days=7,
         snapshot_dest_project="world-fishing-827",
+        no_snapshot=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -145,6 +146,16 @@ def test_parse_args_rejects_negative_recovery_buffer_days() -> None:
             "--recovery-buffer-days", "-1",
             "--experiment-id", "test",
         ])
+
+
+def test_parse_args_no_snapshot_default_false() -> None:
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.no_snapshot is False
+
+
+def test_parse_args_no_snapshot_set_true() -> None:
+    args = mod.parse_args(["--experiment-id", "test", "--no-snapshot"])
+    assert args.no_snapshot is True
 
 
 def test_parse_args_accepts_zero_recovery_buffer_days() -> None:
@@ -250,6 +261,17 @@ def test_canonical_params_changes_with_ssvids() -> None:
     )
     assert a["ssvids"] != b["ssvids"]
     assert b["ssvids"] == ["ssvid_a", "ssvid_b"]
+
+
+def test_canonical_params_no_snapshot_in_key_for_both_modes() -> None:
+    # The boolean must be in BOTH modes' keys so runs with --no-snapshot
+    # and without don't share a cache row (they read different source data).
+    for mode in (mod.MODE_OUTAGE_RECOVERY, mod.MODE_OUTAGE_ORACLE):
+        rec = mod.canonical_params_dict(_args(no_snapshot=False), mode)
+        liv = mod.canonical_params_dict(_args(no_snapshot=True), mode)
+        assert rec["no_snapshot"] is False
+        assert liv["no_snapshot"] is True
+        assert rec != liv
 
 
 def test_canonical_params_ssvids_normalised_by_sort() -> None:

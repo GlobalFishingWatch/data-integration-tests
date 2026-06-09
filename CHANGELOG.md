@@ -6,6 +6,11 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-09
+
+#### Added
+- **`workflows/pipe_gaps/outage_recovery.py --no-snapshot` flag.** When set, every stage reads the live `--source-messages` / `--source-segments` tables directly (no `snapshot_into_experiment` call, no `FOR SYSTEM_TIME AS OF` pin, `--pin-at` ignored). Use ONLY when the source is frozen for the duration of the run — the staging cohort (`pipe_ais_test_*`) is the canonical case (2020 AIS data, never changes). For prod-VMS or any live-ingest source this would silently sample different states across the 17+1 stages and is unsafe; the flag is opt-in (default false) and emits a `WARNING` log line on activation. Unblocks `make dit-cloud` for staging-cohort smokes when the Cloud Build SA lacks `bigquery.tables.create` permission on `tech_great_expectations` (the snapshot-create path). Cache key gains a `no_snapshot: bool` marker so runs with and without the flag don't share a cache row even when `--pin-at` matches; the `_validate_distinct_source_basenames` precondition is now gated to the two snapshot paths (irrelevant for live reads). 3 new tests in `tests/test_pipe_gaps_outage_recovery.py` (default-false, opt-in-true, cache-key boolean both modes).
+
 ### 2026-06-08
 
 #### Fixed
