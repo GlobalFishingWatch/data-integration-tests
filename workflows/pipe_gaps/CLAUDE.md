@@ -6,9 +6,11 @@
 reprocess implicitly commits to overwriting the `raw_gaps` SCD-2 table
 from `start_date` to `+∞`; sub-range backfills leak (rows past your
 chosen `end_date` get deleted but never re-emitted until the next full
-reprocess). See [`pipe-gaps/CLAUDE.md`](https://github.com/GlobalFishingWatch/pipe-gaps/blob/main/CLAUDE.md)
-for the pipeline-side rationale and the `gaps_delete.sql.j2` template
-that implements the contract.
+reprocess). The implementation lives in
+`pipe-gaps/src/pipe_gaps/assets/queries/gaps_delete.sql.j2` — the
+pre-write delete is unbounded on the right (`WHERE end_timestamp >=
+start_date OR start_timestamp >= start_date`), which is the mechanism
+by which a reprocess takes ownership of the tail.
 
 **This is by design.** Workflows here MUST respect it.
 
