@@ -155,6 +155,21 @@ def test_parse_args_no_snapshot_set_true() -> None:
     assert args.no_snapshot is True
 
 
+def test_parse_args_rejects_no_snapshot_and_skip_snapshots_together() -> None:
+    """Both flags affect the read path of the staged stages (live source vs
+    reuse-prior-snapshot) but they're mutually exclusive: --no-snapshot
+    reads live; --skip-snapshots reads a prior snapshot. The if/elif in
+    main() would silently let --no-snapshot win. Reject at arg-parse time
+    so an ambiguous safety-sensitive combo can't reach the read path.
+    (Copilot review on PR #63.)"""
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--experiment-id", "test",
+            "--no-snapshot",
+            "--skip-snapshots",
+        ])
+
+
 def test_parse_args_accepts_zero_recovery_buffer_days() -> None:
     # Buffer = 0 means recovery starts exactly at outage_start (no
     # overlap with the last pre-outage day). Allowed.
@@ -318,6 +333,45 @@ def test_outage_snapshot_dest_fqn_honours_dest_project() -> None:
         project="gfw-int-vms-v3",
     )
     assert name.startswith("gfw-int-vms-v3.tech_great_expectations.")
+
+
+def test_outage_snapshot_dest_fqn_matches_snapshot_into_experiment() -> None:
+    """Synchronisation pin.
+
+    ``_outage_snapshot_dest_fqn`` is a PURE reimplementation of
+    ``dit.bq.snapshot_into_experiment``'s naming convention -- it lets
+    the ``--skip-snapshots`` path reconstruct snapshot FQNs without a BQ
+    round-trip. If the upstream helper's naming ever shifts, the
+    skip-snapshots path silently reads the wrong table (or fails to find
+    one). Pin the two implementations to agree.
+
+    Restored in this commit (Copilot review on PR #63 noted the M2-era
+    sync test had been removed during the 3-stage refactor).
+    """
+    from unittest.mock import MagicMock, patch
+    from dit.bq import snapshot_into_experiment
+
+    # Mock the BQ client so the helper doesn't actually hit BQ -- we only
+    # care about the dest FQN it constructs and returns.
+    bq_client = MagicMock()
+    bq_client.query.return_value.result.return_value = None
+    with patch("google.cloud.bigquery.Client", return_value=bq_client):
+        helper_dest = snapshot_into_experiment(
+            "world-fishing-827.src_ds.research_messages",
+            experiment_id="exp01",
+            role=mod.SNAPSHOT_ROLE,  # mirrors what _snapshot_source_at passes
+        )
+
+    workflow_dest = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01",
+        source_table="world-fishing-827.src_ds.research_messages",
+        project="world-fishing-827",
+    )
+
+    assert workflow_dest == helper_dest, (
+        "_outage_snapshot_dest_fqn drifted from snapshot_into_experiment's "
+        "naming. --skip-snapshots would reconstruct the wrong FQN."
+    )
 
 
 # --------------------------------------------------------------------------

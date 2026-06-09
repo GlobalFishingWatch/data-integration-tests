@@ -181,10 +181,13 @@ def _default_pin_at() -> str:
 # stale experiment-ids.
 DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
 
-# Stage boundaries are tight (Dec 28-31) so a default run finishes in
-# <10 min on a single Dataflow worker while still exercising the 3-stage
-# shape end-to-end (one-day outage on Dec 29, post-outage continuation on
-# Dec 30-31, recovery on Dec 28-31). The 2020-01-01 start matches
+# Stage 1 covers the full year [2020-01-01, 2020-12-28] (the
+# condensed-DAG-history backfill). The outage + recovery geometry is
+# tight (Dec 28-31): one-day outage on Dec 29, post-outage continuation
+# on Dec 30-31, recovery on Dec 28-31. A default run therefore costs
+# roughly one full-year backfill (Stage 1) plus three short stages, and
+# finishes in well under an hour on a single Dataflow worker while
+# exercising the 3-stage shape end-to-end. The 2020-01-01 start matches
 # ``mode_equivalence.py``
 # (``DEFAULT_START = "2020-01-01"``) so both workflows hit the same cohort
 # data; the cohort name ``pipe_ais_test_202408290000`` is the snapshot
@@ -789,9 +792,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--backfill-end", default=DEFAULT_BACKFILL_END,
         help=(f"Inclusive end of the initial backfill (Stage 1). The "
-              f"outage period starts the day after this; Stage 2 "
-              f"(post-outage continuation) resumes the day after the "
-              f"outage ends. Default: {DEFAULT_BACKFILL_END}."),
+              f"outage period starts at --outage-start (which must be "
+              f"strictly greater than this); any days between this and "
+              f"--outage-start aren't written by any stage until the "
+              f"recovery backfill covers them (Stage 3 starts at "
+              f"--outage-start - --recovery-buffer-days). For the canonical "
+              f"shape, set --outage-start = this + 1 (adjacent). "
+              f"Default: {DEFAULT_BACKFILL_END}."),
     )
     p.add_argument(
         "--outage-start", default=DEFAULT_OUTAGE_START,
@@ -921,6 +928,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error(
             f"--snapshot-expiration-days must be >= 1; got "
             f"{args.snapshot_expiration_days}."
+        )
+
+    # --no-snapshot (live source reads) and --skip-snapshots (reuse prior
+    # snapshot tables) are mutually-exclusive safety-sensitive modes; the
+    # if/elif in main() would silently let --no-snapshot win. Reject at
+    # arg-parse time so an ambiguous combination can't reach the read path.
+    # (Copilot review on PR #63.)
+    if args.no_snapshot and args.skip_snapshots:
+        p.error(
+            "--no-snapshot and --skip-snapshots are mutually exclusive. "
+            "--no-snapshot reads the live source directly (no snapshots "
+            "created or read); --skip-snapshots reuses snapshot tables "
+            "from an earlier run with the same --experiment-id. Pick one."
         )
 
     return args
