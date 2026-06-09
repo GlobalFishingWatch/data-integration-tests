@@ -6,6 +6,11 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-09
+
+#### Added
+- **`dit.bq.derived_source_into_experiment(...)` library helper (M6a of synthetic source mutation primitive).** New pure-addition helper that creates a view (default) or materialised table (`materialise=True`) over a source table with a SQL `WHERE` clause applied, at the canonical `<project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>` address with per-table `expiration_timestamp` (7-day default). Returns the dest FQN. Mirrors `snapshot_into_experiment`'s naming + lifecycle exactly so the two helpers compose by passing one's output FQN as the other's `source_table` input — snapshot pins source at a moment in time, derived_source mutates it via SQL, the workflow chooses what to compose. `where_clause` is interpolated verbatim (caller controls the SQL; caller folds the same string into `canonical_params_dict` for cache-key correctness). `if_existing="skip"` (default) emits `CREATE ... IF NOT EXISTS`; `"fail"` drops it. The `"verify_as_of"` mode is the eventual parity follow-up shared with `snapshot_into_experiment`. Motivating consumer is `workflows/pipe_gaps/outage_recovery.py` (M6b, not yet started) — see [`docs/source-mutation-primitive-2026-06.md`](docs/source-mutation-primitive-2026-06.md) and [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59). 9 new mock-based tests in `tests/test_bq.py` (default view + 7-day expiration, `materialise=True` → CREATE TABLE, `experiment_id` + `role` sanitisation, `where_clause` interpolated verbatim, source FQN → table-name extraction, `if_existing="fail"` drops `IF NOT EXISTS`, custom `expiration_days`, custom `project` threads through). Full suite: 350 passing.
+
 ### 2026-06-08
 
 #### Changed

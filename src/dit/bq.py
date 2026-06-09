@@ -336,3 +336,93 @@ def snapshot_into_experiment(
         if_not_exists=(if_existing == "skip"),
     )
     return dest_table
+
+
+def derived_source_into_experiment(
+    source_table: str,
+    *,
+    experiment_id: str,
+    role: str,
+    where_clause: str,
+    expiration_days: int = 7,
+    materialise: bool = False,
+    if_existing: Literal["fail", "skip"] = "skip",
+    project: str = DEFAULT_PROJECT,
+) -> str:
+    """Create a derived view (or materialised table) over ``source_table``
+    with ``WHERE <where_clause>`` applied, at the canonical
+    ``<project>.tech_great_expectations`` dataset with a per-table TTL.
+    Returns the destination FQN.
+
+    Dest FQN shape (identical to ``snapshot_into_experiment``)::
+
+        <project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>
+
+    Sanitisation (``-`` -> ``_`` on both ``experiment_id`` and ``role``)
+    and ``source_table_name`` (last ``.``-separated component of
+    ``source_table``) follow the same rules as ``snapshot_into_experiment``.
+    Callers using the two helpers in the same experiment keep the ``role``
+    values disjoint per layer (e.g. ``"outage_pre"`` for the snapshot,
+    ``"outage_pre_filtered"`` for the view on top) so the two artifacts
+    don't collide on a table name.
+
+    The new primitive layers ON TOP of ``snapshot_into_experiment``: the
+    two concerns (pin source at a moment in time vs. mutate source via a
+    SQL transform) are orthogonal and compose by passing one helper's
+    output FQN as the other's ``source_table`` input. Either step is
+    optional; the workflow picks what it needs. See
+    ``docs/source-mutation-primitive-2026-06.md`` for the full design.
+
+    ``materialise=False`` (the default) emits ``CREATE VIEW``; the source
+    is queried at read time with predicate push-down to the underlying
+    partitioned table. ``materialise=True`` switches to ``CREATE TABLE``
+    (single CTAS); the result is stored once and read fast on multi-pass
+    paths. Both honour ``expiration_timestamp`` and TTL-delete identically.
+
+    ``where_clause`` is interpolated VERBATIM into the SQL. This is the
+    same convention as the other ``dit.bq`` helpers; the caller controls
+    the SQL fragment and is trusted not to inject. The string itself is
+    a stable identifier the caller folds into ``canonical_params_dict`` so
+    two runs with different mutations don't share a cache row.
+
+    ``if_existing="skip"`` (the default) emits ``CREATE ... IF NOT EXISTS``
+    for idempotent re-runs; ``if_existing="fail"`` drops it and lets a
+    name collision raise. The same KNOWN FOOTGUN documented on
+    ``snapshot_table`` applies: a re-run with the same dest name but a
+    DIFFERENT ``where_clause`` silently keeps the prior artifact. Mitigated
+    in practice by keeping ``role`` values disjoint per shape. The
+    ``"verify_as_of"`` mode is the eventual parity follow-up shared with
+    ``snapshot_into_experiment``.
+
+    ``project`` defaults to ``world-fishing-827`` but is overridable for
+    the cross-org dodge path (e.g. when both source and dest must live in
+    the same org for downstream consumers).
+    """
+    sanitised_experiment_id = experiment_id.replace("-", "_")
+    sanitised_role = role.replace("-", "_")
+    source_table_name = source_table.rsplit(".", 1)[-1]
+    dest_table = (
+        f"{project}.{CANONICAL_DATASET}."
+        f"dit_exp_{sanitised_experiment_id}_{sanitised_role}_{source_table_name}"
+    )
+    expiration = _utc_now() + timedelta(days=expiration_days)
+
+    kind = "TABLE" if materialise else "VIEW"
+    parts = [f"CREATE {kind}"]
+    if if_existing == "skip":
+        parts.append("IF NOT EXISTS")
+    parts.append(
+        f'`{dest_table}` OPTIONS(expiration_timestamp=TIMESTAMP("{expiration.isoformat()}"))'
+    )
+    parts.append(
+        f"AS SELECT * FROM `{source_table}` WHERE {where_clause}"
+    )
+    sql = " ".join(parts)
+
+    logger.info(
+        "deriving %s `%s` <- `%s` WHERE %s",
+        kind.lower(), dest_table, source_table, where_clause,
+    )
+    client = bigquery.Client(project=project)
+    client.query(sql).result()
+    return dest_table

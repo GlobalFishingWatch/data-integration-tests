@@ -1,8 +1,8 @@
 # Synthetic source mutation primitive — implementation plan 2026-06-09
 
-Tracking doc for the synthetic-source-mutation primitive proposed in [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) (filed 2026-06-09). Follow-on to the snapshot/dataset migration tracked in [`snapshot-dataset-migration-2026-06.md`](snapshot-dataset-migration-2026-06.md); ships AFTER that migration (M4 + M5) closes.
+Tracking doc for the synthetic-source-mutation primitive proposed in [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) (filed 2026-06-09). Follow-on to the snapshot/dataset migration tracked in [`snapshot-dataset-migration-2026-06.md`](snapshot-dataset-migration-2026-06.md); see Status line below for the per-stage sequencing (M6a ships independently of the migration; M6b is gated on workflow refactor rather than the migration).
 
-**Status (2026-06-09)**: design locked via issue #59 discussion; implementation not yet started; sequenced after M4 + M5 of the canonical-dataset migration.
+**Status (2026-06-09)**: design locked via issue #59 discussion; **M6a landed** (this commit) — `dit.bq.derived_source_into_experiment(...)` helper available; **M6b not yet started**, gated on the in-flight `workflows/pipe_gaps/outage_recovery.py` 5→3-stage refactor (the integration's stage-routing model fundamentally differs between shapes; writing M6b twice would be wasteful). Sequencing relative to M4 + M5 of the canonical-dataset migration: parallel — they touch disjoint files.
 
 ## Why this primitive
 
@@ -65,10 +65,10 @@ Two PRs, mirroring the M1 → M2 shape of the canonical-dataset migration.
 
 | # | Title | Tier | LOC | Pre-merge check | Status |
 |---|---|---|---|---|---|
-| M6a | `dit.bq.derived_source_into_experiment(...)` library helper | A (additive library) | ~+50 LOC + tests | Unit tests only — pure addition, no consumer yet | Not started |
-| M6b | `workflows/pipe_gaps/outage_recovery.py` synthetic-outage integration | B (workflow file) | ~+30 LOC + CLI flag + WHERE-clause construction | Cloud smoke against AIS staging cohort surfaces the 58 candidate-vessels signal | Not started |
+| M6a | `dit.bq.derived_source_into_experiment(...)` library helper | A (additive library) | ~+95 LOC + 9 tests | Unit tests only — pure addition, no consumer yet | **Landed 2026-06-09** |
+| M6b | `workflows/pipe_gaps/outage_recovery.py` synthetic-outage integration | B (workflow file) | ~+30 LOC + CLI flag + WHERE-clause construction | Cloud smoke against AIS staging cohort surfaces the 58 candidate-vessels signal | Not started — gated on outage_recovery 5→3-stage refactor |
 
-Both ship after M4 + M5 close so the canonical-dataset migration completes cleanly first.
+M6a ships in parallel with M4 (canonical-dataset migration's remaining stages) — they touch disjoint files (`src/dit/bq.py` vs `workflows/port_visits/ais.py`). M6b is gated on the in-flight 5→3-stage refactor of `outage_recovery.py` because the stage-routing model (which stages read filtered vs unfiltered) is fundamentally different between the two shapes.
 
 ### M6a — Library helper
 
@@ -151,7 +151,7 @@ pre_filtered = dit_bq.derived_source_into_experiment(
 
 ## Acceptance criteria (when M6 is complete)
 
-- [ ] `dit.bq.derived_source_into_experiment(...)` available; unit tests pass; full suite green.
+- [x] `dit.bq.derived_source_into_experiment(...)` available; unit tests pass; full suite green. (Landed 2026-06-09 as M6a.)
 - [ ] `workflows/pipe_gaps/outage_recovery.py` exposes `--outage-start` / `--outage-end` (or equivalent), threads them through `canonical_params_dict`, and calls the helper after the snapshot step.
 - [ ] Cloud smoke against AIS staging with outage dates set to the 58-candidate-vessels date boundary surfaces a meaningful divergence in the oracle comparison — the workflow's intended bug-surfacing behaviour is finally reachable from staging.
 - [ ] `CHANGELOG.md` gains a `#### Added` entry under `[Unreleased]` for both M6a and M6b.
