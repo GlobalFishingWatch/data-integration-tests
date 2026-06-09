@@ -576,8 +576,11 @@ def execute_outage_recovery(
         reprocess-from-before-outage-to-current. Per the pipe-gaps
         reprocess-to-end contract (see ``workflows/pipe_gaps/CLAUDE.md``),
         this MUST extend to ``end`` -- the pre-write delete in
-        ``gaps_delete.sql.j2`` is unbounded on the right, so a recovery
-        with a narrower end would leak rows for ``[end+1, ...)``.
+        ``gaps_delete.sql.j2`` is unbounded on the right, so any recovery
+        whose ``end_date`` falls short would leak rows for everything
+        past that ``end_date`` (i.e. ``(recovery_end_date, +∞)``,
+        which would include the workflow's ``end`` whenever the recovery
+        stops before it).
 
     All three stages read the same source snapshot (the outage is
     simulated by skipping date ranges, not by mutating source data),
@@ -919,6 +922,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p.error(
             f"--recovery-buffer-days must be >= 0; got "
             f"{args.recovery_buffer_days}."
+        )
+
+    # Stage 3 (recovery) starts at outage_start - recovery_buffer_days.
+    # If recovery_buffer_days > (outage_start - start), Stage 3 starts
+    # BEFORE the modelled history and reprocesses dates the oracle
+    # ([start, end]) never covered -- so comparisons would diverge for
+    # configuration reasons, not for the bug surface the workflow exists
+    # to test. Fail fast with an actionable message. (Copilot review on
+    # PR #63.) Users who genuinely want recovery to extend earlier can
+    # move --start back; the contract is "every reprocess covers the
+    # full modeled history forward to --end".
+    max_buffer = (outage_start_d - start_d).days
+    if args.recovery_buffer_days > max_buffer:
+        p.error(
+            f"--recovery-buffer-days ({args.recovery_buffer_days}) must "
+            f"be <= (outage_start - start).days ({max_buffer}); otherwise "
+            f"Stage 3 starts before --start ({args.start}) and reprocesses "
+            f"dates the oracle never covered. Move --start earlier if "
+            f"you want a deeper recovery window."
         )
 
     # --snapshot-expiration-days = 0 / negative would compute an invalid

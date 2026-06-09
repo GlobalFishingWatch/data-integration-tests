@@ -145,6 +145,42 @@ def test_parse_args_rejects_negative_recovery_buffer_days() -> None:
         ])
 
 
+def test_parse_args_rejects_recovery_buffer_exceeding_history() -> None:
+    """If recovery_buffer_days > (outage_start - start).days, Stage 3
+    starts BEFORE --start and reprocesses dates the oracle never covered,
+    which would make comparisons fail for configuration reasons rather
+    than for the bug surface. Reject at arg-parse time. (Copilot review
+    on PR #63.)"""
+    # start=2020-12-01, outage_start=2020-12-05 -> max buffer = 4.
+    # Asking for buffer=5 should fail.
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--start", "2020-12-01",
+            "--backfill-end", "2020-12-03",
+            "--outage-start", "2020-12-05",
+            "--outage-end", "2020-12-05",
+            "--end", "2020-12-10",
+            "--recovery-buffer-days", "5",
+            "--experiment-id", "test",
+        ])
+
+
+def test_parse_args_accepts_recovery_buffer_at_history_boundary() -> None:
+    """Boundary case: recovery_buffer_days == (outage_start - start).days
+    means Stage 3 starts EXACTLY at --start, which is fine -- the recovery
+    is allowed to cover the full modelled history."""
+    args = mod.parse_args([
+        "--start", "2020-12-01",
+        "--backfill-end", "2020-12-03",
+        "--outage-start", "2020-12-05",
+        "--outage-end", "2020-12-05",
+        "--end", "2020-12-10",
+        "--recovery-buffer-days", "4",  # exactly outage_start - start
+        "--experiment-id", "test",
+    ])
+    assert args.recovery_buffer_days == 4
+
+
 def test_parse_args_no_snapshot_default_false() -> None:
     args = mod.parse_args(["--experiment-id", "test"])
     assert args.no_snapshot is False
