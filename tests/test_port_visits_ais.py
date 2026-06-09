@@ -180,6 +180,24 @@ def test_segs_activity_table_helper_honours_per_table_override():
     )
 
 
+def test_messages_table_helper_treats_empty_string_as_unset():
+    """Truthiness check (Copilot PR #62): ``""`` MUST fall back to
+    stem-derivation -- otherwise a caller accidentally passing
+    ``--source-messages-fqn ''`` (e.g. shell expansion of an unset
+    variable) would generate ``FROM `` `` and break opaquely. Matches the
+    pattern used elsewhere for optional string args (e.g.
+    ``thinned_message_table``)."""
+    assert mod._messages_table(_args(source_messages_fqn="")) == (
+        "world-fishing-827.pipe_ais_test_202408290000_internal.messages_positions"
+    )
+    assert mod._segment_info_table(_args(source_segment_info_fqn="")) == (
+        "world-fishing-827.pipe_ais_test_202408290000_published.segment_info"
+    )
+    assert mod._segs_activity_table(_args(source_segs_activity_fqn="")) == (
+        "world-fishing-827.pipe_ais_test_202408290000_published.segs_activity"
+    )
+
+
 def test_bad_segs_sql_honours_per_table_override():
     """The SQL fragment built in _bad_segs_sql also honours the override
     (lifts the FQN out of the f-string and reads it from the helper). The

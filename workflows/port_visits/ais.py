@@ -349,22 +349,28 @@ def _messages_table(args: argparse.Namespace) -> str:
     Per-table override (``--source-messages-fqn``) wins; otherwise derives
     from ``--source-dataset-stem`` for byte-identical back-compat. M4 of
     the canonical-dataset migration.
+
+    Truthiness check on the override -- treating ``""`` as unset matches
+    other optional string args in this module (``thinned_message_table``)
+    and avoids generating invalid SQL (``FROM `` ``) if a caller
+    accidentally passes ``--source-messages-fqn ''``. (Copilot review on
+    PR #62.)
     """
-    if args.source_messages_fqn is not None:
+    if args.source_messages_fqn:
         return args.source_messages_fqn
     return f"{PROJECT}.{_internal_dataset(args.source_dataset_stem)}.messages_positions"
 
 
 def _segment_info_table(args: argparse.Namespace) -> str:
     """Resolved FQN of the source segment_info table. See ``_messages_table``."""
-    if args.source_segment_info_fqn is not None:
+    if args.source_segment_info_fqn:
         return args.source_segment_info_fqn
     return f"{PROJECT}.{_published_dataset(args.source_dataset_stem)}.segment_info"
 
 
 def _segs_activity_table(args: argparse.Namespace) -> str:
     """Resolved FQN of the source segs_activity table. See ``_messages_table``."""
-    if args.source_segs_activity_fqn is not None:
+    if args.source_segs_activity_fqn:
         return args.source_segs_activity_fqn
     return f"{PROJECT}.{_published_dataset(args.source_dataset_stem)}.segs_activity"
 
@@ -583,7 +589,13 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     reason.
 
     Output content depends on: the mode, the inclusive date window, the
-    source dataset stem (the input AIS cohort), the named-anchorages
+    three RESOLVED source-table FQNs (`messages_positions`,
+    `segment_info`, `segs_activity` — derived from
+    ``--source-dataset-stem`` by default, overridable per table via the
+    ``--source-{messages,segment-info,segs-activity}-fqn`` flags; the
+    cache key is on the resolved FQN, NOT the stem or which CLI shape
+    produced it, so two runs pointing at the same three tables share a
+    cache row regardless of which knob they used), the named-anchorages
     reference, the **submitter image identity** (see
     :func:`_submitter_image_identity` -- the pipeline-construction code that
     builds/submits the Beam graph; mode-independent), and -- when set --
@@ -721,16 +733,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # cross_version_ais.py (M5) uses these to point at snapshots in
     # tech_great_expectations that don't follow the stem-with-halves shape.
     p.add_argument("--source-messages-fqn", default=None,
-                   help="Fully-qualified `<project>.<dataset>.messages_positions` table; "
-                        "overrides --source-dataset-stem-based derivation for this table only. "
+                   help="Fully-qualified `<project>.<dataset>.<table>` for the messages-positions "
+                        "input; overrides --source-dataset-stem-based derivation for this table only. "
+                        "The basename does not have to be `messages_positions` -- the workflow "
+                        "treats whatever table you pass as the equivalent input. "
                         f"Default: stem-derived ({DEFAULT_SOURCE_MESSAGES_FQN}).")
     p.add_argument("--source-segment-info-fqn", default=None,
-                   help="Fully-qualified `<project>.<dataset>.segment_info` table; "
-                        "overrides --source-dataset-stem-based derivation for this table only. "
+                   help="Fully-qualified `<project>.<dataset>.<table>` for the segment-info "
+                        "input; overrides --source-dataset-stem-based derivation for this table only. "
                         f"Default: stem-derived ({DEFAULT_SOURCE_SEGMENT_INFO_FQN}).")
     p.add_argument("--source-segs-activity-fqn", default=None,
-                   help="Fully-qualified `<project>.<dataset>.segs_activity` table; "
-                        "overrides --source-dataset-stem-based derivation for this table only. "
+                   help="Fully-qualified `<project>.<dataset>.<table>` for the segs-activity "
+                        "input (used by --bad-segs filtering); overrides --source-dataset-stem-based "
+                        "derivation for this table only. "
                         f"Default: stem-derived ({DEFAULT_SOURCE_SEGS_ACTIVITY_FQN}).")
     p.add_argument("--named-anchorages", default=DEFAULT_NAMED_ANCHORAGES)
     p.add_argument("--start", default=DEFAULT_START,
