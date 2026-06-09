@@ -2,7 +2,7 @@
 
 Tracking doc for the migration of dit's BQ snapshot/dataset machinery onto the canonical-dataset policy locked 2026-06-08 (PR #54). Companion to [`snapshot-edge-cases-2026-06.md`](snapshot-edge-cases-2026-06.md) (the empirical audit) and [`workflow-reconciliation-2026-06.md`](workflow-reconciliation-2026-06.md) (the broader workflow review). Update as PRs land.
 
-**Status (2026-06-08)**: policy landed (PR #54); **M1 landed** (PR #56) — `dit.bq.snapshot_into_experiment(...)` helper available; **M2 landed** (this commit) — `workflows/pipe_gaps/outage_recovery.py` migrated to the canonical-dataset shape, first consumer of the helper; M3, M4, M5 not yet started. M3 and M4 can ship in parallel after M2; M5 waits for M4. Two adjacent items (cross-org Guard, pipe-segment satellite-offsets tactical fix) are tracked separately as they don't depend on the migration.
+**Status (2026-06-09)**: policy landed (PR #54); **M1 landed** (PR #56) — `dit.bq.snapshot_into_experiment(...)` helper available; **M2 landed** (PR #57) — `workflows/pipe_gaps/outage_recovery.py` migrated; **M3 landed** (PR #58) — `workflows/pipe_segment/identity_match_key.py` migrated, second consumer of the helper, AND the pipe-segment `--snapshot-dest-project` tactical fix folded in; **M4 landed** (this commit) — `workflows/port_visits/ais.py` gained per-table `--source-{messages,segment-info,segs-activity}-fqn` override flags; **M5 not yet started** (unblocked by M4). One remaining adjacent item (cross-org Guard) is tracked separately. The synthetic-source-mutation primitive (issue #59) is tracked separately in [`source-mutation-primitive-2026-06.md`](source-mutation-primitive-2026-06.md); its progress is orthogonal to this migration and isn't reflected here.
 
 ## What we're fixing
 
@@ -39,8 +39,8 @@ M2, M3, M4 can ship in parallel after M1; M5 must come last (it depends on M4's 
 |---|---|---|---|---|---|
 | M1 | `dit.bq.snapshot_into_experiment(...)` library helper | A (additive library) | ~+30 LOC + tests | Unit tests only — pure addition, no consumer yet | **Landed 2026-06-08** |
 | M2 | Convert `workflows/pipe_gaps/outage_recovery.py` | B (workflow file) | ~-56 LOC net | Synchronisation test pins `_outage_snapshot_dest_fqn` to match `snapshot_into_experiment`; optional cloud smoke deferred | **Landed 2026-06-08** |
-| M3 | Convert `workflows/pipe_segment/identity_match_key.py` | B | ~-30 LOC net | Optional cloud smoke; **fold in** the `--snapshot-dest-project` tactical fix (see Adjacent items) | Not started |
-| M4 | Add per-table FQN flags to `workflows/port_visits/ais.py` | B (additive workflow change) | ~+30 LOC | Cloud smoke of `ais.py` standalone — backward compat critical | Not started |
+| M3 | Convert `workflows/pipe_segment/identity_match_key.py` | B | +43 LOC net (the dataclass + cross-org help text + satellite-stem computation offset the dataset-creation drops; no-`create_dataset` is the load-bearing metric) | 8 new unit tests pin the dataclass shape + `_snapshot_source` invocations; `--snapshot-dest-project` tactical fix folded in | **Landed 2026-06-08** |
+| M4 | Add per-table FQN flags to `workflows/port_visits/ais.py` | B (additive workflow change) | ~+50 LOC + 7 new tests | Cloud smoke of `ais.py` standalone — backward compat pinned by `test_canonical_params_dict_stem_and_explicit_fqn_match_when_equivalent` (resolved FQNs identical → cache row identical) | **Landed 2026-06-09** |
 | M5 | Convert `workflows/port_visits/cross_version_ais.py` | B | ~-60 LOC net | Cloud smoke of a real cross-version run | Not started |
 
 Net effect when complete: ~150–200 LOC removed from workflows, one new library helper, one `ais.py` CLI extension, the `dit_exp_*` dataset spam eliminated, the transitional protection rule removed from CLAUDE.md.
@@ -138,11 +138,11 @@ Add the third `if_existing` mode to `snapshot_table` (and via M1's helper, `snap
 
 **Ships as a follow-up PR after M5**, when the migration call sites can flip to `verify_as_of` together. Could come earlier if there's a strong reason, but bundling keeps `snapshot_into_experiment`'s API stable across M1–M5.
 
-### pipe-segment `--include-satellite-offsets` cross-org tactical fix
+### pipe-segment `--include-satellite-offsets` cross-org tactical fix — Landed 2026-06-08 (folded into M3)
 
-Surfaced in the snapshot-edge-cases audit § 4 as a latent bug: the opt-in flag snapshots from `gfw-int-pipe-v3` (org `115316357079`) into `world-fishing-827` (org `433637338589`) and fails fast. Fix is a `--snapshot-dest-project` flag mirroring `outage_recovery.py` (~10 LOC).
+Surfaced in the snapshot-edge-cases audit § 4 as a latent bug: the opt-in flag snapshots from `gfw-int-pipe-v3` (org `115316357079`) into `world-fishing-827` (org `433637338589`) and fails fast. Fix is a `--snapshot-dest-project` flag mirroring `outage_recovery.py`.
 
-**Folded into M3** since both touch `identity_match_key.py`. Worth ensuring the M3 PR description notes the latent-bug fix so reviewers know the file change is doing two things.
+**Landed 2026-06-08 as part of M3**. The flag defaults to `PROJECT` (no behaviour change for existing callers); when set, every `snapshot_into_experiment` call in `_snapshot_source` receives the override as its `project` argument. The cross-org caller-responsibility note (user must also place `--source-normalized-table` in the dest's org when `--include-satellite-offsets` is set) is documented in the workflow's leading comment block above the satellite-offsets constants.
 
 ## Docs that update as each migration PR lands
 
@@ -155,6 +155,14 @@ These files describe current behaviour and are deliberately untouched until the 
 - `docs/run-cache.md` (line ~122) and `docs/run-cache-impl.md` (line ~68) cross-version `dit_exp_*` references → update in M5.
 
 The `CLAUDE.md` § Working agreements transitional protection note → removed in M5 (no more legacy datasets to protect).
+
+## Follow-on: synthetic source mutation primitive (M6)
+
+Filed as [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) (2026-06-09). New library helper `dit.bq.derived_source_into_experiment(source_table, *, experiment_id, role, where_clause, ...)` that creates a view (or materialised table when `materialise=True`) over the source with a SQL `WHERE` clause applied. Layers ON TOP of `snapshot_into_experiment`; the two helpers compose by passing one's output FQN as the other's input.
+
+Motivating case: `workflows/pipe_gaps/outage_recovery.py` against the static AIS staging cohort can't simulate a real outage today — pre/post-snapshot pair on a frozen source produces byte-identical snapshots. Adding the synthetic-outage filter on top of the pre snapshot creates the source divergence the workflow's bug class needs.
+
+Sequenced AFTER M4 + M5 close. Full design + implementation plan in [`source-mutation-primitive-2026-06.md`](source-mutation-primitive-2026-06.md). Two PRs (M6a library helper + M6b workflow integration), same shape as the M1 → M2 pair of this migration.
 
 ## Out of scope
 

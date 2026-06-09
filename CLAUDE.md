@@ -70,6 +70,55 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-09 — Design decision: synthetic source mutation primitive (M6, follow-on to canonical-dataset migration)
+
+[Issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) surfaced a real capability gap: `workflows/pipe_gaps/outage_recovery.py` against the static AIS staging cohort can't simulate a real outage today — the pre/post-snapshot pair on a frozen source produces byte-identical snapshots, so no stage sees the outage-shape source divergence the workflow's bug class needs. 58 candidate vessels sit at the bug-trigger geometry in staging today and stay invisible.
+
+**Design call (with the dit owner, reviewing my initial sketch).** My first draft suggested the pre/post-pin model "becomes legacy on static sources" — wrong; the owner correctly pushed back that the snapshot mechanism and the new outage mechanism are orthogonal concerns that COMPOSE. Snapshots pin sources at a moment in time (relevant on evolving prod sources; benign on static sources). The new primitive mutates the source via a SQL transform (independent of whether the input is live, snapshotted, or another derived view). Either step is optional; the workflow picks what it needs.
+
+```
+[live source]  ──snapshot──▶  [pinned source]  ──derive──▶  [mutated pinned source]
+                                                                    │
+                                                                    └──▶ stage reads here
+```
+
+**Locked design dimensions** (full detail in [`docs/source-mutation-primitive-2026-06.md`](docs/source-mutation-primitive-2026-06.md) and on issue #59):
+
+1. **View by default, `materialise=True` opt-in.** BQ supports `expiration_timestamp` on both; predicate push-down on views handles partition prune; materialised only earns its keep when read cost dominates create cost.
+2. **SQL-WHERE-string predicate, not typed `SourceFilter` constructor.** Simplest API for one consumer; defer the typed-filter shape until duplicate-until-3 forces it.
+3. **Cache integration via caller responsibility.** Helper takes `where_clause`; caller folds the same string into `canonical_params_dict`. No content-hash machinery.
+4. **Naming + lifecycle identical to `snapshot_into_experiment`.** Same `dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>` shape in `tech_great_expectations`; same `if_existing="skip" | "fail"` semantics; same 7-day TTL. Shape-compatible so the two helpers compose without collision concerns when callers use disjoint `role` values per layer.
+5. **Returns dest FQN.** Caller passes it back to another `derived_source_into_experiment` to compose more transforms, or downstream as a pipeline arg.
+
+**Sequencing.** Independent of M4/M5 but lands AFTER them so the canonical-dataset migration completes cleanly first. Implementation is two PRs (M6a library helper + M6b workflow integration), mirroring M1 → M2's shape.
+
+**Sections moved (this commit).**
+- New `docs/source-mutation-primitive-2026-06.md` with the full design + implementation plan + acceptance criteria.
+- `docs/snapshot-dataset-migration-2026-06.md` gains a "Follow-on: M6" section pointing at the new doc.
+- This Plan changelog entry.
+- [Issue #59 comment](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59#issuecomment-4660544468) with the structured design dimensions for the maintainer + outside readers.
+
+No code changes. M6 is queued behind M4 + M5; no implementation work has started.
+
+### 2026-06-08 — M3 landed: `workflows/pipe_segment/identity_match_key.py` migrated + `--snapshot-dest-project` tactical fix (step 3 of 5)
+
+Second consumer of `dit.bq.snapshot_into_experiment` (after M2 outage_recovery). Drops `identity_match_key.py`'s file-local snapshot/dataset machinery (`_snapshot_dataset_name` + `_ensure_dataset` + the `bigquery.Client.create_dataset` call inside). All snapshots now land in `<project>.tech_great_expectations` under `dit_exp_<sanitised(experiment_id)>_pipe_segment_<source_basename>` table names with per-table `expiration_timestamp`. **Folds in the `--snapshot-dest-project` tactical fix** for the `--include-satellite-offsets` latent cross-org bug (tracked in [`docs/snapshot-dataset-migration-2026-06.md`](docs/snapshot-dataset-migration-2026-06.md) as an adjacent item for M3): the satellite-positions source lives in `gfw-int-pipe-v3` (org `115316357079`) while the default wf827 dest is in a different org (`433637338589`), so BQ refuses the snapshot until both source and dest live in the same org. The new flag mirrors `workflows/pipe_gaps/outage_recovery.py`'s shape and lets the user route all snapshots into the source's org.
+
+**Three design points worth noting.**
+
+1. **`_PipeSegmentSnapshotFQNs` frozen dataclass** is the contract between `_snapshot_source` (which calls `snapshot_into_experiment` per source) and the consumers (`_segment_args`, `_run_binding`). Three fields: `normalized_messages` (always populated) + `sat_positions_stem` + `norad` (both populated iff `--include-satellite-offsets` is set; `None` otherwise). The dataclass is `frozen=True` so callers can't accidentally mutate the snapshot pointers; pinned by a test (`test_snapshot_fqns_is_frozen`).
+2. **Satellite-positions stem computation.** pipe-segment's `--in_sat_positions_table` CLI flag wants a FQN-STEM (everything before `<YYYYMMDD>`) that the inner code appends date suffixes to per shard. `_snapshot_source` computes this stem by stripping the trailing `_shard_suffix(...)` chars from any one shard's dest FQN — they all share the same prefix by construction (the snapshot-naming convention puts the source basename, including the date suffix, at the end). A test (`test_snapshot_source_sat_positions_stem_strips_date_suffix`) pins the stem ends with the canonical `PROD_SAT_POS_STEM` (the trailing underscore is load-bearing).
+3. **`--snapshot-dest-project` caller responsibility.** The flag routes the dest project; the user is responsible for ensuring `--source-normalized-table` is ALSO in the dest's org when `--include-satellite-offsets` is set, since otherwise the normalized-messages snapshot itself hits the same cross-org block. The new comment block above the satellite-offsets constants spells this out.
+
+**Sections moved (this commit).**
+- `workflows/pipe_segment/identity_match_key.py`: module docstring § Steps (step 2) rewritten to describe the canonical-dataset shape; the cross-project-source comment block expanded with the cross-org dodge; new `--snapshot-dest-project` CLI flag (default `PROJECT`); `_snapshot_dataset_name` + `_ensure_dataset` replaced with `_PipeSegmentSnapshotFQNs` dataclass; `_snapshot_source` rewritten to call `snapshot_into_experiment` per source and return the dataclass (with a satellite-stem computation block); `_segment_args` + `_run_binding` signatures take the dataclass; main() call sites updated. Added `import dataclasses`. 1078 → 1121 LOC (+43 net — the dataclass + cross-org help text + satellite-stem computation add structural detail; the no-`create_dataset` goal is the load-bearing metric).
+- `tests/test_pipe_segment_identity_match_key.py`: new file, 8 tests covering CLI flag default + override, dataclass shape + frozen-ness, `_snapshot_source` invocation patterns (with/without satellite-offsets, project threading, satellite-stem). Full suite: 333 + 8 new = 341 passing.
+- `CHANGELOG.md` § `[Unreleased]` gains a 2026-06-08 `#### Changed` entry above M2.
+- This Plan changelog entry.
+- `docs/snapshot-dataset-migration-2026-06.md`: status header updated; M3 row in the migration table flipped from "Not started" to "Landed 2026-06-08"; the pipe-segment `--snapshot-dest-project` adjacent item flipped to "Folded into M3".
+
+**Sections NOT moved.** Optional cloud smoke not run (Tier B per refactor-discipline). The dataclass + unit-test coverage of the satellite-stem computation are the structural guarantees that pipe-segment's CLI receives valid FQNs.
+
 ### 2026-06-08 — M2 landed: `workflows/pipe_gaps/outage_recovery.py` migrated to canonical-dataset shape (step 2 of 5)
 
 First consumer of `dit.bq.snapshot_into_experiment` (the M1 helper). Drops `outage_recovery.py`'s file-local snapshot/dataset machinery (~130 LOC of `_sanitize_for_dataset` / `_snapshot_dataset_name` / `_ensure_snapshot_dataset` / `_snapshot_table_into` / `_snapshot_table_names` + the `bigquery.Client.create_dataset` call inside `_ensure_snapshot_dataset`). All snapshots now land in `<project>.tech_great_expectations` as `dit_exp_<sanitised(experiment_id)>_outage_<pre|post>_<source_basename>` tables with per-table `expiration_timestamp` (set by `snapshot_into_experiment` via `--snapshot-expiration-days`); no per-experiment dataset creation, no IAM friction from the Cloud Build SA's missing `bigquery.datasets.create`.
