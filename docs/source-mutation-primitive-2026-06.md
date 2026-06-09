@@ -1,6 +1,6 @@
 # Synthetic source mutation primitive — implementation plan 2026-06-09
 
-Tracking doc for the synthetic-source-mutation primitive proposed in [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) (filed 2026-06-09). Follow-on to the snapshot/dataset migration tracked in [`snapshot-dataset-migration-2026-06.md`](snapshot-dataset-migration-2026-06.md); ships AFTER that migration (M4 + M5) closes.
+Tracking doc for the synthetic-source-mutation primitive proposed in [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) (filed 2026-06-09). Follow-on to the snapshot/dataset migration tracked in [`snapshot-dataset-migration-2026-06.md`](snapshot-dataset-migration-2026-06.md); see Status line below for the per-stage sequencing (M6a ships independently of the migration; M6b is gated on workflow refactor rather than the migration).
 
 **Status (2026-06-09)**: design locked via issue #59 discussion; **M6a landed** (this commit) — `dit.bq.derived_source_into_experiment(...)` helper available; **M6b not yet started**, gated on the in-flight `workflows/pipe_gaps/outage_recovery.py` 5→3-stage refactor (the integration's stage-routing model fundamentally differs between shapes; writing M6b twice would be wasteful). Sequencing relative to M4 + M5 of the canonical-dataset migration: parallel — they touch disjoint files.
 
