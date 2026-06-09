@@ -69,6 +69,36 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-09 — Design decision: synthetic source mutation primitive (M6, follow-on to canonical-dataset migration)
+
+[Issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) surfaced a real capability gap: `workflows/pipe_gaps/outage_recovery.py` against the static AIS staging cohort can't simulate a real outage today — the pre/post-snapshot pair on a frozen source produces byte-identical snapshots, so no stage sees the outage-shape source divergence the workflow's bug class needs. 58 candidate vessels sit at the bug-trigger geometry in staging today and stay invisible.
+
+**Design call (with the dit owner, reviewing my initial sketch).** My first draft suggested the pre/post-pin model "becomes legacy on static sources" — wrong; the owner correctly pushed back that the snapshot mechanism and the new outage mechanism are orthogonal concerns that COMPOSE. Snapshots pin sources at a moment in time (relevant on evolving prod sources; benign on static sources). The new primitive mutates the source via a SQL transform (independent of whether the input is live, snapshotted, or another derived view). Either step is optional; the workflow picks what it needs.
+
+```
+[live source]  ──snapshot──▶  [pinned source]  ──derive──▶  [mutated pinned source]
+                                                                    │
+                                                                    └──▶ stage reads here
+```
+
+**Locked design dimensions** (full detail in [`docs/source-mutation-primitive-2026-06.md`](docs/source-mutation-primitive-2026-06.md) and on issue #59):
+
+1. **View by default, `materialise=True` opt-in.** BQ supports `expiration_timestamp` on both; predicate push-down on views handles partition prune; materialised only earns its keep when read cost dominates create cost.
+2. **SQL-WHERE-string predicate, not typed `SourceFilter` constructor.** Simplest API for one consumer; defer the typed-filter shape until duplicate-until-3 forces it.
+3. **Cache integration via caller responsibility.** Helper takes `where_clause`; caller folds the same string into `canonical_params_dict`. No content-hash machinery.
+4. **Naming + lifecycle identical to `snapshot_into_experiment`.** Same `dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>` shape in `tech_great_expectations`; same `if_existing="skip" | "fail"` semantics; same 7-day TTL. Shape-compatible so the two helpers compose without collision concerns when callers use disjoint `role` values per layer.
+5. **Returns dest FQN.** Caller passes it back to another `derived_source_into_experiment` to compose more transforms, or downstream as a pipeline arg.
+
+**Sequencing.** Independent of M4/M5 but lands AFTER them so the canonical-dataset migration completes cleanly first. Implementation is two PRs (M6a library helper + M6b workflow integration), mirroring M1 → M2's shape.
+
+**Sections moved (this commit).**
+- New `docs/source-mutation-primitive-2026-06.md` with the full design + implementation plan + acceptance criteria.
+- `docs/snapshot-dataset-migration-2026-06.md` gains a "Follow-on: M6" section pointing at the new doc.
+- This Plan changelog entry.
+- [Issue #59 comment](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59#issuecomment-4660544468) with the structured design dimensions for the maintainer + outside readers.
+
+No code changes. M6 is queued behind M4 + M5; no implementation work has started.
+
 ### 2026-06-08 — M3 landed: `workflows/pipe_segment/identity_match_key.py` migrated + `--snapshot-dest-project` tactical fix (step 3 of 5)
 
 Second consumer of `dit.bq.snapshot_into_experiment` (after M2 outage_recovery). Drops `identity_match_key.py`'s file-local snapshot/dataset machinery (`_snapshot_dataset_name` + `_ensure_dataset` + the `bigquery.Client.create_dataset` call inside). All snapshots now land in `<project>.tech_great_expectations` under `dit_exp_<sanitised(experiment_id)>_pipe_segment_<source_basename>` table names with per-table `expiration_timestamp`. **Folds in the `--snapshot-dest-project` tactical fix** for the `--include-satellite-offsets` latent cross-org bug (tracked in [`docs/snapshot-dataset-migration-2026-06.md`](docs/snapshot-dataset-migration-2026-06.md) as an adjacent item for M3): the satellite-positions source lives in `gfw-int-pipe-v3` (org `115316357079`) while the default wf827 dest is in a different org (`433637338589`), so BQ refuses the snapshot until both source and dest live in the same org. The new flag mirrors `workflows/pipe_gaps/outage_recovery.py`'s shape and lets the user route all snapshots into the source's org.
