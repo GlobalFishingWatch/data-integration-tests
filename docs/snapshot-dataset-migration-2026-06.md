@@ -156,6 +156,14 @@ These files describe current behaviour and are deliberately untouched until the 
 
 The `CLAUDE.md` § Working agreements transitional protection note → removed in M5 (no more legacy datasets to protect).
 
+## Follow-on: synthetic source mutation primitive (M6)
+
+Filed as [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) (2026-06-09). New library helper `dit.bq.derived_source_into_experiment(source_table, *, experiment_id, role, where_clause, ...)` that creates a view (or materialised table when `materialise=True`) over the source with a SQL `WHERE` clause applied. Layers ON TOP of `snapshot_into_experiment`; the two helpers compose by passing one's output FQN as the other's input.
+
+Motivating case: `workflows/pipe_gaps/outage_recovery.py` against the static AIS staging cohort can't simulate a real outage today — pre/post-snapshot pair on a frozen source produces byte-identical snapshots. Adding the synthetic-outage filter on top of the pre snapshot creates the source divergence the workflow's bug class needs.
+
+Sequenced AFTER M4 + M5 close. Full design + implementation plan in [`source-mutation-primitive-2026-06.md`](source-mutation-primitive-2026-06.md). Two PRs (M6a library helper + M6b workflow integration), same shape as the M1 → M2 pair of this migration.
+
 ## Out of scope
 
 - Pre-creating `dit_exp_*` datasets via Terraform (Option 2 in the audit). Declined: adds permanent dit-owned datasets, requires admin coordination, doesn't realise the canonical-dataset policy.
