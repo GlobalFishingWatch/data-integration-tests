@@ -116,6 +116,24 @@ DEFAULT_BQ_TEMP_DATASET = os.environ.get(
 # Staging cohort: 2020-01-01 -> 2020-12-31, reduced AIS data.
 DEFAULT_SOURCE_DATASET_STEM = "pipe_ais_test_202408290000"
 
+# Per-table FQN defaults, derived from the stem default for byte-identical
+# back-compat. Callers can override each table individually via the
+# `--source-*-fqn` flags below -- useful for cross_version_ais.py (M5),
+# which snapshots into the canonical `tech_great_expectations` dataset
+# (NOT the stem-with-halves convention) and needs to pass per-table FQNs
+# that don't follow the `<stem>_internal.X` / `<stem>_published.Y` shape.
+# When none of the override flags are set, the workflow resolves the same
+# FQNs the stem-derivation produced before M4.
+DEFAULT_SOURCE_MESSAGES_FQN = (
+    f"{PROJECT}.{DEFAULT_SOURCE_DATASET_STEM}_internal.messages_positions"
+)
+DEFAULT_SOURCE_SEGMENT_INFO_FQN = (
+    f"{PROJECT}.{DEFAULT_SOURCE_DATASET_STEM}_published.segment_info"
+)
+DEFAULT_SOURCE_SEGS_ACTIVITY_FQN = (
+    f"{PROJECT}.{DEFAULT_SOURCE_DATASET_STEM}_published.segs_activity"
+)
+
 # Global anchorages reference (not staging-specific).
 DEFAULT_NAMED_ANCHORAGES = f"{PROJECT}.anchorages.named_anchorages_v20240117"
 
@@ -326,17 +344,41 @@ def _published_dataset(stem: str) -> str:
 
 
 def _messages_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source messages_positions table.
+
+    Per-table override (``--source-messages-fqn``) wins; otherwise derives
+    from ``--source-dataset-stem`` for byte-identical back-compat. M4 of
+    the canonical-dataset migration.
+
+    Truthiness check on the override -- treating ``""`` as unset matches
+    other optional string args in this module (``thinned_message_table``)
+    and avoids generating invalid SQL (``FROM `` ``) if a caller
+    accidentally passes ``--source-messages-fqn ''``. (Copilot review on
+    PR #62.)
+    """
+    if args.source_messages_fqn:
+        return args.source_messages_fqn
     return f"{PROJECT}.{_internal_dataset(args.source_dataset_stem)}.messages_positions"
 
 
 def _segment_info_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source segment_info table. See ``_messages_table``."""
+    if args.source_segment_info_fqn:
+        return args.source_segment_info_fqn
     return f"{PROJECT}.{_published_dataset(args.source_dataset_stem)}.segment_info"
+
+
+def _segs_activity_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source segs_activity table. See ``_messages_table``."""
+    if args.source_segs_activity_fqn:
+        return args.source_segs_activity_fqn
+    return f"{PROJECT}.{_published_dataset(args.source_dataset_stem)}.segs_activity"
 
 
 def _bad_segs_sql(args: argparse.Namespace) -> str:
     return (
         f"(SELECT DISTINCT seg_id "
-        f"FROM `{PROJECT}.{_published_dataset(args.source_dataset_stem)}.segs_activity` "
+        f"FROM `{_segs_activity_table(args)}` "
         f"WHERE overlapping_and_short)"
     )
 
@@ -547,7 +589,13 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     reason.
 
     Output content depends on: the mode, the inclusive date window, the
-    source dataset stem (the input AIS cohort), the named-anchorages
+    three RESOLVED source-table FQNs (`messages_positions`,
+    `segment_info`, `segs_activity` — derived from
+    ``--source-dataset-stem`` by default, overridable per table via the
+    ``--source-{messages,segment-info,segs-activity}-fqn`` flags; the
+    cache key is on the resolved FQN, NOT the stem or which CLI shape
+    produced it, so two runs pointing at the same three tables share a
+    cache row regardless of which knob they used), the named-anchorages
     reference, the **submitter image identity** (see
     :func:`_submitter_image_identity` -- the pipeline-construction code that
     builds/submits the Beam graph; mode-independent), and -- when set --
@@ -559,11 +607,21 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     is NOT a pure runner-only knob -- it IS the submitter image, so its
     identity is folded in via ``_submitter_image_identity`` above.
     """
+    # Cache key includes the RESOLVED source FQNs, not the stem-with-halves
+    # shorthand. Two runs that point at the same three tables -- one via
+    # --source-dataset-stem, one via the three per-table --source-*-fqn
+    # overrides -- must share a cache row. Two runs with DIFFERENT effective
+    # source tables (e.g. cross_version_ais.py routing each binding at its
+    # own snapshot FQNs) must NOT. Storing resolved FQNs answers both.
+    # M4 of canonical-dataset migration: cache-key shape change. First run
+    # after merge misses; subsequent runs converge.
     params: dict = {
         "mode": mode,
         "start": args.start,
         "end": args.end,
-        "source_dataset_stem": args.source_dataset_stem,
+        "source_messages_fqn": _messages_table(args),
+        "source_segment_info_fqn": _segment_info_table(args),
+        "source_segs_activity_fqn": _segs_activity_table(args),
         "named_anchorages": args.named_anchorages,
         "thinned_message_table": args.thinned_message_table,
         **_submitter_image_identity(args),
@@ -667,7 +725,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "${PROJECT}.${DIT_DEST_DATASET}).")
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
                    help=f"Staging dataset stem (default {DEFAULT_SOURCE_DATASET_STEM}); "
-                        "_internal and _published are appended.")
+                        "_internal and _published are appended to derive the three source "
+                        "table FQNs. Per-table overrides via --source-{messages,segment-info,"
+                        "segs-activity}-fqn take precedence when set.")
+    # Per-table FQN overrides (M4 of canonical-dataset migration). Default None
+    # so absence triggers stem-derivation in the helpers; explicit FQNs win.
+    # cross_version_ais.py (M5) uses these to point at snapshots in
+    # tech_great_expectations that don't follow the stem-with-halves shape.
+    p.add_argument("--source-messages-fqn", default=None,
+                   help="Fully-qualified `<project>.<dataset>.<table>` for the messages-positions "
+                        "input; overrides --source-dataset-stem-based derivation for this table only. "
+                        "The basename does not have to be `messages_positions` -- the workflow "
+                        "treats whatever table you pass as the equivalent input. "
+                        f"Default: stem-derived ({DEFAULT_SOURCE_MESSAGES_FQN}).")
+    p.add_argument("--source-segment-info-fqn", default=None,
+                   help="Fully-qualified `<project>.<dataset>.<table>` for the segment-info "
+                        "input; overrides --source-dataset-stem-based derivation for this table only. "
+                        f"Default: stem-derived ({DEFAULT_SOURCE_SEGMENT_INFO_FQN}).")
+    p.add_argument("--source-segs-activity-fqn", default=None,
+                   help="Fully-qualified `<project>.<dataset>.<table>` for the segs-activity "
+                        "input (used by --bad-segs filtering); overrides --source-dataset-stem-based "
+                        "derivation for this table only. "
+                        f"Default: stem-derived ({DEFAULT_SOURCE_SEGS_ACTIVITY_FQN}).")
     p.add_argument("--named-anchorages", default=DEFAULT_NAMED_ANCHORAGES)
     p.add_argument("--start", default=DEFAULT_START,
                    help="Inclusive start date (also pipeline data_available_from).")
@@ -786,7 +865,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("suffix: %s", suffix)
     logger.info("run_id: %s  commit_sha: %s  worker_image_tag: %s  launched_by: %s",
                 args.run_id, args.commit_sha, args.worker_image_tag, args.launched_by)
-    logger.info("source dataset: %s_{internal,published}", args.source_dataset_stem)
+    logger.info("source messages:     %s", _messages_table(args))
+    logger.info("source segment_info: %s", _segment_info_table(args))
+    logger.info("source segs_activity: %s", _segs_activity_table(args))
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
     logger.info("runner: %s", args.runner)
 
