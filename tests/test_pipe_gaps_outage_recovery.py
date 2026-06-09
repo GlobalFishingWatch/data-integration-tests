@@ -1,9 +1,9 @@
 """Tests for ``workflows/pipe_gaps/outage_recovery.py``.
 
-Focused on workflow-local helpers: pin-at validation, the post-vs-pre
-cross-validation in ``parse_args``, ``canonical_params_dict`` cache-key
-composition, and the snapshot-dataset naming. The 3-stage execute
-functions, the snapshot creation, and the dataflow runner are exercised
+Focused on workflow-local helpers: pin-at validation, the stage-boundary
+ordering check in ``parse_args``, ``canonical_params_dict`` cache-key
+composition, and the snapshot-table naming. The 3-stage execute
+function, the snapshot creation, and the dataflow runner are exercised
 by live ``dit run`` invocations against real BQ; they're not unit-tested
 here.
 """
@@ -22,10 +22,12 @@ from workflows.pipe_gaps import outage_recovery as mod
 def _args(**overrides: Any) -> argparse.Namespace:
     base = dict(
         experiment_id="exp01",
-        start="2024-08-22",
-        end="2024-08-29",
-        offset_days=3,
-        backfill_days=4,
+        start="2020-01-01",
+        backfill_end="2020-12-28",
+        outage_start="2020-12-29",
+        outage_end="2020-12-29",
+        end="2020-12-31",
+        recovery_buffer_days=1,
         min_gap_length=1.0,
         n_hours_before=12,
         window_period_d=2,
@@ -43,10 +45,10 @@ def _args(**overrides: Any) -> argparse.Namespace:
             "world-fishing-827.pipe_ais_test_202408290000_published."
             "segs_activity"
         ),
-        pre_outage_pin_at="2026-05-27 18:00:00 UTC",
-        post_outage_pin_at="2026-06-01 18:00:00 UTC",
+        pin_at="2026-06-01 18:00:00 UTC",
         snapshot_expiration_days=7,
         snapshot_dest_project="world-fishing-827",
+        no_snapshot=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -89,35 +91,129 @@ def test_parse_pin_at_returns_tz_aware() -> None:
 
 
 # --------------------------------------------------------------------------
-# parse_args cross-validation
+# parse_args stage-boundary ordering
 # --------------------------------------------------------------------------
 
-def test_parse_args_rejects_post_at_or_before_pre() -> None:
+def test_parse_args_rejects_backfill_end_at_or_after_outage_start() -> None:
     with pytest.raises(SystemExit):
         mod.parse_args([
-            "--pre-outage-pin-at", "2026-06-01 00:00:00 UTC",
-            "--post-outage-pin-at", "2026-06-01 00:00:00 UTC",
+            "--backfill-end", "2020-12-25",
+            "--outage-start", "2020-12-25",
+            "--experiment-id", "test",
+        ])
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--backfill-end", "2020-12-30",
+            "--outage-start", "2020-12-25",
             "--experiment-id", "test",
         ])
 
 
-def test_parse_args_rejects_post_before_pre() -> None:
+def test_parse_args_rejects_outage_end_before_outage_start() -> None:
     with pytest.raises(SystemExit):
         mod.parse_args([
-            "--pre-outage-pin-at", "2026-06-01 00:00:00 UTC",
-            "--post-outage-pin-at", "2026-05-01 00:00:00 UTC",
+            "--backfill-end", "2020-12-26",
+            "--outage-start", "2020-12-27",
+            "--outage-end", "2020-12-25",
             "--experiment-id", "test",
         ])
 
 
-def test_parse_args_accepts_post_strictly_after_pre() -> None:
+def test_parse_args_rejects_outage_end_at_or_after_end() -> None:
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--outage-end", "2020-12-31",
+            "--end", "2020-12-31",
+            "--experiment-id", "test",
+        ])
+
+
+def test_parse_args_accepts_one_day_outage() -> None:
+    # outage_start == outage_end is the minimum bug-reproduction shape:
+    # one skipped day. This is the new default shape too -- exactly the
+    # repro the workflow ships out of the box.
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.outage_start == "2020-12-29"
+    assert args.outage_end == "2020-12-29"
+
+
+def test_parse_args_rejects_negative_recovery_buffer_days() -> None:
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--recovery-buffer-days", "-1",
+            "--experiment-id", "test",
+        ])
+
+
+def test_parse_args_rejects_recovery_buffer_exceeding_history() -> None:
+    """If recovery_buffer_days > (outage_start - start).days, Stage 3
+    starts BEFORE --start and reprocesses dates the oracle never covered,
+    which would make comparisons fail for configuration reasons rather
+    than for the bug surface. Reject at arg-parse time. (Copilot review
+    on PR #63.)"""
+    # start=2020-12-01, outage_start=2020-12-05 -> max buffer = 4.
+    # Asking for buffer=5 should fail.
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--start", "2020-12-01",
+            "--backfill-end", "2020-12-03",
+            "--outage-start", "2020-12-05",
+            "--outage-end", "2020-12-05",
+            "--end", "2020-12-10",
+            "--recovery-buffer-days", "5",
+            "--experiment-id", "test",
+        ])
+
+
+def test_parse_args_accepts_recovery_buffer_at_history_boundary() -> None:
+    """Boundary case: recovery_buffer_days == (outage_start - start).days
+    means Stage 3 starts EXACTLY at --start, which is fine -- the recovery
+    is allowed to cover the full modelled history."""
     args = mod.parse_args([
-        "--pre-outage-pin-at", "2026-05-27 18:00:00 UTC",
-        "--post-outage-pin-at", "2026-06-01 18:00:00 UTC",
+        "--start", "2020-12-01",
+        "--backfill-end", "2020-12-03",
+        "--outage-start", "2020-12-05",
+        "--outage-end", "2020-12-05",
+        "--end", "2020-12-10",
+        "--recovery-buffer-days", "4",  # exactly outage_start - start
         "--experiment-id", "test",
     ])
-    assert args.pre_outage_pin_at.startswith("2026-05-27")
-    assert args.post_outage_pin_at.startswith("2026-06-01")
+    assert args.recovery_buffer_days == 4
+
+
+def test_parse_args_no_snapshot_default_false() -> None:
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.no_snapshot is False
+
+
+def test_parse_args_no_snapshot_set_true() -> None:
+    args = mod.parse_args(["--experiment-id", "test", "--no-snapshot"])
+    assert args.no_snapshot is True
+
+
+def test_parse_args_rejects_no_snapshot_and_skip_snapshots_together() -> None:
+    """Both flags affect the read path of the staged stages (live source vs
+    reuse-prior-snapshot) but they're mutually exclusive: --no-snapshot
+    reads live; --skip-snapshots reads a prior snapshot. The if/elif in
+    main() would silently let --no-snapshot win. Reject at arg-parse time
+    so an ambiguous safety-sensitive combo can't reach the read path.
+    (Copilot review on PR #63.)"""
+    with pytest.raises(SystemExit):
+        mod.parse_args([
+            "--experiment-id", "test",
+            "--no-snapshot",
+            "--skip-snapshots",
+        ])
+
+
+def test_parse_args_accepts_zero_recovery_buffer_days() -> None:
+    # Buffer = 0 means recovery starts exactly at outage_start (no
+    # overlap with the last pre-outage day). Allowed.
+    args = mod.parse_args([
+        "--recovery-buffer-days", "0",
+        "--experiment-id", "test",
+    ])
+    assert args.recovery_buffer_days == 0
 
 
 # --------------------------------------------------------------------------
@@ -134,36 +230,61 @@ def test_canonical_params_pin_at_normalised_to_iso() -> None:
     # equivalent strings (one with " UTC", one with "+00:00") produce
     # identical cache keys.
     a = mod.canonical_params_dict(
-        _args(post_outage_pin_at="2026-06-01 18:00:00 UTC"),
+        _args(pin_at="2026-06-01 18:00:00 UTC"),
         mod.MODE_OUTAGE_ORACLE,
     )
     b = mod.canonical_params_dict(
-        _args(post_outage_pin_at="2026-06-01T18:00:00+00:00"),
+        _args(pin_at="2026-06-01T18:00:00+00:00"),
         mod.MODE_OUTAGE_ORACLE,
     )
-    assert a["post_outage_pin_at"] == b["post_outage_pin_at"]
+    assert a["pin_at"] == b["pin_at"]
 
 
-def test_canonical_params_includes_post_pin_for_both_modes() -> None:
+def test_canonical_params_includes_pin_at_for_both_modes() -> None:
     for mode in (mod.MODE_OUTAGE_RECOVERY, mod.MODE_OUTAGE_ORACLE):
         p = mod.canonical_params_dict(_args(), mode)
-        assert p["post_outage_pin_at"] == "2026-06-01T18:00:00+00:00"
+        assert p["pin_at"] == "2026-06-01T18:00:00+00:00"
 
 
-def test_canonical_params_includes_pre_pin_for_recovery_only() -> None:
-    # The oracle is a single-shot backfill against post; including the
-    # pre-outage pin in its cache key would invalidate it every time the
-    # pre-outage pin moves, dropping the hit rate for no behavioural reason.
+def test_canonical_params_oracle_drops_recovery_only_keys() -> None:
+    # The oracle is a single-shot backfill [start, end] against the
+    # snapshot; including the outage geometry or recovery buffer in its
+    # cache key would invalidate it every time the staged geometry
+    # moves, dropping the hit rate for no behavioural reason.
     rec = mod.canonical_params_dict(_args(), mod.MODE_OUTAGE_RECOVERY)
     ora = mod.canonical_params_dict(_args(), mod.MODE_OUTAGE_ORACLE)
-    assert rec["pre_outage_pin_at"] == "2026-05-27T18:00:00+00:00"
-    assert "pre_outage_pin_at" not in ora
+    for k in ("backfill_end", "outage_start", "outage_end",
+              "recovery_buffer_days"):
+        assert k in rec, f"recovery mode should include {k!r}"
+        assert k not in ora, f"oracle mode should not include {k!r}"
 
 
-def test_canonical_params_recovery_depends_on_offset_days() -> None:
-    a = mod.canonical_params_dict(_args(offset_days=3), mod.MODE_OUTAGE_RECOVERY)
-    b = mod.canonical_params_dict(_args(offset_days=7), mod.MODE_OUTAGE_RECOVERY)
-    assert a["offset_days"] != b["offset_days"]
+def test_canonical_params_recovery_depends_on_outage_geometry() -> None:
+    a = mod.canonical_params_dict(_args(outage_start="2020-12-25"),
+                                  mod.MODE_OUTAGE_RECOVERY)
+    b = mod.canonical_params_dict(_args(outage_start="2020-12-26"),
+                                  mod.MODE_OUTAGE_RECOVERY)
+    assert a["outage_start"] != b["outage_start"]
+
+
+def test_canonical_params_recovery_depends_on_recovery_buffer_days() -> None:
+    a = mod.canonical_params_dict(_args(recovery_buffer_days=1),
+                                  mod.MODE_OUTAGE_RECOVERY)
+    b = mod.canonical_params_dict(_args(recovery_buffer_days=2),
+                                  mod.MODE_OUTAGE_RECOVERY)
+    assert a["recovery_buffer_days"] != b["recovery_buffer_days"]
+
+
+def test_canonical_params_oracle_stable_under_outage_geometry_changes() -> None:
+    # Bumping --outage-start (or any recovery-only key) must NOT change
+    # the oracle's cache key.
+    a = mod.canonical_params_dict(_args(outage_start="2020-12-25",
+                                        recovery_buffer_days=1),
+                                  mod.MODE_OUTAGE_ORACLE)
+    b = mod.canonical_params_dict(_args(outage_start="2020-12-26",
+                                        recovery_buffer_days=5),
+                                  mod.MODE_OUTAGE_ORACLE)
+    assert a == b
 
 
 def test_canonical_params_changes_with_source_messages() -> None:
@@ -190,6 +311,17 @@ def test_canonical_params_changes_with_ssvids() -> None:
     assert b["ssvids"] == ["ssvid_a", "ssvid_b"]
 
 
+def test_canonical_params_no_snapshot_in_key_for_both_modes() -> None:
+    # The boolean must be in BOTH modes' keys so runs with --no-snapshot
+    # and without don't share a cache row (they read different source data).
+    for mode in (mod.MODE_OUTAGE_RECOVERY, mod.MODE_OUTAGE_ORACLE):
+        rec = mod.canonical_params_dict(_args(no_snapshot=False), mode)
+        liv = mod.canonical_params_dict(_args(no_snapshot=True), mode)
+        assert rec["no_snapshot"] is False
+        assert liv["no_snapshot"] is True
+        assert rec != liv
+
+
 def test_canonical_params_ssvids_normalised_by_sort() -> None:
     a = mod.canonical_params_dict(
         _args(ssvids="zeta,alpha,mike"), mod.MODE_OUTAGE_RECOVERY,
@@ -204,102 +336,78 @@ def test_canonical_params_ssvids_normalised_by_sort() -> None:
 # Snapshot naming helpers
 # --------------------------------------------------------------------------
 
-def test_outage_snapshot_dest_fqn_distinct_pre_post() -> None:
-    pre = mod._outage_snapshot_dest_fqn(
-        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_PRE,
-        source_table="world-fishing-827.ds.research_messages",
-        project=mod.PROJECT,
+def test_outage_snapshot_dest_fqn_basic() -> None:
+    name = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01",
+        source_table="proj.ds.research_messages",
+        project="world-fishing-827",
     )
-    post = mod._outage_snapshot_dest_fqn(
-        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_POST,
-        source_table="world-fishing-827.ds.research_messages",
-        project=mod.PROJECT,
+    assert name == (
+        "world-fishing-827.tech_great_expectations."
+        "dit_exp_exp01_outage_research_messages"
     )
-    assert pre != post
-    # Canonical-dataset shape: <project>.tech_great_expectations.dit_exp_<exp>_outage_<label>_<source>
-    assert pre.startswith(f"{mod.PROJECT}.tech_great_expectations.dit_exp_exp01_outage_pre_")
-    assert post.startswith(f"{mod.PROJECT}.tech_great_expectations.dit_exp_exp01_outage_post_")
-    # Source basename suffix preserved
-    assert pre.endswith("_research_messages")
-    assert post.endswith("_research_messages")
 
 
-def test_outage_snapshot_dest_fqn_sanitises_hyphens_in_experiment_id() -> None:
-    # BQ dataset names can't contain hyphens; experiment-ids commonly do.
-    # The helper mirrors dit.bq.snapshot_into_experiment's - -> _ rule.
-    fqn = mod._outage_snapshot_dest_fqn(
-        experiment_id="my-exp-2026", label=mod.SNAPSHOT_LABEL_PRE,
-        source_table="world-fishing-827.ds.research_messages",
-        project=mod.PROJECT,
+def test_outage_snapshot_dest_fqn_sanitises_hyphens() -> None:
+    # BQ identifiers can't contain hyphens; experiment-ids commonly do.
+    name = mod._outage_snapshot_dest_fqn(
+        experiment_id="my-exp-2026",
+        source_table="proj.ds.research_messages",
+        project="world-fishing-827",
     )
-    # No hyphen in the dit_exp_... portion (project itself can contain
-    # hyphens, so check only the table-id portion after the second dot).
-    table_id_part = fqn.rsplit(".", 1)[-1]
-    assert "-" not in table_id_part
-    assert "my_exp_2026" in fqn
+    assert "my_exp_2026" in name
+    assert "my-exp-2026" not in name.split(".", 2)[2]
 
 
-def test_outage_snapshot_dest_fqn_honours_project() -> None:
+def test_outage_snapshot_dest_fqn_honours_dest_project() -> None:
     # Cross-org opt-in: when running against prod-VMS sources, the dest
     # project must match the source's (gfw-int-vms-v3) to avoid the
-    # cross-org snapshot block.
-    fqn = mod._outage_snapshot_dest_fqn(
-        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_PRE,
-        source_table="gfw-int-vms-v3.pipe_vms_v3_internal.research_messages",
+    # cross-org snapshot block. The helper forwards project into the FQN.
+    name = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01",
+        source_table="proj.ds.research_messages",
         project="gfw-int-vms-v3",
     )
-    assert fqn.startswith("gfw-int-vms-v3.tech_great_expectations.dit_exp_exp01_outage_pre_")
+    assert name.startswith("gfw-int-vms-v3.tech_great_expectations.")
 
 
 def test_outage_snapshot_dest_fqn_matches_snapshot_into_experiment() -> None:
-    """Synchronisation test: the local FQN reconstruction must agree with
-    what ``dit.bq.snapshot_into_experiment`` would produce. Otherwise the
-    ``--skip-snapshots`` path points at the wrong tables."""
-    from dit import bq as dit_bq
-    from unittest.mock import MagicMock, patch
+    """Synchronisation pin.
 
-    client = MagicMock()
-    client.query.return_value.result.return_value = None
-    with patch("google.cloud.bigquery.Client", return_value=client):
-        canonical = dit_bq.snapshot_into_experiment(
-            "world-fishing-827.ds.research_messages",
-            experiment_id="exp01",
-            role="outage_pre",
-            project=mod.PROJECT,
-        )
-    local = mod._outage_snapshot_dest_fqn(
-        experiment_id="exp01", label=mod.SNAPSHOT_LABEL_PRE,
-        source_table="world-fishing-827.ds.research_messages",
-        project=mod.PROJECT,
-    )
-    assert local == canonical, (
-        f"reconstruction drift: local={local!r} canonical={canonical!r}"
-    )
+    ``_outage_snapshot_dest_fqn`` is a PURE reimplementation of
+    ``dit.bq.snapshot_into_experiment``'s naming convention -- it lets
+    the ``--skip-snapshots`` path reconstruct snapshot FQNs without a BQ
+    round-trip. If the upstream helper's naming ever shifts, the
+    skip-snapshots path silently reads the wrong table (or fails to find
+    one). Pin the two implementations to agree.
 
-
-def test_validate_distinct_source_basenames_rejects_collision() -> None:
-    """When --source-messages and --source-segments have the same basename,
-    the canonical-dataset shape would produce a single dest table name and
-    collide. ``_validate_distinct_source_basenames`` is called once in
-    ``main()`` so both the create path AND the ``--skip-snapshots``
-    reconstruction path inherit the protection.
+    Restored in this commit (Copilot review on PR #63 noted the M2-era
+    sync test had been removed during the 3-stage refactor).
     """
-    args = argparse.Namespace(
-        source_messages="world-fishing-827.a.messages_positions",
-        source_segments="world-fishing-827.b.messages_positions",
-    )
-    with pytest.raises(ValueError, match="identical basenames"):
-        mod._validate_distinct_source_basenames(args)
+    from unittest.mock import MagicMock, patch
+    from dit.bq import snapshot_into_experiment
 
+    # Mock the BQ client so the helper doesn't actually hit BQ -- we only
+    # care about the dest FQN it constructs and returns.
+    bq_client = MagicMock()
+    bq_client.query.return_value.result.return_value = None
+    with patch("google.cloud.bigquery.Client", return_value=bq_client):
+        helper_dest = snapshot_into_experiment(
+            "world-fishing-827.src_ds.research_messages",
+            experiment_id="exp01",
+            role=mod.SNAPSHOT_ROLE,  # mirrors what _snapshot_source_at passes
+        )
 
-def test_validate_distinct_source_basenames_accepts_distinct() -> None:
-    """The production layout (research_messages vs segs_activity) must
-    pass — sanity check that the validator isn't over-eager."""
-    args = argparse.Namespace(
-        source_messages="world-fishing-827.ds.research_messages",
-        source_segments="world-fishing-827.ds.segs_activity",
+    workflow_dest = mod._outage_snapshot_dest_fqn(
+        experiment_id="exp01",
+        source_table="world-fishing-827.src_ds.research_messages",
+        project="world-fishing-827",
     )
-    mod._validate_distinct_source_basenames(args)  # no raise
+
+    assert workflow_dest == helper_dest, (
+        "_outage_snapshot_dest_fqn drifted from snapshot_into_experiment's "
+        "naming. --skip-snapshots would reconstruct the wrong FQN."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -333,20 +441,18 @@ def test_default_snapshot_dest_project_matches_dit() -> None:
 
 
 # --------------------------------------------------------------------------
-# Today-relative pin-at defaults
+# Today-relative pin-at default
 # --------------------------------------------------------------------------
 
 def test_default_pin_at_inside_time_travel_window() -> None:
-    # Today-relative defaults: pre = today UTC - 6d, post = today UTC - 1d.
-    # Both must be inside BQ's 7-day time-travel window so a default run
-    # always succeeds against staging.
+    # Today-relative default: today UTC midnight minus 1 day. Must be
+    # inside BQ's 7-day time-travel window so a default run always
+    # succeeds against staging.
     args = mod.parse_args(["--experiment-id", "test"])
-    pre = mod._parse_pin_at(args.pre_outage_pin_at)
-    post = mod._parse_pin_at(args.post_outage_pin_at)
+    pin = mod._parse_pin_at(args.pin_at)
     now = datetime.now(timezone.utc)
-    assert (now - pre) < timedelta(days=7)
-    assert (now - post) < timedelta(days=7)
-    assert pre < post
+    assert (now - pin) < timedelta(days=7)
+    assert pin <= now
 
 
 def test_utc_floor_days_ago_is_midnight_utc() -> None:
@@ -359,6 +465,26 @@ def test_utc_floor_days_ago_is_midnight_utc() -> None:
 
 
 # --------------------------------------------------------------------------
+# Basename collision validation
+# --------------------------------------------------------------------------
+
+def test_validate_distinct_source_basenames_accepts_distinct() -> None:
+    # Production layout: research_messages vs segs_activity.
+    mod._validate_distinct_source_basenames(_args(
+        source_messages="proj.ds.research_messages",
+        source_segments="proj.ds.segs_activity",
+    ))
+
+
+def test_validate_distinct_source_basenames_rejects_collision() -> None:
+    with pytest.raises(ValueError, match="identical basenames"):
+        mod._validate_distinct_source_basenames(_args(
+            source_messages="proj.a.messages_positions",
+            source_segments="proj.b.messages_positions",
+        ))
+
+
+# --------------------------------------------------------------------------
 # --snapshot-expiration-days validation
 # --------------------------------------------------------------------------
 
@@ -366,8 +492,7 @@ def test_utc_floor_days_ago_is_midnight_utc() -> None:
 def test_parse_args_rejects_nonpositive_snapshot_expiration(value: str) -> None:
     with pytest.raises(SystemExit):
         mod.parse_args([
-            "--pre-outage-pin-at", "2026-05-27 18:00:00 UTC",
-            "--post-outage-pin-at", "2026-06-01 18:00:00 UTC",
+            "--pin-at", "2026-06-01 18:00:00 UTC",
             "--experiment-id", "test",
             "--snapshot-expiration-days", value,
         ])
@@ -375,8 +500,7 @@ def test_parse_args_rejects_nonpositive_snapshot_expiration(value: str) -> None:
 
 def test_parse_args_accepts_positive_snapshot_expiration() -> None:
     args = mod.parse_args([
-        "--pre-outage-pin-at", "2026-05-27 18:00:00 UTC",
-        "--post-outage-pin-at", "2026-06-01 18:00:00 UTC",
+        "--pin-at", "2026-06-01 18:00:00 UTC",
         "--experiment-id", "test",
         "--snapshot-expiration-days", "30",
     ])
