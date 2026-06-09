@@ -15,7 +15,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from dit.bq import snapshot_dataset, snapshot_into_experiment, snapshot_table
+from dit.bq import (
+    derived_source_into_experiment,
+    snapshot_dataset,
+    snapshot_into_experiment,
+    snapshot_table,
+)
 
 
 def _make_client_mock() -> MagicMock:
@@ -404,3 +409,186 @@ def test_snapshot_into_experiment_custom_project_threads_through() -> None:
     assert dest.startswith("gfw-int-vms-v3.tech_great_expectations.")
     sql = _captured_sql(client)
     assert "`gfw-int-vms-v3.tech_great_expectations.dit_exp_exp1_outage_pre_research_messages`" in sql
+
+
+# -- derived_source_into_experiment ---------------------------------------
+#
+# Same shape as the snapshot_into_experiment block above: mock the BQ
+# client, assert dest FQN naming + DDL string + expiration. The naming
+# convention is shared so the two helpers compose without collision when
+# the caller keeps `role` values disjoint per layer.
+
+
+def test_derived_source_into_experiment_default_view_and_expiration() -> None:
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        dest = derived_source_into_experiment(
+            "world-fishing-827.src_ds.messages_positions",
+            experiment_id="exp1",
+            role="outage_pre_filtered",
+            where_clause="DATE(timestamp) NOT BETWEEN '2020-08-25' AND '2020-08-26'",
+        )
+    expected_dest = (
+        "world-fishing-827.tech_great_expectations."
+        "dit_exp_exp1_outage_pre_filtered_messages_positions"
+    )
+    assert dest == expected_dest
+
+    sql = _captured_sql(client)
+    assert sql.startswith("CREATE VIEW IF NOT EXISTS"), sql
+    assert f"`{expected_dest}`" in sql
+    assert "AS SELECT * FROM `world-fishing-827.src_ds.messages_positions`" in sql
+    assert "WHERE DATE(timestamp) NOT BETWEEN '2020-08-25' AND '2020-08-26'" in sql
+    # Default 7-day expiration -> 2026-06-15T12:00:00+00:00
+    assert 'OPTIONS(expiration_timestamp=TIMESTAMP("2026-06-15T12:00:00+00:00"))' in sql
+
+
+def test_derived_source_into_experiment_materialise_true_emits_create_table() -> None:
+    """``materialise=True`` switches the DDL verb from VIEW to TABLE; rest
+    of the SQL (dest FQN, OPTIONS, SELECT body, WHERE) is byte-identical."""
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        derived_source_into_experiment(
+            "world-fishing-827.src_ds.messages_positions",
+            experiment_id="exp1",
+            role="outage_pre_filtered",
+            where_clause="DATE(timestamp) IS NOT NULL",
+            materialise=True,
+        )
+    sql = _captured_sql(client)
+    assert sql.startswith("CREATE TABLE IF NOT EXISTS"), sql
+    assert "CREATE VIEW" not in sql
+    # Materialised tables honour expiration_timestamp identically.
+    assert 'OPTIONS(expiration_timestamp=TIMESTAMP("2026-06-15T12:00:00+00:00"))' in sql
+
+
+def test_derived_source_into_experiment_sanitises_hyphenated_experiment_id() -> None:
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        dest = derived_source_into_experiment(
+            "world-fishing-827.src_ds.tbl",
+            experiment_id="pipeline-1465",
+            role="outage_pre_filtered",
+            where_clause="TRUE",
+        )
+    assert "dit_exp_pipeline_1465_outage_pre_filtered_tbl" in dest
+    assert "pipeline-1465" not in dest
+
+
+def test_derived_source_into_experiment_sanitises_hyphenated_role() -> None:
+    """``role`` sanitisation mirrors ``snapshot_into_experiment`` so a
+    hyphenated label doesn't produce a dest table id needing quoting."""
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        dest = derived_source_into_experiment(
+            "world-fishing-827.src_ds.tbl",
+            experiment_id="exp1",
+            role="outage-pre-filtered",
+            where_clause="TRUE",
+        )
+    assert "dit_exp_exp1_outage_pre_filtered_tbl" in dest
+    assert "outage-pre-filtered" not in dest
+
+
+def test_derived_source_into_experiment_where_clause_interpolated_verbatim() -> None:
+    """``where_clause`` is the caller's SQL fragment, dropped into the DDL
+    after ``WHERE``. No quoting / no escaping by the helper. Pin this
+    behaviour explicitly so a future "be helpful and add quoting" change
+    can't silently rewrite the caller's SQL."""
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        derived_source_into_experiment(
+            "world-fishing-827.src_ds.tbl",
+            experiment_id="exp1",
+            role="role",
+            where_clause="ssvid IN ('123','456') AND DATE(timestamp) > '2020-01-01'",
+        )
+    sql = _captured_sql(client)
+    assert "WHERE ssvid IN ('123','456') AND DATE(timestamp) > '2020-01-01'" in sql
+
+
+def test_derived_source_into_experiment_strips_source_fqn_to_table_name() -> None:
+    """source_table_name is the last `.`-separated component."""
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        dest = derived_source_into_experiment(
+            "some-project.some_ds.research_messages",
+            experiment_id="exp1",
+            role="outage_pre_filtered",
+            where_clause="TRUE",
+        )
+    assert dest.endswith(".dit_exp_exp1_outage_pre_filtered_research_messages")
+
+
+def test_derived_source_into_experiment_if_existing_fail_drops_if_not_exists() -> None:
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        derived_source_into_experiment(
+            "world-fishing-827.src_ds.tbl",
+            experiment_id="exp1",
+            role="role",
+            where_clause="TRUE",
+            if_existing="fail",
+        )
+    sql = _captured_sql(client)
+    assert sql.startswith("CREATE VIEW `"), sql  # no IF NOT EXISTS
+    assert "IF NOT EXISTS" not in sql
+
+
+def test_derived_source_into_experiment_custom_expiration_days() -> None:
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        derived_source_into_experiment(
+            "world-fishing-827.src_ds.tbl",
+            experiment_id="exp1",
+            role="role",
+            where_clause="TRUE",
+            expiration_days=30,
+        )
+    sql = _captured_sql(client)
+    # 2026-06-08T12:00:00Z + 30d = 2026-07-08T12:00:00+00:00
+    assert 'OPTIONS(expiration_timestamp=TIMESTAMP("2026-07-08T12:00:00+00:00"))' in sql
+
+
+def test_derived_source_into_experiment_custom_project_threads_through() -> None:
+    """``project`` controls both the BQ client target AND the dest FQN."""
+    client = _make_client_mock()
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client) as ctor,
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        dest = derived_source_into_experiment(
+            "gfw-int-vms-v3.pipe_vms_v3_internal.research_messages",
+            experiment_id="exp1",
+            role="outage_pre_filtered",
+            where_clause="TRUE",
+            project="gfw-int-vms-v3",
+        )
+    ctor.assert_called_once_with(project="gfw-int-vms-v3")
+    assert dest.startswith("gfw-int-vms-v3.tech_great_expectations.")
+    sql = _captured_sql(client)
+    assert "`gfw-int-vms-v3.tech_great_expectations.dit_exp_exp1_outage_pre_filtered_research_messages`" in sql
