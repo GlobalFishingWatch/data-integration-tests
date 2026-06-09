@@ -30,11 +30,13 @@ by which a reprocess takes ownership of the tail.
    strictly about the *reprocess* stage(s) — anything that's meant to
    "fix" prior output must extend to `--end`.
 
-3. **`outage_recovery.py` Stage 5 must end at `--end`.** Today this is
-   satisfied: `recovery_ends = daterange_inclusive(outage_start - buffer,
-   end + 1)` always terminates at `end`. Keep it that way in any
-   redesign. The same applies to any future "recovery" / "fix" stage in
-   any sibling workflow.
+3. **`outage_recovery.py` Stage 3 (recovery) must end at `--end`.**
+   Today this is satisfied: the recovery range is `[outage_start -
+   recovery_buffer_days, end]` (the recovery stage runs `pipe-gaps
+   detect --start_date <recovery_start> --end_date <end>` against the
+   snapshot/live source), which always terminates at `end`. Keep it
+   that way in any redesign. The same applies to any future "recovery"
+   / "fix" stage in any sibling workflow.
 
 4. **`mode_equivalence.py`'s `bfd` / `bftruncate` / `mutate_recover`
    modes already terminate at `--end`.** Their multi-day-tail loops
@@ -46,8 +48,10 @@ by which a reprocess takes ownership of the tail.
 The oracle is the "what would a clean single-shot run produce?" answer
 the staged path is compared against. Per the contract above:
 
-- The oracle is **always** `pipe-gaps detect --date-range start,end+1`
-  (single run, full range, frozen source).
+- The oracle is **always** `pipe-gaps detect --date-range start,end`
+  (single run, full range, frozen source) — matching the worked
+  example below and how `execute_outage_oracle` calls it in code
+  (the workflow's inclusive `--end` is passed verbatim).
 - A staged path that diverges from the oracle indicates a real bug in
   pipe-gaps' detection logic (e.g. the `get_first_message_inside_range`
   close-path issue documented in `docs/context.md`), NOT a

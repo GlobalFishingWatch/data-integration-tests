@@ -181,9 +181,11 @@ def _default_pin_at() -> str:
 # stale experiment-ids.
 DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
 
-# Stage boundaries are tight (Dec 20-31) so a default run finishes in
-# <10 min on a single Dataflow worker while still exercising the 5-stage
-# shape end-to-end. The 2020-01-01 start matches ``mode_equivalence.py``
+# Stage boundaries are tight (Dec 28-31) so a default run finishes in
+# <10 min on a single Dataflow worker while still exercising the 3-stage
+# shape end-to-end (one-day outage on Dec 29, post-outage continuation on
+# Dec 30-31, recovery on Dec 28-31). The 2020-01-01 start matches
+# ``mode_equivalence.py``
 # (``DEFAULT_START = "2020-01-01"``) so both workflows hit the same cohort
 # data; the cohort name ``pipe_ais_test_202408290000`` is the snapshot
 # date, NOT the data date.
@@ -633,7 +635,7 @@ def execute_outage_oracle(
 # --------------------------------------------------------------------------
 
 
-# Keys that only affect the staged 5-stage run, not the single-shot oracle.
+# Keys that only affect the staged 3-stage run, not the single-shot oracle.
 # Stripped from the oracle's cache key so iterating on outage geometry
 # (or the recovery buffer) doesn't needlessly invalidate the oracle.
 _RECOVERY_ONLY_KEYS = frozenset({
@@ -787,8 +789,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--backfill-end", default=DEFAULT_BACKFILL_END,
         help=(f"Inclusive end of the initial backfill (Stage 1). The "
-              f"pre-outage daily incrementals (Stage 2) run for the days "
-              f"after this. Default: {DEFAULT_BACKFILL_END}."),
+              f"outage period starts the day after this; Stage 2 "
+              f"(post-outage continuation) resumes the day after the "
+              f"outage ends. Default: {DEFAULT_BACKFILL_END}."),
     )
     p.add_argument(
         "--outage-start", default=DEFAULT_OUTAGE_START,
@@ -804,14 +807,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--end", default=DEFAULT_END,
-        help=(f"Inclusive endpoint of the post-outage daily incrementals "
-              f"(Stage 4), the recovery (Stage 5), and the oracle. "
-              f"Default: {DEFAULT_END}."),
+        help=(f"Inclusive endpoint of the post-outage continuation "
+              f"(Stage 2), the recovery backfill (Stage 3), and the "
+              f"oracle. Default: {DEFAULT_END}."),
     )
     p.add_argument(
         "--recovery-buffer-days", type=int,
         default=DEFAULT_RECOVERY_BUFFER_DAYS,
-        help=(f"Stage 5 (recovery) starts at "
+        help=(f"Stage 3 (recovery) starts at "
               f"``outage_start - recovery_buffer_days`` so it overlaps the "
               f"last pre-outage day(s). Default: {DEFAULT_RECOVERY_BUFFER_DAYS}."),
     )
@@ -870,7 +873,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                          "the staging cohort (`pipe_ais_test_*`) is the canonical "
                          "case (2020 AIS data, never changes). For prod-VMS or "
                          "any live-ingest source this would silently sample "
-                         "different states across the 17+1 stages -- DO NOT USE. "
+                         "different states across the 3+1 staged jobs -- DO NOT USE. "
                          "When set, --pin-at and --snapshot-* flags are ignored "
                          "(but still parsed for argparse coherence); the cache "
                          "key includes a `no_snapshot=true` marker so runs with "

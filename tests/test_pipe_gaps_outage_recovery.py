@@ -2,7 +2,7 @@
 
 Focused on workflow-local helpers: pin-at validation, the stage-boundary
 ordering check in ``parse_args``, ``canonical_params_dict`` cache-key
-composition, and the snapshot-table naming. The 5-stage execute
+composition, and the snapshot-table naming. The 3-stage execute
 function, the snapshot creation, and the dataflow runner are exercised
 by live ``dit run`` invocations against real BQ; they're not unit-tested
 here.
