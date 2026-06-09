@@ -656,10 +656,11 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
     """Output-affecting params for a pipe-gaps outage-recovery run.
 
     The pin timestamp is stored as its ISO-8601 string (normalised by
-    ``_parse_pin_at``); the snapshot dataset / table names are NOT included
-    in the cache key, because two runs with the same ``--source-*`` +
-    pin-at timestamp produce the same snapshot CONTENT regardless of
-    where the snapshot tables live.
+    ``_parse_pin_at``); the snapshot table name + dest project are NOT
+    included in the cache key, because two runs with the same
+    ``--source-*`` + pin-at timestamp produce the same snapshot CONTENT
+    regardless of where the snapshot table lives (canonical-dataset
+    shape: snapshots are tables in ``tech_great_expectations``).
     """
     params: dict[str, Any] = {
         "mode": mode,
@@ -839,12 +840,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--snapshot-expiration-days", type=int,
         default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
-        help=("default_table_expiration on the per-experiment snapshot "
-              f"datasets, in days. Default: {DEFAULT_SNAPSHOT_EXPIRATION_DAYS}."),
+        help=("Per-table `expiration_timestamp` set on the snapshot tables "
+              "in the canonical `tech_great_expectations` dataset, in days "
+              "(M2 of canonical-dataset migration: workflow no longer creates "
+              "per-experiment datasets; snapshots live in tech_great_expectations "
+              "with per-table TTL). Default: "
+              f"{DEFAULT_SNAPSHOT_EXPIRATION_DAYS}."),
     )
     p.add_argument(
         "--snapshot-dest-project", default=PROJECT,
-        help=(f"Project that hosts the snapshot datasets. Default: {PROJECT}. "
+        help=(f"Project that hosts the snapshot tables (in `tech_great_expectations`). Default: {PROJECT}. "
               "Override to the source's project when running against a source "
               "that lives in a different GCP org (e.g. "
               "``--snapshot-dest-project gfw-int-vms-v3`` when --source-* "
