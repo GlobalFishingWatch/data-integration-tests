@@ -28,18 +28,22 @@ The production shape is:
 Stages
 ------
 1. **Initial backfill** ``[start, backfill_end]`` (one big run).
-2. **Pre-outage daily incrementals** -- one run per day in
-   ``[backfill_end + 1, outage_start - 1]``, each over ``[d-W, d]``.
-3. **Outage** -- no runs for ``[outage_start, outage_end]``.
-4. **Post-outage daily incrementals** -- one run per day in
-   ``[outage_end + 1, end]``, each over ``[d-W, d]``.
-5. **Recovery** -- one run per day in
-   ``[outage_start - recovery_buffer_days, end]``, each over ``[d-W, d]``.
+   Represents all prior daily DAG history condensed into one chunk.
+2. **Post-outage continuation** ``[outage_end + 1, end]`` (one big run).
+   Represents the daily DAG resuming after the outage. The outage
+   period ``[outage_start, outage_end]`` is implicitly skipped --
+   no stage writes for those dates until Stage 3.
+3. **Recovery backfill** ``[outage_start - recovery_buffer_days, end]``
+   (one big run). The on-call's reprocess-from-before-outage-to-current.
+   Per the pipe-gaps reprocess-to-end contract
+   (see ``workflows/pipe_gaps/CLAUDE.md``), this MUST extend to ``end``.
 
-All five stages write ``WRITE_APPEND`` to the same SCD-2 ``raw_gaps``
+All three stages write ``WRITE_APPEND`` to the same SCD-2 ``raw_gaps``
 table. The oracle is a single-shot backfill ``[start, end]`` against the
 same source. Comparison is on the ``_last_versions`` view via
 ``dit.compare.compare_tables``.
+
+Total: 3 staged Dataflow jobs + 1 oracle = 4 jobs per run.
 
 Mechanism
 ---------
@@ -113,7 +117,6 @@ from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit import workflow as dit_workflow
 from dit.cache import CacheKey, sha1_of_workflow_file
-from dit.dates import daterange_inclusive
 from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
@@ -125,7 +128,6 @@ from dit.workflow import (
 
 # Reused workflow-wide constants. See mode_equivalence.py for full doc.
 from workflows.pipe_gaps.mode_equivalence import (
-    DEFAULT_BACKFILL_DAYS_W,
     DEFAULT_BQ_TEMP_DATASET,
     DEFAULT_FILTER_GOOD_SEG,
     DEFAULT_IMAGE_TAG,
@@ -186,9 +188,9 @@ DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
 # data; the cohort name ``pipe_ais_test_202408290000`` is the snapshot
 # date, NOT the data date.
 DEFAULT_START = "2020-01-01"
-DEFAULT_BACKFILL_END = "2020-12-20"
-DEFAULT_OUTAGE_START = "2020-12-25"
-DEFAULT_OUTAGE_END = "2020-12-27"
+DEFAULT_BACKFILL_END = "2020-12-28"
+DEFAULT_OUTAGE_START = "2020-12-29"  # one-day outage by default; same as outage_end
+DEFAULT_OUTAGE_END = "2020-12-29"
 DEFAULT_END = "2020-12-31"
 DEFAULT_RECOVERY_BUFFER_DAYS = 1
 
@@ -549,68 +551,57 @@ def execute_outage_recovery(
     outage_end: date,
     end: date,
     recovery_buffer_days: int,
-    backfill_days_w: int,
     output: str,
     experiment_id: str,
     image_tag: str,
 ) -> None:
-    """Five-stage outage simulation writing to a single SCD-2 ``output`` table.
+    """Three-stage outage simulation writing to a single SCD-2 ``output`` table.
 
     Stage 1 (initial backfill): one big slice ``[start, backfill_end]``.
-    Stage 2 (pre-outage daily incrementals): one run per day in
-        ``[backfill_end + 1, outage_start - 1]``, each ``[d-W, d]``.
-    Stage 3 (outage): no runs for ``[outage_start, outage_end]``.
-    Stage 4 (post-outage daily incrementals): one run per day in
-        ``[outage_end + 1, end]``, each ``[d-W, d]``.
-    Stage 5 (recovery): one run per day in
-        ``[outage_start - recovery_buffer_days, end]``, each ``[d-W, d]``.
+        Represents all prior daily DAG history condensed into one
+        chunk -- writes the initial set of gaps that the recovery will
+        clobber and reload.
+    Stage 2 (post-outage continuation): one big slice
+        ``[outage_end + 1, end]``. Represents the daily DAG resuming
+        after the outage. The outage period ``[outage_start, outage_end]``
+        is implicitly skipped -- no stage writes for those dates until
+        the recovery in Stage 3.
+    Stage 3 (recovery backfill): one big slice
+        ``[outage_start - recovery_buffer_days, end]``. The on-call's
+        reprocess-from-before-outage-to-current. Per the pipe-gaps
+        reprocess-to-end contract (see ``workflows/pipe_gaps/CLAUDE.md``),
+        this MUST extend to ``end`` -- the pre-write delete in
+        ``gaps_delete.sql.j2`` is unbounded on the right, so a recovery
+        with a narrower end would leak rows for ``[end+1, ...)``.
 
-    All stages read the same source snapshot (the outage is simulated
-    by skipping runs, not by mutating source data), so ``base_cfg``
-    is a single kwargs dict pointing at the per-experiment snapshot
-    tables. The outage is realised implicitly: no iteration happens
-    between Stage 2's last day and Stage 4's first day.
+    All three stages read the same source snapshot (the outage is
+    simulated by skipping date ranges, not by mutating source data),
+    so ``base_cfg`` is a single kwargs dict.
     """
-    pre_ends = list(daterange_inclusive(
-        backfill_end + timedelta(days=1),
-        outage_start,  # exclusive upper bound -> last pre-outage day = outage_start - 1
-    ))
-    post_ends = list(daterange_inclusive(
-        outage_end + timedelta(days=1),
-        end + timedelta(days=1),  # +1 to include `end`
-    ))
-    recovery_start_day = outage_start - timedelta(days=recovery_buffer_days)
-    recovery_ends = list(daterange_inclusive(
-        recovery_start_day,
-        end + timedelta(days=1),
-    ))
-    # 1 initial backfill + len(pre) + len(post) + len(recovery)
-    total = 1 + len(pre_ends) + len(post_ends) + len(recovery_ends)
-
     # Stage 1: initial backfill [start, backfill_end].
     cfg = _make_config(
         start=start, end=backfill_end, bq_output_gaps=output,
-        job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 1, total),
+        job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 1, 3),
         **base_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
-    # Stages 2, 4, 5 -- three contiguous daily loops sharing the same
-    # per-day window [d - backfill_days_w, d]. Stage 3 (the outage) is
-    # implicit: nothing happens between pre_ends[-1] and post_ends[0].
-    iteration = 2
-    for stage_ends in (pre_ends, post_ends, recovery_ends):
-        for day_end in stage_ends:
-            day_start = day_end - timedelta(days=backfill_days_w)
-            cfg = _make_config(
-                start=day_start, end=day_end, bq_output_gaps=output,
-                job_name=_job_name(
-                    experiment_id, MODE_OUTAGE_RECOVERY, iteration, total,
-                ),
-                **base_cfg,
-            )
-            _run_pipeline(runner, cfg, image_tag)
-            iteration += 1
+    # Stage 2: post-outage continuation [outage_end + 1, end].
+    cfg = _make_config(
+        start=outage_end + timedelta(days=1), end=end, bq_output_gaps=output,
+        job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 2, 3),
+        **base_cfg,
+    )
+    _run_pipeline(runner, cfg, image_tag)
+
+    # Stage 3: recovery backfill [outage_start - buffer, end].
+    recovery_start_day = outage_start - timedelta(days=recovery_buffer_days)
+    cfg = _make_config(
+        start=recovery_start_day, end=end, bq_output_gaps=output,
+        job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 3, 3),
+        **base_cfg,
+    )
+    _run_pipeline(runner, cfg, image_tag)
 
 
 def execute_outage_oracle(
@@ -650,7 +641,6 @@ _RECOVERY_ONLY_KEYS = frozenset({
     "outage_start",
     "outage_end",
     "recovery_buffer_days",
-    "backfill_days",
 })
 
 
@@ -671,7 +661,6 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
         "outage_end": args.outage_end,
         "end": args.end,
         "recovery_buffer_days": args.recovery_buffer_days,
-        "backfill_days": args.backfill_days,
         "min_gap_length": args.min_gap_length,
         "n_hours_before": args.n_hours_before,
         "window_period_d": args.window_period_d,
@@ -826,7 +815,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
               f"``outage_start - recovery_buffer_days`` so it overlaps the "
               f"last pre-outage day(s). Default: {DEFAULT_RECOVERY_BUFFER_DAYS}."),
     )
-    p.add_argument("--backfill-days", type=int, default=DEFAULT_BACKFILL_DAYS_W)
     p.add_argument(
         "--pin-at",
         type=_validate_pin_at,
@@ -974,20 +962,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
     logger.info("Pin-at:        %s", args.pin_at)
-    logger.info("Stage 1 (initial backfill):       [%s, %s]", start, backfill_end)
-    logger.info("Stage 2 (pre-outage incrementals): (%s, %s)",
-                backfill_end, outage_start)
-    logger.info("Stage 3 (outage, skipped):        [%s, %s]", outage_start, outage_end)
-    logger.info("Stage 4 (post-outage incrementals): (%s, %s]",
-                outage_end, end)
+    logger.info("Stage 1 (initial backfill):           [%s, %s]", start, backfill_end)
+    logger.info("       outage (skipped):              [%s, %s]",
+                outage_start, outage_end)
+    logger.info("Stage 2 (post-outage continuation):   [%s, %s]",
+                outage_end + timedelta(days=1), end)
     recovery_start_day = outage_start - timedelta(days=args.recovery_buffer_days)
-    logger.info("Stage 5 (recovery):               [%s, %s]",
+    logger.info("Stage 3 (recovery backfill):          [%s, %s]",
                 recovery_start_day, end)
-    if recovery_start_day <= backfill_end:
+    if recovery_start_day < backfill_end:
         logger.info(
             "recovery start day %s is inside the initial backfill range "
-            "[%s, %s]; this is allowed and exercises the within-backfill "
-            "SCD-2 re-layering path",
+            "[%s, %s]; this is allowed and exercises within-backfill "
+            "SCD-2 re-layering",
             recovery_start_day, start, backfill_end,
         )
 
@@ -1082,7 +1069,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             outage_end=outage_end,
             end=end,
             recovery_buffer_days=args.recovery_buffer_days,
-            backfill_days_w=args.backfill_days,
             output=recovery_table,
             experiment_id=args.experiment_id,
             image_tag=args.image_tag,

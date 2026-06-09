@@ -23,12 +23,11 @@ def _args(**overrides: Any) -> argparse.Namespace:
     base = dict(
         experiment_id="exp01",
         start="2020-01-01",
-        backfill_end="2020-12-20",
-        outage_start="2020-12-25",
-        outage_end="2020-12-27",
+        backfill_end="2020-12-28",
+        outage_start="2020-12-29",
+        outage_end="2020-12-29",
         end="2020-12-31",
         recovery_buffer_days=1,
-        backfill_days=4,
         min_gap_length=1.0,
         n_hours_before=12,
         window_period_d=2,
@@ -113,6 +112,7 @@ def test_parse_args_rejects_backfill_end_at_or_after_outage_start() -> None:
 def test_parse_args_rejects_outage_end_before_outage_start() -> None:
     with pytest.raises(SystemExit):
         mod.parse_args([
+            "--backfill-end", "2020-12-26",
             "--outage-start", "2020-12-27",
             "--outage-end", "2020-12-25",
             "--experiment-id", "test",
@@ -130,14 +130,11 @@ def test_parse_args_rejects_outage_end_at_or_after_end() -> None:
 
 def test_parse_args_accepts_one_day_outage() -> None:
     # outage_start == outage_end is the minimum bug-reproduction shape:
-    # one skipped day.
-    args = mod.parse_args([
-        "--outage-start", "2020-12-25",
-        "--outage-end", "2020-12-25",
-        "--experiment-id", "test",
-    ])
-    assert args.outage_start == "2020-12-25"
-    assert args.outage_end == "2020-12-25"
+    # one skipped day. This is the new default shape too -- exactly the
+    # repro the workflow ships out of the box.
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.outage_start == "2020-12-29"
+    assert args.outage_end == "2020-12-29"
 
 
 def test_parse_args_rejects_negative_recovery_buffer_days() -> None:
@@ -206,7 +203,7 @@ def test_canonical_params_oracle_drops_recovery_only_keys() -> None:
     rec = mod.canonical_params_dict(_args(), mod.MODE_OUTAGE_RECOVERY)
     ora = mod.canonical_params_dict(_args(), mod.MODE_OUTAGE_ORACLE)
     for k in ("backfill_end", "outage_start", "outage_end",
-              "recovery_buffer_days", "backfill_days"):
+              "recovery_buffer_days"):
         assert k in rec, f"recovery mode should include {k!r}"
         assert k not in ora, f"oracle mode should not include {k!r}"
 
