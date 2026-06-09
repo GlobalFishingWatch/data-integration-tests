@@ -25,6 +25,11 @@ def _args(**overrides: Any) -> argparse.Namespace:
         end="2020-12-31",
         tail_days=3,
         source_dataset_stem="pipe_ais_test_202408290000",
+        # Per-table FQN overrides default to None so stem-derivation applies
+        # (M4). Tests that exercise the override path set them explicitly.
+        source_messages_fqn=None,
+        source_segment_info_fqn=None,
+        source_segs_activity_fqn=None,
         named_anchorages="world-fishing-827.anchorages.named_anchorages_v1",
         thinned_message_table=None,
         dest_dataset="tech_great_expectations",
@@ -97,9 +102,98 @@ def test_canonical_params_dict_includes_output_affecting_inputs():
     p = mod.canonical_params_dict(_args(), mod.MODE_BF)
     assert p["start"] == "2020-01-01"
     assert p["end"] == "2020-12-31"
-    assert p["source_dataset_stem"] == "pipe_ais_test_202408290000"
+    # M4: cache key keys on RESOLVED FQNs, not the stem. Defaults derive
+    # from the stem; explicit FQN overrides win (tested below).
+    assert p["source_messages_fqn"] == (
+        "world-fishing-827.pipe_ais_test_202408290000_internal.messages_positions"
+    )
+    assert p["source_segment_info_fqn"] == (
+        "world-fishing-827.pipe_ais_test_202408290000_published.segment_info"
+    )
+    assert p["source_segs_activity_fqn"] == (
+        "world-fishing-827.pipe_ais_test_202408290000_published.segs_activity"
+    )
     assert p["named_anchorages"] == "world-fishing-827.anchorages.named_anchorages_v1"
     assert p["thinned_message_table"] is None
+
+
+def test_canonical_params_dict_per_table_fqn_override_wins():
+    """M4: --source-messages-fqn (etc.) takes precedence over stem-derivation."""
+    p = mod.canonical_params_dict(
+        _args(source_messages_fqn="proj.ds.alt_messages"), mod.MODE_BF,
+    )
+    assert p["source_messages_fqn"] == "proj.ds.alt_messages"
+
+
+def test_canonical_params_dict_stem_and_explicit_fqn_match_when_equivalent():
+    """M4: a stem-default run and a per-table-FQN run pointing at the same
+    three tables produce IDENTICAL cache rows -- the resolved FQNs are what
+    the cache keys on, not the CLI shape used to specify them."""
+    via_stem = mod.canonical_params_dict(_args(), mod.MODE_BF)
+    via_explicit = mod.canonical_params_dict(_args(
+        source_messages_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_internal.messages_positions"
+        ),
+        source_segment_info_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_published.segment_info"
+        ),
+        source_segs_activity_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_published.segs_activity"
+        ),
+    ), mod.MODE_BF)
+    assert via_stem == via_explicit
+
+
+def test_canonical_params_dict_changes_when_messages_fqn_differs():
+    """M4: pointing each binding at a different snapshot FQN (M5 use case)
+    must produce distinct cache rows so a cross-version run doesn't pick up
+    a hit from a different binding's tables."""
+    a = mod.canonical_params_dict(
+        _args(source_messages_fqn="proj.ds.binding_a_messages"), mod.MODE_BF,
+    )
+    b = mod.canonical_params_dict(
+        _args(source_messages_fqn="proj.ds.binding_b_messages"), mod.MODE_BF,
+    )
+    assert a != b
+
+
+def test_messages_table_helper_honours_per_table_override():
+    """The _messages_table helper itself prefers the override; absent it,
+    falls back to stem-derivation byte-identically to pre-M4."""
+    assert mod._messages_table(_args(source_messages_fqn="proj.ds.alt")) == "proj.ds.alt"
+    assert mod._messages_table(_args()) == (
+        "world-fishing-827.pipe_ais_test_202408290000_internal.messages_positions"
+    )
+
+
+def test_segment_info_table_helper_honours_per_table_override():
+    assert mod._segment_info_table(_args(source_segment_info_fqn="proj.ds.alt")) == "proj.ds.alt"
+    assert mod._segment_info_table(_args()) == (
+        "world-fishing-827.pipe_ais_test_202408290000_published.segment_info"
+    )
+
+
+def test_segs_activity_table_helper_honours_per_table_override():
+    assert mod._segs_activity_table(_args(source_segs_activity_fqn="proj.ds.alt")) == "proj.ds.alt"
+    assert mod._segs_activity_table(_args()) == (
+        "world-fishing-827.pipe_ais_test_202408290000_published.segs_activity"
+    )
+
+
+def test_bad_segs_sql_honours_per_table_override():
+    """The SQL fragment built in _bad_segs_sql also honours the override
+    (lifts the FQN out of the f-string and reads it from the helper). The
+    override exists to make a snapshot in tech_great_expectations addressable
+    end-to-end; if _bad_segs_sql ignored it, the workflow would read a mix
+    of the override (for messages/segment_info) and the stem-derived
+    segs_activity, defeating the point."""
+    sql = mod._bad_segs_sql(_args(source_segs_activity_fqn="proj.ds.alt_segs"))
+    assert "`proj.ds.alt_segs`" in sql
+    assert "_published.segs_activity" not in sql
+
+    # Absent the override, the stem-derived FQN appears.
+    sql_default = mod._bad_segs_sql(_args())
+    assert "`world-fishing-827.pipe_ais_test_202408290000_published.segs_activity`" in sql_default
 
 
 def test_canonical_params_dict_thinned_table_changes_key():

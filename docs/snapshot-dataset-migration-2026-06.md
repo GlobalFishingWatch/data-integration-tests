@@ -2,7 +2,7 @@
 
 Tracking doc for the migration of dit's BQ snapshot/dataset machinery onto the canonical-dataset policy locked 2026-06-08 (PR #54). Companion to [`snapshot-edge-cases-2026-06.md`](snapshot-edge-cases-2026-06.md) (the empirical audit) and [`workflow-reconciliation-2026-06.md`](workflow-reconciliation-2026-06.md) (the broader workflow review). Update as PRs land.
 
-**Status (2026-06-08)**: policy landed (PR #54); **M1 landed** (PR #56) — `dit.bq.snapshot_into_experiment(...)` helper available; **M2 landed** (PR #57) — `workflows/pipe_gaps/outage_recovery.py` migrated; **M3 landed** (this commit) — `workflows/pipe_segment/identity_match_key.py` migrated, second consumer of the helper, AND the pipe-segment `--snapshot-dest-project` tactical fix folded in (closes the `--include-satellite-offsets` latent cross-org bug); M4 and M5 not yet started. M4 can ship anytime; M5 waits for M4. One remaining adjacent item (cross-org Guard) is tracked separately.
+**Status (2026-06-09)**: policy landed (PR #54); **M1 landed** (PR #56) — `dit.bq.snapshot_into_experiment(...)` helper available; **M2 landed** (PR #57) — `workflows/pipe_gaps/outage_recovery.py` migrated; **M3 landed** (PR #58) — `workflows/pipe_segment/identity_match_key.py` migrated, second consumer of the helper, AND the pipe-segment `--snapshot-dest-project` tactical fix folded in; **M4 landed** (this commit) — `workflows/port_visits/ais.py` gained per-table `--source-{messages,segment-info,segs-activity}-fqn` override flags; **M5 not yet started** (unblocked by M4). One remaining adjacent item (cross-org Guard) is tracked separately. Follow-on tracked separately in [`source-mutation-primitive-2026-06.md`](source-mutation-primitive-2026-06.md): M6a landed PR #61 (independent of M4/M5).
 
 ## What we're fixing
 
@@ -40,7 +40,7 @@ M2, M3, M4 can ship in parallel after M1; M5 must come last (it depends on M4's 
 | M1 | `dit.bq.snapshot_into_experiment(...)` library helper | A (additive library) | ~+30 LOC + tests | Unit tests only — pure addition, no consumer yet | **Landed 2026-06-08** |
 | M2 | Convert `workflows/pipe_gaps/outage_recovery.py` | B (workflow file) | ~-56 LOC net | Synchronisation test pins `_outage_snapshot_dest_fqn` to match `snapshot_into_experiment`; optional cloud smoke deferred | **Landed 2026-06-08** |
 | M3 | Convert `workflows/pipe_segment/identity_match_key.py` | B | +43 LOC net (the dataclass + cross-org help text + satellite-stem computation offset the dataset-creation drops; no-`create_dataset` is the load-bearing metric) | 8 new unit tests pin the dataclass shape + `_snapshot_source` invocations; `--snapshot-dest-project` tactical fix folded in | **Landed 2026-06-08** |
-| M4 | Add per-table FQN flags to `workflows/port_visits/ais.py` | B (additive workflow change) | ~+30 LOC | Cloud smoke of `ais.py` standalone — backward compat critical | Not started |
+| M4 | Add per-table FQN flags to `workflows/port_visits/ais.py` | B (additive workflow change) | ~+50 LOC + 7 new tests | Cloud smoke of `ais.py` standalone — backward compat pinned by `test_canonical_params_dict_stem_and_explicit_fqn_match_when_equivalent` (resolved FQNs identical → cache row identical) | **Landed 2026-06-09** |
 | M5 | Convert `workflows/port_visits/cross_version_ais.py` | B | ~-60 LOC net | Cloud smoke of a real cross-version run | Not started |
 
 Net effect when complete: ~150–200 LOC removed from workflows, one new library helper, one `ais.py` CLI extension, the `dit_exp_*` dataset spam eliminated, the transitional protection rule removed from CLAUDE.md.

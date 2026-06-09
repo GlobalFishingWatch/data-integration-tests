@@ -6,6 +6,11 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-09
+
+#### Added
+- **`workflows/port_visits/ais.py` per-table source-FQN flags (M4 of canonical-dataset migration).** Three new CLI flags — `--source-messages-fqn`, `--source-segment-info-fqn`, `--source-segs-activity-fqn` — let callers point each source table at an arbitrary FQN, taking precedence over the existing `--source-dataset-stem`-based derivation when set. Backward compat is byte-identical: when none of the new flags are set, the helpers fall back to stem-derivation. Cache key shape changes — `canonical_params_dict` now keys on RESOLVED FQNs (`source_messages_fqn`, `source_segment_info_fqn`, `source_segs_activity_fqn`) instead of the stem-with-halves shorthand, so two runs that point at the same three tables via different CLI shapes share a cache row; two runs with different effective tables (the M5 cross_version use case) get distinct rows. **First run after merge MISSES the cache for all callers; subsequent runs converge** — no migration concern (integration-test cache; rows expire on their own). Also lifts the segs_activity FQN out of `_bad_segs_sql`'s f-string into the new `_segs_activity_table` helper so the override actually reaches the bad-segs filter (otherwise the workflow would read a mix: override for messages/segment_info, stem-derived for segs_activity, defeating the point). Unblocks M5 (port-visits `cross_version_ais.py`), which uses these flags to route each binding at its own snapshots in `tech_great_expectations` (which don't follow the stem-with-halves shape). Workflow LOC: +50 net. New tests in `tests/test_port_visits_ais.py`: 7 covering override precedence, stem-vs-explicit equivalence (the backward-compat pin), distinct cache rows on different FQNs, all three helpers, and `_bad_segs_sql` honouring the override. Full suite: 348 passing (341 prior + 7 new).
+
 ### 2026-06-08
 
 #### Changed
