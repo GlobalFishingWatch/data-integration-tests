@@ -182,6 +182,19 @@ def test_parse_args_accepts_recovery_buffer_at_history_boundary() -> None:
     assert args.recovery_buffer_days == 4
 
 
+def test_parse_args_parallel_default_false() -> None:
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.parallel is False
+
+
+@pytest.mark.parametrize("flag", ["--parallel", "--async"])
+def test_parse_args_parallel_set_true(flag: str) -> None:
+    # --async is the alias mode_equivalence also accepts; both spellings
+    # land on args.parallel.
+    args = mod.parse_args(["--experiment-id", "test", flag])
+    assert args.parallel is True
+
+
 def test_parse_args_no_snapshot_default_false() -> None:
     args = mod.parse_args(["--experiment-id", "test"])
     assert args.no_snapshot is False
