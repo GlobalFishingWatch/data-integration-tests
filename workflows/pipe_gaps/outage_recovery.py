@@ -76,17 +76,32 @@ dates derives a fresh view instead of silently reusing a stale filter.
 
 Expected results
 ----------------
-* Current pipe-gaps main: ``outage_recovery`` vs ``oracle`` diverges on
-  ``raw_gaps_last_versions`` because the recovery's daily DELETE-then-LOAD
-  doesn't reproduce what a single-shot backfill would write. The
-  divergence is the bug.
-* With ``--synthetic-outage`` on the staging cohort, the divergence should
-  additionally surface the boundary-geometry bug class from issue #59:
-  vessels whose sub-threshold full-data gap stretches past the threshold
-  when the outage days' messages are missing (58 candidate vessels sit at
-  that geometry in staging), where the recovery fails to clean up the
-  wrong long gap.
-* Once the pipe-gaps fix lands: zero diff.
+Verified live (issue #59 2x2 matrix, 2026-06-10), with
+``--synthetic-outage --recovery-buffer-days 0`` on the staging cohort:
+
+* Stage 2 (bridging range over the filtered view) creates the wrong
+  over-threshold gaps + their open-v1 seeds for the boundary-geometry
+  vessels (68 + 72 on the default one-day outage) -- identically on all
+  pipe-gaps versions; the simulation is version-independent.
+* **Pre-MAP-1676 pipe-gaps** (e.g. ``6cd6706``): the recovery orphans
+  the open-v1 seeds (DELETE removes closed gaps with
+  ``end_timestamp >= start_date`` but not opens with
+  ``start_timestamp < start_date``), then the self-fed open-gaps side
+  input closes them WITHOUT re-checking ``min_gap_length`` -> 58
+  sub-threshold closed gaps survive -> **RED** (staged row count exceeds
+  the oracle's; asymmetric only-in-staged keys).
+* **Post-MAP-1676 pipe-gaps** (main >= ``81118be``): the same orphaned
+  seeds are handled correctly -> zero outage-class leftovers ->
+  **GREEN** on the outage class.
+* All runs additionally carry the known close-path non-determinism
+  (~45/45 symmetric key drift + msgid/coordinate value diffs) -- a
+  separate pipe-gaps issue, NOT outage-related. The workflow's verdict
+  is zero-diff, so runs stay RED until that issue is also fixed or
+  tolerated in the comparison; attribute via the table-check summary
+  before reading a RED as an outage regression.
+* ``--recovery-buffer-days >= 1`` widens the recovery's DELETE to sweep
+  the open-v1 seeds too, masking the outage class entirely (clean on
+  both fixed and broken code) -- which is why 0 is the default.
 
 Defaults
 --------
@@ -216,7 +231,15 @@ DEFAULT_BACKFILL_END = "2020-12-28"
 DEFAULT_OUTAGE_START = "2020-12-29"  # one-day outage by default; same as outage_end
 DEFAULT_OUTAGE_END = "2020-12-29"
 DEFAULT_END = "2020-12-31"
-DEFAULT_RECOVERY_BUFFER_DAYS = 1
+# 0 is the DISCRIMINATING setting (verified by the issue #59 2x2 matrix):
+# with the recovery starting exactly at outage_start, the pre-write DELETE
+# removes the wrong CLOSED gaps (end_timestamp >= start_date) but orphans
+# their open-v1 seeds (start_timestamp < start_date); the self-fed
+# open-gaps side input then exercises the close-recovery path on the
+# orphans -- the code path where the MAP-1676 bug class lived (sub-threshold
+# closes during reprocessing; RED on pipe-gaps 6cd6706, GREEN on 81118be).
+# buffer >= 1 widens the DELETE to sweep the seeds too, masking the class.
+DEFAULT_RECOVERY_BUFFER_DAYS = 0
 
 # Role passed to ``dit.bq.snapshot_into_experiment`` so the dest tables
 # land at ``<project>.tech_great_expectations.dit_exp_<experiment>_outage_<source_table_name>``.
@@ -991,8 +1014,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--recovery-buffer-days", type=int,
         default=DEFAULT_RECOVERY_BUFFER_DAYS,
         help=(f"Stage 3 (recovery) starts at "
-              f"``outage_start - recovery_buffer_days`` so it overlaps the "
-              f"last pre-outage day(s). Default: {DEFAULT_RECOVERY_BUFFER_DAYS}."),
+              f"``outage_start - recovery_buffer_days``. 0 (the default) is "
+              f"the discriminating regression-test setting: the recovery's "
+              f"pre-write DELETE then orphans the open-v1 seeds of any wrong "
+              f"gaps starting before the outage, exercising the close-recovery "
+              f"path where the MAP-1676 bug class lived. Values >= 1 widen "
+              f"the DELETE to sweep the seeds too, masking that class "
+              f"(verified by the issue #59 2x2 matrix). "
+              f"Default: {DEFAULT_RECOVERY_BUFFER_DAYS}."),
     )
     p.add_argument(
         "--pin-at",
@@ -1387,10 +1416,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     if rc != 0:
         logger.error(
-            "outage_recovery vs oracle reported differences -- "
-            "these are the sub-threshold close artefacts (the bug). "
-            "Expected RED on current pipe-gaps main; expected GREEN after "
-            "the redesign lands."
+            "outage_recovery vs oracle reported differences. Two known "
+            "classes (issue #59 forensics): (a) OUTAGE-CLASS LEFTOVERS -- "
+            "sub-threshold closed gaps starting in the last hour before "
+            "the outage boundary, surviving the recovery (a pipe-gaps "
+            "regression; RED on pre-MAP-1676 code, fixed on main >= "
+            "81118be). Signature: asymmetric only-in-staged keys + "
+            "staged row count exceeding the oracle's. (b) CLOSE-PATH "
+            "NON-DETERMINISM -- symmetric only-in counts and "
+            "msgid/coordinate value diffs; a separate known pipe-gaps "
+            "issue, NOT outage-related. Inspect the table-check summary "
+            "to attribute before treating this as an outage regression."
         )
         return 1
     logger.info("outage_recovery vs oracle matched -- no bug-shape divergence.")
