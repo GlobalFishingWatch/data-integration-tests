@@ -240,8 +240,10 @@ def _snapshot_source(args: argparse.Namespace) -> _CrossVersionSnapshotFQNs:
     `if_existing="skip"` (the helper's default) makes per-source-table
     re-runs idempotent BUT silently keeps the prior snapshot if the
     same `--experiment-id` is re-run with a different `--pin-source-at`.
-    Mitigated by the auto-generated `solo_<6-hex>` `--experiment-id`
-    default + 7-day TTL on each snapshot table. The explicit fail-fast
+    `--experiment-id` is REQUIRED in this workflow (no auto-generated
+    default, unlike ais.py's `solo_<6-hex>` fallback) -- use a fresh
+    experiment id per distinct pin timestamp; the 7-day TTL on each
+    snapshot table cleans up afterwards. The explicit fail-fast
     path remains `--thinned-message-table` (uses
     `if_existing="fail"` so a colliding name raises rather than reads
     the wrong pin). Full write-up + recommended `if_existing="verify_as_of"`
