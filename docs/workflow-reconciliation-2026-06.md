@@ -6,6 +6,8 @@ Point-in-time review of dit's workflow inventory, the trajectory that produced i
 
 **Status**: snapshot of the trajectory and design space as of 2026-06-05. Revisit when a fourth workflow lands in any pipeline family or when composer-dags configs become a more frequent moving target.
 
+**Follow-up 2026-06-10**: [`workflow-orchestration-2026-06.md`](workflow-orchestration-2026-06.md) evaluates the narrower question of the workflows' *configuration surface* (source/date flavours, mode composability, comparison config), post-dating the canonical-dataset migration (M1–M5) and the outage_recovery 3-stage reshape. It re-affirms the § 4 `dit.cohorts` recommendation as the highest-leverage open item, and flags the `--modes` asymmetry (only `cross_version_ais` has mode selection) as the most actionable inconsistency. Note § 4's per-workflow inventory below predates M4 — `port_visits/ais.py` has since gained per-table FQN override flags alongside the stem.
+
 ## 1. Workflow inventory + side-by-side comparison
 
 | File | Pipeline | Runner | Mode set | Default window | Default source | Compare shape | Compare keys | Cache? |
