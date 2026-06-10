@@ -11,7 +11,7 @@ here.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -49,6 +49,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         snapshot_expiration_days=7,
         snapshot_dest_project="world-fishing-827",
         no_snapshot=False,
+        synthetic_outage=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -320,6 +321,170 @@ def test_canonical_params_no_snapshot_in_key_for_both_modes() -> None:
         assert rec["no_snapshot"] is False
         assert liv["no_snapshot"] is True
         assert rec != liv
+
+
+def test_canonical_params_synthetic_outage_in_recovery_key_only() -> None:
+    """M6b: the flag changes what stages 1+2 READ (filtered view vs full
+    source), so it must distinguish recovery-mode cache rows. The oracle
+    reads the unfiltered source either way -- its output is invariant to
+    the flag, so _RECOVERY_ONLY_KEYS drops it from the oracle key
+    (otherwise toggling the flag would needlessly invalidate the oracle)."""
+    rec_off = mod.canonical_params_dict(
+        _args(synthetic_outage=False), mod.MODE_OUTAGE_RECOVERY)
+    rec_on = mod.canonical_params_dict(
+        _args(synthetic_outage=True), mod.MODE_OUTAGE_RECOVERY)
+    assert rec_off["synthetic_outage"] is False
+    assert rec_on["synthetic_outage"] is True
+    assert rec_off != rec_on
+
+    ora_off = mod.canonical_params_dict(
+        _args(synthetic_outage=False), mod.MODE_OUTAGE_ORACLE)
+    ora_on = mod.canonical_params_dict(
+        _args(synthetic_outage=True), mod.MODE_OUTAGE_ORACLE)
+    assert "synthetic_outage" not in ora_off
+    assert ora_off == ora_on  # oracle invariant to the flag
+
+
+def test_synthetic_outage_where_clause_excludes_inclusive_window() -> None:
+    clause = mod._synthetic_outage_where_clause(
+        date(2020, 12, 29), date(2020, 12, 29))
+    assert clause == (
+        "DATE(timestamp) NOT BETWEEN '2020-12-29' AND '2020-12-29'"
+    )
+
+
+def test_synthetic_outage_role_encodes_geometry() -> None:
+    """The role (hence the derived view's name) encodes the outage dates,
+    so a re-run with the same --experiment-id but different geometry
+    derives a NEW view instead of silently reusing the stale one --
+    the same staleness class as the documented skip-existing snapshot
+    footgun, dodged structurally."""
+    a = mod._synthetic_outage_role(date(2020, 12, 29), date(2020, 12, 29))
+    b = mod._synthetic_outage_role(date(2020, 12, 25), date(2020, 12, 29))
+    assert a == "outage_filtered_20201229_20201229"
+    assert b == "outage_filtered_20201225_20201229"
+    assert a != b
+
+
+def test_derive_synthetic_outage_view_calls_helper() -> None:
+    """_derive_synthetic_outage_view delegates to the M6a helper with the
+    geometry-encoding role, the outage WHERE clause, and the workflow's
+    expiration/project knobs; returns the helper's dest FQN."""
+    from unittest.mock import patch
+
+    with patch(
+        "workflows.pipe_gaps.outage_recovery.dit_bq.derived_source_into_experiment"
+    ) as helper:
+        helper.return_value = "proj.tech_great_expectations.dit_exp_exp01_view"
+        out = mod._derive_synthetic_outage_view(
+            _args(),
+            source_messages_fqn="proj.ds.messages_snap",
+            outage_start=date(2020, 12, 29),
+            outage_end=date(2020, 12, 29),
+        )
+
+    assert out == "proj.tech_great_expectations.dit_exp_exp01_view"
+    helper.assert_called_once()
+    call = helper.call_args
+    assert call.args[0] == "proj.ds.messages_snap"
+    assert call.kwargs["experiment_id"] == "exp01"
+    assert call.kwargs["role"] == "outage_filtered_20201229_20201229"
+    assert call.kwargs["where_clause"] == (
+        "DATE(timestamp) NOT BETWEEN '2020-12-29' AND '2020-12-29'"
+    )
+    assert call.kwargs["expiration_days"] == 7
+    assert call.kwargs["project"] == "world-fishing-827"
+
+
+def test_execute_outage_recovery_routes_filtered_messages_to_stages_1_2_only() -> None:
+    """The load-bearing M6b routing: stages 1+2 read the filtered view
+    (the source as it looked DURING the outage); stage 3 (recovery) reads
+    the unfiltered messages (the source after it healed). If stage 3 ever
+    read the filtered view, the recovery couldn't reconcile and the test
+    would flag a false positive; if stages 1+2 read unfiltered, the bug
+    class never triggers and the comparison is trivially clean."""
+    from unittest.mock import patch
+
+    captured: list[dict] = []
+
+    def fake_make_config(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    with (
+        patch.object(mod, "_make_config", side_effect=fake_make_config),
+        patch.object(mod, "_run_pipeline"),
+    ):
+        mod.execute_outage_recovery(
+            "dataflow",
+            base_cfg=dict(
+                bq_input_messages="proj.ds.messages_unfiltered",
+                bq_input_segments="proj.ds.segments",
+            ),
+            start=date(2020, 1, 1),
+            backfill_end=date(2020, 12, 28),
+            outage_start=date(2020, 12, 29),
+            outage_end=date(2020, 12, 29),
+            end=date(2020, 12, 31),
+            recovery_buffer_days=1,
+            output="proj.ds.out",
+            experiment_id="exp01",
+            image_tag="img",
+            filtered_messages="proj.ds.messages_FILTERED",
+        )
+
+    assert len(captured) == 3
+    assert captured[0]["bq_input_messages"] == "proj.ds.messages_FILTERED"  # Stage 1
+    assert captured[1]["bq_input_messages"] == "proj.ds.messages_FILTERED"  # Stage 2
+    assert captured[2]["bq_input_messages"] == "proj.ds.messages_unfiltered"  # Stage 3
+    # Segments are never filtered (known simplification).
+    assert all(c["bq_input_segments"] == "proj.ds.segments" for c in captured)
+
+
+def test_execute_outage_recovery_default_no_filter_all_stages_unfiltered() -> None:
+    """Without filtered_messages (the default), all three stages read the
+    same source -- byte-identical to the pre-M6b behaviour."""
+    from unittest.mock import patch
+
+    captured: list[dict] = []
+
+    def fake_make_config(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    with (
+        patch.object(mod, "_make_config", side_effect=fake_make_config),
+        patch.object(mod, "_run_pipeline"),
+    ):
+        mod.execute_outage_recovery(
+            "dataflow",
+            base_cfg=dict(
+                bq_input_messages="proj.ds.messages",
+                bq_input_segments="proj.ds.segments",
+            ),
+            start=date(2020, 1, 1),
+            backfill_end=date(2020, 12, 28),
+            outage_start=date(2020, 12, 29),
+            outage_end=date(2020, 12, 29),
+            end=date(2020, 12, 31),
+            recovery_buffer_days=1,
+            output="proj.ds.out",
+            experiment_id="exp01",
+            image_tag="img",
+        )
+
+    assert len(captured) == 3
+    assert all(c["bq_input_messages"] == "proj.ds.messages" for c in captured)
+
+
+def test_parse_args_synthetic_outage_default_false() -> None:
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.synthetic_outage is False
+
+
+def test_parse_args_synthetic_outage_set_true() -> None:
+    args = mod.parse_args(["--experiment-id", "test", "--synthetic-outage"])
+    assert args.synthetic_outage is True
 
 
 def test_canonical_params_ssvids_normalised_by_sort() -> None:
