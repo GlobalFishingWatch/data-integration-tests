@@ -220,6 +220,16 @@ def test_parse_args_rejects_no_snapshot_and_skip_snapshots_together() -> None:
         ])
 
 
+def test_parse_args_recovery_buffer_defaults_to_zero() -> None:
+    """0 is the discriminating regression-test setting (issue #59 2x2
+    matrix): the recovery's DELETE then orphans the open-v1 seeds of
+    wrong gaps starting before the outage, exercising the close-recovery
+    path where the MAP-1676 bug class lived. buffer >= 1 sweeps the
+    seeds too and masks the class on both fixed and broken code."""
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.recovery_buffer_days == 0
+
+
 def test_parse_args_accepts_zero_recovery_buffer_days() -> None:
     # Buffer = 0 means recovery starts exactly at outage_start (no
     # overlap with the last pre-outage day). Allowed.
