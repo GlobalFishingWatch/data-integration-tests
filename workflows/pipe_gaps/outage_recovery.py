@@ -11,10 +11,15 @@ Scenario
 The production shape is:
 
 1. The pipe-gaps daily DAG runs normally as incrementals for a long time.
-2. At some point an outage interrupts daily runs for one or more days
-   (here simulated by simply SKIPPING the daily runs for those days --
-   the source is NOT mutated, which keeps the workflow runnable against
-   the frozen 2020 staging cohort).
+2. At some point an outage interrupts daily runs for one or more days.
+   By default this is simulated by simply SKIPPING the daily runs for
+   those days (the source is NOT mutated). With ``--synthetic-outage``
+   (M6b, issue #59) the outage is additionally simulated in the SOURCE
+   DATA: stages 1+2 read a derived view with the outage dates filtered
+   out -- the source as it looked DURING the outage -- which is what
+   actually makes the bug class reachable on the frozen 2020 staging
+   cohort (without it, every stage reads the full source and the staged
+   run trivially matches the oracle).
 3. The daily DAG resumes after the outage and keeps running through to
    the most recent day. The SCD-2 ``raw_gaps`` table now reflects "all
    days processed, except the outage days were never seen at their
@@ -59,8 +64,15 @@ it's reading a snapshot. Per-table ``expiration_timestamp`` is set at
 creation (``--snapshot-expiration-days``); BQ self-cleans.
 
 Only ONE snapshot is needed because the outage is simulated by skipping
-runs, not by mutating source data. (A future variant could add a synthetic
-source-mutation step; out of scope here.)
+runs, not by snapshotting the source twice. With ``--synthetic-outage``
+the workflow ADDITIONALLY derives an outage-filtered VIEW of the messages
+snapshot via ``dit.bq.derived_source_into_experiment`` (the M6a helper;
+issue #59): stages 1+2 read the view, stage 3 + the oracle read the
+unfiltered snapshot. Snapshot and filter are orthogonal layers that
+compose -- the filter applies on top of whichever source path is active
+(snapshot / ``--skip-snapshots`` / ``--no-snapshot`` live read). The
+view's name encodes the outage geometry so re-running with different
+dates derives a fresh view instead of silently reusing a stale filter.
 
 Expected results
 ----------------
@@ -68,6 +80,12 @@ Expected results
   ``raw_gaps_last_versions`` because the recovery's daily DELETE-then-LOAD
   doesn't reproduce what a single-shot backfill would write. The
   divergence is the bug.
+* With ``--synthetic-outage`` on the staging cohort, the divergence should
+  additionally surface the boundary-geometry bug class from issue #59:
+  vessels whose sub-threshold full-data gap stretches past the threshold
+  when the outage days' messages are missing (58 candidate vessels sit at
+  that geometry in staging), where the recovery fails to clean up the
+  wrong long gap.
 * Once the pipe-gaps fix lands: zero diff.
 
 Defaults
@@ -363,6 +381,84 @@ def _snapshot_source_at(
     return msgs_fqn, segs_fqn
 
 
+# --------------------------------------------------------------------------
+# Synthetic outage (M6b -- issue #59)
+# --------------------------------------------------------------------------
+#
+# The 3-stage shape simulates an outage by SKIPPING stage writes for the
+# outage dates -- but every stage still reads the full source, so on a
+# frozen source (the staging cohort) no stage ever sees the
+# outage-shaped source divergence the workflow's bug class needs: the
+# daily DAG running AT cadence against a source with a hole, writing a
+# wrong long gap that the recovery must later reconcile. `--synthetic-
+# outage` closes that gap by deriving a view of the messages source with
+# the outage dates filtered OUT (via dit.bq.derived_source_into_
+# experiment, the M6a helper); stages 1+2 read the filtered view, while
+# stage 3 (recovery) + the oracle read the unfiltered source. The two
+# mechanisms COMPOSE: snapshot pins the source at a moment in time
+# (meaningful on evolving sources), the filter mutates what stages see
+# (meaningful everywhere); the filter applies on top of whatever source
+# path is active (snapshot / skip-snapshots / --no-snapshot live read).
+#
+# Only the MESSAGES source is filtered. The segments input
+# (segs_activity) is a per-segment summary used for good-seg filtering;
+# a real outage would eventually dent it too, but the bug-trigger
+# geometry is about message gaps, and filtering segments would need a
+# different (non-`timestamp`) predicate shape. Known simplification --
+# revisit if the cloud smoke shows segment-side artefacts.
+
+def _synthetic_outage_where_clause(outage_start: date, outage_end: date) -> str:
+    """SQL WHERE body excluding the outage window (inclusive both ends).
+
+    `timestamp` is the universal message-timestamp column across GFW
+    messages tables (staging cohort + prod research_messages).
+    """
+    return (
+        f"DATE(timestamp) NOT BETWEEN "
+        f"'{outage_start.isoformat()}' AND '{outage_end.isoformat()}'"
+    )
+
+
+def _synthetic_outage_role(outage_start: date, outage_end: date) -> str:
+    """Role for the derived view, encoding the outage geometry.
+
+    Encoding the dates in the role (hence in the view name) means a
+    re-run with the same --experiment-id but DIFFERENT outage dates
+    derives a NEW view instead of silently reusing the old one with the
+    stale filter baked in -- the same staleness class as the documented
+    skip-existing snapshot footgun, dodged structurally here. Re-runs
+    with the SAME geometry hit `IF NOT EXISTS` and are idempotent.
+    """
+    return f"outage_filtered_{outage_start:%Y%m%d}_{outage_end:%Y%m%d}"
+
+
+def _derive_synthetic_outage_view(
+    args: argparse.Namespace,
+    *,
+    source_messages_fqn: str,
+    outage_start: date,
+    outage_end: date,
+) -> str:
+    """Create (idempotently) the outage-filtered view over the resolved
+    messages source and return its FQN. Stages 1+2 read this; stage 3 +
+    the oracle keep reading ``source_messages_fqn`` unfiltered."""
+    filtered_fqn = dit_bq.derived_source_into_experiment(
+        source_messages_fqn,
+        experiment_id=args.experiment_id,
+        role=_synthetic_outage_role(outage_start, outage_end),
+        where_clause=_synthetic_outage_where_clause(outage_start, outage_end),
+        expiration_days=args.snapshot_expiration_days,
+        project=args.snapshot_dest_project,
+    )
+    logger.info(
+        "synthetic outage: stages 1+2 read %s (messages with "
+        "[%s, %s] filtered out); stage 3 + oracle read %s unfiltered",
+        filtered_fqn, outage_start.isoformat(), outage_end.isoformat(),
+        source_messages_fqn,
+    )
+    return filtered_fqn
+
+
 def _make_config(
     *,
     start: date,
@@ -559,6 +655,7 @@ def execute_outage_recovery(
     output: str,
     experiment_id: str,
     image_tag: str,
+    filtered_messages: Optional[str] = None,
 ) -> None:
     """Three-stage outage simulation writing to a single SCD-2 ``output`` table.
 
@@ -582,15 +679,29 @@ def execute_outage_recovery(
         which would include the workflow's ``end`` whenever the recovery
         stops before it).
 
-    All three stages read the same source snapshot (the outage is
-    simulated by skipping date ranges, not by mutating source data),
-    so ``base_cfg`` is a single kwargs dict.
+    By default all three stages read the same source (the outage is
+    simulated by skipping date ranges only), so ``base_cfg`` is a single
+    kwargs dict. With ``filtered_messages`` set (the ``--synthetic-outage``
+    path, M6b), stages 1+2 read THAT as their ``bq_input_messages``
+    (a derived view with the outage dates filtered out -- they see the
+    source as it would have looked DURING the outage), while stage 3
+    keeps ``base_cfg``'s unfiltered messages (the recovery runs after the
+    source healed). That source-level divergence between the pre-recovery
+    stages and the recovery is what actually triggers the workflow's bug
+    class on a frozen source.
     """
+    # Stages 1+2 read the outage-filtered view when the synthetic-outage
+    # path is active; stage 3 (recovery) always reads base_cfg's
+    # unfiltered messages.
+    stage12_cfg = dict(base_cfg)
+    if filtered_messages is not None:
+        stage12_cfg["bq_input_messages"] = filtered_messages
+
     # Stage 1: initial backfill [start, backfill_end].
     cfg = _make_config(
         start=start, end=backfill_end, bq_output_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 1, 3),
-        **base_cfg,
+        **stage12_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
@@ -598,7 +709,7 @@ def execute_outage_recovery(
     cfg = _make_config(
         start=outage_end + timedelta(days=1), end=end, bq_output_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 2, 3),
-        **base_cfg,
+        **stage12_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
@@ -643,12 +754,16 @@ def execute_outage_oracle(
 
 # Keys that only affect the staged 3-stage run, not the single-shot oracle.
 # Stripped from the oracle's cache key so iterating on outage geometry
-# (or the recovery buffer) doesn't needlessly invalidate the oracle.
+# (or the recovery buffer, or whether the outage is synthetic) doesn't
+# needlessly invalidate the oracle. `synthetic_outage` is recovery-only
+# because the oracle always reads the UNFILTERED source -- its output is
+# invariant to the flag.
 _RECOVERY_ONLY_KEYS = frozenset({
     "backfill_end",
     "outage_start",
     "outage_end",
     "recovery_buffer_days",
+    "synthetic_outage",
 })
 
 
@@ -688,6 +803,16 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
         # stability. The boolean differentiates live-source runs from
         # snapshot runs that happen to share a pin_at.
         "no_snapshot": bool(args.no_snapshot),
+        # M6b: when set, stages 1+2 read a derived view of the messages
+        # source with the outage dates filtered OUT (real source-data
+        # divergence, not just stage-skipping). Same geometry with vs
+        # without the filter produces different staged output, so the
+        # flag is in the recovery key; the oracle reads the unfiltered
+        # source either way, so _RECOVERY_ONLY_KEYS drops it there. The
+        # WHERE clause itself is fully determined by (synthetic_outage,
+        # outage_start, outage_end) which are all in the key already --
+        # no need to store the SQL string.
+        "synthetic_outage": bool(args.synthetic_outage),
     }
     if mode == MODE_OUTAGE_ORACLE:
         for k in _RECOVERY_ONLY_KEYS:
@@ -893,6 +1018,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                          "(but still parsed for argparse coherence); the cache "
                          "key includes a `no_snapshot=true` marker so runs with "
                          "and without snapshotting don't conflate."))
+    p.add_argument("--synthetic-outage", action="store_true",
+                   help=("Simulate the outage in the SOURCE DATA, not just in the "
+                         "stage schedule: derive a view of the messages source with "
+                         "[--outage-start, --outage-end] filtered out (via "
+                         "dit.bq.derived_source_into_experiment; lands next to the "
+                         "snapshots in tech_great_expectations, same TTL). Stages 1+2 "
+                         "read the filtered view -- they see the source as it looked "
+                         "DURING the outage; stage 3 (recovery) + the oracle read the "
+                         "unfiltered source -- the recovery runs after the source "
+                         "healed. This is what actually triggers the workflow's bug "
+                         "class on a frozen source (issue #59): without it, every "
+                         "stage reads the full source and the staged run trivially "
+                         "matches the oracle. Composes with all three source paths "
+                         "(snapshot / --skip-snapshots / --no-snapshot); the filter "
+                         "applies on top of whichever messages FQN the path resolves. "
+                         "Only the messages source is filtered (the segments input is "
+                         "a per-segment summary; known simplification). The cache key "
+                         "gains a `synthetic_outage=true` marker (recovery mode only "
+                         "-- the oracle's output is invariant to the flag)."))
     add_infra_args(p)
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
@@ -1084,6 +1228,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     logger.info("source tables: %s, %s", src_msgs, src_segs)
 
+    # M6b (issue #59): derive the outage-filtered messages view on top of
+    # whichever source path resolved above -- the snapshot/filter layers
+    # compose. Stages 1+2 read the filtered view (threaded through
+    # execute_outage_recovery's filtered_messages param); stage 3 + the
+    # oracle keep reading src_msgs unfiltered.
+    filtered_msgs: Optional[str] = None
+    if args.synthetic_outage:
+        filtered_msgs = _derive_synthetic_outage_view(
+            args,
+            source_messages_fqn=src_msgs,
+            outage_start=outage_start,
+            outage_end=outage_end,
+        )
+
     base_cfg = dict(
         bq_input_messages=src_msgs,
         bq_input_segments=src_segs,
@@ -1122,6 +1280,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output=recovery_table,
             experiment_id=args.experiment_id,
             image_tag=args.image_tag,
+            # M6b: None unless --synthetic-outage; stages 1+2 read this,
+            # stage 3 reads base_cfg's unfiltered messages.
+            filtered_messages=filtered_msgs,
         )
         oracle_kwargs = dict(
             runner=args.runner,

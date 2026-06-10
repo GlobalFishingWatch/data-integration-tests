@@ -2,7 +2,7 @@
 
 Tracking doc for the synthetic-source-mutation primitive proposed in [issue #59](https://github.com/GlobalFishingWatch/data-integration-tests/issues/59) (filed 2026-06-09). Follow-on to the snapshot/dataset migration tracked in [`snapshot-dataset-migration-2026-06.md`](snapshot-dataset-migration-2026-06.md); see Status line below for the per-stage sequencing (M6a ships independently of the migration; M6b is gated on workflow refactor rather than the migration).
 
-**Status (2026-06-09)**: design locked via issue #59 discussion; **M6a landed** (this commit) — `dit.bq.derived_source_into_experiment(...)` helper available; **M6b not yet started**, gated on the in-flight `workflows/pipe_gaps/outage_recovery.py` 5→3-stage refactor (the integration's stage-routing model fundamentally differs between shapes; writing M6b twice would be wasteful). Sequencing relative to M4 + M5 of the canonical-dataset migration: parallel — they touch disjoint files.
+**Status (2026-06-10)**: **COMPLETE** (pending the live cloud smoke). Design locked via issue #59 discussion; **M6a landed** (PR #61) — `dit.bq.derived_source_into_experiment(...)` helper; **M6b landed** (this commit) — `workflows/pipe_gaps/outage_recovery.py` gained the `--synthetic-outage` flag, integrating the helper against the 3-stage shape that landed in PR #63. The as-built M6b differs from the sketch below in two ways (the sketch predates the 3-stage refactor): (a) no new date flags — the 3-stage shape's existing `--outage-start` / `--outage-end` drive the WHERE clause; the new surface is a single `--synthetic-outage` boolean; (b) the filtered view's role encodes the outage geometry (`outage_filtered_<start>_<end>`), so a re-run with different dates derives a fresh view instead of silently reusing a stale filter. The cloud smoke that surfaces the 58-candidate-vessels signal remains the outstanding live verification (see acceptance criteria).
 
 ## Why this primitive
 
@@ -66,9 +66,9 @@ Two PRs, mirroring the M1 → M2 shape of the canonical-dataset migration.
 | # | Title | Tier | LOC | Pre-merge check | Status |
 |---|---|---|---|---|---|
 | M6a | `dit.bq.derived_source_into_experiment(...)` library helper | A (additive library) | ~+95 LOC + 9 tests | Unit tests only — pure addition, no consumer yet | **Landed 2026-06-09** |
-| M6b | `workflows/pipe_gaps/outage_recovery.py` synthetic-outage integration | B (workflow file) | ~+30 LOC + CLI flag + WHERE-clause construction | Cloud smoke against AIS staging cohort surfaces the 58 candidate-vessels signal | Not started — gated on outage_recovery 5→3-stage refactor |
+| M6b | `workflows/pipe_gaps/outage_recovery.py` synthetic-outage integration | B (workflow file) | ~+110 LOC (the 3 pure helpers + `--synthetic-outage` flag + stage-routing + docstring updates) + 8 tests | Cloud smoke against AIS staging cohort surfaces the 58 candidate-vessels signal (OUTSTANDING — user-gated live verification; the stage-routing unit test is the structural guarantee meanwhile) | **Landed 2026-06-10** |
 
-M6a ships in parallel with M4 (canonical-dataset migration's remaining stages) — they touch disjoint files (`src/dit/bq.py` vs `workflows/port_visits/ais.py`). M6b is gated on the in-flight 5→3-stage refactor of `outage_recovery.py` because the stage-routing model (which stages read filtered vs unfiltered) is fundamentally different between the two shapes.
+M6a shipped in parallel with M4 (disjoint files). M6b landed after the outage_recovery 5→3-stage refactor (PR #63) settled the stage-routing model it integrates against.
 
 ### M6a — Library helper
 
@@ -92,49 +92,50 @@ Pure addition under `src/dit/bq.py`. Mirrors `snapshot_into_experiment`'s shape:
 - Custom `project` threads through both the BQ client and the dest FQN.
 - Return value matches the constructed dest FQN.
 
-### M6b — outage_recovery integration
+### M6b — outage_recovery integration (AS BUILT, 2026-06-10)
 
-Add a CLI flag for outage dates, build the WHERE clause in the workflow (workflow-specific shape), call the helper after `snapshot_into_experiment`, route pre-recovery stages at the filtered FQN, fold outage dates into `canonical_params_dict`.
+The original sketch (preserved in git history) predates the 3-stage refactor (PR #63); the as-built shape integrates against it:
 
-**New CLI flag**:
+**New CLI flag** — a single opt-in boolean; the 3-stage shape's existing `--outage-start` / `--outage-end` drive the WHERE clause:
 ```
---outage-start YYYY-MM-DD     # inclusive
---outage-end YYYY-MM-DD       # inclusive
+--synthetic-outage
 ```
-(Or a single `--outage-dates YYYY-MM-DD,YYYY-MM-DD` flag, matching `--date-range`'s shape.)
 
-**Workflow integration sketch**:
+**As-built integration**:
 ```python
-# 1. Snapshot (unchanged from M2):
-pre_snap = dit_bq.snapshot_into_experiment(
-    args.source_messages,
-    experiment_id=args.experiment_id,
-    role="outage_pre",
-    as_of=args.pre_outage_pin_at,
-    project=args.snapshot_dest_project,
-)
+# In main(), after the source path resolves (snapshot / --skip-snapshots /
+# --no-snapshot all compose -- the filter applies on top of whichever
+# messages FQN the path produced):
+filtered_msgs = None
+if args.synthetic_outage:
+    filtered_msgs = _derive_synthetic_outage_view(
+        args, source_messages_fqn=src_msgs,
+        outage_start=outage_start, outage_end=outage_end,
+    )
+    # -> dit_bq.derived_source_into_experiment(
+    #        src_msgs,
+    #        role=f"outage_filtered_{start:%Y%m%d}_{end:%Y%m%d}",
+    #        where_clause="DATE(timestamp) NOT BETWEEN '<start>' AND '<end>'",
+    #        ...)
 
-# 2. Filter on top:
-pre_filtered = dit_bq.derived_source_into_experiment(
-    pre_snap,
-    experiment_id=args.experiment_id,
-    role="outage_pre_filtered",
-    where_clause=(
-        f"DATE(timestamp) NOT BETWEEN "
-        f"'{args.outage_start.isoformat()}' AND '{args.outage_end.isoformat()}'"
-    ),
-    project=args.snapshot_dest_project,
-)
-
-# 3. Stage routing:
-#   - Pre-recovery stages (the ones that establish the open-v1) read pre_filtered.
-#   - Recovery stage + oracle read the unfiltered post-pin snapshot.
-# This is what creates the outage divergence the workflow exists to surface.
+# execute_outage_recovery(..., filtered_messages=filtered_msgs):
+#   - Stages 1+2 read filtered_messages as bq_input_messages (the source
+#     as it looked DURING the outage).
+#   - Stage 3 (recovery) reads base_cfg's unfiltered messages (the source
+#     after it healed).
+#   - The oracle never sees the filter.
 ```
 
-**Cache key**: include `outage_start` and `outage_end` in `canonical_params_dict`. Two runs with different outage windows must not share a cache row.
+Three pure helpers carry the logic (`_synthetic_outage_where_clause`, `_synthetic_outage_role`, `_derive_synthetic_outage_view`) — each unit-testable without BQ.
 
-**Pre-merge cloud smoke**: run against AIS staging with outage dates set to the date boundary where the 58 candidate vessels sit. The workflow should now flag a meaningful set of those 58 against the oracle — that's the load-bearing pre-merge check (M6b without that signal would mean the primitive isn't doing what the issue says it should).
+**Design points beyond the sketch**:
+- **Role encodes outage geometry** (`outage_filtered_<YYYYMMDD>_<YYYYMMDD>`): a re-run with the same `--experiment-id` but different outage dates derives a NEW view instead of silently reusing the stale filter (the same staleness class as the documented skip-existing snapshot footgun, dodged structurally). Same-geometry re-runs hit `IF NOT EXISTS` and are idempotent.
+- **Only the messages source is filtered.** The segments input (`segs_activity`) is a per-segment summary used for good-seg filtering; a real outage would eventually dent it too, but the bug-trigger geometry is about message gaps and segments would need a different (non-`timestamp`) predicate shape. Known simplification — revisit if the cloud smoke shows segment-side artefacts.
+- **View (not materialised).** pipe-gaps reads inputs via SQL queries (the EXPORT-staging `--bq-temp-dataset` machinery exists for exactly this), and BQ resolves views inside queries with predicate push-down. `materialise=True` stays available if read cost ever dominates.
+
+**Cache key**: `synthetic_outage: bool` in `canonical_params_dict` — recovery mode only. The oracle reads the unfiltered source either way (output invariant to the flag), so `_RECOVERY_ONLY_KEYS` drops it from the oracle key; toggling the flag doesn't invalidate the oracle. The WHERE clause itself is fully determined by `(synthetic_outage, outage_start, outage_end)`, all already in the recovery key — no SQL string stored.
+
+**Cloud smoke (OUTSTANDING)**: run against AIS staging with outage dates set to the date boundary where the 58 candidate vessels sit. The workflow should flag a meaningful set of those 58 against the oracle — the load-bearing live verification (M6b without that signal would mean the primitive isn't doing what the issue says it should). User-gated; the stage-routing unit test (`test_execute_outage_recovery_routes_filtered_messages_to_stages_1_2_only`) is the structural guarantee meanwhile.
 
 ## Adjacent items / future extensions
 
@@ -152,6 +153,6 @@ pre_filtered = dit_bq.derived_source_into_experiment(
 ## Acceptance criteria (when M6 is complete)
 
 - [x] `dit.bq.derived_source_into_experiment(...)` available; unit tests pass; full suite green. (Landed 2026-06-09 as M6a.)
-- [ ] `workflows/pipe_gaps/outage_recovery.py` exposes `--outage-start` / `--outage-end` (or equivalent), threads them through `canonical_params_dict`, and calls the helper after the snapshot step.
-- [ ] Cloud smoke against AIS staging with outage dates set to the 58-candidate-vessels date boundary surfaces a meaningful divergence in the oracle comparison — the workflow's intended bug-surfacing behaviour is finally reachable from staging.
-- [ ] `CHANGELOG.md` gains a `#### Added` entry under `[Unreleased]` for both M6a and M6b.
+- [x] `workflows/pipe_gaps/outage_recovery.py` exposes the outage-geometry flags (`--outage-start` / `--outage-end`, from the 3-stage refactor) + the new `--synthetic-outage` opt-in, threads `synthetic_outage` through `canonical_params_dict` (recovery mode), and calls the helper after the source path resolves. (Landed 2026-06-10 as M6b.)
+- [ ] Cloud smoke against AIS staging with outage dates set to the 58-candidate-vessels date boundary surfaces a meaningful divergence in the oracle comparison — the workflow's intended bug-surfacing behaviour is finally reachable from staging. (OUTSTANDING — user-gated live verification.)
+- [x] `CHANGELOG.md` gains `#### Added` entries under `[Unreleased]` for both M6a (2026-06-09) and M6b (2026-06-10).
