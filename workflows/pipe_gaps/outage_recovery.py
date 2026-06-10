@@ -668,7 +668,15 @@ def execute_outage_recovery(
         ``[outage_end + 1, end]``. Represents the daily DAG resuming
         after the outage. The outage period ``[outage_start, outage_end]``
         is implicitly skipped -- no stage writes for those dates until
-        the recovery in Stage 3.
+        the recovery in Stage 3. **Synthetic-outage variant**: with
+        ``filtered_messages`` set, Stage 2 instead runs
+        ``[outage_start - 1, end]`` -- a range load that SPANS the outage
+        window against the filtered source, modelling production's
+        rolling-window load (e.g. VMS's 4-day window) whose date range
+        covers the missing day(s). The bridge day (``outage_start - 1``)
+        guarantees the detector pairs the last pre-outage message with
+        the first post-outage one and emits the incorrect over-threshold
+        gap.
     Stage 3 (recovery backfill): one big slice
         ``[outage_start - recovery_buffer_days, end]``. The on-call's
         reprocess-from-before-outage-to-current. Per the pipe-gaps
@@ -679,6 +687,10 @@ def execute_outage_recovery(
         past that ``end_date`` (i.e. ``(recovery_end_date, +∞)``,
         which would include the workflow's ``end`` whenever the recovery
         stops before it).
+
+    All stage boundary dates above are INCLUSIVE; each pipeline
+    invocation converts to pipe-gaps' exclusive upper bound by passing
+    ``<inclusive end> + 1 day``.
 
     By default all three stages read the same source (the outage is
     simulated by skipping date ranges only), so ``base_cfg`` is a single
@@ -691,6 +703,8 @@ def execute_outage_recovery(
     stages and the recovery is what actually triggers the workflow's bug
     class on a frozen source.
     """
+    one_day = timedelta(days=1)
+
     # Stages 1+2 read the outage-filtered view when the synthetic-outage
     # path is active; stage 3 (recovery) always reads base_cfg's
     # unfiltered messages.
@@ -698,26 +712,48 @@ def execute_outage_recovery(
     if filtered_messages is not None:
         stage12_cfg["bq_input_messages"] = filtered_messages
 
-    # Stage 1: initial backfill [start, backfill_end].
+    # All workflow-level dates are INCLUSIVE; pipe-gaps' --date-range upper
+    # bound is EXCLUSIVE (messages.sql.j2 filters DATE(timestamp) <
+    # end_date), so every pipeline invocation passes <inclusive end> + 1.
+    # Before this conversion the workflow silently dropped each stage's
+    # final day (verified live: zero gaps on the cohort's last data day
+    # despite 62k source messages -- see issue #59 debugging).
+
+    # Stage 1: initial backfill [start, backfill_end] inclusive.
     cfg = _make_config(
-        start=start, end=backfill_end, bq_output_gaps=output,
+        start=start, end=backfill_end + one_day, bq_output_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 1, 3),
         **stage12_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
-    # Stage 2: post-outage continuation [outage_end + 1, end].
+    # Stage 2: post-outage continuation.
+    #   Schedule-skip mode:    [outage_end + 1, end]   -- the DAG resumes
+    #     after the outage; the outage dates were simply never run.
+    #   Synthetic-outage mode: [outage_start - 1, end] -- the DAG's first
+    #     post-outage run is a range load spanning the missing day(s)
+    #     (production rolling-window shape, e.g. VMS's 4-day window); the
+    #     filtered source returns nothing for the outage dates, so the
+    #     detector bridges from the last pre-outage message to the first
+    #     post-outage one and emits the incorrect over-threshold gap --
+    #     the bug surface this workflow exists to catch. Without the
+    #     spanning range the filter is a no-op: it hides rows the stage's
+    #     date range never queries (issue #59 feedback).
+    if filtered_messages is not None:
+        stage2_start = outage_start - one_day
+    else:
+        stage2_start = outage_end + one_day
     cfg = _make_config(
-        start=outage_end + timedelta(days=1), end=end, bq_output_gaps=output,
+        start=stage2_start, end=end + one_day, bq_output_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 2, 3),
         **stage12_cfg,
     )
     _run_pipeline(runner, cfg, image_tag)
 
-    # Stage 3: recovery backfill [outage_start - buffer, end].
+    # Stage 3: recovery backfill [outage_start - buffer, end] inclusive.
     recovery_start_day = outage_start - timedelta(days=recovery_buffer_days)
     cfg = _make_config(
-        start=recovery_start_day, end=end, bq_output_gaps=output,
+        start=recovery_start_day, end=end + one_day, bq_output_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 3, 3),
         **base_cfg,
     )
@@ -734,14 +770,17 @@ def execute_outage_oracle(
     experiment_id: str,
     image_tag: str,
 ) -> None:
-    """Single-shot backfill ``[start, end]`` against the source snapshot.
+    """Single-shot backfill ``[start, end]`` (inclusive) against the
+    source snapshot.
 
     The ground-truth answer the staged ``execute_outage_recovery`` should
     match: what a clean one-shot run over the full range would produce
-    on a healthy source.
+    on a healthy source. ``end`` is inclusive at the workflow level and
+    converted to pipe-gaps' exclusive upper bound (``end + 1 day``) here,
+    matching the staged stages.
     """
     cfg = _make_config(
-        start=start, end=end, bq_output_gaps=output,
+        start=start, end=end + timedelta(days=1), bq_output_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_ORACLE, 1, 1),
         **base_cfg,
     )
