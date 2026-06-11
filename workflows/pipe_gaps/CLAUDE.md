@@ -72,9 +72,16 @@ exclusive upper bound actually passed (`inclusive end + 1`):
 ```
 Stage 1 (initial backfill):  pipe-gaps detect [2020-01-01, 2020-12-29)   → processes through 12-28
 Stage 2 (post-outage):       pipe-gaps detect [2020-12-30, 2021-01-01)   → processes 12-30..12-31
-Stage 3 (recovery):          pipe-gaps detect [2020-12-28, 2021-01-01)   ← reaches --end ✓
+Stage 3 (recovery):          pipe-gaps detect [2020-12-29, 2021-01-01)   ← reaches --end ✓
 Oracle:                      pipe-gaps detect [2020-01-01, 2021-01-01)
 ```
+
+Stage 3 starts at `outage_start` because the default
+`--recovery-buffer-days` is 0 (the discriminating regression-test
+setting — see the flag's help). A non-zero buffer shifts the recovery
+start earlier (`outage_start - buffer`), which also widens the
+pre-write DELETE enough to sweep the orphaned open-v1 seeds and mask
+the MAP-1676 leftover class.
 
 With `--synthetic-outage`, Stage 2 instead runs
 `[2020-12-28, 2021-01-01)` against the outage-filtered view — a range
@@ -92,10 +99,10 @@ detection-logic bug worth investigating.
 A counter-example that would be wrong:
 
 ```
-Stage 3 (WRONG):  pipe-gaps detect [2020-12-28, 2020-12-31)  ← stops before --end
+Stage 3 (WRONG):  pipe-gaps detect [2020-12-29, 2020-12-31)  ← stops before --end
 ```
 
-This would delete every gap whose end/start was on `2020-12-28` or
+This would delete every gap whose end/start was on `2020-12-29` or
 later (including the rows for `2020-12-31`), then only re-emit rows
 through `2020-12-30`. The `2020-12-31` rows that Stage 2 wrote are
 gone, and the comparison to the oracle would FAIL — but for a
