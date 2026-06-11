@@ -48,10 +48,13 @@ by which a reprocess takes ownership of the tail.
 The oracle is the "what would a clean single-shot run produce?" answer
 the staged path is compared against. Per the contract above:
 
-- The oracle is **always** `pipe-gaps detect --date-range start,end`
-  (single run, full range, frozen source) — matching the worked
-  example below and how `execute_outage_oracle` calls it in code
-  (the workflow's inclusive `--end` is passed verbatim).
+- The oracle is **always** `pipe-gaps detect --date-range start,end+1`
+  (single run, full range, frozen source). The workflow's `--end` is
+  INCLUSIVE; pipe-gaps' `--date-range` upper bound is EXCLUSIVE
+  (`messages.sql.j2` filters `DATE(timestamp) < end_date`), so
+  `execute_outage_oracle` — like every staged stage — passes
+  `end + 1 day`. (Before 2026-06-10 the workflow passed the inclusive
+  dates verbatim and silently dropped each stage's final day.)
 - A staged path that diverges from the oracle indicates a real bug in
   pipe-gaps' detection logic (e.g. the `get_first_message_inside_range`
   close-path issue documented in `docs/context.md`), NOT a
@@ -62,29 +65,46 @@ the staged path is compared against. Per the contract above:
 
 ### Worked example
 
-For `outage_recovery.py` defaults (one-day outage on `2020-12-29`):
+For `outage_recovery.py` defaults (one-day outage on `2020-12-29`).
+Workflow dates are inclusive; the pipeline ranges below show the
+exclusive upper bound actually passed (`inclusive end + 1`):
 
 ```
-Stage 1 (initial backfill):  pipe-gaps detect [start=2020-01-01, end=2020-12-28]
-Stage 2 (post-outage):       pipe-gaps detect [start=2020-12-30, end=2020-12-31]
-Stage 3 (recovery):          pipe-gaps detect [start=2020-12-28, end=2020-12-31]  ← ends at --end ✓
-Oracle:                      pipe-gaps detect [start=2020-01-01, end=2020-12-31]
+Stage 1 (initial backfill):  pipe-gaps detect [2020-01-01, 2020-12-29)   → processes through 12-28
+Stage 2 (post-outage):       pipe-gaps detect [2020-12-30, 2021-01-01)   → processes 12-30..12-31
+Stage 3 (recovery):          pipe-gaps detect [2020-12-29, 2021-01-01)   ← reaches --end ✓
+Oracle:                      pipe-gaps detect [2020-01-01, 2021-01-01)
 ```
 
-Stage 3 ends at `--end` (`2020-12-31`), which is the most-recent-data
-day for the staging cohort. After Stage 3, `raw_gaps_last_versions`
-should equal the oracle's `_last_versions` view; any divergence is a
+Stage 3 starts at `outage_start` because the default
+`--recovery-buffer-days` is 0 (the discriminating regression-test
+setting — see the flag's help). A non-zero buffer shifts the recovery
+start earlier (`outage_start - buffer`), which also widens the
+pre-write DELETE enough to sweep the orphaned open-v1 seeds and mask
+the MAP-1676 leftover class.
+
+With `--synthetic-outage`, Stage 2 instead runs
+`[2020-12-28, 2021-01-01)` against the outage-filtered view — a range
+load that SPANS the missing day, modelling production's rolling-window
+load (the detector bridges from the last 12-28 message to the first
+12-30 message and emits the incorrect over-threshold gap). Without the
+spanning range, filtering the source is a no-op: the stages would be
+hiding rows their date ranges never query (issue #59).
+
+Stage 3 reaches `--end` (`2020-12-31`, the most-recent-data day for
+the staging cohort). After Stage 3, `raw_gaps_last_versions` should
+equal the oracle's `_last_versions` view; any divergence is a
 detection-logic bug worth investigating.
 
 A counter-example that would be wrong:
 
 ```
-Stage 3 (WRONG):  pipe-gaps detect [start=2020-12-28, end=2020-12-30]  ← stops before --end
+Stage 3 (WRONG):  pipe-gaps detect [2020-12-29, 2020-12-31)  ← stops before --end
 ```
 
-This would delete every gap whose end/start was on `2020-12-28` or
+This would delete every gap whose end/start was on `2020-12-29` or
 later (including the rows for `2020-12-31`), then only re-emit rows
-through `2020-12-30`. The `2020-12-31` rows that Stages 1+2 wrote are
+through `2020-12-30`. The `2020-12-31` rows that Stage 2 wrote are
 gone, and the comparison to the oracle would FAIL — but for a
 contract-violation reason, not a pipe-gaps bug. Don't do this.
 

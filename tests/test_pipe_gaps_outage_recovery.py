@@ -237,6 +237,16 @@ def test_parse_args_rejects_no_snapshot_and_skip_snapshots_together() -> None:
         ])
 
 
+def test_parse_args_recovery_buffer_defaults_to_zero() -> None:
+    """0 is the discriminating regression-test setting (issue #59 2x2
+    matrix): the recovery's DELETE then orphans the open-v1 seeds of
+    wrong gaps starting before the outage, exercising the close-recovery
+    path where the MAP-1676 bug class lived. buffer >= 1 sweeps the
+    seeds too and masks the class on both fixed and broken code."""
+    args = mod.parse_args(["--experiment-id", "test"])
+    assert args.recovery_buffer_days == 0
+
+
 def test_parse_args_accepts_zero_recovery_buffer_days() -> None:
     # Buffer = 0 means recovery starts exactly at outage_start (no
     # overlap with the last pre-outage day). Allowed.
@@ -505,6 +515,133 @@ def test_execute_outage_recovery_default_no_filter_all_stages_unfiltered() -> No
 
     assert len(captured) == 3
     assert all(c["bq_input_messages"] == "proj.ds.messages" for c in captured)
+
+
+def _captured_stage_configs(**execute_overrides: Any) -> list[dict]:
+    """Run execute_outage_recovery with mocked pipeline calls and return
+    the per-stage _make_config kwargs. Defaults mirror the workflow's
+    default geometry (one-day outage on 2020-12-29,
+    recovery_buffer_days=0 -- the discriminating regression-test
+    default)."""
+    from unittest.mock import patch
+
+    captured: list[dict] = []
+
+    def fake_make_config(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    kwargs: dict[str, Any] = dict(
+        base_cfg=dict(
+            bq_input_messages="proj.ds.messages",
+            bq_input_segments="proj.ds.segments",
+        ),
+        start=date(2020, 1, 1),
+        backfill_end=date(2020, 12, 28),
+        outage_start=date(2020, 12, 29),
+        outage_end=date(2020, 12, 29),
+        end=date(2020, 12, 31),
+        recovery_buffer_days=0,
+        output="proj.ds.out",
+        experiment_id="exp01",
+        image_tag="img",
+    )
+    kwargs.update(execute_overrides)
+
+    with (
+        patch.object(mod, "_make_config", side_effect=fake_make_config),
+        patch.object(mod, "_run_pipeline"),
+    ):
+        mod.execute_outage_recovery("dataflow", **kwargs)
+
+    return captured
+
+
+def test_stage_ranges_inclusive_end_schedule_skip() -> None:
+    """Workflow-level dates are inclusive; pipe-gaps' --date-range upper
+    bound is exclusive (messages.sql.j2: DATE(timestamp) < end_date), so
+    every pipeline call must pass <inclusive end> + 1 day. Pre-fix, the
+    workflow passed the inclusive dates verbatim and silently dropped
+    each stage's final day (verified live in issue #59 debugging: zero
+    gaps on the cohort's last data day despite 62k source messages)."""
+    captured = _captured_stage_configs()
+
+    # Stage 1: [start, backfill_end] inclusive -> end passes 12-29.
+    assert captured[0]["start"] == date(2020, 1, 1)
+    assert captured[0]["end"] == date(2020, 12, 29)
+    # Stage 2 (schedule-skip): [outage_end + 1, end] -> 12-30 .. 1-1.
+    assert captured[1]["start"] == date(2020, 12, 30)
+    assert captured[1]["end"] == date(2021, 1, 1)
+    # Stage 3 (default buffer=0): [outage_start, end] -> 12-29 .. 1-1.
+    assert captured[2]["start"] == date(2020, 12, 29)
+    assert captured[2]["end"] == date(2021, 1, 1)
+
+
+def test_stage3_start_shifts_with_recovery_buffer() -> None:
+    """A non-zero --recovery-buffer-days shifts the recovery start
+    earlier (outage_start - buffer); kept covered explicitly since the
+    default flipped to 0."""
+    captured = _captured_stage_configs(recovery_buffer_days=1)
+    assert captured[2]["start"] == date(2020, 12, 28)
+    assert captured[2]["end"] == date(2021, 1, 1)
+
+
+def test_stage2_bridges_outage_when_synthetic() -> None:
+    """The issue #59 geometry fix: with the synthetic outage active,
+    Stage 2 must SPAN the outage window ([outage_start - 1, end]) so its
+    range queries the filtered-out dates and the detector bridges from
+    the last pre-outage message to the first post-outage one. Without
+    the spanning range the filter is a no-op (it hides rows the stage's
+    range never queries) -- proven live on run e2esynth1."""
+    captured = _captured_stage_configs(
+        filtered_messages="proj.ds.messages_FILTERED",
+    )
+
+    # Stage 2 starts on the bridge day (outage_start - 1), not after the
+    # outage -- AND reads the filtered view. (The bridge day is
+    # independent of --recovery-buffer-days.)
+    assert captured[1]["start"] == date(2020, 12, 28)
+    assert captured[1]["end"] == date(2021, 1, 1)
+    assert captured[1]["bq_input_messages"] == "proj.ds.messages_FILTERED"
+    # Stages 1+3 keep their schedule-skip ranges (Stage 3 with the
+    # default buffer=0 starts at outage_start).
+    assert captured[0]["start"] == date(2020, 1, 1)
+    assert captured[0]["end"] == date(2020, 12, 29)
+    assert captured[2]["start"] == date(2020, 12, 29)
+    assert captured[2]["end"] == date(2021, 1, 1)
+
+
+def test_oracle_end_inclusive() -> None:
+    """The oracle converts the workflow's inclusive --end the same way
+    the staged stages do (end + 1 day)."""
+    from unittest.mock import patch
+
+    captured: list[dict] = []
+
+    def fake_make_config(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    with (
+        patch.object(mod, "_make_config", side_effect=fake_make_config),
+        patch.object(mod, "_run_pipeline"),
+    ):
+        mod.execute_outage_oracle(
+            "dataflow",
+            base_cfg=dict(
+                bq_input_messages="proj.ds.messages",
+                bq_input_segments="proj.ds.segments",
+            ),
+            start=date(2020, 1, 1),
+            end=date(2020, 12, 31),
+            output="proj.ds.out",
+            experiment_id="exp01",
+            image_tag="img",
+        )
+
+    assert len(captured) == 1
+    assert captured[0]["start"] == date(2020, 1, 1)
+    assert captured[0]["end"] == date(2021, 1, 1)
 
 
 def test_parse_args_synthetic_outage_default_false() -> None:
