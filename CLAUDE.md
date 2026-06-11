@@ -70,6 +70,20 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-10 — Workflow orchestration evaluation (point-in-time analysis; three config axes)
+
+Filed [`docs/workflow-orchestration-2026-06.md`](docs/workflow-orchestration-2026-06.md) — an evaluation of the six workflows' *configuration surface*, requested by the dit owner after the M1–M6 arc closed. Narrower follow-up to `workflow-reconciliation-2026-06.md` (2026-06-05, structural/code-sharing review); this one covers three axes: (1) flavours (source cohort + date ranges), (2) mode composability (bf-only / mix-and-match), (3) evaluation config (TIC keys, comparison skippability, exit-code semantics).
+
+**Verdict: locally sensible, globally drifted.** Key findings:
+
+- **Axis 1**: source addressing converged organically toward per-table FQNs (no stated policy; pipe-events' dataset-pair and cross_version's stem are the part-justified holdouts); date-flag shape varies three ways with silently different `--start/--end` semantics (half-open vs inclusive — downstream-contract wart); "flavour" doesn't exist as a concept — the `dit.cohorts` recommendation from the reconciliation review (named source-FQNs + data-window + snapshot-date bundles, `--cohort` flag) is re-affirmed as the highest-leverage open item.
+- **Axis 2 (the genuinely inconsistent one)**: only `cross_version_ais` has `--modes`; the three mode-family workflows (mode_equivalence, port_visits/ais, pipe_events/fishing) hardcode all modes — no cheap bf-only first-run smoke. Recommended: additive `--modes` mirroring cross_version's shape; per-mode cache keys mean mix-and-match composability falls out of the existing cache design for free. Explicit non-goal: no `dit.phases` framework (declined 2026-05-29, unchanged).
+- **Axis 3 (mostly healthy)**: hardcoded compare keys are CORRECT (schema property, not user choice; CLI-configurable keys would invite false-IDENTICAL wrong-key comparisons); pipe-segment's per-table `COMPARE_KEYS` dict is the template. The equivalence-fails-on-diff vs cross-version-reports-diff exit-code split is deliberate and consistent within families but documented only in docstrings — should get a conventions section. Skip-flag coverage (`--skip-comparisons`/`--skip-pipelines`) is ragged across families.
+
+**Recommendations by leverage**: (1) `dit.cohorts` [medium], (2) `--modes` on the three mode-family workflows [small], (3) document the equivalence-vs-cross-version contract [small]. The `_detect.py` dedup (reconciliation § 3-d, ~200 LOC duplicated between the two pipe-gaps workflows, possibly diverged during the 3-stage refactor) remains open as orthogonal correctness hygiene.
+
+**Sections moved.** New `docs/workflow-orchestration-2026-06.md`; `docs/workflow-reconciliation-2026-06.md` header gains a follow-up pointer (+ note that its § 4 inventory predates M4's per-table FQN flags on ais.py); this Plan changelog entry. No code changes; no CHANGELOG entry (dev-internal analysis, matching the reconciliation-docs precedent).
+
 ### 2026-06-10 — M6b landed: `--synthetic-outage` on outage_recovery; synthetic source mutation primitive COMPLETE (issue #59)
 
 Second and final implementation PR for the issue #59 primitive (M6a, the `dit.bq.derived_source_into_experiment` helper, landed PR #61). Integrates the helper into `workflows/pipe_gaps/outage_recovery.py` against the 3-stage shape from PR #63 — the gating dependency that made M6b wait: the stage-routing model (which stages read filtered vs unfiltered) is the load-bearing design surface, and writing it against the pre-refactor 5-stage shape would have meant writing it twice.
