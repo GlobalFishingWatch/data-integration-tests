@@ -520,7 +520,9 @@ def test_execute_outage_recovery_default_no_filter_all_stages_unfiltered() -> No
 def _captured_stage_configs(**execute_overrides: Any) -> list[dict]:
     """Run execute_outage_recovery with mocked pipeline calls and return
     the per-stage _make_config kwargs. Defaults mirror the workflow's
-    default geometry (one-day outage on 2020-12-29)."""
+    default geometry (one-day outage on 2020-12-29,
+    recovery_buffer_days=0 -- the discriminating regression-test
+    default)."""
     from unittest.mock import patch
 
     captured: list[dict] = []
@@ -539,7 +541,7 @@ def _captured_stage_configs(**execute_overrides: Any) -> list[dict]:
         outage_start=date(2020, 12, 29),
         outage_end=date(2020, 12, 29),
         end=date(2020, 12, 31),
-        recovery_buffer_days=1,
+        recovery_buffer_days=0,
         output="proj.ds.out",
         experiment_id="exp01",
         image_tag="img",
@@ -570,7 +572,16 @@ def test_stage_ranges_inclusive_end_schedule_skip() -> None:
     # Stage 2 (schedule-skip): [outage_end + 1, end] -> 12-30 .. 1-1.
     assert captured[1]["start"] == date(2020, 12, 30)
     assert captured[1]["end"] == date(2021, 1, 1)
-    # Stage 3: [outage_start - buffer, end] -> 12-28 .. 1-1.
+    # Stage 3 (default buffer=0): [outage_start, end] -> 12-29 .. 1-1.
+    assert captured[2]["start"] == date(2020, 12, 29)
+    assert captured[2]["end"] == date(2021, 1, 1)
+
+
+def test_stage3_start_shifts_with_recovery_buffer() -> None:
+    """A non-zero --recovery-buffer-days shifts the recovery start
+    earlier (outage_start - buffer); kept covered explicitly since the
+    default flipped to 0."""
+    captured = _captured_stage_configs(recovery_buffer_days=1)
     assert captured[2]["start"] == date(2020, 12, 28)
     assert captured[2]["end"] == date(2021, 1, 1)
 
@@ -587,14 +598,16 @@ def test_stage2_bridges_outage_when_synthetic() -> None:
     )
 
     # Stage 2 starts on the bridge day (outage_start - 1), not after the
-    # outage -- AND reads the filtered view.
+    # outage -- AND reads the filtered view. (The bridge day is
+    # independent of --recovery-buffer-days.)
     assert captured[1]["start"] == date(2020, 12, 28)
     assert captured[1]["end"] == date(2021, 1, 1)
     assert captured[1]["bq_input_messages"] == "proj.ds.messages_FILTERED"
-    # Stages 1+3 keep their schedule-skip ranges.
+    # Stages 1+3 keep their schedule-skip ranges (Stage 3 with the
+    # default buffer=0 starts at outage_start).
     assert captured[0]["start"] == date(2020, 1, 1)
     assert captured[0]["end"] == date(2020, 12, 29)
-    assert captured[2]["start"] == date(2020, 12, 28)
+    assert captured[2]["start"] == date(2020, 12, 29)
     assert captured[2]["end"] == date(2021, 1, 1)
 
 
