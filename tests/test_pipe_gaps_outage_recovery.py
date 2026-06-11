@@ -195,6 +195,23 @@ def test_parse_args_parallel_set_true(flag: str) -> None:
     assert args.parallel is True
 
 
+def test_canonical_params_independent_of_parallel() -> None:
+    """``--parallel`` is a runner-only knob (same convention as
+    ``image_tag``): a parallel run and a sequential run produce identical
+    output tables and must share a cache row. Pin that
+    ``canonical_params_dict`` ignores it, so a future refactor can't
+    silently fold it into the cache key and tank the hit rate.
+    (Copilot review on PR #66.)"""
+    base = ["--experiment-id", "test", "--pin-at", "2026-06-01 18:00:00 UTC"]
+    sequential = mod.parse_args(base)
+    parallel = mod.parse_args(base + ["--parallel"])
+    for mode in (mod.MODE_OUTAGE_RECOVERY, mod.MODE_OUTAGE_ORACLE):
+        assert (
+            mod.canonical_params_dict(sequential, mode)
+            == mod.canonical_params_dict(parallel, mode)
+        )
+
+
 def test_parse_args_no_snapshot_default_false() -> None:
     args = mod.parse_args(["--experiment-id", "test"])
     assert args.no_snapshot is False
