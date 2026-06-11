@@ -127,6 +127,7 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -994,6 +995,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--require-clean", action="store_true")
     p.add_argument("--skip-pipelines", action="store_true")
     p.add_argument("--skip-comparisons", action="store_true")
+    p.add_argument("--parallel", "--async", dest="parallel", action="store_true",
+                   help=("Run the oracle concurrently with the 3-stage staged "
+                         "path (they're independent: different output tables, "
+                         "oracle reads the unfiltered source). The 3 staged "
+                         "jobs remain sequential among themselves. Mirrors "
+                         "mode_equivalence's --parallel. Wall-clock roughly "
+                         "max(staged chain, oracle) instead of the sum."))
     p.add_argument("--skip-snapshots", action="store_true",
                    help=("Don't create snapshot tables; assume an earlier run "
                          "of the same --experiment-id already did. Useful when "
@@ -1293,16 +1301,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             image_tag=args.image_tag,
         )
 
-        recovery_table = _run_with_cache(
-            execute_outage_recovery,
-            args=args, mode=MODE_OUTAGE_RECOVERY,
-            output_fqn=recovery_table, execute_kwargs=recovery_kwargs,
-        )
-        oracle_table = _run_with_cache(
-            execute_outage_oracle,
-            args=args, mode=MODE_OUTAGE_ORACLE,
-            output_fqn=oracle_table, execute_kwargs=oracle_kwargs,
-        )
+        def _wrap_recovery() -> str:
+            return _run_with_cache(
+                execute_outage_recovery,
+                args=args, mode=MODE_OUTAGE_RECOVERY,
+                output_fqn=recovery_table, execute_kwargs=recovery_kwargs,
+            )
+
+        def _wrap_oracle() -> str:
+            return _run_with_cache(
+                execute_outage_oracle,
+                args=args, mode=MODE_OUTAGE_ORACLE,
+                output_fqn=oracle_table, execute_kwargs=oracle_kwargs,
+            )
+
+        if args.parallel:
+            # The oracle has no dependency on the staged path (different
+            # output table, reads the unfiltered source), so it can run
+            # alongside the whole 3-stage chain. The 3 staged jobs stay
+            # sequential among themselves inside execute_outage_recovery
+            # (same WRITE_APPEND SCD-2 table; each stage's pre-write DELETE
+            # depends on prior state). Mirrors mode_equivalence's --parallel;
+            # dit.runners.dataflow serialises only Beam's submit step
+            # (_DATAFLOW_SUBMIT_LOCK) and parallelises wait_until_finish.
+            # Wall-clock: ~max(S1+S2+S3, oracle) instead of the sum -- the
+            # oracle is a full-range job (~Stage 1's cost), so this saves
+            # roughly a third of the run.
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_recovery = ex.submit(_wrap_recovery)
+                f_oracle = ex.submit(_wrap_oracle)
+                recovery_table = f_recovery.result()
+                oracle_table = f_oracle.result()
+        else:
+            recovery_table = _wrap_recovery()
+            oracle_table = _wrap_oracle()
 
     if args.skip_comparisons:
         return 0
