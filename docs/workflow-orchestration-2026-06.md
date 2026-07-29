@@ -23,16 +23,27 @@ Point-in-time evaluation of how the six workflows handle **orchestration configu
 
 ## Axis 2 — Mode composability
 
-| Workflow | Mode selection |
-|---|---|
-| `cross_version_ais` | ✅ `--modes` (comma list) |
-| `mode_equivalence` | ❌ always all (bf+bfd+bftruncate, + mutate_recover conditionally) |
-| `port_visits/ais` | ❌ hardcoded `[MODE_BF, MODE_BFD, MODE_BFTRUNCATE]` |
-| `pipe_events/fishing` | ❌ runs all three unconditionally |
+**RESOLVED 2026-06-11** — `--modes` now on all four; the table below records the state that motivated the change.
+
+| Workflow | Mode selection (before) | After |
+|---|---|---|
+| `cross_version_ais` | ✅ `--modes` (comma list), but diff-set only — bindings still ran every mode | ✅ validated + **forwarded to `ais.py`** so bindings run only the selected modes |
+| `mode_equivalence` | ❌ always all (bf+bfd+bftruncate, + mutate_recover conditionally) | ✅ `--modes` over the three primary modes |
+| `port_visits/ais` | ❌ hardcoded `[MODE_BF, MODE_BFD, MODE_BFTRUNCATE]` | ✅ `--modes` |
+| `pipe_events/fishing` | ❌ runs all three unconditionally | ✅ `--modes` |
 
 **This is the genuinely inconsistent axis.** One workflow has the flag; the three workflows where a bf-only smoke would be most wanted don't. Today's mitigation is the run cache (re-runs of unchanged modes are hits), but a **first** run on new params always pays for all modes — there is no cheap bf-only smoke against a new cohort / pin / image.
 
-**Recommended fix (small, additive):** a `--modes` flag on the three mode-family workflows, defaulting to the full set, mirroring `cross_version_ais`'s exact shape. Because each mode is already cached *independently* (per-mode cache keys), `--modes 1_bf` today + `--modes 1_bf,2_bfd` tomorrow gives a bf cache hit on the second run — **the mix-and-match composability falls out of the existing per-mode cache design for free.** Comparisons run only pairs where both sides exist (copy `cross_version_ais`'s skip-pairs pattern).
+**As built (2026-06-11).** `--modes` on all three mode-family workflows, defaulting to the full set. Shared `dit.workflow.add_modes_arg` / `parse_modes` (four consumers → past duplicate-until-3) give identical validation and error messages. Because each mode is already cached *independently*, `--modes 1_bf` today + `--modes 1_bf,2_bfd` tomorrow gives a bf cache hit on the second run — **the mix-and-match composability falls out of the existing per-mode cache design for free.**
+
+Four decisions worth recording:
+
+- **Canonical-order normalisation.** `parse_modes` returns the selection in the workflow's declared order, not CLI order, so `--modes 3_bftruncate,1_bf` and `--modes 1_bf,3_bftruncate` produce identical run order, pair order, and logs.
+- **Unknown modes are a hard error**, naming the valid set — a typo'd mode that silently ran and compared nothing is indistinguishable from a clean pass. Validation lives in `parse_args`, so it fires before any snapshot, image build, or Dataflow submission.
+- **Single-mode runs say "nothing to compare"** explicitly and return 0, rather than falling through to "all 0 comparisons passed" — which would read like an equivalence assertion that never actually ran. This is the cheap-smoke shape, so it must not look like a stronger result than it is.
+- **`mode_equivalence`'s `4_mutate_recover` is deliberately NOT selectable** via `--modes`; it keeps `--enable-pipeline-4` as its single gate (it needs the restricted-ssvids machinery `--modes` knows nothing about). Two overlapping gates for one mode would be worse than one explicit one. `--enable-pipeline-4` now additionally requires `1_bf` in `--modes`, since mutate_recover is compared against it and `--auto-restrict` reads its output table.
+
+**Bonus fix found while wiring it:** `cross_version_ais`'s pre-existing `--modes` selected only which output tables to *diff* — every binding still *ran* all three modes, so the flag saved nothing on the expensive half. It now forwards the selection to each binding's `ais.py`. Its value is also validated now (it previously accepted any string, so a typo yielded zero diff pairs — which reads exactly like "everything matched").
 
 **Explicit non-goal:** do NOT generalize into a `dit.phases` / stage-composition framework. That extraction was declined 2026-05-29 (`workflows/README.md`: <20% similarity across the three execute-body families), and mode-subset selection doesn't need it.
 
@@ -47,7 +58,7 @@ Point-in-time evaluation of how the six workflows handle **orchestration configu
 | # | Item | Axis | Effort | Status |
 |---|---|---|---|---|
 | 1 | **`dit.cohorts`** — named (source FQNs, data window, snapshot date) bundles; `--cohort` flag with per-table overrides retained | 1 | Medium | Recommended 2026-06-05, re-affirmed here; not started |
-| 2 | **`--modes` on mode_equivalence / ais / fishing** — mirror cross_version_ais's flag; comparisons skip absent pairs | 2 | Small (3 parallel edits) | Not started |
+| 2 | **`--modes` on mode_equivalence / ais / fishing** — mirror cross_version_ais's flag; comparisons skip absent pairs | 2 | Small (3 parallel edits) | **Landed 2026-06-11** (+ cross_version now forwards its selection to ais.py, and validates it) |
 | 3 | **Document the equivalence-vs-cross-version exit-code contract** (+ optionally unify skip-flag coverage) | 3 | Small | Not started |
 | — | `workflows/pipe_gaps/_detect.py` dedup (reconciliation § 3-d) | orthogonal | Small-medium | Open; correctness hygiene, not orchestration design |
 

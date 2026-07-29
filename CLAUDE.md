@@ -70,6 +70,32 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-06-11 — `--modes` on the three mode-family workflows (orchestration-evaluation axis 2; PR-triggers T2)
+
+Second item of the PR-triggers prerequisite track ([`docs/pr-triggers-2026-06.md`](docs/pr-triggers-2026-06.md) T2) and the highest-actionability recommendation from the 2026-06-10 orchestration evaluation. `mode_equivalence` / `port_visits/ais` / `pipe_events/fishing` hardcoded "run every mode", so there was no cheap bf-only smoke against a new cohort / pin / worker image — the first run on any new params always paid for all three. All three now take `--modes`, defaulting to the full set (existing invocations byte-unchanged).
+
+**Why this is a PR-trigger prerequisite, not just ergonomics.** The tiered-trigger design is "cheap staging bf on every PR, heavy on label", and the plan's PR-run shape is "run the PR's `1_bf`, diff against main's cached `1_bf`". Neither was expressible before.
+
+**Shared helper, justified.** `dit.workflow.add_modes_arg` + `parse_modes` — four consumers (the three above plus `cross_version_ais`) with identical parse/validate needs, past the duplicate-until-3 bar. Gives all four the same error text.
+
+**Four decisions worth recording.**
+
+1. **Canonical-order normalisation.** `parse_modes` returns the selection in the workflow's declared order, not CLI order, so `--modes 3_bftruncate,1_bf` ≡ `--modes 1_bf,3_bftruncate` — identical run order, comparison-pair order, and logs. Without this, two equivalent invocations produce diffable-looking log noise.
+2. **Unknown mode = hard error naming the valid set, validated in `parse_args`** (before any snapshot / image build / Dataflow submission). A typo'd mode that silently ran nothing and compared nothing is indistinguishable from a clean pass — the exact failure shape a CI gate must never have.
+3. **Single-mode runs say "no pair to compare"** and return 0, instead of falling through to "all N comparisons passed" with N=0. That message would claim an equivalence assertion that never ran; the cheap-smoke shape must not read as a stronger result than it is.
+4. **`mode_equivalence`'s `4_mutate_recover` is deliberately NOT selectable via `--modes`** — it keeps `--enable-pipeline-4` as its single gate, because it needs the restricted-ssvids machinery (`--restricted-ssvids` / `--auto-restrict`) that `--modes` knows nothing about. Two overlapping gates for one mode is worse than one explicit one; `parse_modes` rejects the name and the help text redirects. `--enable-pipeline-4` now additionally **requires `1_bf` in `--modes`**, since mutate_recover is compared against it and `--auto-restrict` reads its output table — previously an impossible config, now expressible and therefore worth rejecting.
+
+**Bonus fix found while wiring it.** `cross_version_ais`'s pre-existing `--modes` selected only which output tables to *diff* — every binding still *ran* all three modes, so the flag saved nothing on the expensive half. It now forwards the selection into each binding's `ais.py` invocation (only possible now that ais.py has the flag) and drops any user-supplied `--modes` from the pass-through extras, so the run-set and diff-set cannot desync. Its value is now validated too, against `ais.py`'s `SELECTABLE_MODES` (imported, so the two can't drift) — previously any string was accepted and a typo produced zero diff pairs, which reads exactly like "everything matched".
+
+**Sections moved (this commit).**
+- `src/dit/workflow.py`: new section (b2) with `parse_modes` + `add_modes_arg`.
+- The three workflows: `--modes` flag, `parse_args` validation, dict-dispatch execution gating (`mode_equivalence` restructured from three named futures to a mode→wrapper map), comparison pairs via `itertools.combinations` over the selection, plus a `SELECTABLE_MODES` constant each (`pipe_events` reuses its existing `MODES`).
+- `workflows/port_visits/cross_version_ais.py`: forwards + validates `--modes`; `_ais_args_for_binding` / `_run_binding` take a `modes` parameter.
+- `tests/test_modes_flag.py` (new, 31 tests); existing `compare_all` / `_ais_args_for_binding` call sites in two test files updated for the new signatures. Full suite 396 → 427.
+- `CHANGELOG.md` 2026-06-11 `#### Added` + `#### Fixed`; `docs/workflow-orchestration-2026-06.md` axis-2 section rewritten to the as-built shape and recommendation 2 flipped to landed.
+
+**Sections NOT moved.** No cloud smoke — the change is additive and the default path is byte-unchanged (pinned by tests asserting the full-set default still yields three pairs). Remaining orchestration-evaluation items unchanged: `dit.cohorts` (still the highest-leverage open item) and the exit-code-contract documentation, which T3's Check Run schema will have to encode anyway.
+
 ### 2026-06-10 — Workflow orchestration evaluation (point-in-time analysis; three config axes)
 
 Filed [`docs/workflow-orchestration-2026-06.md`](docs/workflow-orchestration-2026-06.md) — an evaluation of the six workflows' *configuration surface*, requested by the dit owner after the M1–M6 arc closed. Narrower follow-up to `workflow-reconciliation-2026-06.md` (2026-06-05, structural/code-sharing review); this one covers three axes: (1) flavours (source cohort + date ranges), (2) mode composability (bf-only / mix-and-match), (3) evaluation config (TIC keys, comparison skippability, exit-code semantics).

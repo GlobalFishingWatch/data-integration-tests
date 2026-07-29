@@ -121,6 +121,8 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     add_dataset_args,
     add_experiment_id_arg,
+    add_modes_arg,
+    parse_modes,
     resolve_run_context,
 )
 
@@ -431,15 +433,32 @@ def execute_bftruncate(args: argparse.Namespace, suffix: str) -> None:
 # Comparisons (the value-add the bash never had)
 # --------------------------------------------------------------------------
 
-def compare_all(mode_fqns: dict[str, str], *, label: str) -> int:
-    """Pairwise-compare the three modes on ``event_id`` (truncate shape).
+def compare_all(mode_fqns: dict[str, str], modes: Sequence[str], *, label: str) -> int:
+    """Pairwise-compare the selected modes on ``event_id`` (truncate shape).
 
     ``mode_fqns`` maps each mode to the FQN to compare. Returns 0 iff all
     pairwise comparisons are identical; non-zero on any divergence (a
     divergence IS a test failure — the modes must be equivalent).
+
+    Pairs cover the SELECTED modes only -- comparing against a mode that never
+    ran would diff an absent view and report a spurious difference. ``modes``
+    arrives in canonical order (``parse_modes``), so pair order is stable
+    regardless of the order given on the command line.
     """
+    pairs = list(itertools.combinations(modes, 2))
+    if not pairs:
+        # Single-mode run (the cheap smoke shape). Say so explicitly rather
+        # than returning a clean 0 that reads like a passed equivalence
+        # assertion which actually never ran.
+        only = modes[0]
+        logger.info(
+            "[%s] only one mode selected (%s) -- no pair to compare. Its "
+            "output view is %s. Add a second mode to --modes to compare.",
+            label, only, mode_fqns[only],
+        )
+        return 0
     overall = 0
-    for a, b in itertools.combinations(MODES, 2):
+    for a, b in pairs:
         rc = dit_compare.compare_tables(
             mode_fqns[a],
             mode_fqns[b],
@@ -508,7 +527,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add_experiment_id_arg(p)
     # Only the dataset/SA knobs — pipe-events runs no Dataflow (Phase 3 split).
     add_dataset_args(p)
-    return p.parse_args(argv)
+    add_modes_arg(p, choices=MODES)
+    args = p.parse_args(argv)
+    # Validate before any container run: a typo'd mode that silently ran
+    # nothing would look exactly like a passing run.
+    args.modes = parse_modes(args.modes, choices=MODES)
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -574,6 +598,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             (MODE_BFD, execute_bfd),
             (MODE_BFTRUNCATE, execute_bftruncate),
         ]
+        # --modes gates which modes actually run (this workflow has no run
+        # cache, so a subset is purely a cost/time saving on this invocation).
+        mode_execs = [(m, fn) for m, fn in mode_execs if m in args.modes]
+        skipped = [m for m in MODES if m not in args.modes]
+        if skipped:
+            logger.info(
+                "--modes: running %s; skipping %s",
+                ",".join(args.modes), ",".join(skipped),
+            )
         if args.parallel:
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(mode_execs)) as pool:
                 futures = {
@@ -593,8 +626,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # VIEW (the view abstracts each mode's differing _v{date} table suffix).
     fishing_fqns = {m: _fishing_events_view(args, suffix, m) for m in MODES}
     product_fqns = {m: _product_events_view(args, suffix, m) for m in MODES}
-    rc_fishing = compare_all(fishing_fqns, label="fishing_events")
-    rc_product = compare_all(product_fqns, label="product_events_fishing")
+    rc_fishing = compare_all(fishing_fqns, args.modes, label="fishing_events")
+    rc_product = compare_all(product_fqns, args.modes, label="product_events_fishing")
     return rc_fishing or rc_product
 
 

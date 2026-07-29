@@ -254,7 +254,7 @@ def test_compare_all_keys_and_view_suffix():
 
     fqns = {m: f"proj.ds.{m}_view" for m in mod.MODES}
     with patch.object(dit_compare, "compare_tables", side_effect=fake_compare):
-        rc = mod.compare_all(fqns, label="fishing_events")
+        rc = mod.compare_all(fqns, mod.MODES, label="fishing_events")
     assert rc == 0
     # 3 pairwise comparisons over the 3 modes.
     assert len(captured) == 3
@@ -269,7 +269,7 @@ def test_compare_all_nonzero_on_divergence():
 
     fqns = {m: f"proj.ds.{m}_view" for m in mod.MODES}
     with patch.object(dit_compare, "compare_tables", side_effect=fake_compare):
-        rc = mod.compare_all(fqns, label="fishing_events")
+        rc = mod.compare_all(fqns, mod.MODES, label="fishing_events")
     assert rc != 0
 
 
@@ -282,7 +282,7 @@ def test_compare_all_propagates_partial_divergence():
 
     fqns = {m: f"proj.ds.{m}_view" for m in mod.MODES}
     with patch.object(dit_compare, "compare_tables", side_effect=fake_compare):
-        rc = mod.compare_all(fqns, label="fishing_events")
+        rc = mod.compare_all(fqns, mod.MODES, label="fishing_events")
     assert rc != 0
 
 

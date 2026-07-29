@@ -154,6 +154,66 @@ def add_experiment_id_arg(parser: argparse.ArgumentParser) -> None:
 
 
 # --------------------------------------------------------------------------
+# (b2) Mode-subset selection
+# --------------------------------------------------------------------------
+# Shared by every mode-family workflow (pipe-gaps mode_equivalence,
+# port-visits ais, pipe-events fishing) plus port-visits cross_version_ais.
+# Four consumers, identical parse-and-validate needs -> shared, per the
+# duplicate-until-3 rule.
+
+def parse_modes(raw: str, *, choices: Sequence[str]) -> list[str]:
+    """Parse a comma-separated ``--modes`` value into a validated list.
+
+    Returns the selection in **``choices`` order**, not CLI order, so
+    ``--modes 3_bftruncate,1_bf`` and ``--modes 1_bf,3_bftruncate`` produce
+    identical run order, comparison-pair order, and log output. Duplicates
+    collapse. Whitespace around names is tolerated.
+
+    Raises ``SystemExit`` (argparse-style) on an unknown or empty selection,
+    naming the valid choices -- a typo'd mode silently running nothing would
+    look exactly like a passing run.
+    """
+    requested = [m.strip() for m in raw.split(",") if m.strip()]
+    if not requested:
+        raise SystemExit(
+            f"error: --modes must name at least one mode; valid: {','.join(choices)}"
+        )
+    unknown = [m for m in requested if m not in choices]
+    if unknown:
+        raise SystemExit(
+            f"error: unknown mode(s) {','.join(unknown)}; "
+            f"valid: {','.join(choices)}"
+        )
+    return [m for m in choices if m in set(requested)]
+
+
+def add_modes_arg(
+    parser: argparse.ArgumentParser,
+    *,
+    choices: Sequence[str],
+    help_suffix: str = "",
+) -> None:
+    """Add ``--modes`` (comma-separated subset; defaults to all of ``choices``).
+
+    The value stays a raw string on the namespace; call :func:`parse_modes`
+    to validate it (workflows do this in their ``parse_args`` so a bad value
+    fails before any cloud call).
+    """
+    default = ",".join(choices)
+    parser.add_argument(
+        "--modes", default=default,
+        help=(
+            f"Comma-separated subset of modes to run. Default: {default} (all). "
+            f"Use a subset for a cheap smoke (e.g. --modes {choices[0]}); "
+            f"comparisons run only for pairs where both modes ran, and a "
+            f"single-mode run performs no comparison at all. Modes are cached "
+            f"independently, so running a subset now and more later reuses the "
+            f"earlier modes' output." + (f" {help_suffix}" if help_suffix else "")
+        ),
+    )
+
+
+# --------------------------------------------------------------------------
 # (c) RunContext + resolve_run_context — the shared main() preamble
 # --------------------------------------------------------------------------
 

@@ -78,6 +78,10 @@ from typing import Optional, Sequence
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
+from dit.workflow import parse_modes
+
+# ais.py owns the canonical mode set; import it so the two can't drift.
+from workflows.port_visits.ais import SELECTABLE_MODES as AIS_SELECTABLE_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +144,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                         "this wrapper flag.")
     args, ais_extra_args = p.parse_known_args(argv)
     args.bindings = [_parse_binding(b) for b in args.bindings]
-    args.modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    # Validate against ais.py's selectable modes -- previously any string
+    # was accepted, so a typo silently produced zero diff pairs (which
+    # reads identically to "everything matched").
+    args.modes = parse_modes(args.modes, choices=AIS_SELECTABLE_MODES)
     args.pin_source_at = _parse_iso8601(args.pin_source_at)
     args.binding_worker_images = dict(_parse_binding(b) for b in args.binding_worker_images)
     _binding_names = {n for n, _ in args.bindings}
@@ -331,6 +338,7 @@ def _ais_args_for_binding(
     suffix: str,
     experiment_id: str,
     binding_name: str,
+    modes: Sequence[str],
     worker_image: Optional[str] = None,
 ) -> list[str]:
     """Strip user-supplied overrides for fields the wrapper owns, then
@@ -362,6 +370,9 @@ def _ais_args_for_binding(
         "--source-segs-activity-fqn",
         "--suffix", "--experiment-id", "--binding-name",
         "--thinned-message-table",
+        # --modes is the wrapper's own flag (it selects which modes to run
+        # AND which to diff); a user extra must not desync the two halves.
+        "--modes",
     }
     if worker_image is not None:
         drop_kvs = drop_kvs | {"--worker-image"}
@@ -386,6 +397,11 @@ def _ais_args_for_binding(
         "--source-messages-fqn", snapshot_fqns.messages_positions,
         "--source-segment-info-fqn", snapshot_fqns.segment_info,
         "--source-segs-activity-fqn", snapshot_fqns.segs_activity,
+        # Forward the mode selection so each binding RUNS only the modes we
+        # will diff. Before ais.py grew --modes, a --modes subset narrowed the
+        # diff set only -- every binding still ran all three, so the flag
+        # saved nothing on the expensive half.
+        "--modes", ",".join(modes),
         "--suffix", suffix,
         "--experiment-id", experiment_id,
         "--binding-name", binding_name,
@@ -419,6 +435,7 @@ def _run_binding(
     experiment_id: str,
     snapshot_fqns: _CrossVersionSnapshotFQNs,
     suffix: str,
+    modes: Sequence[str],
     pipeline_dir: str,
     ais_extra_args: list[str],
     dry_run: bool,
@@ -436,6 +453,7 @@ def _run_binding(
             ais_extra_args,
             snapshot_fqns=snapshot_fqns, suffix=suffix,
             experiment_id=experiment_id, binding_name=name,
+            modes=modes,
             worker_image=worker_image,
         )
         cmd = [sys.executable, str(AIS_WORKFLOW), *argv]
@@ -578,6 +596,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             experiment_id=args.experiment_id,
             snapshot_fqns=snapshot_fqns,
             suffix=suffix_by_binding[name],
+            modes=args.modes,
             pipeline_dir=args.pipeline_dir,
             ais_extra_args=ais_extra_args,
             dry_run=args.dry_run,

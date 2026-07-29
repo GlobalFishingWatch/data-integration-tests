@@ -170,6 +170,7 @@ def test_ais_args_for_binding_emits_per_table_fqn_flags_not_stem() -> None:
         suffix="exp01-before",
         experiment_id="exp01",
         binding_name="before",
+        modes=mod.AIS_SELECTABLE_MODES,
     )
     assert "--source-messages-fqn" in out
     assert "--source-segment-info-fqn" in out
@@ -201,6 +202,7 @@ def test_ais_args_for_binding_drops_user_supplied_source_fqn_overrides() -> None
         suffix="exp01-before",
         experiment_id="exp01",
         binding_name="before",
+        modes=mod.AIS_SELECTABLE_MODES,
     )
     # No user-supplied value reaches ais.py.
     assert "proj.ds.user_provided_messages" not in out
@@ -225,6 +227,7 @@ def test_ais_args_for_binding_threads_thinned_when_present() -> None:
         suffix="exp01-before",
         experiment_id="exp01",
         binding_name="before",
+        modes=mod.AIS_SELECTABLE_MODES,
     )
     assert "--thinned-message-table" in out
     assert out[out.index("--thinned-message-table") + 1] == "dst.thinned_snap"
@@ -237,6 +240,7 @@ def test_ais_args_for_binding_omits_thinned_when_absent() -> None:
         suffix="exp01-before",
         experiment_id="exp01",
         binding_name="before",
+        modes=mod.AIS_SELECTABLE_MODES,
     )
     assert "--thinned-message-table" not in out
 
@@ -251,6 +255,7 @@ def test_ais_args_for_binding_drops_user_thinned_message_table() -> None:
         suffix="exp01-before",
         experiment_id="exp01",
         binding_name="before",
+        modes=mod.AIS_SELECTABLE_MODES,
     )
     assert "proj.ds.user_thinned" not in out
     assert "--thinned-message-table" not in out

@@ -58,6 +58,8 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
+    add_modes_arg,
+    parse_modes,
     resolve_run_context,
 )
 
@@ -84,6 +86,9 @@ MODE_BFTRUNCATE = "3_bftruncate"
 #: NOT contribute to BF's cache key (else a ``--tail-days`` change would
 #: needlessly invalidate BF, matching the pipe-gaps mode-aware rule).
 _MODES_USING_TAIL = frozenset({MODE_BFD, MODE_BFTRUNCATE})
+
+#: Modes selectable via --modes, in canonical order.
+SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
 
 
 # --------------------------------------------------------------------------
@@ -684,17 +689,32 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
 # Comparisons
 # --------------------------------------------------------------------------
 
-def compare_all(mode_fqns: dict[str, str]) -> int:
-    """Pairwise-compare the three modes' visits tables.
+def compare_all(mode_fqns: dict[str, str], modes: Sequence[str]) -> int:
+    """Pairwise-compare the selected modes' visits tables.
 
     ``mode_fqns`` maps each mode label to the FQN to compare -- the
     cached-or-fresh table returned by the cache wrapper (a cache hit reuses a
     prior run's UUID-suffixed table, so the FQN is NOT derivable from the
     current run's ``suffix`` alone).
     """
-    modes = [MODE_BF, MODE_BFD, MODE_BFTRUNCATE]
+    # Pairs over the SELECTED modes only -- comparing against a mode that
+    # never ran would diff an absent table and report a spurious difference.
+    # ``modes`` arrives in canonical order (parse_modes), so pair order is
+    # stable regardless of the order given on the command line.
+    pairs = list(itertools.combinations(modes, 2))
+    if not pairs:
+        # Single-mode run (the cheap smoke shape). Say so explicitly rather
+        # than returning a clean 0 that reads like a passed equivalence
+        # assertion which actually never ran.
+        only = modes[0]
+        logger.info(
+            "only one mode selected (%s) -- no pair to compare. Its output "
+            "table is %s. Add a second mode to --modes to get a comparison.",
+            only, mode_fqns[only],
+        )
+        return 0
     overall = 0
-    for a, b in itertools.combinations(modes, 2):
+    for a, b in pairs:
         rc = dit_compare.compare_tables(
             mode_fqns[a],
             mode_fqns[b],
@@ -787,7 +807,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Infra knobs: --dest-dataset, --service-account, --dataflow-region,
     # --dataflow-temp-bucket, --dataflow-subnetwork (identical to both workflows).
     add_infra_args(p)
-    return p.parse_args(argv)
+    add_modes_arg(p, choices=SELECTABLE_MODES)
+    args = p.parse_args(argv)
+    # Validate before any cloud call: a typo'd mode that silently ran
+    # nothing would look exactly like a passing run.
+    args.modes = parse_modes(args.modes, choices=SELECTABLE_MODES)
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -887,11 +912,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # reuses a prior run's visits table instead of re-submitting Dataflow.
         # run_with_cache returns the FQN to compare (cached on hit, fresh
         # on miss). compare keys on the visits table only.
-        mode_execs = [
-            (MODE_BF, execute_bf),
-            (MODE_BFD, execute_bfd),
-            (MODE_BFTRUNCATE, execute_bftruncate),
-        ]
+        # --modes gates which modes actually run. Each is cached
+        # independently, so a later run adding a mode reuses the earlier
+        # modes' output tables rather than recomputing them.
+        _execs_by_mode = {
+            MODE_BF: execute_bf,
+            MODE_BFD: execute_bfd,
+            MODE_BFTRUNCATE: execute_bftruncate,
+        }
+        mode_execs = [(m, _execs_by_mode[m]) for m in args.modes]
+        skipped = [m for m in SELECTABLE_MODES if m not in args.modes]
+        if skipped:
+            logger.info(
+                "--modes: running %s; skipping %s",
+                ",".join(args.modes), ",".join(skipped),
+            )
         if args.parallel:
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(mode_execs)) as pool:
                 future_to_mode = {
@@ -906,7 +941,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.skip_comparisons:
         return 0
-    return compare_all(mode_fqns)
+    return compare_all(mode_fqns, args.modes)
 
 
 if __name__ == "__main__":
