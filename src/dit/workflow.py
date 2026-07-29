@@ -44,6 +44,7 @@ from dit.cache import (
     write_cache,
 )
 from dit.git_info import git_info
+from dit.runstate import set_active_run_id
 from dit.snapshot import is_unreviewed, resolve_pipeline_commit, snapshot_parent
 from dit.worker_image import ensure_pipeline_image
 
@@ -271,6 +272,12 @@ def resolve_run_context(
         )
 
     run_id = uuid.uuid4().hex[:12]
+    # Publish for `dit run`'s SIGTERM handler (see dit.runstate): a cancelled
+    # build -- Cloud Build cancellation, or a force-push to a triggered PR --
+    # needs this id to cancel the Dataflow jobs this run is about to submit.
+    # Set BEFORE the digest resolution and job submission below, so the window
+    # in which a cancellation could leak an unlabelled job stays minimal.
+    set_active_run_id(run_id)
     dc = dit_commit()
     if resolve_digest:
         # resolve_worker_image_to_digest is a one-off ~1-2s gcloud call;

@@ -6,6 +6,11 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-06-11
+
+#### Added
+- **`dit run` now cancels its own Dataflow jobs on SIGTERM (run-cache M6 — the cache arc M1–M6 is COMPLETE).** A dit run submits Dataflow jobs that outlive the submitting process: killing `dit run` never stopped them, so every cancelled Cloud Build (and, once PR triggers land, every force-push to a triggered PR) orphaned the run's jobs to burn worker-hours and quota until someone noticed and ran `make dit-cancel`. `dit run` now installs a SIGTERM handler that calls `dit.cache.cancel_run(run_id)` best-effort, then exits `143` (the conventional 128+SIGTERM). New **`dit.runstate`** module carries the `run_id` from where it's minted (`dit.workflow.resolve_run_context`, inside the workflow's `main()`) to the CLI handler that needs it — published before any job is submitted, so the leak window is as small as the code allows. Deliberate design points: **no lock in `runstate`** (a lock held when SIGTERM arrives would deadlock the handler against itself — single-name access is atomic under the GIL); **`sys.exit` not `os._exit`** so workflows' own `finally` blocks still run (git-worktree teardown, docker network removal), the expensive remote cleanup having already happened; **a second SIGTERM escalates** to an immediate exit instead of stacking a second `cancel_run`; **SIGTERM only, not SIGINT** — Ctrl-C keeps its conventional `KeyboardInterrupt` behaviour so an interactive operator can interrupt and inspect. Escape hatch `DIT_NO_CANCEL_ON_SIGTERM=1` (logs loudly when set). **Known limitation:** `cancel_run` looks for jobs in `DIT_DATAFLOW_REGION` (default `us-central1`), so a run overriding the region via `--dataflow-region` alone needs that env var set too for the trap to find its jobs; the failure message names the manual `make dit-cancel RUN_ID=… REGION=…` fallback. 9 new tests in `tests/test_cli_sigterm.py`, plus an out-of-band `kill -TERM` smoke against a live `dit run` (trap installed, blocking call interrupted, `cancel_run` invoked with the published id, exit 143). Full suite: 405 passing.
+
 ### 2026-06-10
 
 #### Changed

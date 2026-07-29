@@ -81,16 +81,30 @@ Refined 2026-05-29; **landed 2026-05-29** (M5a + M5b on one branch). The `dit.wo
 
 **M6 (SIGTERM → `cancel_run`)** is the natural follow-on now M5a has landed — out of scope for this PR.
 
-### Milestone 6 — SIGTERM trap inside `dit run`
+### Milestone 6 — SIGTERM trap inside `dit run` — ✓ **LANDED 2026-06-11**
 
-When Cloud Build cancels a build mid-flight, the orchestrator process gets SIGTERM. Catch it; run `cancel_run(self.run_id)`; exit.
+When Cloud Build cancels a build mid-flight, the orchestrator process gets SIGTERM. Catch it; run `cancel_run(run_id)`; exit. Without it, every cancellation orphans the run's Dataflow jobs — they keep burning worker-hours and quota until someone notices. This is the last run-cache milestone; **the cache arc (M1–M6) is now complete.**
 
-**Tasks**:
-- `dit.cli` (or a new `dit.signal_handlers` module) registers a SIGTERM handler at workflow entry. Handler is best-effort — log + cancel + exit even on errors.
-- Pass `run_id` into the handler via closure or module-level state.
-- **Tests**: subprocess-driven test that starts `dit run` with a mock workflow, sends SIGTERM, asserts cancel_run was called.
+**As built:**
 
-**Estimated effort**: half-day.
+- **New `src/dit/runstate.py`** — a deliberately tiny, import-light registry (`set_active_run_id` / `get_active_run_id` / `clear_active_run_id`). Solves the structural problem the plan flagged as "pass `run_id` into the handler via closure or module-level state": the `run_id` is minted *inside* the workflow's `main()` (`resolve_run_context`), which `dit run` invokes opaquely — so the workflow publishes, the handler reads. Import-light so `dit.cli` can import it at module scope without pulling in the BQ stack (the same reasoning behind `dit.cli`'s lazy `dit.cache` import).
+- **`dit.workflow.resolve_run_context`** publishes the id the moment it mints it — deliberately *before* digest resolution and any job submission, minimising the window in which a cancellation could leak an unlabelled job.
+- **`dit.cli._on_sigterm` + `_install_sigterm_handler`**, installed at the top of `dit run`.
+
+**Four design points:**
+
+1. **No lock in `runstate`** — and that's load-bearing, not laziness. Python delivers signals to the main thread between bytecodes, so a `threading.Lock` held by `set_active_run_id` when SIGTERM arrives would deadlock the handler's `get_active_run_id` against itself. Single-name assignment/read is atomic under the GIL, which is all that's needed.
+2. **`sys.exit`, not `os._exit`**, on the normal path — so the workflow's own `finally` blocks still run (git-worktree teardown in the cross-version workflows, docker compose network removal in the runner). Those are cheap and local; the expensive remote cleanup already happened in the handler.
+3. **A second SIGTERM escalates** to an immediate `os._exit` rather than stacking a second `cancel_run` — the operator (or the platform) is insisting.
+4. **SIGTERM only, not SIGINT.** Cloud Build cancellation is the target; Ctrl-C keeps its conventional `KeyboardInterrupt` behaviour so an interactive operator can interrupt and inspect, with `make dit-cancel` as the explicit cleanup path.
+
+**Escape hatch:** `DIT_NO_CANCEL_ON_SIGTERM=1` leaves SIGTERM at its default disposition (for debugging a hang with the jobs left alive). Logs loudly when set — a silently-disabled cleanup is how jobs leak.
+
+**KNOWN LIMITATION — region.** `cancel_run` discovers jobs in `DIT_DATAFLOW_REGION` (default `us-central1`). A run that overrides the region via `--dataflow-region` *alone*, without also exporting `DIT_DATAFLOW_REGION`, will have its jobs looked for in the wrong region and the handler will find nothing. The failure message names the manual fallback (`make dit-cancel RUN_ID=… REGION=…`). Closing this properly means publishing the resolved region alongside the run_id in `dit.runstate`, which needs a workflow-side change to thread it through — deferred as additive follow-up.
+
+**Tests**: 9 in `tests/test_cli_sigterm.py` (runstate roundtrip; the `resolve_run_context` → runstate wiring; no-run_id path; cancel-the-active-run path; failure still exits + names the manual fallback; second-signal escalation; handler registration; opt-out; non-main-thread tolerance). Verified end-to-end out-of-band with a real `kill -TERM` against a live `dit run` — trap installed, blocking `sleep` interrupted, `cancel_run` invoked with the published id, exit 143.
+
+**Still user-gated (unchanged from M5a):** the live verification that `automated-testing@` can actually execute `dataflow.jobs.cancel` + the BQ table deletes. Both M5a's tests and M6's mock the cloud calls.
 
 ## Open infra prerequisites
 
