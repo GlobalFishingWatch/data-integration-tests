@@ -70,6 +70,24 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-07-30 — `workflows/encounters/vms.py`: the first workflow to default to PROD sources (documented exception to staging-by-default)
+
+Second encounters workflow, and the first deliberate exception to the **"workflows default to the `pipe_ais_test_202408290000` staging cohort"** working agreement. Recording it here because the agreement explicitly requires a Plan-changelog entry when a workflow carries a deviation.
+
+**Why the exception is justified, with numbers.** The trigger was a real bugfix: `Resample._interpolate` guarded interpolation with `DT < max_gap_s`, skipping a gap of *exactly* `max_gap_s`, while the documented contract is "gaps **longer than** max_gap_s are not fully interpolated". An A/B of that fix on the AIS cohort returned IDENTICAL — truthfully, but uninformatively: there is exactly **one** 3600.000s gap in the whole test window (1 of 268,913 gaps, 0.0004%), and it belongs to a segment participating in **zero** encounters. Measured on VMS instead: **200,825 of 3,662,711 gaps (5.48%)** are exactly one hour — *more common than gaps longer than an hour* (125,064), because VMS reporting cadences are hourly. The AIS cohort cannot exercise this bug class; VMS can. That is a data property, not a preference.
+
+**What the exception does and does not concede.** It concedes the cohort, not the cost guard: the guard moves from "small cohort" to "narrow date window" — a 7-day default (`2026-06-01`..`2026-06-07`, a complete stable month, the window the statistics were measured on) against a ~503 GB / 1.13 B-row table, with `--ssvid-filter` (accepted on **both** encounters steps) as the preferred further shrink. The general rule stands: a default no-flag run must not hit prod *volume*. Anyone widening those dates should have to break `test_default_window_is_narrow_because_sources_are_prod` first.
+
+**Three structural facts worth carrying forward.**
+
+1. **Three projects, two orgs.** Messages/segs_activity/spatial_measures in `gfw-int-vms-v3` (org 115316357079), segment_info in `global-fishing-watch`, dit output + EXPORT temp dataset in `world-fishing-827` (org 433637338589). All US-located, so `--bq-temp-dataset` works unchanged. Plain cross-org **reads** are fine; cross-org **snapshots** are structurally refused by BQ, so **source pinning must not be added here** without first moving the destination into the source's org. Pinned by `test_sources_span_two_orgs_so_snapshotting_is_not_viable` so the constraint lives in the suite, not only in a docstring.
+2. **Unverified IAM precondition.** `automated-testing@` has no *direct* binding on either external project. GFW cross-project access usually flows via group bindings, which could not be confirmed from outside. Deliberately **not** worked around (no impersonation probe, per the standing hard-break rule): documented so a first-run source-read failure is read as an IAM grant, not a workflow bug. Laptop `--runner docker` uses the operator's ADC and is unaffected.
+3. **Shared execution, forked CLI — on purpose.** `ais.main` split into `parse_args` + a source-agnostic `run(args)`; `vms.py` reuses `run` wholesale and owns only defaults + help. The CLI is deliberately *not* shared (reusing ais.py's parser would have printed AIS defaults in `--help` for a VMS run — a documentation lie this repo should not ship). The resulting drift risk is covered by `test_parser_exposes_every_attribute_ais_run_consumes`, which fails at test time rather than after an image build and a Dataflow submission.
+
+**Sections moved (this commit).** New `workflows/encounters/vms.py` + `tests/test_encounters_vms.py` (9 tests; suite 470 → 479). `workflows/encounters/ais.py`: `main` → `parse_args` + `run(args, *, default_worker_image=…)`, docstring stating the source-agnostic contract. `README.md` § "Staging data sources": new exception paragraph. `CHANGELOG.md` 2026-07-30 `#### Added`.
+
+**Sections NOT moved.** No live run yet — the IAM precondition above is the first thing a run will test. `dit.cohorts` remains the structural answer to "flavours as first-class"; this workflow is a second concrete data point for it (after encounters-on-AIS cohort sparsity), not a substitute.
+
 ### 2026-07-30 — `workflows/encounters/ais.py` landed (dit's 5th pipeline; generation half only)
 
 Step 2 of the encounters onboarding, straight after the audit entry below. Two-step generation chain (`create_raw_encounters` → `merge_encounters`) x 3 modes, AIS staging defaults, `--modes` from day one, `--ssvid-filter` to both steps. Template was `workflows/port_visits/ais.py` — the same per-slice-step-1 / full-recompute-step-2 shape, which is *not* a coincidence: both are generation-half event pipelines, whereas `fishing.py`'s 4-step chain spans generation AND product only because pipe-events happens to own both.

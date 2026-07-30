@@ -692,10 +692,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    args = parse_args(argv)
+def run(
+    args: argparse.Namespace,
+    *,
+    default_worker_image: str = DEFAULT_WORKER_IMAGE,
+) -> int:
+    """Execute a parsed encounters run: validate, resolve context, run the
+    selected modes, compare.
 
+    Everything here is source-agnostic -- it reads FQNs, dates and tuning off
+    ``args`` and never looks at this module's defaults. That is what lets
+    ``workflows/encounters/vms.py`` reuse it wholesale rather than fork 80
+    lines: the two workflows differ ONLY in their defaults and help text, which
+    is exactly the part each owns. Keep it that way -- anything genuinely
+    source-specific belongs in the caller, not behind a flag here.
+    """
     if args.tail_days < 0:
         raise SystemExit(f"--tail-days must be >= 0; got {args.tail_days}.")
     if _parse_date(args.start) > _parse_date(args.end):
@@ -715,7 +726,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         require_clean=args.require_clean,
         suffix=args.suffix or None,
         worker_image=args.worker_image,
-        default_worker_image=DEFAULT_WORKER_IMAGE,
+        default_worker_image=default_worker_image,
         build_from_source=args.build_from_source,
         # No run-cache integration yet (mirrors pipe-events' deferral), so the
         # worker-image digest is unused -- skip the gcloud describe.
@@ -772,6 +783,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.skip_comparisons:
         return 0
     return compare_all(raw_fqns, merged_fqns, args.modes)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    return run(parse_args(argv))
 
 
 if __name__ == "__main__":
