@@ -87,7 +87,7 @@ Last milestone of the run cache, and the first item of the PR-triggers prerequis
 
 **Sections moved (this commit).**
 - New `src/dit/runstate.py`; `dit.workflow.resolve_run_context` publishes the id (before digest resolution + job submission, minimising the leak window); `dit.cli` gains `_on_sigterm` + `_install_sigterm_handler`, installed at the top of `run()`.
-- New `tests/test_cli_sigterm.py` (9 tests) incl. the `resolve_run_context` → runstate wiring pin. Full suite 396 → 405.
+- New `tests/test_cli_sigterm.py` (11 tests) incl. the `resolve_run_context` → runstate wiring pin and the nothing-to-cancel vs discovery-failure split. Full suite 396 → 407.
 - `docs/run-cache-impl.md` § Milestone 6 rewritten from plan to as-built record; `README.md` operational item 2 flipped to landed; `CHANGELOG.md` 2026-06-11 `#### Added`.
 
 **Sections NOT moved.** The M5a live verification (`automated-testing@` actually executing `dataflow.jobs.cancel` + BQ deletes) is still outstanding and now covers M6 too — both mock the cloud calls. Verified out-of-band instead: a real `kill -TERM` against a live `dit run` (trap installs, blocking `sleep` interrupted, `cancel_run` invoked with the published id, exit 143). **Known limitation, documented in three places**: `cancel_run` discovers jobs in `DIT_DATAFLOW_REGION` (default `us-central1`), so a run overriding the region via `--dataflow-region` alone will have its jobs looked for in the wrong region; closing it means publishing the resolved region alongside the run_id, which needs a workflow-side change — deferred as additive follow-up.
