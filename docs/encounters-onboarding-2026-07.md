@@ -2,7 +2,7 @@
 
 Step 1 of [`pipeline-contract.md`](pipeline-contract.md) § "Process: adding a new pipeline to dit's scope", for **encounters**. Records the prod orchestration + parameters (read out of `composer-dags-production`), the contract audit (matrix column added in the same commit), staging-cohort readiness, and the proposed workflow shape.
 
-**Status (2026-07-30)**: audit complete; no workflow written yet. Two upstream gaps block the cloud path (§ Blockers).
+**Status (2026-07-30)**: audit complete; **`workflows/encounters/ais.py` written** (27 unit tests) — laptop smoke and cloud run both outstanding. Two upstream gaps block the cloud path (§ Blockers).
 
 ## Scope: generation only, not publication
 
@@ -121,7 +121,7 @@ The `_internal.spatial_measures_thinned_0_0_5_20201105` referenced by `encounter
 
 Per the working agreement, workflow-side workarounds for missing contract items need a Plan-changelog entry explaining the trade-off — #2 gets one; #1 cannot be worked around workflow-side and gates the cloud path.
 
-## Proposed workflow: `workflows/encounters/ais.py`
+## Workflow: `workflows/encounters/ais.py` — AS BUILT (2026-07-30)
 
 Modelled on `port_visits/ais.py` (two-step Beam-in-container generation, per-mode output tables, truncate-shape comparison).
 
@@ -134,8 +134,15 @@ Modelled on `port_visits/ais.py` (two-step Beam-in-container generation, per-mod
 
 ## Suggested order
 
-1. This audit (done).
-2. `workflows/encounters/ais.py` + unit tests; laptop `--build-from-source` smoke on a 1–2 day window with `--ssvid_filter` (dodges the temp-dataset blocker).
+1. ~~This audit~~ — **done**.
+2. ~~`workflows/encounters/ais.py` + unit tests~~ — **done** (27 tests). Next: **laptop `--build-from-source` smoke** on a 1–2 day window with `--ssvid-filter`, which dodges the temp-dataset blocker. Suggested:
+   ```
+   PYTHONPATH=. dit run workflows/encounters/ais.py \
+       --build-from-source --runner docker \
+       --modes 1_bf --start 2020-01-01 --end 2020-01-02 \
+       --ssvid-filter '<a few ssvids>' --experiment-id enc-smoke
+   ```
+   Two things to confirm on that first run: **(a)** the `--end_date` inclusivity against the emitted SQL (per the PR #69 lesson — don't trust the flag help alone); **(b)** the published-image entrypoint, if not using `--build-from-source`.
 3. File the two upstream asks (`--temp_dataset`, None-safe labels).
-4. Cloud smoke once #1 lands upstream.
+4. Cloud smoke once the `--temp_dataset` ask lands upstream.
 5. `vms.py` sibling; cache integration; then optionally the publication half if dit's scope ever extends there.

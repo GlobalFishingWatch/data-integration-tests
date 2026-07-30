@@ -70,6 +70,26 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-07-30 — `workflows/encounters/ais.py` landed (dit's 5th pipeline; generation half only)
+
+Step 2 of the encounters onboarding, straight after the audit entry below. Two-step generation chain (`create_raw_encounters` → `merge_encounters`) x 3 modes, AIS staging defaults, `--modes` from day one, `--ssvid-filter` to both steps. Template was `workflows/port_visits/ais.py` — the same per-slice-step-1 / full-recompute-step-2 shape, which is *not* a coincidence: both are generation-half event pipelines, whereas `fishing.py`'s 4-step chain spans generation AND product only because pipe-events happens to own both.
+
+**Three decisions worth recording.**
+
+1. **Both output tables are compared, and the workflow says which one matters.** `merge_encounters` rebuilds its full range with `WRITE_TRUNCATE` on every call, so the modes agree on the merged sink almost tautologically — the *raw* table (built incrementally, bounded pre-write DELETE + append per slice) is the discriminating signal. `compare_all` runs both and labels them `DISCRIMINATING` / `weak`. Without that, a green merged-sink result would read as "the modes agree" when it only means "merge is idempotent". Inverse of pipe-gaps, where the SCD-2 tail is what diverges.
+2. **`encounter_id` verified as a unique key, not assumed.** It is `md5("encounter|<seg_1>|<seg_2>|<start_time>")` (`pipeline/transforms/add_id.py`), so unique — but a *content hash*, which means a content difference yields a different id and TIC reports only-in-A/only-in-B rather than field diffs. Documented so nobody reads only-in-X rows as missing data. **Pre-registered hypothesis** for the first diff: the merged id keys on `vessel_N_seg_ids[0]`, the first element of a REPEATED field — if the merge groups seg_ids non-deterministically, identical encounters get different ids. Same bug class as pipe-gaps' message-sort tie-break and pipe-events' `ARRAY_AGG`-without-`ORDER BY`, both of which dit caught.
+3. **`cached=False` on `add_modes_arg`.** No run-cache integration yet (pipe-events' precedent: defer until the workflow runs green), so `resolve_digest=False` too and the `--modes` help gets the honest "saves time on this invocation only" wording rather than promising cross-run reuse — exactly the distinction Copilot caught on PR #71.
+
+**Also fixed in passing:** `workflows/encounters/` was missing `__init__.py`, which every other workflow package has. Tests passed without it (implicit namespace packages) but Pyright couldn't resolve the import — so a real, if quiet, inconsistency.
+
+**Sections moved (this commit).**
+- New `workflows/encounters/ais.py` + `workflows/encounters/__init__.py`.
+- New `tests/test_encounters_ais.py` (27 tests). Emphasis on what would go wrong *silently*: per-step argv parity with the prod DAG; **merge receiving the full-history start, not the slice start** (get that wrong and the modes stop being comparable); `--ssvid_filter` reaching both steps; labels always emitted; both tables compared with `encounter_id`; date/mode validation firing before any cloud call. Full suite 440 → 467.
+- `docs/encounters-onboarding-2026-07.md`: status → as-built; "Proposed workflow" → "AS BUILT"; suggested-order steps 1–2 struck through with the concrete laptop-smoke invocation and the two things to confirm on it.
+- `CHANGELOG.md` 2026-07-30 `#### Added`.
+
+**Sections NOT moved.** No live run yet. The laptop `--build-from-source --runner docker --modes 1_bf --ssvid-filter …` smoke is next and dodges the cloud blocker; the cloud path stays blocked on the upstream `--temp_dataset` ask. Two things to confirm on that first run: the `--end_date` inclusivity **against the emitted SQL** (the PR #69 lesson — flag help is not the contract), and the published-image entrypoint (`cmds=["pipe-encounters"]` per the DAG, but encounters' `setup.py` declares no console script — `--build-from-source` sidesteps it).
+
 ### 2026-07-30 — Encounters onboarding audit (step 1 of the pipeline-contract process); events generation-vs-product scoping recorded
 
 First artifact of the new-pipeline arc the dit owner prioritised. Audits `encounters_pipeline` against [`docs/pipeline-contract.md`](docs/pipeline-contract.md) and records the prod orchestration + parameters read out of `composer-dags-production`. Full write-up in [`docs/encounters-onboarding-2026-07.md`](docs/encounters-onboarding-2026-07.md).

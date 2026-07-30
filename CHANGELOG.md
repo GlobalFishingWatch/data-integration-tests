@@ -6,6 +6,11 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-07-30
+
+#### Added
+- **`workflows/encounters/ais.py` — mode-equivalence test for encounters detection (new pipeline: `encounters_pipeline`).** dit's fifth pipeline. Drives the two-step encounters *generation* chain (`create_raw_encounters` → `merge_encounters`) in the three standard modes against the AIS staging cohort and compares them pairwise. **Scope is generation only**: every GFW event type is produced in two halves — generation in a pipeline-specific repo, then a `product_events_*` step in pipe-events — and dit covers generation, so `port_visits/ais.py` (not `fishing.py`) is the structural template. Mirrors prod (`composer-dags-production` `gfw/pipes/v3/detect_encounters.py`, image `v4.4.0`): step 1 is per-slice, step 2 recomputes the **full history** from `--start` on every call. `--modes` supported from day one; `--ssvid-filter` threads to **both** steps (encounters is the first onboarded pipeline offering a real INCLUDE-semantics cohort filter on every step, which makes cheap runs easy). Comparison is truncate-shape on `encounter_id` over **both** output tables — the raw table is the discriminating signal, the merged sink near-tautological because `merge` truncates and rebuilds every call, and the workflow says so rather than letting a green merged result be over-read. Dates are **inclusive on both ends**, matching the pipeline's own `--end_date` help. **Known limitation:** encounters_pipeline has no `--temp_dataset`, so the *cloud* path fails until that lands upstream (the Cloud Build SA deliberately lacks `bigquery.datasets.create`) — laptop `--build-from-source` runs work today. Labels are always emitted because the pipeline's `list_to_dict(cloud_opts.labels)` has no `None` guard (same workaround pipe-anchorages needs). 27 tests in `tests/test_encounters_ais.py`. Audit + orchestration reference: [`docs/encounters-onboarding-2026-07.md`](docs/encounters-onboarding-2026-07.md). Full suite: 467 passing.
+
 ### 2026-06-11
 
 #### Added
