@@ -228,6 +228,46 @@ Non-zero raw means Beam's load path genuinely executed — this is *not* the zer
 
 **But it caps what this cohort can validate.** Every encounter in the window comes from a single vessel pair, one of whose segments is flagged bad — so the *merged* comparison (the non-determinism signal the owner wants kept) can only ever be 0-vs-0 here, which is trivially identical. The *raw* comparison is viable: 4 real rows, so a two-mode run gives a genuine incrementality check. Concrete reinforcement of the cohort-sparsity finding above and of the `dit.cohorts` case.
 
+## VMS A/B of the interpolation fix — DIFFERENCES FOUND (2026-07-30)
+
+The positive control for the null recorded above. Same two overlay images, same
+`encounter_id` comparison, but run through `workflows/encounters/vms.py` on a
+laptop (`--runner docker`, DirectRunner in-container) against 4 co-located VMS
+vessel pairs over `2026-06-01..07`.
+
+**Vessel selection was the load-bearing step.** Filtering to vessels that are
+*individually* co-located would not work — their partners can fall outside the
+filter, yielding zero encounters. The probe selected co-located **pairs** where
+at least one member carries exact-hour gaps; the top pair had 920 co-located
+hours and 118 gaps of exactly 3600.000s.
+
+| table | rows | value diffs | affected |
+|---|---|---|---|
+| `raw_encounters` | 60 v 60, all keys matched | 4 | 6.67% of encounters |
+| `encounters` (merged) | 6 v 6, all keys matched | 1 | 16.7% |
+
+Both tables non-empty, so unlike the AIS run *both* comparison signals were live.
+
+**The diff is exactly the fix's signature, not noise.** `vessel_1_point_count` /
+`vessel_2_point_count` move (+2 raw, +6 merged) — interpolating across a
+previously-skipped exact-hour gap adds resampled points — and the aggregates
+computed over those points follow: `mean_latitude`, `mean_longitude`,
+`median_distance_km`, `median_speed_knots`. Everything defining the encounter's
+identity and extent is **identical**: `start_time`, `end_time`, `start_lat/lon`,
+`end_lat/lon`, `vessel_*_seg_id(s)`. So the fix refines point sampling *within*
+existing encounters rather than creating or destroying any — and all 60/6 keys
+matched, so there are no only-in-A/only-in-B rows.
+
+Incidentally this also **fails to reproduce the pre-registered hypothesis**
+about `vessel_N_seg_ids[0]` ordering non-determinism: the repeated fields
+compared identical across both runs. Not disproven (one small sample, one
+window), but no evidence for it yet.
+
+**What this pair of runs establishes methodologically.** AIS staging said
+IDENTICAL; VMS said DIFFERENCES FOUND, for the *same* code change. The AIS
+verdict was truthful and worthless — the target could not reach the behaviour.
+Choosing a target that *can* discriminate is part of the test, not a detail.
+
 ## Cohort sparsity — a constraint on encounters testing
 
 `pipe_ais_test_202408290000` carries only **67–72 distinct vessels/day** (~47k msgs/day). Encounters need two vessels within 0.5 km for 120+ minutes, so they are rare here: a coarse proximity probe over January 2020 found **2–3 co-located pairs/day**, and **2020-01-01 none at all**. Densest window found: **2020-01-19..22**.
