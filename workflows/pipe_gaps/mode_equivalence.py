@@ -9,6 +9,7 @@ from ``pipe-gaps/tests/integration/mode_equivalence.py`` onto the
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import os
 import re
@@ -31,6 +32,8 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
+    add_modes_arg,
+    parse_modes,
     resolve_run_context,
 )
 
@@ -58,6 +61,13 @@ MODE_BF = "1_bf"
 MODE_BFD = "2_bfd"
 MODE_BFTRUNCATE = "3_bftruncate"
 MODE_MUTATE_RECOVER = "4_mutate_recover"
+
+#: Modes selectable via --modes. MODE_MUTATE_RECOVER is deliberately NOT
+#: here: it keeps its own --enable-pipeline-4 gate (it needs the
+#: restricted-ssvids machinery, which --modes knows nothing about). Two
+#: overlapping gates for one mode would be worse than one explicit one;
+#: parse_modes rejects it by name and the help text points at the flag.
+SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
 
 # Per-user infra knobs identical to both workflows (--dest-dataset,
 # --service-account, --dataflow-*) live in dit.workflow; add_infra_args wires
@@ -624,6 +634,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--skip-pipelines", action="store_true")
     p.add_argument("--skip-comparisons", action="store_true")
     p.add_argument("--parallel", "--async", dest="parallel", action="store_true")
+    add_modes_arg(
+        p, choices=SELECTABLE_MODES,
+        help_suffix=f"{MODE_MUTATE_RECOVER} is not selectable here -- it "
+                    f"keeps its own --enable-pipeline-4 gate.",
+    )
     add_infra_args(p)
     # --bq-temp-dataset is workflow-local; not part of add_infra_args.
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
@@ -639,7 +654,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--restricted-ssvids", default="")
     p.add_argument("--auto-restrict", action="store_true")
     p.add_argument("--auto-restrict-seed", type=int, default=42)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # Validate before any cloud call: a typo'd mode that silently ran
+    # nothing would look exactly like a passing run.
+    args.modes = parse_modes(args.modes, choices=SELECTABLE_MODES)
+    if args.enable_pipeline_4 and MODE_BF not in args.modes:
+        # mutate_recover is compared against bf, and --auto-restrict reads
+        # bf's output table to pick the restricted ssvids.
+        raise SystemExit(
+            f'error: --enable-pipeline-4 compares {MODE_MUTATE_RECOVER} against '
+            f'{MODE_BF}, so {MODE_BF} must be in --modes '
+            f'(got {",".join(args.modes)}).'
+        )
+    return args
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -769,14 +796,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output_fqn=bft_table, execute_kwargs=bft_kwargs,
             )
 
+        # --modes gates which of the three primary modes actually run. Each
+        # mode is cached independently, so a run that adds a mode later reuses
+        # the earlier modes' output tables rather than recomputing them.
+        _wrappers = {
+            MODE_BF: _wrap_bf,
+            MODE_BFD: _wrap_bfd,
+            MODE_BFTRUNCATE: _wrap_bft,
+        }
+        skipped = [m for m in SELECTABLE_MODES if m not in args.modes]
+        if skipped:
+            logger.info(
+                "--modes: running %s; skipping %s",
+                ",".join(args.modes), ",".join(skipped),
+            )
+        results: dict[str, str] = {}
+
         if args.parallel:
             can_parallel_p4 = args.enable_pipeline_4 and mr_restricted is not None
-            max_workers = 4 if can_parallel_p4 else 3
+            max_workers = len(args.modes) + (1 if can_parallel_p4 else 0)
 
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                f_bf = ex.submit(_wrap_bf)
-                f_bfd = ex.submit(_wrap_bfd)
-                f_bft = ex.submit(_wrap_bft)
+                futures = {m: ex.submit(_wrappers[m]) for m in args.modes}
                 f_mr = None
                 if can_parallel_p4:
                     assert mr_restricted is not None  # narrowed by can_parallel_p4
@@ -796,15 +837,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         output_fqn=mr_table, execute_kwargs=mr_kwargs,
                         cache_key_extras={"restricted_ssvids": sorted(mr_restricted)},
                     )
-                bf_table = f_bf.result()
-                bfd_table = f_bfd.result()
-                bft_table = f_bft.result()
+                results = {m: f.result() for m, f in futures.items()}
                 if f_mr is not None:
                     mr_table = f_mr.result()
         else:
-            bf_table = _wrap_bf()
-            bfd_table = _wrap_bfd()
-            bft_table = _wrap_bft()
+            results = {m: _wrappers[m]() for m in args.modes}
+
+        # Unselected modes keep their derived FQN (unused -- no pair
+        # references them); selected modes take the cached-or-fresh value.
+        bf_table = results.get(MODE_BF, bf_table)
+        bfd_table = results.get(MODE_BFD, bfd_table)
+        bft_table = results.get(MODE_BFTRUNCATE, bft_table)
 
         if args.enable_pipeline_4 and args.auto_restrict:
             mid = end - timedelta(days=args.tail_days)
@@ -851,13 +894,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.skip_comparisons:
         return 0
 
+    # Pairwise over the SELECTED modes only -- comparing against a mode that
+    # never ran would diff an empty/absent table and report a spurious
+    # difference. args.modes is in canonical order (parse_modes), so pair
+    # order is stable regardless of the order given on the command line.
+    tables_by_mode = {
+        MODE_BF: bf_table,
+        MODE_BFD: bfd_table,
+        MODE_BFTRUNCATE: bft_table,
+    }
     pairs = [
-        (f"{MODE_BF} vs {MODE_BFD}",         bf_table, bfd_table),
-        (f"{MODE_BF} vs {MODE_BFTRUNCATE}",  bf_table, bft_table),
-        (f"{MODE_BFD} vs {MODE_BFTRUNCATE}", bfd_table, bft_table),
+        (f"{a} vs {b}", tables_by_mode[a], tables_by_mode[b])
+        for a, b in itertools.combinations(args.modes, 2)
     ]
     if args.enable_pipeline_4:
         pairs.append((f"{MODE_BF} vs {MODE_MUTATE_RECOVER}", bf_table, mr_table))
+
+    if not pairs:
+        # Single-mode run (the cheap smoke shape). Say so explicitly rather
+        # than falling through to "all 0 comparisons passed", which reads
+        # like an equivalence assertion that actually never ran.
+        only = args.modes[0]
+        logger.info(
+            "only one mode selected (%s) -- no pair to compare. Its output "
+            "table is %s. Add a second mode to --modes to get a comparison.",
+            only, tables_by_mode[only],
+        )
+        return 0
 
     rcs = []
     for label, a, b in pairs:
