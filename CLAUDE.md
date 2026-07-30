@@ -93,10 +93,32 @@ Second item of the PR-triggers prerequisite track ([`docs/pr-triggers-2026-06.md
 - `src/dit/workflow.py`: new section (b2) with `parse_modes` + `add_modes_arg` (`cached` parameter; precomputed choice/request sets).
 - The three workflows: `--modes` flag, `parse_args` validation, dict-dispatch execution gating (`mode_equivalence` restructured from three named futures to a mode→wrapper map), comparison pairs via `itertools.combinations` over the selection, plus a `SELECTABLE_MODES` constant each (`pipe_events` reuses its existing `MODES`).
 - `workflows/port_visits/cross_version_ais.py`: forwards + validates `--modes`; `_ais_args_for_binding` / `_run_binding` take a `modes` parameter.
-- `tests/test_modes_flag.py` (new, 33 tests incl. the per-consumer help-text pin); existing `compare_all` / `_ais_args_for_binding` call sites in two test files updated for the new signatures. Full suite 396 → 429.
+- `tests/test_modes_flag.py` (new, 33 tests incl. the per-consumer help-text pin); existing `compare_all` / `_ais_args_for_binding` call sites in two test files updated for the new signatures. Full suite 407 → 440 (this merged on top of the M6 SIGTERM work, whose 11 tests are already in the 407).
 - `CHANGELOG.md` 2026-06-11 `#### Added` + `#### Fixed`; `docs/workflow-orchestration-2026-06.md` axis-2 section rewritten to the as-built shape and recommendation 2 flipped to landed.
 
 **Sections NOT moved.** No cloud smoke — the change is additive and the default path is byte-unchanged (pinned by tests asserting the full-set default still yields three pairs). Remaining orchestration-evaluation items unchanged: `dit.cohorts` (still the highest-leverage open item) and the exit-code-contract documentation, which T3's Check Run schema will have to encode anyway.
+
+### 2026-06-11 — Run-cache M6 landed: SIGTERM trap in `dit run`; the cache arc (M1–M6) is COMPLETE
+
+Last milestone of the run cache, and the first item of the PR-triggers prerequisite track (T1 in [`docs/pr-triggers-2026-06.md`](docs/pr-triggers-2026-06.md)). A dit run submits Dataflow jobs that outlive the submitting process, so every cancelled Cloud Build orphaned them until someone ran `make dit-cancel` by hand. `dit run` now traps SIGTERM → `dit.cache.cancel_run(run_id)` → exit 143.
+
+**The structural problem M6 had to solve** (the plan doc left it open as "closure or module-level state"): the `run_id` is minted *inside* the workflow's `main()` (`resolve_run_context`), which `dit run` invokes opaquely — the CLI can't know it up front, and threading it back out would change every workflow's entry-point contract. Resolution: a new **`dit.runstate`** module — the workflow publishes, the handler reads. Deliberately import-light so `dit.cli` can import it at module scope without paying for the BQ stack (same reasoning as `dit.cli`'s existing lazy `dit.cache` import).
+
+**Four design decisions worth recording.**
+
+1. **No lock in `runstate` — load-bearing, not laziness.** Python delivers signals to the main thread between bytecodes, so a non-reentrant `threading.Lock` held by `set_active_run_id` when SIGTERM lands would deadlock the handler's `get_active_run_id` against *itself*. Single-name assignment/read is atomic under the GIL; that's the whole requirement. Documented in the module docstring so a future "add thread safety" refactor doesn't reintroduce the deadlock.
+2. **`sys.exit`, not `os._exit`, on the normal path.** Lets the workflow's own `finally` blocks run (git-worktree teardown in the cross-version workflows, docker compose network removal in the runner) — cheap and local, and the expensive remote cleanup already happened in the handler.
+3. **A second SIGTERM escalates** to `os._exit` rather than stacking a second `cancel_run`.
+4. **SIGTERM only, not SIGINT.** Cloud Build cancellation is the target case; Ctrl-C keeps conventional `KeyboardInterrupt` semantics so an interactive operator can interrupt and inspect, with `make dit-cancel` as the explicit path.
+
+`cancel_run`'s existing ordering turned out to be exactly right for this caller: it cancels labelled Dataflow jobs FIRST, before any cache-row lookup — and an interrupted run characteristically has live jobs but no cache row yet (rows are written only when a mode completes).
+
+**Sections moved (this commit).**
+- New `src/dit/runstate.py`; `dit.workflow.resolve_run_context` publishes the id (before digest resolution + job submission, minimising the leak window); `dit.cli` gains `_on_sigterm` + `_install_sigterm_handler`, installed at the top of `run()`.
+- New `tests/test_cli_sigterm.py` (11 tests) incl. the `resolve_run_context` → runstate wiring pin and the nothing-to-cancel vs discovery-failure split. Full suite 396 → 407.
+- `docs/run-cache-impl.md` § Milestone 6 rewritten from plan to as-built record; `README.md` operational item 2 flipped to landed; `CHANGELOG.md` 2026-06-11 `#### Added`.
+
+**Sections NOT moved.** The M5a live verification (`automated-testing@` actually executing `dataflow.jobs.cancel` + BQ deletes) is still outstanding and now covers M6 too — both mock the cloud calls. Verified out-of-band instead: a real `kill -TERM` against a live `dit run` (trap installs, blocking `sleep` interrupted, `cancel_run` invoked with the published id, exit 143). **Known limitation, documented in three places**: `cancel_run` discovers jobs in `DIT_DATAFLOW_REGION` (default `us-central1`), so a run overriding the region via `--dataflow-region` alone will have its jobs looked for in the wrong region; closing it means publishing the resolved region alongside the run_id, which needs a workflow-side change — deferred as additive follow-up.
 
 ### 2026-06-10 — Workflow orchestration evaluation (point-in-time analysis; three config axes)
 
