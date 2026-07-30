@@ -527,7 +527,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add_experiment_id_arg(p)
     # Only the dataset/SA knobs — pipe-events runs no Dataflow (Phase 3 split).
     add_dataset_args(p)
-    add_modes_arg(p, choices=MODES)
+    # cached=False: this workflow has no run-cache integration (deferred --
+    # no Dataflow worker image to digest), so the help must not promise that
+    # a subset now is reused by a larger selection later.
+    add_modes_arg(p, choices=MODES, cached=False)
     args = p.parse_args(argv)
     # Validate before any container run: a typo'd mode that silently ran
     # nothing would look exactly like a passing run.

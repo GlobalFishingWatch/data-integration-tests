@@ -87,11 +87,13 @@ Second item of the PR-triggers prerequisite track ([`docs/pr-triggers-2026-06.md
 
 **Bonus fix found while wiring it.** `cross_version_ais`'s pre-existing `--modes` selected only which output tables to *diff* — every binding still *ran* all three modes, so the flag saved nothing on the expensive half. It now forwards the selection into each binding's `ais.py` invocation (only possible now that ais.py has the flag) and drops any user-supplied `--modes` from the pass-through extras, so the run-set and diff-set cannot desync. Its value is now validated too, against `ais.py`'s `SELECTABLE_MODES` (imported, so the two can't drift) — previously any string was accepted and a typo produced zero diff pairs, which reads exactly like "everything matched".
 
+**A fifth, from review.** `add_modes_arg`'s help originally asserted "modes are cached independently, so a subset now is reused later" for every consumer — but `pipe_events/fishing.py` has no run-cache integration, so that was wrong there (and contradicted this workflow's own inline comment). The helper now takes `cached: bool`; pipe-events passes `cached=False` and gets the truthful "saves time and cost on this invocation only" wording. Caught by Copilot on PR #71 — a reminder that lifting a help string into a shared helper silently generalises its claims.
+
 **Sections moved (this commit).**
-- `src/dit/workflow.py`: new section (b2) with `parse_modes` + `add_modes_arg`.
+- `src/dit/workflow.py`: new section (b2) with `parse_modes` + `add_modes_arg` (`cached` parameter; precomputed choice/request sets).
 - The three workflows: `--modes` flag, `parse_args` validation, dict-dispatch execution gating (`mode_equivalence` restructured from three named futures to a mode→wrapper map), comparison pairs via `itertools.combinations` over the selection, plus a `SELECTABLE_MODES` constant each (`pipe_events` reuses its existing `MODES`).
 - `workflows/port_visits/cross_version_ais.py`: forwards + validates `--modes`; `_ais_args_for_binding` / `_run_binding` take a `modes` parameter.
-- `tests/test_modes_flag.py` (new, 31 tests); existing `compare_all` / `_ais_args_for_binding` call sites in two test files updated for the new signatures. Full suite 396 → 427.
+- `tests/test_modes_flag.py` (new, 33 tests incl. the per-consumer help-text pin); existing `compare_all` / `_ais_args_for_binding` call sites in two test files updated for the new signatures. Full suite 396 → 429.
 - `CHANGELOG.md` 2026-06-11 `#### Added` + `#### Fixed`; `docs/workflow-orchestration-2026-06.md` axis-2 section rewritten to the as-built shape and recommendation 2 flipped to landed.
 
 **Sections NOT moved.** No cloud smoke — the change is additive and the default path is byte-unchanged (pinned by tests asserting the full-set default still yields three pairs). Remaining orchestration-evaluation items unchanged: `dit.cohorts` (still the highest-leverage open item) and the exit-code-contract documentation, which T3's Check Run schema will have to encode anyway.

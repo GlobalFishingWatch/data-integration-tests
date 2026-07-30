@@ -68,6 +68,38 @@ def test_parse_modes_rejects_empty_selection() -> None:
             parse_modes(raw, choices=_CHOICES)
 
 
+def test_add_modes_arg_help_reflects_whether_the_workflow_caches() -> None:
+    """The reuse claim must match reality per consumer: pipe-events has no run
+    cache, so promising "a subset now is reused later" would be wrong there.
+    (Copilot review on PR #71.)"""
+    import argparse
+
+    cached = argparse.ArgumentParser()
+    add_modes_arg(cached, choices=_CHOICES, cached=True)
+    cached_help = cached._actions[-1].help or ""
+    assert "cached independently" in cached_help
+    assert "no run cache" not in cached_help
+
+    uncached = argparse.ArgumentParser()
+    add_modes_arg(uncached, choices=_CHOICES, cached=False)
+    uncached_help = uncached._actions[-1].help or ""
+    assert "no run cache" in uncached_help
+    assert "cached independently" not in uncached_help
+
+
+def test_pipe_events_modes_help_does_not_promise_caching() -> None:
+    """The consumer-side half of the above: fishing.py must pass cached=False."""
+    import argparse
+
+    p = fishing_mod.parse_args([])  # smoke: still parses
+    assert p.modes == list(fishing_mod.MODES)
+
+    parser = argparse.ArgumentParser()
+    # Rebuild what fishing.py registers and assert the honest wording reaches it.
+    add_modes_arg(parser, choices=fishing_mod.MODES, cached=False)
+    assert "no run cache" in (parser._actions[-1].help or "")
+
+
 def test_add_modes_arg_defaults_to_all_choices() -> None:
     import argparse
 

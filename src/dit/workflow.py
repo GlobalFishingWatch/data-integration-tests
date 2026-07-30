@@ -178,19 +178,23 @@ def parse_modes(raw: str, *, choices: Sequence[str]) -> list[str]:
         raise SystemExit(
             f"error: --modes must name at least one mode; valid: {','.join(choices)}"
         )
-    unknown = [m for m in requested if m not in choices]
+    choices_set = set(choices)
+    requested_set = set(requested)
+    # Report unknowns in the order given, so the message echoes what was typed.
+    unknown = [m for m in requested if m not in choices_set]
     if unknown:
         raise SystemExit(
             f"error: unknown mode(s) {','.join(unknown)}; "
             f"valid: {','.join(choices)}"
         )
-    return [m for m in choices if m in set(requested)]
+    return [m for m in choices if m in requested_set]
 
 
 def add_modes_arg(
     parser: argparse.ArgumentParser,
     *,
     choices: Sequence[str],
+    cached: bool = True,
     help_suffix: str = "",
 ) -> None:
     """Add ``--modes`` (comma-separated subset; defaults to all of ``choices``).
@@ -198,17 +202,30 @@ def add_modes_arg(
     The value stays a raw string on the namespace; call :func:`parse_modes`
     to validate it (workflows do this in their ``parse_args`` so a bad value
     fails before any cloud call).
+
+    ``cached`` describes whether THIS workflow runs its modes through the run
+    cache, because that changes what a subset actually buys the user: with a
+    cache, a subset now is reused by a larger selection later; without one
+    (pipe-events has no cache integration) a subset only saves time and cost
+    on this invocation. Claiming the cache behaviour unconditionally would make
+    the CLI help wrong for that consumer -- Copilot review on PR #71.
     """
     default = ",".join(choices)
+    reuse_note = (
+        "Modes are cached independently, so running a subset now and more "
+        "later reuses the earlier modes' output."
+        if cached else
+        "This workflow has no run cache, so a subset saves time and cost on "
+        "this invocation only -- a later run re-executes the modes it needs."
+    )
     parser.add_argument(
         "--modes", default=default,
         help=(
             f"Comma-separated subset of modes to run. Default: {default} (all). "
             f"Use a subset for a cheap smoke (e.g. --modes {choices[0]}); "
             f"comparisons run only for pairs where both modes ran, and a "
-            f"single-mode run performs no comparison at all. Modes are cached "
-            f"independently, so running a subset now and more later reuses the "
-            f"earlier modes' output." + (f" {help_suffix}" if help_suffix else "")
+            f"single-mode run performs no comparison at all. {reuse_note}"
+            + (f" {help_suffix}" if help_suffix else "")
         ),
     )
 
