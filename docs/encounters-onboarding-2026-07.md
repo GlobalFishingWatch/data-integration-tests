@@ -186,10 +186,30 @@ The 403 is raised **from inside the Dataflow job**, i.e. by the WORKERS running 
 - The `--sdk_container_image` + boot-entrypoint arrangement works with one image serving as both submitter and worker.
 - Placement options (region, subnetwork, temp/staging buckets) are accepted, and `--wait_for_job` propagates failure correctly.
 
-So the **only** thing standing between dit and a working cloud encounters run is the temp dataset. Two possible fixes:
+So the **only** thing standing between dit and a working cloud encounters run is the temp dataset. Three possible fixes:
 
 1. **Upstream (preferred, matches pipe-anchorages)** — expose `--temp_dataset` so dit can point it at `tech_great_expectations`, where the SA already has `bigquery.tables.create`.
 2. **IAM** — grant `automated-testing@` `bigquery.datasets.create` on `world-fishing-827`. Deliberately narrow today (see CLAUDE.md § canonical-dataset policy), so this would be a policy change, not just a grant.
+3. **Overlay image (done 2026-07-30, unblocks now)** — see below.
+
+### Resolution: overlay image (2026-07-30)
+
+The patch is written but unmerged, so waiting on option 1 would idle the whole cloud path. Instead the patch is layered over the published image:
+
+```
+gcr.io/world-fishing-827/dit/encounters:v4.4.0-temp-dataset-d2536aaf
+sha256:5edc1f29b0197cacfd71eeb9ef87bf39a70d3b38b64f4ced4796be4c919ce964
+```
+
+`FROM` the published `v4.4.0`, five patched `.py` files `COPY`d over `site-packages/pipe_encounters/`. Base image, Beam 2.71.0 and the `/opt/apache/beam/boot` ENTRYPOINT are all inherited unchanged, so it still serves as both submitter and `sdk_container_image`. Build is in `scratchpad/encounters-overlay/`; it asserts the patched modules import and the flag parses, so a broken overlay fails the build rather than shipping.
+
+**The patch was applied to the v4.4.0 sources extracted from the image, not to the local 4.3.2 checkout** — different package name and formatting. The local checkout carries the same change on branch `dit-temp-dataset-support` (commit `298f30f`, unpushed) for the eventual upstream PR; its `ReadSources` is structurally identical to v4.4.0's, so it should port mechanically.
+
+Mechanism: Beam's `_CustomBigQuerySource._setup_temporary_dataset()` returns early when `temp_dataset` is set, so nothing is created. Note `ReadFromBigQuery` has **no named `temp_dataset` parameter** — it captures the kwarg and forwards it to the source at `expand()` time; a test in both repos pins that, so a Beam upgrade that stopped forwarding fails loudly rather than silently reverting to dataset creation.
+
+Retire the overlay the moment upstream lands and publishes a new tag.
+
+**Scope correction worth keeping.** The original framing here called this a *Cloud-Build* blocker. It is not: the 403 is raised from **inside the Dataflow job**, i.e. by workers running as `automated-testing@`, so it breaks any run with those workers. Laptop DirectRunner escapes it only because the dataset is then created under the user's own ADC.
 
 ## Cohort sparsity — a constraint on encounters testing
 
@@ -208,6 +228,6 @@ So the **only** thing standing between dit and a working cloud encounters run is
        --ssvid-filter '<a few ssvids>' --experiment-id enc-smoke
    ```
    Two things to confirm on that first run: **(a)** the `--end_date` inclusivity against the emitted SQL (per the PR #69 lesson — don't trust the flag help alone); **(b)** the published-image entrypoint, if not using `--build-from-source`.
-3. File the two upstream asks (`--temp_dataset`, None-safe labels).
-4. Cloud smoke once the `--temp_dataset` ask lands upstream.
+3. File the upstream asks. `--temp_dataset` is ~~pending~~ **written** (`encounters_pipeline@dit-temp-dataset-support`, local/unpushed) — still needs a PR. None-safe labels and the missing `.result()` in `writers.py delete_rows` are still unfiled.
+4. ~~Cloud smoke once the `--temp_dataset` ask lands upstream~~ — **no longer gated on upstream**; run it against the overlay image via `--worker-image gcr.io/world-fishing-827/dit/encounters:v4.4.0-temp-dataset-d2536aaf`. Pick a window with actual encounters (2020-01-19..22) so the run is not a zero-row pass.
 5. `vms.py` sibling; cache integration; then optionally the publication half if dit's scope ever extends there.

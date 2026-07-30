@@ -48,6 +48,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         dataflow_region="us-central1",
         dataflow_temp_bucket="bucket",
         dataflow_subnetwork="regions/us-central1/subnetworks/net",
+        bq_temp_dataset="proj.tech_great_expectations",
         parallel=False,
         run_id="abc123abc123",
         commit_sha="c0ffee1",
@@ -232,8 +233,14 @@ def test_project_and_temp_location_present_on_every_runner(runner: str) -> None:
     pipeline builds its own BQ client from cloud_opts.project, and
     ReadFromBigQuery's EXPORT read stages through GCS and raises
     "requires a GCS location" without --temp_location on ANY runner. Both were
-    found by the first laptop smokes. --temp_location (settable) is distinct
-    from --temp_dataset (not exposed by encounters -- the cloud blocker)."""
+    found by the first laptop smokes.
+
+    --temp_dataset is emitted on every runner too, and is a DIFFERENT thing
+    from --temp_location: the latter is a GCS path, the former the BQ dataset
+    the EXPORT temp table lands in. Without it Beam creates a
+    beam_temp_dataset_* per read, which needs bigquery.datasets.create --
+    a permission automated-testing@ deliberately lacks, so any run whose
+    Dataflow workers are that SA dies on a 403 from inside the job."""
     calls = _capture_slice(
         _args(runner=runner), mode=mod.MODE_BF,
         slice_start=date(2020, 1, 1), slice_end=date(2020, 1, 2),
@@ -242,6 +249,7 @@ def test_project_and_temp_location_present_on_every_runner(runner: str) -> None:
     for argv in calls:
         assert f"--project={mod.PROJECT}" in argv
         assert any(a.startswith("--temp_location=gs://") for a in argv), argv
+        assert "--temp_dataset=proj.tech_great_expectations" in argv, argv
 
 
 def test_nonzero_rc_aborts_the_slice() -> None:

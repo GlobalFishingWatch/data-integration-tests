@@ -75,15 +75,27 @@ on both steps). Verified against the flag help; re-verify against the SQL
 before trusting a first live run -- the pipe-gaps off-by-one (PR #69) came
 from trusting a flag name over the query.
 
-KNOWN BLOCKER -- cloud path
----------------------------
-encounters_pipeline has **no ``--temp_dataset``** flag, so Beam's
-``ReadFromBigQuery`` EXPORT staging tries to create ``beam_temp_dataset_*``
-and the Cloud Build SA (``automated-testing@``) deliberately lacks
-``bigquery.datasets.create``. **Cloud runs will fail until that is patched
-upstream** (same gap, same fix shape as pipe-anchorages'). Laptop runs by a
-user with broader perms work today -- use ``--build-from-source`` +
-``--ssvid-filter`` for a cheap smoke.
+``--temp_dataset`` and the overlay image
+----------------------------------------
+Both steps read via ``ReadFromBigQuery``'s EXPORT method, which creates a
+``beam_temp_dataset_*`` per read and so needs ``bigquery.datasets.create``.
+``automated-testing@`` deliberately lacks that, so **any** run whose Dataflow
+workers are that SA dies on a 403 ``POST /datasets`` raised from inside the
+job -- this is not a Cloud-Build-only problem. (Laptop DirectRunner escapes it
+because the dataset is then created under the user's own ADC.)
+
+Published ``pipe-encounters`` does not expose ``--temp_dataset``. Until that
+lands upstream, point ``--worker-image`` at the dit overlay image, which is
+the published v4.4.0 with the patch layered over site-packages -- same Beam
+version, same entrypoint, so it serves as both submitter and
+``sdk_container_image``::
+
+    --worker-image gcr.io/world-fishing-827/dit/encounters:v4.4.0-temp-dataset-<sha>
+
+``--bq-temp-dataset`` is emitted unconditionally (mirroring
+``workflows/port_visits/ais.py``); against a stock image the flag is simply
+rejected as unknown, which fails loudly rather than silently reverting to
+dataset creation.
 """
 from __future__ import annotations
 
@@ -101,6 +113,7 @@ from typing import Optional, Sequence
 
 from dit import compare as dit_compare
 from dit import dates as dit_dates
+from dit import workflow as dit_workflow
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
@@ -182,6 +195,14 @@ DEFAULT_IMAGE_TAG = "gfw/pipe-encounters"
 # per the absolute prod-infra boundary.
 DEFAULT_WORKER_IMAGE = (
     "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-encounters:v4.4.0"
+)
+
+# Pre-existing BQ dataset Beam uses for ReadFromBigQuery EXPORT staging, so the
+# SA never needs bigquery.datasets.create. Same shape as
+# workflows/port_visits/ais.py. Requires an image exposing --temp_dataset; see
+# the module docstring for the overlay tag until that lands upstream.
+DEFAULT_BQ_TEMP_DATASET = os.environ.get(
+    "DIT_BQ_TEMP_DATASET", f"{PROJECT}.{dit_workflow.DEFAULT_DEST_DATASET}"
 )
 
 # Entrypoint for the published image. The composer DAG passes
@@ -403,13 +424,13 @@ def _pipeline_options(
         #                    which stages the table to GCS first and raises
         #                    "requires a GCS location" without it on ANY runner.
         # Both were found by the first laptop smokes, in that order.
-        # NOTE --temp_location (a GCS path, settable) is NOT the same thing as
-        # --temp_dataset (the BQ dataset the EXPORT temp table lands in), which
-        # encounters does not expose at all -- that is the cloud blocker, see
-        # the module docstring.
+        # NOTE --temp_location (a GCS path) is NOT --temp_dataset (the BQ
+        # dataset the EXPORT temp table lands in). Both are emitted; see the
+        # module docstring for why the latter needs the overlay image.
         return [
             f"--project={PROJECT}",
             f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
+            f"--temp_dataset={args.bq_temp_dataset}",
             "--runner=DirectRunner",
             "--wait_for_job",
             *labels,
@@ -420,6 +441,7 @@ def _pipeline_options(
         f"--region={args.dataflow_region}",
         f"--service_account_email={args.service_account}",
         f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
+        f"--temp_dataset={args.bq_temp_dataset}",
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
         f"--sdk_container_image={args.worker_image}",
@@ -641,6 +663,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
                    help=f"Dataflow worker image (sdk_container_image). "
                         f"Default: {DEFAULT_WORKER_IMAGE}")
+    p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET,
+                   help="Pre-existing BQ dataset for Beam EXPORT staging; "
+                        "env-var fallback DIT_BQ_TEMP_DATASET (defaults to "
+                        "${PROJECT}.${DIT_DEST_DATASET}). Needs an image that "
+                        "exposes --temp_dataset; see the module docstring.")
     p.add_argument("--build-from-source", action="store_true",
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one. Recommended on laptop: "
