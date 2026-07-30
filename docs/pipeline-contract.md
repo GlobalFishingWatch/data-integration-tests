@@ -139,6 +139,17 @@ Legend: ✓ = satisfies, ✗ = missing, partial = present with caveats, — = N/
 - **§11 (✗):** no ssvid filter; test-scale reduction comes from the `pipe_ais_test_*` staging cohort instead. Filed as a future upstream issue (a `--ssvid_filter` with INCLUDE semantics would let pipe-events tests run on a vessel subset like pipe-anchorages does).
 - **No workflow-side workarounds** were needed for pipe-events (contrast pipe-anchorages' `--temp_dataset` + None-labels patches) — the one infra addition was the docker runner's `volumes`/`service` params for the `gcp` auth volume, which is dit-side plumbing, not a pipeline workaround.
 
+## Recurring invocation gaps (check all of these on every new pipeline)
+
+Found the hard way onboarding encounters (2026-07-30, six failed smokes). None are visible in unit tests; all are re-encounterable.
+
+1. **Emit `--labels` on EVERY runner, not just Dataflow.** Several GFW pipelines do `list_to_dict(cloud_opts.labels)` with no `None` guard, and the transform is often constructed regardless of runner (pipe-anchorages and encounters both).
+2. **`--project` is needed on DirectRunner too** — pipelines commonly build their own `bigquery.Client(project=cloud_opts.project)`.
+3. **`--temp_location` is needed on DirectRunner too** — `ReadFromBigQuery`'s EXPORT method stages via GCS on any runner. NOT the same knob as `--temp_dataset` (the BQ dataset for the temp table), which is what the Cloud Build SA cannot create and is the usual *cloud* blocker.
+4. **`container_env={"GOOGLE_CLOUD_PROJECT": …}`** — Beam's `WriteToBigQuery` builds its own BQ client inside the SDK worker, which reads the env var and never sees `--project`. Hit by pipe-segment (2026-06-03) and encounters; a third consumer should make it a `dit.runners.docker` default.
+5. **Destination tables may need pre-creating, WITH the sink's partitioning.** If a pipeline stamps table metadata (`get_table()`) before its `CREATE_IF_NEEDED` sink runs, a fresh table 404s. dit mints fresh tables per run while prod reuses long-lived ones, so **dit is often the first thing to exercise a bootstrap path**. Take schema/partitioning/clustering from the **sink's `additional_bq_parameters`**, not from the DAG's convenience `ensure_table` task — the latter can be an unpartitioned no-op that would itself fail. Read schemas out of the image rather than hardcoding a copy that can drift.
+6. **Validate flags against the PUBLISHED IMAGE, not the repo source.** Encounters' published `v4.4.0` was Python 3.12 with a renamed package; local master was `4.3.2` on Python 3.8. `docker run --entrypoint <cli> <image> <subcommand> --help` turns assumptions into facts.
+
 ## Process: adding a new pipeline to `dit`'s scope
 
 1. **Audit** the pipeline against this contract; fill in a new column in the adoption matrix above.

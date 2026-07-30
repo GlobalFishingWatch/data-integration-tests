@@ -28,15 +28,28 @@ Structurally identical to port-visits: **step 1 is per-slice, step 2 is a full
 recompute** from the pipeline's ``--start`` to the slice end, matching what the
 composer DAG does (``merge_encounters --start_date=data_available_from_date``).
 
-WHICH COMPARISON CARRIES THE SIGNAL
------------------------------------
-``merge_encounters`` rebuilds its whole range every call and writes
-``WRITE_TRUNCATE``, so the modes agree on the **merged sink** almost trivially
--- it is the WEAK signal. The discriminating comparison is the **raw table**,
-which ``create_raw_encounters`` builds incrementally (bounded pre-write DELETE
-+ append per slice). Both are compared; read a green merged-sink result as
-"merge is idempotent", NOT as "the modes agree". This is the inverse of
-pipe-gaps, where the SCD-2 tail is what diverges.
+WHAT EACH COMPARISON DETECTS
+---------------------------
+Both output tables are compared, and they are sensitive to **different** bug
+classes -- neither is redundant:
+
+* **raw_encounters** -- built incrementally (bounded pre-write DELETE + append
+  per slice), so it is the one that can catch *incrementality* bugs: a
+  re-run-over-processed-days path that duplicates, drops, or fails to replace
+  rows. The modes genuinely diverge here if that logic is wrong.
+* **encounters (merged)** -- ``merge_encounters`` rebuilds its whole range and
+  writes ``WRITE_TRUNCATE`` every call, so incrementality bugs are invisible
+  here by construction. That makes it a *weak* detector of those -- but a
+  **strong** detector of NON-DETERMINISM: if the same inputs recomputed from
+  scratch produce different output across modes, the pipeline is
+  non-deterministic. There is a live candidate for exactly that (see the
+  ``vessel_N_seg_ids[0]`` hypothesis below), and non-determinism can also be
+  introduced by a future change, so this comparison stays.
+
+So: a diff in raw points at re-run logic; a diff in merged points at
+non-determinism. Read a green *merged* result as "recompute is reproducible",
+not as "the modes agree" -- the raw table is what proves the latter. (Contrast
+pipe-gaps, where the SCD-2 tail is what diverges.)
 
 INTERPRETING DIFFS -- ``encounter_id`` IS A CONTENT HASH
 --------------------------------------------------------
@@ -77,8 +90,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import itertools
+import json
 import logging
 import os
+import subprocess
 import sys
 import uuid
 from datetime import date, datetime, timedelta
@@ -183,6 +198,22 @@ CLI_ENTRYPOINT = "pipe-encounters"
 # (dit.runners.docker._apply_cloud_mode).
 GCP_VOLUME = "gcp:/root/.config"
 
+# Beam's WriteToBigQuery builds its OWN google-cloud-bigquery client inside the
+# SDK worker, and that client resolves its project from the GOOGLE_CLOUD_PROJECT
+# env var / ADC metadata -- NOT from the `--project` pipeline option, which Beam
+# consumes earlier and does not forward. Without this the write fails with
+# `OSError: Project was not passed and could not be determined from the
+# environment` at BigQueryBatchFileLoads/TriggerLoadJobs.
+#
+# Exactly the failure pipe-segment hit on 2026-06-03, which is why
+# dit.runners.docker.run has `container_env` at all (see CLAUDE.md Plan
+# changelog). Second consumer of that parameter -- a third would justify making
+# it a runner default rather than per-workflow opt-in.
+#
+# NOTE it only bites once the write path has ROWS to load: a run that produces
+# zero encounters never triggers a load job and appears to pass.
+CONTAINER_ENV = {"GOOGLE_CLOUD_PROJECT": PROJECT}
+
 # Comparison contract: truncate shape, no SCD-2. encounter_id is a verified
 # unique content hash on BOTH tables (see module docstring).
 COMPARE_KEYS = ("encounter_id",)
@@ -228,6 +259,100 @@ def _bad_segs_sql(args: argparse.Namespace) -> str:
 
 
 # --------------------------------------------------------------------------
+# Destination-table bootstrap
+# --------------------------------------------------------------------------
+# BOTH steps call `writer.update_table_metadata()`, which does a
+# `bqclient.get_table(...)` to stamp description + labels -- BEFORE Beam's
+# CREATE_IF_NEEDED sink has made anything. On a table that does not exist yet
+# that is a hard 404. Production never notices: its `raw_encounters` /
+# `encounters` tables are long-lived, and the DAG additionally carries an
+# explicit `ensure_daily_encounters_table_exists` task. dit mints a FRESH
+# table per (suffix, mode) on every run, so without this bootstrap every run
+# fails on the first step. Found by the third laptop smoke; the audit had
+# wrongly assumed CREATE_IF_NEEDED was sufficient.
+#
+# The schemas are read OUT OF THE IMAGE rather than copied into dit, so they
+# cannot drift from the pipeline that writes them. (A hardcoded copy would be
+# a silent-divergence hazard exactly like the compare-key class of bug.)
+
+_SCHEMA_SNIPPET = (
+    "import json;"
+    "from apache_beam.io.gcp.bigquery_tools import get_dict_table_schema as g;"
+    # v4.4.0 renamed the package `pipeline` -> `pipe_encounters`; support both
+    # so --build-from-source against an older checkout still works.
+    "\ntry:\n    from pipe_encounters.schemas import output\n"
+    "except ImportError:\n    from pipeline.schemas import output\n"
+    "print('DIT_SCHEMAS=' + json.dumps({"
+    "'raw': g(output.build_raw_encounter())['fields'],"
+    "'merged': g(output.build())['fields']}))"
+)
+
+
+def _fetch_schemas(image_tag: str) -> dict[str, list[dict]]:
+    """Read the raw + merged output schemas out of the pipeline image."""
+    proc = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "python", image_tag,
+         "-c", _SCHEMA_SNIPPET],
+        capture_output=True, text=True,
+    )
+    for line in proc.stdout.splitlines():
+        if line.startswith("DIT_SCHEMAS="):
+            return json.loads(line[len("DIT_SCHEMAS="):])
+    raise SystemExit(
+        f"could not read output schemas from {image_tag} (rc={proc.returncode}).\n"
+        f"stdout: {proc.stdout[-500:]}\nstderr: {proc.stderr[-500:]}"
+    )
+
+
+def _ensure_table(fqn: str, fields: list[dict]) -> None:
+    """Create ``fqn`` with ``fields`` if absent. Idempotent (``exists_ok``).
+
+    Partitioning MUST match what the pipeline's sink declares in
+    ``additional_bq_parameters`` (transforms/writers.py): MONTH on
+    ``start_time``, clustered on ``start_time``. BigQuery rejects a load whose
+    partitioning spec differs from the destination's with
+    "Incompatible table partitioning specification", so creating a plain
+    unpartitioned table here fails every write.
+
+    Note the DAG's own ``ensure_daily_encounters_table_exists`` task creates
+    the table WITHOUT partitioning -- copying it is not sufficient. Prod does
+    not notice because its tables were created partitioned long ago and that
+    task is then a no-op. Found by the sixth laptop smoke.
+    """
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=PROJECT)
+    schema = [
+        bigquery.SchemaField(
+            f["name"], f["type"], mode=f.get("mode", "NULLABLE"),
+            description=f.get("description"),
+        )
+        for f in fields
+    ]
+    table = bigquery.Table(fqn, schema=schema)
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.MONTH,
+        field="start_time",
+        require_partition_filter=False,
+    )
+    table.clustering_fields = ["start_time"]
+    client.create_table(table, exists_ok=True)
+    logger.info(
+        "ensured output table %s (%d fields, MONTH-partitioned on start_time)",
+        fqn, len(schema),
+    )
+
+
+def _ensure_output_tables(args: argparse.Namespace, suffix: str) -> None:
+    """Pre-create every selected mode's raw + merged table. See the comment
+    block above for why this is required rather than merely tidy."""
+    schemas = _fetch_schemas(args.image_tag)
+    for mode in args.modes:
+        _ensure_table(_raw_table(args, suffix, mode), schemas["raw"])
+        _ensure_table(_encounters_table(args, suffix, mode), schemas["merged"])
+
+
+# --------------------------------------------------------------------------
 # Beam pipeline options
 # --------------------------------------------------------------------------
 
@@ -249,8 +374,46 @@ def _pipeline_options(
     args: argparse.Namespace, *, step: str, mode: str,
     iteration: int, total_iterations: int,
 ) -> list[str]:
+    # Labels are a PIPELINE requirement, not a Dataflow one: readers.py and
+    # writers.py both do `list_to_dict(cloud_opts.labels)` -- a comprehension
+    # over `labels` with no None guard -- and ReadSources is constructed on
+    # EVERY runner. Omitting them raises
+    # `TypeError: 'NoneType' object is not iterable` before the pipeline even
+    # starts. Confirmed the hard way by the first laptop smoke, which failed
+    # exactly here on DirectRunner. Contract item #6 (docs/pipeline-contract.md);
+    # a 1-line upstream guard would remove the need.
+    labels = [
+        "--labels=environment=integration_test",
+        "--labels=resource_creator=dit",
+        "--labels=project=core_pipeline",
+        "--labels=workflow=encounters_ais",
+        "--labels=stage=testing",
+        f"--labels=dit_run_id={args.run_id}",
+        f"--labels=dit_mode={mode}",
+    ]
     if args.runner != "dataflow":
-        return ["--runner=DirectRunner", "--wait_for_job"]
+        # Two options are required even on DirectRunner, because they are
+        # demanded by the PIPELINE's BQ access rather than by Dataflow:
+        #   --project      : the pipeline builds its own client as
+        #                    `bigquery.Client(project=cloud_opts.project)`
+        #                    (transforms/writers.py); omitting it yields
+        #                    project=None and leaves the destination to ADC's
+        #                    default -- which may not be ours.
+        #   --temp_location: ReadFromBigQuery uses the EXPORT read method,
+        #                    which stages the table to GCS first and raises
+        #                    "requires a GCS location" without it on ANY runner.
+        # Both were found by the first laptop smokes, in that order.
+        # NOTE --temp_location (a GCS path, settable) is NOT the same thing as
+        # --temp_dataset (the BQ dataset the EXPORT temp table lands in), which
+        # encounters does not expose at all -- that is the cloud blocker, see
+        # the module docstring.
+        return [
+            f"--project={PROJECT}",
+            f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
+            "--runner=DirectRunner",
+            "--wait_for_job",
+            *labels,
+        ]
     return [
         "--runner=DataflowRunner",
         f"--project={PROJECT}",
@@ -262,18 +425,7 @@ def _pipeline_options(
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
         "--wait_for_job",
-        # encounters_pipeline requires --labels to be non-None: writers.py /
-        # readers.py both do `list_to_dict(cloud_opts.labels)`, a comprehension
-        # over `labels` with no None guard, so omitting these raises TypeError.
-        # Same workaround pipe-anchorages needs (contract item #6 -- see
-        # docs/pipeline-contract.md). A 1-line upstream guard would remove it.
-        "--labels=environment=integration_test",
-        "--labels=resource_creator=dit",
-        "--labels=project=core_pipeline",
-        "--labels=workflow=encounters_ais",
-        "--labels=stage=testing",
-        f"--labels=dit_run_id={args.run_id}",
-        f"--labels=dit_mode={mode}",
+        *labels,
     ]
 
 
@@ -317,6 +469,7 @@ def _run_slice(
         entrypoint=CLI_ENTRYPOINT,
         volumes=[GCP_VOLUME],
         service="pipe_encounters",
+        container_env=CONTAINER_ENV,
         build_from_source=args.build_from_source,
     )
     if rc != 0:
@@ -349,6 +502,7 @@ def _run_slice(
         entrypoint=CLI_ENTRYPOINT,
         volumes=[GCP_VOLUME],
         service="pipe_encounters",
+        container_env=CONTAINER_ENV,
         build_from_source=args.build_from_source,
     )
     if rc != 0:
@@ -411,10 +565,11 @@ def compare_all(
 ) -> int:
     """Pairwise-compare the selected modes, on BOTH output tables.
 
-    The RAW table is the discriminating comparison; the merged sink is the weak
-    one (``merge_encounters`` rebuilds its full range with WRITE_TRUNCATE every
-    call, so modes agree there almost trivially). Both are reported so a green
-    merged result is not mistaken for mode agreement -- see module docstring.
+    The two are sensitive to different bug classes and neither is redundant:
+    **raw** catches incrementality bugs (it is built slice-by-slice), **merged**
+    catches non-determinism (it is recomputed from scratch every call, so
+    incrementality bugs cannot show there but irreproducible output can). See
+    the module docstring.
     """
     pairs = list(itertools.combinations(modes, 2))
     if not pairs:
@@ -428,8 +583,8 @@ def compare_all(
 
     overall = 0
     for label, fqns, note in (
-        ("raw_encounters", raw_fqns, "DISCRIMINATING"),
-        ("encounters (merged)", merged_fqns, "weak -- merge truncates+rebuilds"),
+        ("raw_encounters", raw_fqns, "detects incrementality bugs"),
+        ("encounters (merged)", merged_fqns, "detects non-determinism"),
     ):
         for a, b in pairs:
             rc = dit_compare.compare_tables(
@@ -563,6 +718,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     merged_fqns = {m: _encounters_table(args, suffix, m) for m in SELECTABLE_MODES}
 
     if not args.skip_pipelines:
+        # Must happen BEFORE any step runs -- see the bootstrap comment block.
+        _ensure_output_tables(args, suffix)
         _execs_by_mode = {
             MODE_BF: execute_bf,
             MODE_BFD: execute_bfd,

@@ -2,7 +2,7 @@
 
 Step 1 of [`pipeline-contract.md`](pipeline-contract.md) § "Process: adding a new pipeline to dit's scope", for **encounters**. Records the prod orchestration + parameters (read out of `composer-dags-production`), the contract audit (matrix column added in the same commit), staging-cohort readiness, and the proposed workflow shape.
 
-**Status (2026-07-30)**: audit complete; **`workflows/encounters/ais.py` written** (27 unit tests) — laptop smoke and cloud run both outstanding. Two upstream gaps block the cloud path (§ Blockers).
+**Status (2026-07-30)**: audit complete; **`workflows/encounters/ais.py` written** (30 unit tests) and **runs end-to-end on a laptop** (`--runner docker`, published v4.4.0 image) after six defects found by seven smokes (§ First-smoke findings). **Partially validated**: the RAW comparison is genuine (4 rows vs 4 rows, identical); the MERGED comparison is still 0-vs-0 because this cohort's only vessel pair involves a bad segment (§ Cohort sparsity). Cloud run remains blocked upstream (§ Blockers).
 
 ## Scope: generation only, not publication
 
@@ -131,6 +131,47 @@ Modelled on `port_visits/ais.py` (two-step Beam-in-container generation, per-mod
 - **Sources**: per-table FQN flags (the M4 convention), staging defaults, `--pipe-static` for spatial measures, `--ssvid-filter` passthrough for cheap runs.
 - **Cache**: cacheable in principle (Dataflow worker-image digest exists), but follow pipe-events' precedent and defer until the workflow runs green.
 - **Dates**: `--start` / `--end` **inclusive**, matching the pipeline. Default window inside the cohort's 2020 data, mirroring `port_visits/ais.py` (`2020-01-01` → `2020-12-31`) per the staging-cohort working agreement.
+
+## First-smoke findings (2026-07-30) — what actually broke
+
+Seven laptop smokes (`--runner docker`, published v4.4.0 image) produced **six distinct defects that the 30 unit tests could not have caught**. Recorded because most are re-encounterable on the next pipeline.
+
+| # | Failure | Whose | Fix |
+|---|---|---|---|
+| 1 | `TypeError: 'NoneType' object is not iterable` (labels) | dit | `--labels` were emitted only on the Dataflow path, but `readers.py`/`writers.py` do `list_to_dict(cloud_opts.labels)` with no `None` guard and `ReadSources` is built on EVERY runner. Now on both paths; test parametrised over both runners. |
+| 2 | `ReadFromBigQuery requires a GCS location` | dit | `--temp_location` missing on DirectRunner — EXPORT reads stage via GCS on any runner. Added, along with `--project` (the pipeline builds its own `bigquery.Client(project=cloud_opts.project)`). |
+| 3 | `404 ... tables/raw_encounters_*` | dit (audit was wrong) | Both steps call `update_table_metadata()` → `get_table()` **before** the `CREATE_IF_NEEDED` sink creates anything. The audit had claimed dit did not need the DAG's `ensure_table_exists` task — it does. Prod never notices: its tables are long-lived. |
+| 4 | **Clean exit, zero rows** | neither | 2020-01-01 has no encounters in this cohort. The run "passed" while never exercising the write path. See § Cohort sparsity. |
+| 5 | `OSError: Project was not passed...` at `TriggerLoadJobs` | dit | Beam's `WriteToBigQuery` builds its own BQ client *inside the SDK worker*, which reads `GOOGLE_CLOUD_PROJECT` and never sees `--project`. Fixed with `container_env` — **verbatim the pipe-segment failure of 2026-06-03** that the parameter was added for. Encounters is its 2nd consumer; a 3rd should make it a runner default. Only reachable once there are rows to load, which is why #4 masked it. |
+| 6 | `Incompatible table partitioning specification` | dit | The bootstrap mirrored the DAG's `ensure` task, which creates **unpartitioned** tables, but the sink declares `timePartitioning: MONTH on start_time` + `clustering`. **Mirroring the DAG is not sufficient** — the DAG task would fail too if it ever really created the table; it is a permanent no-op in prod. Spec now taken from the sink's own `additional_bq_parameters`. |
+
+Plus one **upstream latent bug found in passing**: `writers.py` `delete_rows` calls `bqclient.query(DELETE_QUERY...)` with **no `.result()`** — fire-and-forget, so a failed pre-write DELETE is silently swallowed **in production too**. That is why #3 surfaced one call later than its actual cause.
+
+Two environment notes:
+
+- **gcloud impersonation blocks docker pulls.** With `impersonate_service_account` set in `gcloud config`, docker's credential helper authenticates as that SA, which lacked `artifactregistry.repositories.downloadArtifacts` on wf827's `gcr.io` — blocking `--build-from-source` (whose base image lives there). `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=` overrides per-command. The *published* image (different registry) was never blocked; an early 60s timeout on a 1.83 GB pull merely looked like a denial.
+- **Published v4.4.0 ≠ local master 4.3.2**: Python 3.12 + `pipe_encounters` package vs Python 3.8 + `pipeline/`. So `--build-from-source` tests a different, older codebase. All flags were therefore re-verified against the **image**, not the source — and `--temp_dataset` is confirmed absent there too, so the cloud blocker is real for the version prod runs.
+
+## Smoke result (2026-07-30, attempt 7)
+
+`--runner docker --modes 1_bf,2_bfd --start 2020-01-19 --end 2020-01-22 --tail-days 1` completed: 3 slices x 2 steps across 2 modes, then both comparisons.
+
+| Table | 1_bf | 2_bfd | Comparison |
+|---|---|---|---|
+| `raw_encounters_*` | 4 rows | 4 rows | `rc=0` — **genuine pass** |
+| `encounters_*` (merged) | 0 rows | 0 rows | `rc=0` — **trivial**, not evidence |
+
+So the **incrementality** comparison is validated on real data; the **non-determinism** comparison is not yet exercised.
+
+**Why merged is empty — and it is CORRECT behaviour, not a bug.** The window's raw encounters are all one vessel pair (`663092000` ↔ `100900000`, recorded in both orderings, hence 4 rows for 2 encounters), lasting 900–1310 minutes — far above the 120-minute threshold. Both seg_ids ARE present in `segment_info`, so the vessel-id join is not the cause. But **one of the two segments is flagged `overlapping_and_short`** in `segs_activity`, so the `--bad_segs_table` filter drops it — and an encounter needs both vessels. `create` does not apply that filter, `merge` does; hence 4 raw, 0 merged.
+
+To validate the merged comparison, a window is needed whose encounters involve **two good segments**. That is a cohort-selection problem, not a workflow problem.
+
+## Cohort sparsity — a constraint on encounters testing
+
+`pipe_ais_test_202408290000` carries only **67–72 distinct vessels/day** (~47k msgs/day). Encounters need two vessels within 0.5 km for 120+ minutes, so they are rare here: a coarse proximity probe over January 2020 found **2–3 co-located pairs/day**, and **2020-01-01 none at all**. Densest window found: **2020-01-19..22**.
+
+**This puts the default `--start 2020-01-01 / --end 2020-12-31` in question** — not because the window misses the data year, but because a mode-equivalence comparison over two empty tables passes trivially. Encounters may need a denser cohort than the shared AIS staging one; this is concrete input to the `dit.cohorts` proposal in [`workflow-orchestration-2026-06.md`](workflow-orchestration-2026-06.md).
 
 ## Suggested order
 

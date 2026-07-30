@@ -187,14 +187,24 @@ def test_runner_config_passes_gcp_volume_and_entrypoint() -> None:
     for kw in seen:
         assert kw["volumes"] == [mod.GCP_VOLUME]
         assert kw["entrypoint"] == mod.CLI_ENTRYPOINT
+        # GOOGLE_CLOUD_PROJECT must reach INSIDE the container: Beam's
+        # WriteToBigQuery builds its own BQ client in the SDK worker, which
+        # ignores --project and reads the env. Without it the write dies at
+        # TriggerLoadJobs -- but ONLY once there are rows to load, so a
+        # zero-row run hides the bug. Found by the fifth laptop smoke.
+        assert kw["container_env"] == {"GOOGLE_CLOUD_PROJECT": mod.PROJECT}
 
 
-def test_labels_always_emitted_on_dataflow() -> None:
-    """encounters' writers.py/readers.py do list_to_dict(cloud_opts.labels)
-    with no None guard, so omitting --labels raises TypeError in-container.
-    Contract item #6 workaround -- must never regress."""
+@pytest.mark.parametrize("runner", ["dataflow", "docker"])
+def test_labels_emitted_on_every_runner(runner: str) -> None:
+    """encounters' readers.py/writers.py do list_to_dict(cloud_opts.labels)
+    with no None guard, and ReadSources is built on EVERY runner -- so omitting
+    --labels raises TypeError before the pipeline starts. The first laptop
+    smoke failed exactly this way on DirectRunner, because labels were
+    initially emitted only on the Dataflow path. Parametrised so that
+    regression can't come back on either runner. Contract item #6."""
     calls = _capture_slice(
-        _args(runner="dataflow"), mode=mod.MODE_BF,
+        _args(runner=runner), mode=mod.MODE_BF,
         slice_start=date(2020, 1, 1), slice_end=date(2020, 1, 2),
         suffix="sfx", iteration=1, total_iterations=1,
     )
@@ -203,7 +213,7 @@ def test_labels_always_emitted_on_dataflow() -> None:
         assert "--labels=resource_creator=dit" in argv
 
 
-def test_directrunner_mode_skips_dataflow_options() -> None:
+def test_directrunner_mode_skips_dataflow_placement_options() -> None:
     calls = _capture_slice(
         _args(runner="docker"), mode=mod.MODE_BF,
         slice_start=date(2020, 1, 1), slice_end=date(2020, 1, 2),
@@ -211,7 +221,27 @@ def test_directrunner_mode_skips_dataflow_options() -> None:
     )
     for argv in calls:
         assert "--runner=DirectRunner" in argv
+        # Placement knobs are Dataflow-only ...
         assert not any(a.startswith("--sdk_container_image") for a in argv)
+        assert not any(a.startswith("--subnetwork") for a in argv)
+
+
+@pytest.mark.parametrize("runner", ["dataflow", "docker"])
+def test_project_and_temp_location_present_on_every_runner(runner: str) -> None:
+    """... but --project and --temp_location are NOT Dataflow-only: the
+    pipeline builds its own BQ client from cloud_opts.project, and
+    ReadFromBigQuery's EXPORT read stages through GCS and raises
+    "requires a GCS location" without --temp_location on ANY runner. Both were
+    found by the first laptop smokes. --temp_location (settable) is distinct
+    from --temp_dataset (not exposed by encounters -- the cloud blocker)."""
+    calls = _capture_slice(
+        _args(runner=runner), mode=mod.MODE_BF,
+        slice_start=date(2020, 1, 1), slice_end=date(2020, 1, 2),
+        suffix="sfx", iteration=1, total_iterations=1,
+    )
+    for argv in calls:
+        assert f"--project={mod.PROJECT}" in argv
+        assert any(a.startswith("--temp_location=gs://") for a in argv), argv
 
 
 def test_nonzero_rc_aborts_the_slice() -> None:
