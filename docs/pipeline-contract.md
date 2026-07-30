@@ -113,22 +113,22 @@ A flag that prints the generated queries or pipeline graph without executing. Us
 
 ## Adoption matrix
 
-Snapshot as of 2026-05-29 (pipe-events column re-verified during the Phase 3 port; see below). **U** = universal, **B** = Beam-only, **C** = Beam-in-container, **S** = BQ-SQL-only, **R** = strongly recommended.
+Snapshot as of 2026-07-30 (encounters column added from the onboarding audit — see [`encounters-onboarding-2026-07.md`](encounters-onboarding-2026-07.md); pipe-events column re-verified during the Phase 3 port; see below). **pipe-segment is still missing a column** — `workflows/pipe_segment/identity_match_key.py` shipped 2026-06-08 without one; audit outstanding. **U** = universal, **B** = Beam-only, **C** = Beam-in-container, **S** = BQ-SQL-only, **R** = strongly recommended.
 
-| # | Requirement | pipe-gaps | pipe-anchorages | pipe-events |
-|---|---|---|---|---|
-| 1 | Date range (U) | ✓ (half-open) | ✓ (inclusive) | ✓ (half-open) |
-| 2 | Overridable tables (U) | ✓ | ✓ | ✓ |
-| 3 | Synchronous exit (U) | ✓ | ✓ (`--wait_for_job`) | ✓ |
-| 4 | Idempotent re-runs (U) | ✓ (SCD-2) | ✓ (partitioned) | ✓ (truncate/merge) |
-| 5 | Temp-dataset override (B) | ✓ (factory hook) | ✓ (CLI flag, local patch — PR pending) | — |
-| 6 | None-safe labels (B) | ✓ | ✗ (workflow always passes `--labels`) | — |
-| 7 | Beam options pass-through (B) | ✓ | ✓ | — |
-| 8 | SDK image w/ package (C) | — (in-process) | ✓ (`gfw/pipe-anchorages:<tag>`) | — |
-| 9 | Session-isolated parallel (S) | — | — | ✓ |
-| 10 | Intermediate tables overridable (S) | — | — | ✓ |
-| 11 | Vessel-cohort filter (R) | partial (`--restricted-ssvids`, EXCLUDE) | ✓ (`--ssvid_filter`, INCLUDE) | ✗ |
-| 12 | `--test` mode (nice) | — | — | ✓ |
+| # | Requirement | pipe-gaps | pipe-anchorages | pipe-events | encounters |
+|---|---|---|---|---|---|
+| 1 | Date range (U) | ✓ (half-open) | ✓ (inclusive) | ✓ (half-open) | ✓ (**inclusive**, documented in `--end_date` help on both steps) |
+| 2 | Overridable tables (U) | ✓ | ✓ | ✓ | ✓ (every table a flag; `--source_table` / `--vessel_id_table` are appendable with `{ID}::` prefixes for multi-source) |
+| 3 | Synchronous exit (U) | ✓ | ✓ (`--wait_for_job`) | ✓ | ✓ (`--wait_for_job`, both steps) |
+| 4 | Idempotent re-runs (U) | ✓ (SCD-2) | ✓ (partitioned) | ✓ (truncate/merge) | ✓ (create: bounded pre-write `DELETE … BETWEEN start AND end` + append; merge: `WRITE_TRUNCATE`) |
+| 5 | Temp-dataset override (B) | ✓ (factory hook) | ✓ (CLI flag, local patch — PR pending) | — | ✗ **no `--temp_dataset`** — same gap pipe-anchorages had; blocks the cloud path |
+| 6 | None-safe labels (B) | ✓ | ✗ (workflow always passes `--labels`) | — | ✗ `list_to_dict(cloud_opts.labels)` raises on `None` (workflow must always pass `--labels`) |
+| 7 | Beam options pass-through (B) | ✓ | ✓ | — | ✓ (`PipelineOptions` subclass) |
+| 8 | SDK image w/ package (C) | — (in-process) | ✓ (`gfw/pipe-anchorages:<tag>`) | — | ✓ (DAG sets `sdk_container_image` = the scheduler image, which `pip install`s the package; `setup_file=None`) |
+| 9 | Session-isolated parallel (S) | — | — | ✓ | — |
+| 10 | Intermediate tables overridable (S) | — | — | ✓ | — |
+| 11 | Vessel-cohort filter (R) | partial (`--restricted-ssvids`, EXCLUDE) | ✓ (`--ssvid_filter`, INCLUDE) | ✗ | ✓✓ `--ssvid_filter` on **both** steps (subquery, list, or `@path`) — the most capable of any onboarded pipeline |
+| 12 | `--test` mode (nice) | — | — | ✓ | ✗ |
 
 Legend: ✓ = satisfies, ✗ = missing, partial = present with caveats, — = N/A for this pipeline's architecture.
 

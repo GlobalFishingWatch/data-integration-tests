@@ -70,6 +70,32 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-07-30 — Encounters onboarding audit (step 1 of the pipeline-contract process); events generation-vs-product scoping recorded
+
+First artifact of the new-pipeline arc the dit owner prioritised. Audits `encounters_pipeline` against [`docs/pipeline-contract.md`](docs/pipeline-contract.md) and records the prod orchestration + parameters read out of `composer-dags-production`. Full write-up in [`docs/encounters-onboarding-2026-07.md`](docs/encounters-onboarding-2026-07.md).
+
+**Scoping correction from the owner, worth recording as a general rule.** My first read framed "encounters is two pipelines" as an encounters-specific discovery. It isn't: **every GFW event type is produced in two halves** — a *generation* step in a pipeline-specific repo, then a *product* step (`product_events_*`) in pipe-events. port-visits generates in `anchorages_pipeline`; encounters in `encounters_pipeline`; fishing generates in pipe-events, which is the *only* reason `workflows/pipe_events/fishing.py` drives a 4-step chain spanning both halves. **dit covers the generation half.** So `port_visits/ais.py` — not `fishing.py` — is the template for encounters, and the absent `product_events_port_visit` in the staging cohort is a publication-half input that is NOT on this critical path.
+
+**"Core AIS v3/v4" resolves to two different version axes** (the source of the ambiguity): the **DAG** is `dags/core/ais/v3.py` (no `core/ais/v4.py` exists; `v5.py` has no encounters yet), while the **image** is `Versions.DETECT_ENCOUNTERS = "v4.4.0"` — the `encounters_pipeline` image, which is v4.x. Local master is 4.3.2, slightly behind prod.
+
+**Four audit findings that shape the workflow.**
+
+1. **Contract is unusually strong — one item better than any onboarded pipeline.** `--ssvid_filter` (subquery / list / `@path`) exists on **both** steps: a real INCLUDE-semantics cohort filter, which pipe-events lacks entirely and pipe-gaps only has partially (EXCLUDE). Cheap dit runs are easy here.
+2. **`--end_date` is INCLUSIVE and documented as such** in the help on both steps — no repeat of the pipe-gaps exclusive-end trap. Still to be re-verified against the SQL before the first live run, per the PR #69 lesson (*verify date contracts against the pipeline's SQL, not its flag names*).
+3. **No reprocess-to-end contract.** The raw-table pre-write delete is `DELETE … WHERE DATE(start_time) BETWEEN start AND end` — **bounded on both sides**, unlike pipe-gaps' right-unbounded delete. Re-running `create` over a window is idempotent and does not take ownership of the tail.
+4. **The discriminating comparison is the RAW table, not the merged sink.** `merge` always rebuilds the full range with `WRITE_TRUNCATE`, so the modes agree *trivially* on the merged sink unless `create`'s raw output diverges. The inverse of pipe-gaps, where the SCD-2 tail is what diverges. Recorded so a green merged-sink result isn't mistaken for a strong one.
+
+**Two blockers, both shapes pipe-anchorages already hit.** (a) **No `--temp_dataset`** — Beam EXPORT staging tries to create a temp dataset and the Cloud Build SA deliberately can't, so this **gates the cloud path** (laptop unaffected). (b) **Labels not None-safe** (`list_to_dict(cloud_opts.labels)` raises on `None`) — mitigated workflow-side by always emitting `--labels`, exactly as `port_visits/ais.py` does. Per the working agreement, (b) is a workflow-side workaround for a missing contract item and will get its own Plan-changelog note when the workflow lands; (a) cannot be worked around workflow-side.
+
+**One trap documented rather than followed.** `encounters_pipeline/scripts/generate_incremental_encounters.sh` looks like a ready-made workflow model but is **not the prod path**: despite its location it drives pipe-events (`--entrypoint pipe`) and calls a `product_encounters` operation that does **not exist** in the pipe-events CLI. With `resource_creator: "chris"` and prefix `incremental_encounters_fix_daily_load_two` it reads as in-progress experimentation. The DAG is the source of truth.
+
+**Sections moved (this commit).**
+- New `docs/encounters-onboarding-2026-07.md`: scope, version axes, per-step prod parameters, date/idempotency semantics, comparison contract (`encounter_id`, truncate shape), container/runner shape, staging readiness, blockers, proposed `workflows/encounters/ais.py`, suggested order.
+- `docs/pipeline-contract.md`: **encounters column added** to the adoption matrix (all 12 requirements); snapshot date refreshed to 2026-07-30; header now flags that **pipe-segment still has no column** despite `identity_match_key.py` shipping 2026-06-08 (audit outstanding — deliberately not fabricated).
+- This Plan changelog entry.
+
+No code and no CHANGELOG entry (dev-internal audit, matching the reconciliation/orchestration-docs precedent).
+
 ### 2026-06-11 — `--modes` on the three mode-family workflows (orchestration-evaluation axis 2; PR-triggers T2)
 
 Second item of the PR-triggers prerequisite track ([`docs/pr-triggers-2026-06.md`](docs/pr-triggers-2026-06.md) T2) and the highest-actionability recommendation from the 2026-06-10 orchestration evaluation. `mode_equivalence` / `port_visits/ais` / `pipe_events/fishing` hardcoded "run every mode", so there was no cheap bf-only smoke against a new cohort / pin / worker image — the first run on any new params always paid for all three. All three now take `--modes`, defaulting to the full set (existing invocations byte-unchanged).
