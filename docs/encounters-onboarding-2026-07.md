@@ -167,6 +167,30 @@ So the **incrementality** comparison is validated on real data; the **non-determ
 
 To validate the merged comparison, a window is needed whose encounters involve **two good segments**. That is a cohort-selection problem, not a workflow problem.
 
+## Dataflow run (2026-07-30) — the blocker is BROADER than first documented
+
+A laptop-submitted **Dataflow** run (`--runner dataflow --modes 1_bf`, 2020-01-19..22, job `2026-07-30_06_57_39-11212595608470669383`) failed — and pins down exactly who is blocked:
+
+```
+POST .../projects/world-fishing-827/datasets                       -> 403 Forbidden
+GET  .../datasets/beam_temp_dataset_0edb68e51a694395ae0cc867b9a32506 -> 404 Not Found
+JOB_STATE_FAILED
+```
+
+The 403 is raised **from inside the Dataflow job**, i.e. by the WORKERS running as `automated-testing@` — not by the submitter. **Correction to the original audit**, which implied this was specific to the Cloud Build path: it applies to **any run whose Dataflow workers are `automated-testing@`**, including a laptop-submitted one. The DirectRunner laptop path works only because the temp dataset is then created under the *user's* ADC, which can create datasets.
+
+**What this run DID validate** (none of it reachable from DirectRunner):
+
+- Dataflow **submission** from the laptop container works.
+- **Dataflow workers can pull the published image** from `gfw-int-infrastructure` as `automated-testing@` — a real unknown beforehand (same-project residency is not sufficient for SA pulls, and prod runs this image under a different SA). The workers got far enough to make BQ API calls, which requires the SDK harness to have started.
+- The `--sdk_container_image` + boot-entrypoint arrangement works with one image serving as both submitter and worker.
+- Placement options (region, subnetwork, temp/staging buckets) are accepted, and `--wait_for_job` propagates failure correctly.
+
+So the **only** thing standing between dit and a working cloud encounters run is the temp dataset. Two possible fixes:
+
+1. **Upstream (preferred, matches pipe-anchorages)** — expose `--temp_dataset` so dit can point it at `tech_great_expectations`, where the SA already has `bigquery.tables.create`.
+2. **IAM** — grant `automated-testing@` `bigquery.datasets.create` on `world-fishing-827`. Deliberately narrow today (see CLAUDE.md § canonical-dataset policy), so this would be a policy change, not just a grant.
+
 ## Cohort sparsity — a constraint on encounters testing
 
 `pipe_ais_test_202408290000` carries only **67–72 distinct vessels/day** (~47k msgs/day). Encounters need two vessels within 0.5 km for 120+ minutes, so they are rare here: a coarse proximity probe over January 2020 found **2–3 co-located pairs/day**, and **2020-01-01 none at all**. Densest window found: **2020-01-19..22**.
