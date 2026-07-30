@@ -211,6 +211,23 @@ Retire the overlay the moment upstream lands and publishes a new tag.
 
 **Scope correction worth keeping.** The original framing here called this a *Cloud-Build* blocker. It is not: the 403 is raised from **inside the Dataflow job**, i.e. by workers running as `automated-testing@`, so it breaks any run with those workers. Laptop DirectRunner escapes it only because the dataset is then created under the user's own ADC.
 
+### Dataflow smoke against the overlay — VERIFIED 2026-07-30
+
+`--runner dataflow --modes 1_bf --start 2020-01-19 --end 2020-01-22`, overlay as both `--image-tag` and `--worker-image`. Both jobs reached `JOB_STATE_DONE` (last: `2026-07-30_08_12_48-14117319945993493700`). **No `POST /datasets` 403** — the blocker is gone, with workers running as `automated-testing@` exactly as before.
+
+Row counts, checked rather than inferred from exit 0:
+
+| table | rows | distinct `encounter_id` | window |
+|---|---|---|---|
+| `raw_encounters_tempds1_1_bf` | **4** | 4 | 2020-01-20 08:50 → 2020-01-21 00:00 |
+| `encounters_tempds1_1_bf` | **0** | 0 | — |
+
+Non-zero raw means Beam's load path genuinely executed — this is *not* the zero-row pass that made an earlier smoke look green while proving nothing.
+
+**Merged = 0 is correct, and verified rather than assumed.** All four raw encounters involve the same segment `100900000-2020-01-01T00:02:47.000000Z-1`, which carries `overlapping_and_short = true`; `_bad_segs_sql` is literally `SELECT DISTINCT seg_id … WHERE overlapping_and_short`, so `merge_encounters` drops all four. Not a regression, and not a bug.
+
+**But it caps what this cohort can validate.** Every encounter in the window comes from a single vessel pair, one of whose segments is flagged bad — so the *merged* comparison (the non-determinism signal the owner wants kept) can only ever be 0-vs-0 here, which is trivially identical. The *raw* comparison is viable: 4 real rows, so a two-mode run gives a genuine incrementality check. Concrete reinforcement of the cohort-sparsity finding above and of the `dit.cohorts` case.
+
 ## Cohort sparsity — a constraint on encounters testing
 
 `pipe_ais_test_202408290000` carries only **67–72 distinct vessels/day** (~47k msgs/day). Encounters need two vessels within 0.5 km for 120+ minutes, so they are rare here: a coarse proximity probe over January 2020 found **2–3 co-located pairs/day**, and **2020-01-01 none at all**. Densest window found: **2020-01-19..22**.
@@ -229,5 +246,5 @@ Retire the overlay the moment upstream lands and publishes a new tag.
    ```
    Two things to confirm on that first run: **(a)** the `--end_date` inclusivity against the emitted SQL (per the PR #69 lesson — don't trust the flag help alone); **(b)** the published-image entrypoint, if not using `--build-from-source`.
 3. File the upstream asks. `--temp_dataset` is ~~pending~~ **written** (`encounters_pipeline@dit-temp-dataset-support`, local/unpushed) — still needs a PR. None-safe labels and the missing `.result()` in `writers.py delete_rows` are still unfiled.
-4. ~~Cloud smoke once the `--temp_dataset` ask lands upstream~~ — **no longer gated on upstream**; run it against the overlay image via `--worker-image gcr.io/world-fishing-827/dit/encounters:v4.4.0-temp-dataset-d2536aaf`. Pick a window with actual encounters (2020-01-19..22) so the run is not a zero-row pass.
+4. ~~Cloud smoke once the `--temp_dataset` ask lands upstream~~ — **done 2026-07-30 against the overlay image**, see below.
 5. `vms.py` sibling; cache integration; then optionally the publication half if dit's scope ever extends there.
