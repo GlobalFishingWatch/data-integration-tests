@@ -98,11 +98,19 @@ When Cloud Build cancels a build mid-flight, the orchestrator process gets SIGTE
 3. **A second SIGTERM escalates** to an immediate `os._exit` rather than stacking a second `cancel_run` — the operator (or the platform) is insisting.
 4. **SIGTERM only, not SIGINT.** Cloud Build cancellation is the target; Ctrl-C keeps its conventional `KeyboardInterrupt` behaviour so an interactive operator can interrupt and inspect, with `make dit-cancel` as the explicit cleanup path.
 
+**Three distinct outcomes, not two** (Copilot review on PR #70). `cancel_run` raises `ValueError` for exactly one condition — no cache rows AND no labelled Dataflow jobs — and `RuntimeError` when job *discovery* itself failed. The handler separates them:
+
+| Outcome | Message | Why it matters |
+|---|---|---|
+| cancelled | `run <id> cancelled.` | the normal case |
+| `ValueError` | `nothing found to cancel …` (+ region fallback) | **expected**, not a failure: the run_id is published before the first job is submitted (digest resolution + source snapshotting sit in between), so a SIGTERM in that window genuinely has nothing to clean up. Reporting it as "cleanup FAILED" would send the operator chasing a non-problem. The one way this branch can hide a real leak is a wrong-region search, so it still names the manual fallback. |
+| any other exception (incl. `RuntimeError`) | `cleanup … FAILED` + manual fallback | discovery failed — jobs may well be running |
+
 **Escape hatch:** `DIT_NO_CANCEL_ON_SIGTERM=1` leaves SIGTERM at its default disposition (for debugging a hang with the jobs left alive). Logs loudly when set — a silently-disabled cleanup is how jobs leak.
 
 **KNOWN LIMITATION — region.** `cancel_run` discovers jobs in `DIT_DATAFLOW_REGION` (default `us-central1`). A run that overrides the region via `--dataflow-region` *alone*, without also exporting `DIT_DATAFLOW_REGION`, will have its jobs looked for in the wrong region and the handler will find nothing. The failure message names the manual fallback (`make dit-cancel RUN_ID=… REGION=…`). Closing this properly means publishing the resolved region alongside the run_id in `dit.runstate`, which needs a workflow-side change to thread it through — deferred as additive follow-up.
 
-**Tests**: 9 in `tests/test_cli_sigterm.py` (runstate roundtrip; the `resolve_run_context` → runstate wiring; no-run_id path; cancel-the-active-run path; failure still exits + names the manual fallback; second-signal escalation; handler registration; opt-out; non-main-thread tolerance). Verified end-to-end out-of-band with a real `kill -TERM` against a live `dit run` — trap installed, blocking `sleep` interrupted, `cancel_run` invoked with the published id, exit 143.
+**Tests**: 11 in `tests/test_cli_sigterm.py` (runstate roundtrip; the `resolve_run_context` → runstate wiring; no-run_id path; cancel-the-active-run path; nothing-to-cancel reported as expected rather than failure; discovery-failure reported as failure; failure still exits + names the manual fallback; second-signal escalation; handler registration; opt-out; non-main-thread tolerance). Verified end-to-end out-of-band with a real `kill -TERM` against a live `dit run` — trap installed, blocking `sleep` interrupted, `cancel_run` invoked with the published id, exit 143.
 
 **Still user-gated (unchanged from M5a):** the live verification that `automated-testing@` can actually execute `dataflow.jobs.cancel` + the BQ table deletes. Both M5a's tests and M6's mock the cloud calls.
 

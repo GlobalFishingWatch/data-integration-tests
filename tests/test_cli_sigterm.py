@@ -89,6 +89,40 @@ def test_sigterm_cancels_the_active_run() -> None:
     assert exc.value.code == cli._SIGTERM_EXIT_CODE
 
 
+def test_sigterm_nothing_to_cancel_is_not_reported_as_failure(capsys) -> None:
+    """cancel_run raises ValueError for exactly one condition -- no cache rows
+    AND no labelled Dataflow jobs. In the SIGTERM path that is the EXPECTED
+    early-termination case: the run_id is published before the first job is
+    submitted (digest resolution + source snapshotting sit in between), so a
+    signal in that window has genuinely nothing to clean up. Reporting it as
+    "cleanup FAILED" would send the operator chasing a non-problem.
+    (Copilot review on PR #70.)"""
+    runstate.set_active_run_id("deadbeef1234")
+    with patch("dit.cache.cancel_run", side_effect=ValueError("no rows and no labelled jobs")):
+        with pytest.raises(SystemExit) as exc:
+            cli._on_sigterm(signal.SIGTERM, None)
+    assert exc.value.code == cli._SIGTERM_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "nothing found to cancel" in err
+    assert "FAILED" not in err
+    # The one way this branch can hide a real leak is a wrong-region search,
+    # so it must still point at the manual fallback.
+    assert "REGION=" in err
+
+
+def test_sigterm_discovery_failure_is_reported_as_failure(capsys) -> None:
+    """cancel_run's RuntimeError means job DISCOVERY failed (gcloud/auth/region)
+    -- jobs may well be running, so this one must keep the loud message."""
+    runstate.set_active_run_id("deadbeef1234")
+    with patch("dit.cache.cancel_run", side_effect=RuntimeError("gcloud jobs list errored")):
+        with pytest.raises(SystemExit) as exc:
+            cli._on_sigterm(signal.SIGTERM, None)
+    assert exc.value.code == cli._SIGTERM_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "FAILED" in err
+    assert "make dit-cancel RUN_ID=deadbeef1234" in err
+
+
 def test_sigterm_still_exits_when_cleanup_fails(capsys) -> None:
     """A failing cancel_run must never mask the termination, and must tell the
     operator how to finish the job by hand."""

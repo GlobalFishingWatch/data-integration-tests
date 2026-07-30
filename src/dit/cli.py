@@ -99,7 +99,30 @@ def _on_sigterm(signum: int, frame: object) -> None:
         from dit.cache import cancel_run
 
         cancel_run(run_id)
+    except ValueError as e:
+        # cancel_run raises ValueError for EXACTLY one condition: the run_id
+        # matched no cache rows AND no labelled Dataflow jobs. Reaching it here
+        # is the expected early-termination case, NOT a failure: the run_id is
+        # published before the first job is submitted (digest resolution and
+        # source snapshotting happen in between), so a SIGTERM in that window
+        # has genuinely nothing to clean up. Reporting it as "cleanup FAILED"
+        # would send the operator chasing a non-problem. (Copilot review, #70.)
+        #
+        # The one way this branch can hide a real leak is the region caveat
+        # below: jobs submitted to a region we did not search look identical to
+        # no jobs at all, so the message still points at the manual fallback.
+        click.echo(
+            f"run {run_id}: nothing found to cancel -- no labelled Dataflow "
+            f"jobs and no cache rows (expected if SIGTERM arrived before the "
+            f"first job was submitted).\n"
+            f"If this run used a non-default --dataflow-region, re-check with "
+            f"`make dit-cancel RUN_ID={run_id} REGION=<region>`.\n"
+            f"({e})",
+            err=True,
+        )
     except Exception as e:  # noqa: BLE001 -- terminating anyway; never mask the exit
+        # Includes cancel_run's RuntimeError (Dataflow job discovery itself
+        # failed -- gcloud/auth/region problem), where jobs may well be running.
         click.echo(
             f"cleanup for run {run_id} FAILED: {e}\n"
             f"Run `make dit-cancel RUN_ID={run_id}` manually "
