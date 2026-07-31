@@ -285,6 +285,30 @@ Choosing a target that *can* discriminate is part of the test, not a detail.
        --ssvid-filter '<a few ssvids>' --experiment-id enc-smoke
    ```
    Two things to confirm on that first run: **(a)** the `--end_date` inclusivity against the emitted SQL (per the PR #69 lesson — don't trust the flag help alone); **(b)** the published-image entrypoint, if not using `--build-from-source`.
-3. File the upstream asks. `--temp_dataset` is ~~pending~~ **written** (`encounters_pipeline@dit-temp-dataset-support`, local/unpushed) — still needs a PR. None-safe labels and the missing `.result()` in `writers.py delete_rows` are still unfiled.
+3. File the upstream asks — see the consolidated list below.
 4. ~~Cloud smoke once the `--temp_dataset` ask lands upstream~~ — **done 2026-07-30 against the overlay image**, see below.
-5. `vms.py` sibling; cache integration; then optionally the publication half if dit's scope ever extends there.
+5. ~~`vms.py` sibling~~ — **done 2026-07-30** (`workflows/encounters/vms.py`). Cache integration still open; then optionally the publication half if dit's scope ever extends there.
+
+## Upstream asks for the encounters team (consolidated)
+
+| ask | state | why it matters to dit |
+|---|---|---|
+| **`--temp_dataset` on both steps** | **Patch written**, `encounters_pipeline@dit-temp-dataset-support` (local, unpushed) — needs a PR | Gates every run whose Dataflow workers are `automated-testing@`. Worked around today by the overlay image. |
+| **`Resample` interpolation boundary** (`DT < max_gap_s` → `<=`) | **Patch written**, `encounters_pipeline@fix/interpolation-gap-inclusive-boundary` (local, unpushed) — needs a PR | Aligns the guard with its own documented contract ("gaps *longer than* max_gap_s are not fully interpolated"). Ships with a test that fails on the unfixed code plus a control proving longer gaps are still skipped. |
+| **None-safe `labels`** | Unfiled | `list_to_dict(cloud_opts.labels)` has no `None` guard and `ReadSources` is built on every runner, so omitting `--labels` raises `TypeError` before the pipeline starts. dit works around it by always emitting labels. |
+| **`delete_rows` missing `.result()`** | Unfiled | `writers.py` fires the pre-write DELETE without awaiting it, so a failed delete is silent — **in production too**, not just under dit. |
+| **Self-encounters across tenants** | Unfiled, newly observed | The same physical vessel reported by two VMS tenants gets two distinct `vessel_id`/`ssvid` values and can therefore "encounter itself". Pre-existing (not introduced by any dit change), but it means a slice of encounters are artifacts of identity resolution rather than real proximity. |
+
+## Known gap: no `--binding-name`, so no encounters cross-version workflow yet
+
+Two concurrent runs of an encounters workflow under the same `--experiment-id` collide with `DataflowJobAlreadyExistsError`. The job name is built from repo/step/experiment-id/mode/iteration and has **no binding or suffix component**.
+
+`dit.job_names.make_job_name` already accepts `binding=`, and `workflows/port_visits/ais.py` threads it in from a `--binding-name` flag (also stamping a `dit_binding=` BQ label). **The encounters workflows contain the string "binding" zero times.** Note where the machinery actually lives — it is easy to misattribute: `cross_version_ais.py` does *not* build job names, it passes `--binding-name` **down** to `ais.py`, which does.
+
+Consequence: `workflows/encounters/cross_version_ais.py` cannot simply be written on top of what exists — `--binding-name` has to land on `encounters/ais.py` and `vms.py` first. The interim workaround is a distinct `--experiment-id` per binding, which works only because experiment-id is itself part of the job name, and which sacrifices the run-clustering `--experiment-id` exists to provide.
+
+## Operational notes from running at scale
+
+- **A long run can outlive the operator's ADC token.** A full-year VMS run took ~16 hours wall-clock; afterwards `bq` failed with `Reauthentication failed. cannot prompt during non-interactive execution` and results were unreadable until re-auth. The Dataflow jobs themselves were fine — they carry their own service-account credentials — so only the laptop-side submitter and follow-up queries are exposed. Precursor symptom, obvious only in hindsight: transient `TransportError: Unable to find the server at oauth2.googleapis.com` retries mid-run.
+- **Sizing.** A full-year, all-vessel VMS run in `1_bf` is ~16 hours. `1_bf` runs the whole window as ONE job per step, whereas prod runs `create_raw_encounters` daily. The daily-slice modes do **not** scale to a year — `2_bfd` would be ~365 slices x 2 steps per binding — so validate the incremental path on a short window, not at year scale.
+- **Worker cap.** `--max-num-workers` defaults to 50, matching prod. Before this existed, `_pipeline_options` emitted no ceiling at all and a wide run autoscaled freely.

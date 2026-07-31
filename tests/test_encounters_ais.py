@@ -49,6 +49,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         dataflow_temp_bucket="bucket",
         dataflow_subnetwork="regions/us-central1/subnetworks/net",
         bq_temp_dataset="proj.tech_great_expectations",
+        max_num_workers=50,
         parallel=False,
         run_id="abc123abc123",
         commit_sha="c0ffee1",

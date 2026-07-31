@@ -6,6 +6,14 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-07-31
+
+#### Added
+- **`--max-num-workers` on both encounters workflows (default 50, mirroring prod).** `_pipeline_options` previously emitted no autoscaling ceiling at all, so a wide run — all VMS vessels over a full year — would scale unbounded. Prod caps this same step at 50 (`detect_encounters_config.max_num_workers` in composer-dags `dags/core/vms/config.py`), so the default is parity rather than a new policy. Emitted on the Dataflow path only; the docker/DirectRunner path is unaffected, pinned by a test that also asserts the value actually reaches the pipeline options (a cap that never arrives is worthless).
+
+#### Fixed
+- **Nothing yet for the Dataflow job-name collision — recorded as a known gap.** Running two `workflows/encounters/*.py` invocations concurrently under the same `--experiment-id` fails the second with `DataflowJobAlreadyExistsError`: the job name is built from repo/step/experiment-id/mode/iteration and carries **no binding or suffix component**. `workflows/port_visits/ais.py` solves this with a `--binding-name` flag threaded into `make_job_name` (and into the `dit_binding=` BQ label); the encounters workflows have no equivalent — the string "binding" does not appear in either file. Workaround today is distinct `--experiment-id` values per binding, which works because experiment-id *is* in the job name, but it splits the runs across experiment ids — defeating the clustering `--experiment-id` exists to provide. **This is a prerequisite for any `workflows/encounters/cross_version_ais.py`**, since a cross-version orchestrator would have nothing to pass `--binding-name` to.
+
 ### 2026-07-30
 
 #### Verified

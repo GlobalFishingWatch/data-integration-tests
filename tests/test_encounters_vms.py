@@ -117,3 +117,27 @@ def test_main_delegates_to_shared_run() -> None:
     assert run.call_count == 1
     passed = run.call_args.args[0]
     assert passed.source_messages_fqn.startswith("gfw-int-vms-v3.")
+
+
+def test_worker_cap_defaults_to_prod_ceiling() -> None:
+    """An all-vessel, year-wide VMS run would otherwise autoscale unbounded.
+    Prod caps this same step at 50 (detect_encounters_config.max_num_workers
+    in composer-dags dags/core/vms/config.py)."""
+    assert vms.parse_args([]).max_num_workers == 50
+    assert ais.parse_args([]).max_num_workers == 50
+
+
+def test_worker_cap_is_emitted_on_dataflow_only() -> None:
+    """A cap that never reaches the pipeline options is worthless."""
+    import workflows.encounters.ais as mod
+    args = vms.parse_args(["--max-num-workers", "7"])
+    # run() stamps these at runtime; _pipeline_options reads them for labels.
+    args.run_id, args.commit_sha = "abc123abc123", "deadbee"
+    args.runner = "dataflow"
+    df = mod._pipeline_options(args, mode="1_bf", step="create_raw_encounters",
+                               iteration=1, total_iterations=1)
+    assert "--max_num_workers=7" in df
+    args.runner = "docker"
+    local = mod._pipeline_options(args, mode="1_bf", step="create_raw_encounters",
+                                  iteration=1, total_iterations=1)
+    assert not any(a.startswith("--max_num_workers") for a in local)

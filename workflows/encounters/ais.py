@@ -181,6 +181,11 @@ DEFAULT_START = "2020-01-01"
 DEFAULT_END = "2020-12-31"
 DEFAULT_TAIL_DAYS = 3
 
+# Dataflow autoscaling ceiling. Mirrors prod's
+# detect_encounters_config.max_num_workers (composer-dags dags/core/vms/config.py).
+# Without a cap, a wide run (all vessels over a year) scales unbounded.
+DEFAULT_MAX_NUM_WORKERS = 50
+
 # Detection tuning -- prod values from composer-dags-production
 # gfw/pipes/v3/detect_encounters.py.
 DEFAULT_MAX_ENCOUNTER_DIST_KM = 0.5
@@ -444,6 +449,10 @@ def _pipeline_options(
         f"--temp_dataset={args.bq_temp_dataset}",
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
+        # Bound autoscaling. Without this a wide run (all vessels over a year)
+        # scales freely; prod caps this same step at 50
+        # (detect_encounters_config.max_num_workers in composer-dags).
+        f"--max_num_workers={args.max_num_workers}",
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
         "--wait_for_job",
@@ -668,6 +677,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "env-var fallback DIT_BQ_TEMP_DATASET (defaults to "
                         "${PROJECT}.${DIT_DEST_DATASET}). Needs an image that "
                         "exposes --temp_dataset; see the module docstring.")
+    p.add_argument("--max-num-workers", type=int, default=DEFAULT_MAX_NUM_WORKERS,
+                   help=f"Dataflow autoscaling ceiling, mirroring prod's cap for this "
+                        f"step. Default: {DEFAULT_MAX_NUM_WORKERS}")
     p.add_argument("--build-from-source", action="store_true",
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one. Recommended on laptop: "
