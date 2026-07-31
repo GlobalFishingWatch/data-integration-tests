@@ -113,22 +113,24 @@ A flag that prints the generated queries or pipeline graph without executing. Us
 
 ## Adoption matrix
 
-Snapshot as of 2026-05-29 (pipe-events column re-verified during the Phase 3 port; see below). **U** = universal, **B** = Beam-only, **C** = Beam-in-container, **S** = BQ-SQL-only, **R** = strongly recommended.
+Snapshot as of 2026-07-30 (encounters column added from the onboarding audit — see [`encounters-onboarding-2026-07.md`](encounters-onboarding-2026-07.md); pipe-events column re-verified during the Phase 3 port; see below). **pipe-segment is still missing a column** — `workflows/pipe_segment/identity_match_key.py` shipped 2026-06-08 without one; audit outstanding. **U** = universal, **B** = Beam-only, **C** = Beam-in-container, **S** = BQ-SQL-only, **R** = strongly recommended.
 
-| # | Requirement | pipe-gaps | pipe-anchorages | pipe-events |
-|---|---|---|---|---|
-| 1 | Date range (U) | ✓ (half-open) | ✓ (inclusive) | ✓ (half-open) |
-| 2 | Overridable tables (U) | ✓ | ✓ | ✓ |
-| 3 | Synchronous exit (U) | ✓ | ✓ (`--wait_for_job`) | ✓ |
-| 4 | Idempotent re-runs (U) | ✓ (SCD-2) | ✓ (partitioned) | ✓ (truncate/merge) |
-| 5 | Temp-dataset override (B) | ✓ (factory hook) | ✓ (CLI flag, local patch — PR pending) | — |
-| 6 | None-safe labels (B) | ✓ | ✗ (workflow always passes `--labels`) | — |
-| 7 | Beam options pass-through (B) | ✓ | ✓ | — |
-| 8 | SDK image w/ package (C) | — (in-process) | ✓ (`gfw/pipe-anchorages:<tag>`) | — |
-| 9 | Session-isolated parallel (S) | — | — | ✓ |
-| 10 | Intermediate tables overridable (S) | — | — | ✓ |
-| 11 | Vessel-cohort filter (R) | partial (`--restricted-ssvids`, EXCLUDE) | ✓ (`--ssvid_filter`, INCLUDE) | ✗ |
-| 12 | `--test` mode (nice) | — | — | ✓ |
+**Cells state UPSTREAM support, not whether dit can run.** A ✗ means the pipeline does not expose the thing; it does *not* mean the workflow is blocked, because dit may carry a workflow-side mitigation (always emitting `--labels`, an overlay image, a local patch). Where a mitigation exists the cell says so — read "✗ upstream, mitigated" as "works today, but on dit's crutch, and the crutch is retired when upstream lands". Keeping the two separate matters: the ✗ is what tracks the outstanding upstream ask, and per the working agreements every mitigation also needs a Plan-changelog entry recording the trade-off.
+
+| # | Requirement | pipe-gaps | pipe-anchorages | pipe-events | encounters |
+|---|---|---|---|---|---|
+| 1 | Date range (U) | ✓ (half-open) | ✓ (inclusive) | ✓ (half-open) | ✓ (**inclusive**, documented in `--end_date` help on both steps) |
+| 2 | Overridable tables (U) | ✓ | ✓ | ✓ | ✓ (every table a flag; `--source_table` / `--vessel_id_table` are appendable with `{ID}::` prefixes for multi-source) |
+| 3 | Synchronous exit (U) | ✓ | ✓ (`--wait_for_job`) | ✓ | ✓ (`--wait_for_job`, both steps) |
+| 4 | Idempotent re-runs (U) | ✓ (SCD-2) | ✓ (partitioned) | ✓ (truncate/merge) | ✓ (create: bounded pre-write `DELETE … BETWEEN start AND end` + append; merge: `WRITE_TRUNCATE`) |
+| 5 | Temp-dataset override (B) | ✓ (factory hook) | ✓ (CLI flag, local patch — PR pending) | — | ✗ upstream, **mitigated** — no `--temp_dataset` in any published tag (same gap pipe-anchorages had); patch written (`dit-temp-dataset-support`, PR pending) and shipped meanwhile via a dit **overlay image**, so Dataflow/cloud runs work today |
+| 6 | None-safe labels (B) | ✓ | ✗ (workflow always passes `--labels`) | — | ✗ `list_to_dict(cloud_opts.labels)` raises on `None` (workflow must always pass `--labels`) |
+| 7 | Beam options pass-through (B) | ✓ | ✓ | — | ✓ (`PipelineOptions` subclass) |
+| 8 | SDK image w/ package (C) | — (in-process) | ✓ (`gfw/pipe-anchorages:<tag>`) | — | ✓ (DAG sets `sdk_container_image` = the scheduler image, which `pip install`s the package; `setup_file=None`) |
+| 9 | Session-isolated parallel (S) | — | — | ✓ | — |
+| 10 | Intermediate tables overridable (S) | — | — | ✓ | — |
+| 11 | Vessel-cohort filter (R) | partial (`--restricted-ssvids`, EXCLUDE) | ✓ (`--ssvid_filter`, INCLUDE) | ✗ | ✓✓ `--ssvid_filter` on **both** steps (subquery, list, or `@path`) — the most capable of any onboarded pipeline |
+| 12 | `--test` mode (nice) | — | — | ✓ | ✗ |
 
 Legend: ✓ = satisfies, ✗ = missing, partial = present with caveats, — = N/A for this pipeline's architecture.
 
@@ -138,6 +140,17 @@ Legend: ✓ = satisfies, ✗ = missing, partial = present with caveats, — = N/
 - **§9 / §10:** `_SESSION`-isolated; every step's source/dest is a CLI flag (`-dest`, `-dest_tbl_prefix`, `-source_*`, `-mtbl`), so per-mode prefixes never collide.
 - **§11 (✗):** no ssvid filter; test-scale reduction comes from the `pipe_ais_test_*` staging cohort instead. Filed as a future upstream issue (a `--ssvid_filter` with INCLUDE semantics would let pipe-events tests run on a vessel subset like pipe-anchorages does).
 - **No workflow-side workarounds** were needed for pipe-events (contrast pipe-anchorages' `--temp_dataset` + None-labels patches) — the one infra addition was the docker runner's `volumes`/`service` params for the `gcp` auth volume, which is dit-side plumbing, not a pipeline workaround.
+
+## Recurring invocation gaps (check all of these on every new pipeline)
+
+Found the hard way onboarding encounters (2026-07-30, six failed smokes). None are visible in unit tests; all are re-encounterable.
+
+1. **Emit `--labels` on EVERY runner, not just Dataflow.** Several GFW pipelines do `list_to_dict(cloud_opts.labels)` with no `None` guard, and the transform is often constructed regardless of runner (pipe-anchorages and encounters both).
+2. **`--project` is needed on DirectRunner too** — pipelines commonly build their own `bigquery.Client(project=cloud_opts.project)`.
+3. **`--temp_location` is needed on DirectRunner too** — `ReadFromBigQuery`'s EXPORT method stages via GCS on any runner. NOT the same knob as `--temp_dataset` (the BQ dataset for the temp table), which is what the Cloud Build SA cannot create and is the usual *cloud* blocker.
+4. **`container_env={"GOOGLE_CLOUD_PROJECT": …}`** — Beam's `WriteToBigQuery` builds its own BQ client inside the SDK worker, which reads the env var and never sees `--project`. Hit by pipe-segment (2026-06-03) and encounters; a third consumer should make it a `dit.runners.docker` default.
+5. **Destination tables may need pre-creating, WITH the sink's partitioning.** If a pipeline stamps table metadata (`get_table()`) before its `CREATE_IF_NEEDED` sink runs, a fresh table 404s. dit mints fresh tables per run while prod reuses long-lived ones, so **dit is often the first thing to exercise a bootstrap path**. Take schema/partitioning/clustering from the **sink's `additional_bq_parameters`**, not from the DAG's convenience `ensure_table` task — the latter can be an unpartitioned no-op that would itself fail. Read schemas out of the image rather than hardcoding a copy that can drift.
+6. **Validate flags against the PUBLISHED IMAGE, not the repo source.** Encounters' published `v4.4.0` was Python 3.12 with a renamed package; local master was `4.3.2` on Python 3.8. `docker run --entrypoint <cli> <image> <subcommand> --help` turns assumptions into facts.
 
 ## Process: adding a new pipeline to `dit`'s scope
 
