@@ -391,6 +391,7 @@ def _make_job_name(
         step=_JOB_STEP_NAMES[step],
         experiment_id=args.experiment_id,
         mode=mode,
+        binding=args.binding_name or None,
         iteration=iteration,
         total_iterations=total_iterations,
     )
@@ -417,6 +418,8 @@ def _pipeline_options(
         f"--labels=dit_run_id={args.run_id}",
         f"--labels=dit_mode={mode}",
     ]
+    if args.binding_name:
+        labels.append(f"--labels=dit_binding={args.binding_name}")
     if args.runner != "dataflow":
         # Two options are required even on DirectRunner, because they are
         # demanded by the PIPELINE's BQ access rather than by Dataflow:
@@ -684,6 +687,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one. Recommended on laptop: "
                         "also sidesteps the unconfirmed published-image entrypoint.")
+    p.add_argument("--binding-name", default="",
+                   help="Optional binding label (e.g. 'before', 'after') for "
+                        "cross-version runs. Surfaces in the Dataflow job name and "
+                        "as the dit_binding=<name> BQ label. WITHOUT it, two "
+                        "concurrent runs sharing an --experiment-id collide with "
+                        "DataflowJobAlreadyExistsError. Empty when standalone.")
     p.add_argument("--suffix", default=None)
     add_experiment_id_arg(p)
     p.add_argument("--require-clean", action="store_true",

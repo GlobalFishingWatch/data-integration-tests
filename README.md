@@ -321,6 +321,7 @@ Each phase below is a short summary of what's planned and where we are. The cano
 5. **Track 5** — pipe-gaps repo shim, opportunistically (replace `pipe-gaps/tests/integration/mode_equivalence.py` with a thin re-export from `dit/workflows/pipe_gaps/...`).
 6. VMS port-visits workflow, then AIS-full (the latter is what motivates Cloud Run jobs hardest once concurrent runs scale up).
 7. PIPELINE-1465 cross-version full validation against newly-built pipe-anchorages images (parallel to the pipe-gaps validation just completed).
-8. The first dit release tag (`v0.1.0`) once per-pipeline PR triggers + caching land — that's the natural "framework is usable by outsiders" milestone.
+8. **Docs reorganisation.** This README has outgrown its shape — it now carries source-target inventories, per-workflow interpretation notes, and operational findings that belong in `docs/` or alongside the workflow they describe (`workflows/<pipeline>/README.md`, as `workflows/encounters/README.md` now does). Near-term: move content out and leave the README as an index. Longer-term this needs a **concept for storing dit outputs and analyses in a structured way** — run results, comparison summaries and their interpretation currently have no home at all, which is why they keep landing in prose. Recorded 2026-07-31.
+9. The first dit release tag (`v0.1.0`) once per-pipeline PR triggers + caching land — that's the natural "framework is usable by outsiders" milestone.
 
 The canonical detailed version of this list lives in `docs/plan.md` § Next steps.

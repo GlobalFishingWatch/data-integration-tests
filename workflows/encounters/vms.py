@@ -171,6 +171,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--build-from-source", action="store_true",
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one.")
+    p.add_argument("--binding-name", default="",
+                   help="Optional binding label (e.g. 'before', 'after') for "
+                        "cross-version runs. Surfaces in the Dataflow job name and "
+                        "as the dit_binding=<name> BQ label. WITHOUT it, two "
+                        "concurrent runs sharing an --experiment-id collide with "
+                        "DataflowJobAlreadyExistsError. Empty when standalone.")
     p.add_argument("--suffix", default=None)
     add_experiment_id_arg(p)
     p.add_argument("--require-clean", action="store_true",

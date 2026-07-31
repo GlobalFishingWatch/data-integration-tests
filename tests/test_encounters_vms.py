@@ -141,3 +141,30 @@ def test_worker_cap_is_emitted_on_dataflow_only() -> None:
     local = mod._pipeline_options(args, mode="1_bf", step="create_raw_encounters",
                                   iteration=1, total_iterations=1)
     assert not any(a.startswith("--max_num_workers") for a in local)
+
+
+def test_binding_name_disambiguates_concurrent_runs() -> None:
+    """Without a binding component two concurrent runs sharing an
+    --experiment-id collide with DataflowJobAlreadyExistsError. Mirrors
+    workflows/port_visits/ais.py, which already threads binding_name into
+    make_job_name and stamps a dit_binding= label."""
+    import workflows.encounters.ais as mod
+    base = vms.parse_args([])
+    base.run_id, base.commit_sha, base.runner = "abc123abc123", "deadbee", "dataflow"
+
+    plain = mod._make_job_name(base, step="create_raw_encounters", mode="1_bf",
+                               iteration=1, total_iterations=1)
+    bound = vms.parse_args(["--binding-name", "after"])
+    bound.run_id, bound.commit_sha, bound.runner = "abc123abc123", "deadbee", "dataflow"
+    named = mod._make_job_name(bound, step="create_raw_encounters", mode="1_bf",
+                               iteration=1, total_iterations=1)
+
+    assert plain != named, "binding must change the job name"
+    assert "after" in named
+    # ...and the label follows, so cancel-run / the Dataflow UI can filter on it.
+    opts = mod._pipeline_options(bound, mode="1_bf", step="create_raw_encounters",
+                                 iteration=1, total_iterations=1)
+    assert "--labels=dit_binding=after" in opts
+    plain_opts = mod._pipeline_options(base, mode="1_bf", step="create_raw_encounters",
+                                       iteration=1, total_iterations=1)
+    assert not any(a.startswith("--labels=dit_binding") for a in plain_opts)
