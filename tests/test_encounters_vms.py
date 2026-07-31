@@ -168,3 +168,46 @@ def test_binding_name_disambiguates_concurrent_runs() -> None:
     plain_opts = mod._pipeline_options(base, mode="1_bf", step="create_raw_encounters",
                                        iteration=1, total_iterations=1)
     assert not any(a.startswith("--labels=dit_binding") for a in plain_opts)
+
+
+def test_submitter_image_default_is_pullable_not_a_local_tag() -> None:
+    """An unversioned local compose tag is neither pullable nor reproducible,
+    so a default (no --build-from-source) run failed on any machine that had
+    not built it by hand. Copilot review, PR #72."""
+    assert ais.DEFAULT_IMAGE_TAG == ais.DEFAULT_WORKER_IMAGE
+    assert "/" in ais.DEFAULT_IMAGE_TAG and ":" in ais.DEFAULT_IMAGE_TAG
+    assert ais.DEFAULT_IMAGE_TAG != ais.LOCAL_IMAGE_TAG
+    assert vms.parse_args([]).image_tag == ais.DEFAULT_WORKER_IMAGE
+
+
+def test_build_from_source_builds_compose_image_before_fetching_schemas() -> None:
+    """_ensure_output_tables shells out to `docker run <image>` BEFORE any
+    runner call, and the runner is what lazily builds the compose image. So on
+    --build-from-source the schema fetch would hit a non-existent image and
+    fail a run that would otherwise have succeeded. Copilot review, PR #72."""
+    import workflows.encounters.ais as mod
+    args = vms.parse_args(["--build-from-source", "--modes", "1_bf"])
+    args.dest_dataset = "ds"
+
+    with patch.object(mod.subprocess, "run") as sub, \
+         patch.object(mod, "_fetch_schemas", return_value={"raw": [], "merged": []}) as fetch, \
+         patch.object(mod, "_ensure_table"):
+        mod._ensure_output_tables(args, "sfx")
+
+    built = [c for c in sub.call_args_list if "build" in c.args[0]]
+    assert built, "compose image was not built before the schema fetch"
+    assert mod.COMPOSE_SERVICE in built[0].args[0]
+    # ...and the schema fetch must then target the LOCAL tag, not the published one.
+    assert fetch.call_args.args[0] == mod.LOCAL_IMAGE_TAG
+
+
+def test_no_compose_build_when_not_building_from_source() -> None:
+    import workflows.encounters.ais as mod
+    args = vms.parse_args(["--modes", "1_bf"])
+    args.dest_dataset = "ds"
+    with patch.object(mod.subprocess, "run") as sub, \
+         patch.object(mod, "_fetch_schemas", return_value={"raw": [], "merged": []}) as fetch, \
+         patch.object(mod, "_ensure_table"):
+        mod._ensure_output_tables(args, "sfx")
+    assert not any("build" in c.args[0] for c in sub.call_args_list)
+    assert fetch.call_args.args[0] == mod.DEFAULT_WORKER_IMAGE

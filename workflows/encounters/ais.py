@@ -192,8 +192,19 @@ DEFAULT_MAX_ENCOUNTER_DIST_KM = 0.5
 DEFAULT_MIN_ENCOUNTER_TIME_MINUTES = 120.0
 DEFAULT_MIN_HOURS_BETWEEN_ENCOUNTERS = 4.0
 
-# Local compose image tag (docker-compose.yaml `image: gfw/pipe-encounters`).
-DEFAULT_IMAGE_TAG = "gfw/pipe-encounters"
+#: Compose service + the local tag docker-compose.yaml builds
+#: (`image: gfw/pipe-encounters`). Only used on the --build-from-source path.
+COMPOSE_SERVICE = "pipe_encounters"
+LOCAL_IMAGE_TAG = "gfw/pipe-encounters"
+
+# Submitter image. Pinned to the SAME canonical published tag as the worker
+# image rather than the local compose tag: an unversioned local tag is neither
+# pullable nor reproducible, so a default (no --build-from-source) run failed on
+# any machine that had not built it by hand. Note a default run against the
+# STOCK published image still fails fast on `--temp_dataset` being unknown --
+# that is the documented, deliberate loud failure, and pinning here means the
+# default simply starts working once upstream publishes the flag, with no code
+# change needed to retire the overlay.
 
 # Canonical published image, pinned at the version composer-dags-production
 # runs (`Versions.DETECT_ENCOUNTERS` in dags/core/ais/v3.py). Read-only to dit
@@ -201,6 +212,7 @@ DEFAULT_IMAGE_TAG = "gfw/pipe-encounters"
 DEFAULT_WORKER_IMAGE = (
     "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-encounters:v4.4.0"
 )
+DEFAULT_IMAGE_TAG = DEFAULT_WORKER_IMAGE
 
 # Pre-existing BQ dataset Beam uses for ReadFromBigQuery EXPORT staging, so the
 # SA never needs bigquery.datasets.create. Same shape as
@@ -372,7 +384,19 @@ def _ensure_table(fqn: str, fields: list[dict]) -> None:
 def _ensure_output_tables(args: argparse.Namespace, suffix: str) -> None:
     """Pre-create every selected mode's raw + merged table. See the comment
     block above for why this is required rather than merely tidy."""
-    schemas = _fetch_schemas(args.image_tag)
+    # --build-from-source means the compose image may not exist yet: the runner
+    # builds it lazily on its first invocation, which happens AFTER this. Build
+    # it here so schema bootstrap doesn't fail on a run that would otherwise
+    # have succeeded. (Copilot review, PR #72.)
+    image = args.image_tag
+    if args.build_from_source:
+        image = LOCAL_IMAGE_TAG
+        logger.info("building compose service %s before schema fetch", COMPOSE_SERVICE)
+        subprocess.run(
+            ["docker", "compose", "build", COMPOSE_SERVICE],
+            check=True,
+        )
+    schemas = _fetch_schemas(image)
     for mode in args.modes:
         _ensure_table(_raw_table(args, suffix, mode), schemas["raw"])
         _ensure_table(_encounters_table(args, suffix, mode), schemas["merged"])
@@ -502,7 +526,7 @@ def _run_slice(
         args.image_tag, create_args,
         entrypoint=CLI_ENTRYPOINT,
         volumes=[GCP_VOLUME],
-        service="pipe_encounters",
+        service=COMPOSE_SERVICE,
         container_env=CONTAINER_ENV,
         build_from_source=args.build_from_source,
     )
@@ -535,7 +559,7 @@ def _run_slice(
         args.image_tag, merge_args,
         entrypoint=CLI_ENTRYPOINT,
         volumes=[GCP_VOLUME],
-        service="pipe_encounters",
+        service=COMPOSE_SERVICE,
         container_env=CONTAINER_ENV,
         build_from_source=args.build_from_source,
     )
