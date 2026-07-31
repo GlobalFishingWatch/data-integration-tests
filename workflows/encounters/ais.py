@@ -141,6 +141,12 @@ MODE_BFTRUNCATE = "3_bftruncate"
 #: Modes selectable via --modes, in canonical order.
 SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
 
+#: Value of the `workflow=` Dataflow/BQ label. Per-workflow, NOT per-pipeline:
+#: vms.py shares this module's execution path via run(), so without an override
+#: its jobs would be labelled `encounters_ais` and every label-driven filter
+#: (Dataflow UI, cancel_run, cost attribution) would misattribute them.
+WORKFLOW_LABEL = "encounters_ais"
+
 
 # --------------------------------------------------------------------------
 # Constants / defaults
@@ -437,7 +443,7 @@ def _pipeline_options(
         "--labels=environment=integration_test",
         "--labels=resource_creator=dit",
         "--labels=project=core_pipeline",
-        "--labels=workflow=encounters_ais",
+        f"--labels=workflow={getattr(args, 'workflow_label', WORKFLOW_LABEL)}",
         "--labels=stage=testing",
         f"--labels=dit_run_id={args.run_id}",
         f"--labels=dit_mode={mode}",
@@ -741,6 +747,7 @@ def run(
     args: argparse.Namespace,
     *,
     default_worker_image: str = DEFAULT_WORKER_IMAGE,
+    workflow_label: str = WORKFLOW_LABEL,
 ) -> int:
     """Execute a parsed encounters run: validate, resolve context, run the
     selected modes, compare.
@@ -752,6 +759,10 @@ def run(
     is exactly the part each owns. Keep it that way -- anything genuinely
     source-specific belongs in the caller, not behind a flag here.
     """
+    # Stamped here rather than passed down through execute_*/_run_slice: the
+    # label is per-workflow, and run() is the one place both workflows meet.
+    args.workflow_label = workflow_label
+
     if args.tail_days < 0:
         raise SystemExit(f"--tail-days must be >= 0; got {args.tail_days}.")
     if _parse_date(args.start) > _parse_date(args.end):

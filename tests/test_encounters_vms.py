@@ -211,3 +211,34 @@ def test_no_compose_build_when_not_building_from_source() -> None:
         mod._ensure_output_tables(args, "sfx")
     assert not any("build" in c.args[0] for c in sub.call_args_list)
     assert fetch.call_args.args[0] == mod.DEFAULT_WORKER_IMAGE
+
+
+def test_vms_runs_are_labelled_encounters_vms_not_ais() -> None:
+    """vms.py shares ais.py's execution path via run(), so without an override
+    its Dataflow/BQ jobs would carry workflow=encounters_ais and every
+    label-driven filter -- Dataflow UI, cancel_run, cost attribution -- would
+    misattribute them. Copilot review (suppressed comment), PR #72."""
+    import workflows.encounters.ais as mod
+    assert vms.WORKFLOW_LABEL != ais.WORKFLOW_LABEL
+
+    with patch.object(mod, "run", return_value=0) as run:
+        vms.main(["--modes", "1_bf"])
+    assert run.call_args.kwargs["workflow_label"] == "encounters_vms"
+
+    args = vms.parse_args(["--modes", "1_bf"])
+    args.run_id, args.commit_sha, args.runner = "abc", "dead", "dataflow"
+    args.workflow_label = vms.WORKFLOW_LABEL
+    opts = mod._pipeline_options(args, mode="1_bf", step="create_raw_encounters",
+                                 iteration=1, total_iterations=1)
+    assert "--labels=workflow=encounters_vms" in opts
+    assert "--labels=workflow=encounters_ais" not in opts
+
+
+def test_ais_label_unchanged() -> None:
+    """The AIS default must not have drifted while making the label per-workflow."""
+    import workflows.encounters.ais as mod
+    args = mod.parse_args(["--modes", "1_bf"])
+    args.run_id, args.commit_sha, args.runner = "abc", "dead", "dataflow"
+    opts = mod._pipeline_options(args, mode="1_bf", step="create_raw_encounters",
+                                 iteration=1, total_iterations=1)
+    assert "--labels=workflow=encounters_ais" in opts

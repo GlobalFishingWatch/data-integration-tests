@@ -94,6 +94,10 @@ logger = logging.getLogger("encounters_vms")
 # global-fishing-watch. These are the tables PROD encounters actually reads,
 # so the workflow mirrors prod rather than inventing a source shape.
 # --------------------------------------------------------------------------
+#: Distinct from ais.py's, so Dataflow/BQ label filters, cancel_run and cost
+#: attribution can tell VMS runs apart despite the shared execution path.
+WORKFLOW_LABEL = "encounters_vms"
+
 VMS_INTERNAL = "gfw-int-vms-v3.pipe_vms_v3_internal"
 
 DEFAULT_SOURCE_MESSAGES_FQN = f"{VMS_INTERNAL}.messages_positions"
@@ -204,7 +208,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "VMS sources are PROD (%s + global-fishing-watch); window %s..%s inclusive",
         VMS_INTERNAL, args.start, args.end,
     )
-    return ais.run(args)
+    return ais.run(args, workflow_label=WORKFLOW_LABEL)
 
 
 if __name__ == "__main__":
