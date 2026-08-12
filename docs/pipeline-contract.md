@@ -141,6 +141,8 @@ Legend: ✓ = satisfies, ✗ = missing, partial = present with caveats, — = N/
 - **§11 (✗):** no ssvid filter; test-scale reduction comes from the `pipe_ais_test_*` staging cohort instead. Filed as a future upstream issue (a `--ssvid_filter` with INCLUDE semantics would let pipe-events tests run on a vessel subset like pipe-anchorages does).
 - **No workflow-side workarounds** were needed for pipe-events (contrast pipe-anchorages' `--temp_dataset` + None-labels patches) — the one infra addition was the docker runner's `volumes`/`service` params for the `gcp` auth volume, which is dit-side plumbing, not a pipeline workaround.
 
+**pipe-events cross-version wrapper (2026-08-12).** `workflows/pipe_events/cross_version_fishing.py` landed as dit's second cross-version consumer (sibling of `port_visits/cross_version_ais.py`). Snapshots seven of the eight `fishing.py` source tables into `<project>.tech_great_expectations` via `dit.bq.snapshot_into_experiment` (role `cross_version`); the eighth (`spatial_measures_20201105`) is content-addressed by its `_YYYYMMDD` filename suffix and skipped by design. Per-binding docker image identity comes free from `ensure_pipeline_image` reading each `git worktree`'s HEAD — no `--binding-image` flag surface (contrast port_visits' Dataflow-shaped `--binding-worker-image`). Diffs both `_fishing_events` and `_product_events_fishing` views pairwise on `event_id`. Enabled by E4 (2026-08-12), which added eight `--source-*-fqn` flags to `fishing.py` — the same pattern port_visits' M4 introduced there.
+
 ## Recurring invocation gaps (check all of these on every new pipeline)
 
 Found the hard way onboarding encounters (2026-07-30, six failed smokes). None are visible in unit tests; all are re-encounterable.
