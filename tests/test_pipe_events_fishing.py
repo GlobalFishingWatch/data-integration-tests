@@ -14,6 +14,8 @@ from datetime import date
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from dit import compare as dit_compare
 from workflows.pipe_events import fishing as mod
 
@@ -35,6 +37,16 @@ def _args(**overrides: Any) -> argparse.Namespace:
         commit_sha="abc1234",
         experiment_id="exp01",
         run_id="rid01",
+        # Per-table FQN overrides (E4). Default None so dataset-derivation
+        # applies. Tests that exercise the override path set them explicitly.
+        source_research_messages_fqn=None,
+        source_segs_activity_fqn=None,
+        source_segment_vessel_fqn=None,
+        source_product_vessel_info_summary_fqn=None,
+        source_identity_core_fqn=None,
+        source_identity_authorization_fqn=None,
+        source_spatial_measures_fqn=None,
+        source_event_regions_fqn=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -207,6 +219,172 @@ def test_run_slice_raises_on_nonzero_rc():
             assert "rc=1" in str(e)
         else:
             raise AssertionError("expected SystemExit on non-zero docker rc")
+
+
+# --------------------------------------------------------------------------
+# E4: Source-table FQN resolvers
+# --------------------------------------------------------------------------
+
+# (helper_fn, override_kw, fallback_expected) — one entry per source table.
+# Fallback strings mirror the _args() dataset defaults; keep in sync if the
+# defaults ever change (test_stem_and_explicit_fqn_produce_identical_step_args
+# below re-derives its overrides from this list rather than re-hardcoding,
+# so THIS list is the single source of truth).
+_HELPER_CASES = [
+    (
+        mod._research_messages_table,
+        "source_research_messages_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_internal.research_messages",
+    ),
+    (
+        mod._segs_activity_table,
+        "source_segs_activity_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.segs_activity",
+    ),
+    (
+        mod._segment_vessel_table,
+        "source_segment_vessel_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_internal.segment_vessel",
+    ),
+    (
+        mod._product_vessel_info_summary_table,
+        "source_product_vessel_info_summary_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.product_vessel_info_summary",
+    ),
+    (
+        mod._identity_core_table,
+        "source_identity_core_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.identity_core",
+    ),
+    (
+        mod._identity_authorization_table,
+        "source_identity_authorization_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.identity_authorization",
+    ),
+    (
+        mod._spatial_measures_table,
+        "source_spatial_measures_fqn",
+        # Version literal (_20201105) baked into fallback -- pipe-events'
+        # release cadence owns this, not the workflow. Override the full FQN
+        # via --source-spatial-measures-fqn to pin a different version.
+        "world-fishing-827.pipe_static.spatial_measures_20201105",
+    ),
+    (
+        mod._event_regions_table,
+        "source_event_regions_fqn",
+        "world-fishing-827.pipe_regions_layers.event_regions",
+    ),
+]
+
+# pytest ids: strip source_ / _fqn from the kw name for readable test names
+# (research_messages / segs_activity / segment_vessel / …). Parametrize by
+# NAME rather than positional index so a reorder / insert in _HELPER_CASES
+# can't silently point a test's assertion at a different helper.
+_HELPER_IDS = [kw.removeprefix("source_").removesuffix("_fqn") for _, kw, _ in _HELPER_CASES]
+
+
+@pytest.mark.parametrize("helper,kw,fallback", _HELPER_CASES, ids=_HELPER_IDS)
+def test_helper_honours_per_table_override(helper, kw, fallback):
+    """Explicit override wins; absent it, the helper falls back to the
+    dataset-derived value byte-identically to pre-E4."""
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+@pytest.mark.parametrize("helper,kw,fallback", _HELPER_CASES, ids=_HELPER_IDS)
+def test_helper_treats_empty_string_as_unset(helper, kw, fallback):
+    """Truthiness check (matches port_visits M4 discipline): "" MUST fall
+    back to dataset-derivation -- otherwise a caller accidentally passing
+    e.g. --source-research-messages-fqn '' (shell expansion of an unset
+    variable) would generate an invalid docker CLI arg opaquely.
+
+    Parametrized (not a for-loop) so the failure names the offending helper
+    and doesn't stop at the first divergence."""
+    assert helper(_args(**{kw: ""})) == fallback
+
+
+def test_run_slice_uses_pvis_override_at_both_call_sites():
+    """product_vessel_info_summary is referenced at BOTH the filter step's
+    -pvesselinfo AND the auth step's -allvessels -- one flag governs both.
+    A future refactor splitting these into two knobs would let one binding
+    read a snapshot while the other read live, defeating cross-version.
+
+    (Subsumed by test_run_slice_threads_every_override_into_step_args
+    below, which exercises rows 3 and 4 of _STEP_BINDINGS. Kept as a named
+    pin of the load-bearing invariant per the module docstring on
+    _product_vessel_info_summary_table.)"""
+    captured = _run_slice_steps(
+        _args(source_product_vessel_info_summary_fqn="proj.ds.pvis_override"),
+    )
+    filt_pvis = [
+        s[s.index("-pvesselinfo") + 1]
+        for _, s, _ in captured
+        if "incremental_filter_events" in s
+    ]
+    auth_allvessels = [
+        s[s.index("-allvessels") + 1]
+        for _, s, _ in captured
+        if "auth_and_regions_fishing_events" in s
+    ]
+    assert filt_pvis == ["proj.ds.pvis_override", "proj.ds.pvis_override"]
+    assert auth_allvessels == ["proj.ds.pvis_override"]
+
+
+# (_HELPER_CASES index, operation name, docker step flag). pvis appears
+# TWICE -- once at the filter step's -pvesselinfo and once at the auth
+# step's -allvessels -- which IS the both-call-sites invariant, now
+# expressed as data. Kept in the same order as the docker chain runs.
+_STEP_BINDINGS = [
+    (0, "incremental_events",              "-messages"),
+    (1, "incremental_filter_events",       "-segsact"),
+    (2, "incremental_filter_events",       "-segvessel"),
+    (3, "incremental_filter_events",       "-pvesselinfo"),
+    (3, "auth_and_regions_fishing_events", "-allvessels"),
+    (4, "auth_and_regions_fishing_events", "-idcore"),
+    (5, "auth_and_regions_fishing_events", "-idauth"),
+    (6, "auth_and_regions_fishing_events", "-measures"),
+    (7, "auth_and_regions_fishing_events", "-regions"),
+]
+
+
+def test_run_slice_threads_every_override_into_step_args():
+    """Every one of the 8 flags must actually reach its docker step arg.
+
+    Distinct sentinel per table, so a mis-wired call site cannot pass by
+    coincidence -- nor by agreeing with the dataset-derived fallback, which
+    is the failure mode the stem-vs-explicit test below only weakly guards
+    against (both sides of that test resolve to the same strings by
+    construction). If any of the 9 substitutions in _run_slice were
+    reverted to its pre-E4 f-string form, THIS test fails immediately."""
+    overrides = {
+        kw: f"proj.ds.sentinel_{i}" for i, (_, kw, _) in enumerate(_HELPER_CASES)
+    }
+    captured = _run_slice_steps(_args(**overrides))
+    for idx, op, flag in _STEP_BINDINGS:
+        steps = [s for _, s, _ in captured if op in s]
+        assert steps, f"no {op} step captured"
+        for s in steps:
+            assert s[s.index(flag) + 1] == f"proj.ds.sentinel_{idx}", (
+                f"{op} {flag} did not receive the override for _HELPER_CASES[{idx}]"
+            )
+
+
+def test_stem_and_explicit_fqn_produce_identical_step_args():
+    """Backward-compat pin: an invocation with the default dataset knobs
+    produces byte-identical _run_slice step-args to one that explicitly
+    sets each FQN override to the same value the fallback would produce.
+
+    Overrides are derived from _HELPER_CASES so the fallback FQNs live in
+    exactly ONE place in the test file. Detects a changed fallback (a
+    helper now derives a different string) or a changed default (_args()
+    dataset defaults drift out of sync with _HELPER_CASES). Does NOT by
+    itself pin that _run_slice actually calls the helpers -- that's what
+    test_run_slice_threads_every_override_into_step_args pins."""
+    via_datasets = _run_slice_steps(_args())
+    via_explicit = _run_slice_steps(
+        _args(**{kw: fallback for _, kw, fallback in _HELPER_CASES})
+    )
+    assert via_datasets == via_explicit
 
 
 # --------------------------------------------------------------------------
