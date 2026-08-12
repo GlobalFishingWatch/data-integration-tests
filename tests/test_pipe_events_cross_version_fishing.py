@@ -110,7 +110,11 @@ def test_snapshot_source_calls_helper_seven_times() -> None:
     assert any(s.endswith(".event_regions") for s in sources)
 
     for call in helper.call_args_list:
-        assert call.kwargs["role"] == "cross_version"
+        # Workflow-specific role, NOT the bare "cross_version" (which
+        # port_visits/cross_version_ais.py uses) -- pins that a shared
+        # basename like segs_activity does not collide across the two
+        # workflows for the same --experiment-id.
+        assert call.kwargs["role"] == "cross_version_fishing"
         assert call.kwargs["experiment_id"] == "exp01"
         assert call.kwargs["expiration_days"] == 7
         assert call.kwargs["project"] == mod.PROJECT
@@ -186,6 +190,7 @@ def test_fishing_args_for_binding_emits_seven_per_table_fqn_flags() -> None:
         snapshot_fqns=_example_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
+        dest_dataset="tech_great_expectations",
         modes=FISHING_MODES,
     )
     for flag, expected in [
@@ -217,6 +222,7 @@ def test_fishing_args_for_binding_does_not_emit_spatial_measures_fqn() -> None:
         snapshot_fqns=_example_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
+        dest_dataset="tech_great_expectations",
         modes=FISHING_MODES,
     )
     assert "--source-spatial-measures-fqn" not in out
@@ -245,6 +251,7 @@ def test_fishing_args_for_binding_drops_user_supplied_source_fqn_overrides() -> 
         snapshot_fqns=_example_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
+        dest_dataset="tech_great_expectations",
         modes=FISHING_MODES,
     )
     # No user-supplied value reaches fishing.py.
@@ -276,6 +283,7 @@ def test_fishing_args_for_binding_drops_user_supplied_dataset_knob_overrides() -
         snapshot_fqns=_example_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
+        dest_dataset="tech_great_expectations",
         modes=FISHING_MODES,
     )
     for absent in ("--internal-ds", "--published-ds",
@@ -283,6 +291,29 @@ def test_fishing_args_for_binding_drops_user_supplied_dataset_knob_overrides() -
                    "proj.internal", "proj.published",
                    "proj.pipestatic", "proj.regions"):
         assert absent not in out
+
+
+def test_fishing_args_for_binding_drops_image_tag() -> None:
+    """--image-tag pins a single container image across all bindings.
+    For pipe-events (BQ-SQL-via-container) the image IS the pipeline code:
+    pin it and both bindings run the SAME code, producing a
+    guaranteed-empty diff that the wrapper cheerfully reports as
+    IDENTICAL -- a confident false pass on the exact question this tool
+    exists to answer. Per-binding image identity has to come from the
+    worktree HEAD via ensure_pipeline_image; --image-tag would short-
+    circuit that path.
+
+    Same hazard as --build-from-source, different mechanism."""
+    out = mod._fishing_args_for_binding(
+        ["--image-tag", "gfw/pipe-events:pinned"],
+        snapshot_fqns=_example_fqns(),
+        suffix="exp01-before",
+        experiment_id="exp01",
+        dest_dataset="tech_great_expectations",
+        modes=FISHING_MODES,
+    )
+    assert "--image-tag" not in out
+    assert "gfw/pipe-events:pinned" not in out
 
 
 def test_fishing_args_for_binding_drops_build_from_source() -> None:
@@ -296,48 +327,57 @@ def test_fishing_args_for_binding_drops_build_from_source() -> None:
         snapshot_fqns=_example_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
+        dest_dataset="tech_great_expectations",
         modes=FISHING_MODES,
     )
     assert "--build-from-source" not in out
     assert "-v" in out
 
 
-def test_fishing_args_for_binding_re_injects_suffix_modes_and_experiment_id() -> None:
-    """Wrapper-owned run identity and mode selection flow through as
-    --suffix, --modes, and --experiment-id on the child argv. --suffix
-    wins for table names via fishing.py's _resolve_suffix; --experiment-id
-    is threaded so both bindings' startup logs report the same value
-    instead of each auto-generating a distinct solo_<hex>."""
+def test_fishing_args_for_binding_re_injects_wrapper_owned_flags() -> None:
+    """Wrapper-owned run identity, mode selection, and destination
+    dataset flow through as --suffix, --modes, --experiment-id, and
+    --dest-dataset on the child argv. --suffix wins for table names via
+    fishing.py's _resolve_suffix; --experiment-id is threaded so both
+    bindings' startup logs report the same value instead of each auto-
+    generating a distinct solo_<hex>; --dest-dataset keeps the write
+    side (fishing.py) and the diff side (_view_fqn) in sync so passing
+    an explicit --dest-dataset to the wrapper doesn't silently point
+    them at different datasets."""
     out = mod._fishing_args_for_binding(
         [],
         snapshot_fqns=_example_fqns(),
         suffix="exp01-refactor",
         experiment_id="exp01",
+        dest_dataset="scratch_christian_ttl120d",
         modes=("1_bf",),
     )
     assert out[out.index("--suffix") + 1] == "exp01-refactor"
     assert out[out.index("--modes") + 1] == "1_bf"
     assert out[out.index("--experiment-id") + 1] == "exp01"
+    assert out[out.index("--dest-dataset") + 1] == "scratch_christian_ttl120d"
 
 
-def test_fishing_args_for_binding_drops_user_supplied_suffix_modes_experiment_id() -> None:
-    """A user extra --suffix, --modes, or --experiment-id could desync
-    output-table names or the modes-run/modes-diff halves. Wrapper always
-    wins on all three."""
+def test_fishing_args_for_binding_drops_user_supplied_wrapper_owned_flags() -> None:
+    """User extras for --suffix, --modes, --experiment-id, or
+    --dest-dataset could desync output-table names, modes-run/modes-diff,
+    or write/diff dataset. Wrapper always wins on all four."""
     out = mod._fishing_args_for_binding(
         ["--suffix", "user_suffix", "--modes", "3_bftruncate",
-         "--experiment-id", "user_experiment"],
+         "--experiment-id", "user_experiment",
+         "--dest-dataset", "user_dataset"],
         snapshot_fqns=_example_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
+        dest_dataset="tech_great_expectations",
         modes=("1_bf", "2_bfd"),
     )
-    assert "user_suffix" not in out
-    assert "3_bftruncate" not in out
-    assert "user_experiment" not in out
+    for tainted in ("user_suffix", "3_bftruncate", "user_experiment", "user_dataset"):
+        assert tainted not in out
     assert out[out.index("--suffix") + 1] == "exp01-before"
     assert out[out.index("--modes") + 1] == "1_bf,2_bfd"
     assert out[out.index("--experiment-id") + 1] == "exp01"
+    assert out[out.index("--dest-dataset") + 1] == "tech_great_expectations"
 
 
 # --------------------------------------------------------------------------
@@ -377,3 +417,28 @@ def test_validate_binding_names_accepts_bq_safe() -> None:
         ("before_2", "sha1abc"),
         ("v4-2-17", "v4.2.17"),
     ])
+
+
+def test_validate_binding_names_rejects_duplicate_names() -> None:
+    """suffix_by_binding is a dict keyed on name -- a duplicate binding
+    name silently collapses to one suffix while args.bindings still has
+    both entries, so _invoke runs twice against the same suffix
+    (concurrently under the default --parallel). Result: two fishing.py
+    runs writing the SAME output tables at once, then zero diff pairs,
+    then a clean exit 0. Plausible typo path is
+    `--binding main=main --binding main=refactor/...` when someone means
+    `--binding refactor=...` for the second."""
+    with pytest.raises(SystemExit, match=r"must be unique"):
+        mod._validate_binding_names([
+            ("main", "main"),
+            ("main", "refactor/branch"),
+        ])
+
+
+def test_validate_binding_names_reports_all_dupes_sorted() -> None:
+    """Error message names every duplicated binding, sorted, so a fix
+    doesn't need iterative bisection."""
+    with pytest.raises(SystemExit, match=r"a.*b"):
+        mod._validate_binding_names([
+            ("b", "r1"), ("a", "r2"), ("b", "r3"), ("a", "r4"),
+        ])

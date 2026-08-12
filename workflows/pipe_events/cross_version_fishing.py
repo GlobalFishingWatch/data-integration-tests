@@ -211,19 +211,37 @@ def _parse_binding(spec: str) -> tuple[str, str]:
 
 
 def _validate_binding_names(bindings: list[tuple[str, str]]) -> None:
-    """Reject binding names that would produce an invalid BQ table suffix.
+    """Reject binding names that would produce an invalid or ambiguous
+    BQ table suffix.
 
-    Binding name flows into ``{experiment_id}-{binding_name}`` which becomes
-    part of the output-table name; must match the same regex
-    ``add_experiment_id_arg`` enforces on ``experiment_id`` itself
-    ([a-z0-9][a-z0-9_-]{0,31}). Fail at parse time rather than deep into
-    the run when the first BQ write errors opaquely.
+    Two checks -- both fail at parse time rather than deep into the run:
+
+    1. Regex: must match [a-z0-9][a-z0-9_-]{0,31} (same shape
+       ``add_experiment_id_arg`` enforces on ``experiment_id``), because
+       binding name flows into ``{experiment_id}-{binding_name}``. A
+       ``refactor/branch`` binding name would produce an invalid BQ table.
+
+    2. Uniqueness: ``suffix_by_binding`` is a dict keyed on name, so a
+       duplicate binding name silently collapses to one suffix -- but
+       ``args.bindings`` still has both entries, so ``_invoke`` runs
+       twice against the same suffix (concurrently, since parallel is
+       the default). Result: two ``fishing.py`` runs writing the same
+       output tables at once, zero diff pairs, exit 0. Plausible typo
+       path is ``--binding main=main --binding main=refactor/...`` when
+       someone means ``--binding refactor=...`` for the second.
     """
     bad = [name for name, _ in bindings if not _BINDING_NAME_RE.match(name)]
     if bad:
         raise SystemExit(
             f"--binding NAME must match {_BINDING_NAME_RE.pattern} (BQ-table-suffix-safe); "
             f"invalid: {bad}"
+        )
+    seen = [n for n, _ in bindings]
+    dupes = sorted({n for n in seen if seen.count(n) > 1})
+    if dupes:
+        raise SystemExit(
+            f"--binding NAME must be unique (names key the output-table suffix "
+            f"AND the diff matrix); duplicated: {dupes}"
         )
 
 
@@ -261,10 +279,23 @@ def _verify_refs(pipeline_dir: str, bindings: list[tuple[str, str]]) -> None:
 # Snapshot tables (canonical-dataset shape)
 # --------------------------------------------------------------------------
 
-# Role used by dit.bq.snapshot_into_experiment. Same role name as
-# port_visits precedent; the source_basename half of the dest FQN keeps
-# distinct pipe-events sources from colliding with port-visits ones.
-_SOURCE_SNAPSHOT_ROLE = "cross_version"
+# Role used by dit.bq.snapshot_into_experiment.
+#
+# The role is workflow-specific -- NOT the bare "cross_version" that
+# port_visits/cross_version_ais.py uses -- because a shared basename can
+# collide across workflows for the same --experiment-id. Concrete case:
+# both this workflow and cross_version_ais.py snapshot a `segs_activity`
+# table, so with role="cross_version" both dest FQNs resolve to
+# `...tech_great_expectations.dit_exp_<exp>_cross_version_segs_activity`.
+# Because snapshot_into_experiment defaults to if_existing="skip", the
+# second workflow silently adopts the first workflow's snapshot -- pinned
+# at a different --pin-source-at and possibly derived from a different
+# dataset. snapshot_into_experiment's own docstring puts the duty here:
+# "Caller is responsible for keeping roles disjoint per workflow so
+# concurrent experiments don't collide on a table name." The precedent
+# is cross_version_ais.py's own second role (_THINNED_SNAPSHOT_ROLE) --
+# same trap, same fix.
+_SOURCE_SNAPSHOT_ROLE = "cross_version_fishing"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -308,13 +339,29 @@ def _snapshot_source(args: argparse.Namespace) -> _CrossVersionSnapshotFQNs:
     default) -- use a fresh experiment id per distinct pin timestamp; the
     7-day TTL on each snapshot table cleans up afterwards.
     """
-    src_research_messages = f"{PROJECT}.{args.internal_ds.split('.', 1)[-1]}.research_messages"
-    src_segs_activity = f"{PROJECT}.{args.published_ds.split('.', 1)[-1]}.segs_activity"
-    src_segment_vessel = f"{PROJECT}.{args.internal_ds.split('.', 1)[-1]}.segment_vessel"
-    src_pvis = f"{PROJECT}.{args.published_ds.split('.', 1)[-1]}.product_vessel_info_summary"
-    src_identity_core = f"{PROJECT}.{args.published_ds.split('.', 1)[-1]}.identity_core"
-    src_identity_auth = f"{PROJECT}.{args.published_ds.split('.', 1)[-1]}.identity_authorization"
-    src_event_regions = f"{PROJECT}.{args.pipe_regions_layers.split('.', 1)[-1]}.event_regions"
+    # Use dataset knobs verbatim -- they already carry the project. Splitting
+    # ``project.dataset`` on ``.`` and re-prefixing PROJECT silently discards
+    # a user-supplied project (e.g. ``--internal-ds gfw-int-vms-v3.some_internal``
+    # snapshotting from world-fishing-827 instead), which best-case produces
+    # a mid-run 404 and worst-case snapshots the wrong data from a same-named
+    # dataset in the default project. Match fishing.py's ``_run_slice``
+    # (``f"{args.internal_ds}.research_messages"``, etc.) so "the wrapper
+    # snapshots exactly what fishing.py would have read" holds by
+    # construction, not by coincidence with the defaults. Cross-org sources
+    # are already real (encounters/vms.py targets gfw-int-vms-v3) and
+    # snapshot_into_experiment carries a ``project`` param for cross-org
+    # writes.
+    #
+    # (This deliberately diverges from cross_version_ais.py, which DOES need
+    # ``PROJECT`` re-prefixing because its ``--source-dataset-stem`` is a
+    # bare stem with no project.)
+    src_research_messages = f"{args.internal_ds}.research_messages"
+    src_segs_activity = f"{args.published_ds}.segs_activity"
+    src_segment_vessel = f"{args.internal_ds}.segment_vessel"
+    src_pvis = f"{args.published_ds}.product_vessel_info_summary"
+    src_identity_core = f"{args.published_ds}.identity_core"
+    src_identity_auth = f"{args.published_ds}.identity_authorization"
+    src_event_regions = f"{args.pipe_regions_layers}.event_regions"
 
     def _snap(source: str) -> str:
         return dit_bq.snapshot_into_experiment(
@@ -347,6 +394,7 @@ def _fishing_args_for_binding(
     snapshot_fqns: _CrossVersionSnapshotFQNs,
     suffix: str,
     experiment_id: str,
+    dest_dataset: str,
     modes: Sequence[str],
 ) -> list[str]:
     """Strip user-supplied overrides for fields the wrapper owns, then
@@ -402,6 +450,25 @@ def _fishing_args_for_binding(
         # --modes is the wrapper's own flag (it selects which modes to run
         # AND which to diff); a user extra must not desync the two halves.
         "--modes",
+        # --image-tag pins a single container image across all bindings.
+        # For pipe-events (BQ-SQL-via-container) the image IS the pipeline
+        # code: pin it, both bindings run the SAME code, and the diff is
+        # empty by construction while the wrapper cheerfully reports
+        # IDENTICAL on both view families -- the worst possible failure
+        # mode for this tool: a confident false pass on the exact question
+        # it exists to answer. Per-binding image identity must come from
+        # the worktree HEAD via ensure_pipeline_image, so --image-tag has
+        # to be off-limits. Same reasoning as --build-from-source below,
+        # via a different mechanism (ensure_pipeline_image short-circuits
+        # on any override != default_worker_image).
+        "--image-tag",
+        # --dest-dataset is a fishing.py knob but the WRAPPER owns it
+        # too (this parser accepts it, and _run_diffs reads it via
+        # args.dest_dataset). Drop from user extras so the wrapper's
+        # value is what gets threaded to fishing.py -- otherwise a user
+        # extra could silently point the two bindings' writes at a
+        # dataset different from where _run_diffs then reads.
+        "--dest-dataset",
     }
     drop_bare = {
         # --build-from-source makes the docker runner ignore --image-tag
@@ -447,6 +514,14 @@ def _fishing_args_for_binding(
         # already wins for the table names via fishing.py's
         # _resolve_suffix; experiment_id is a label/log consistency knob.
         "--experiment-id", experiment_id,
+        # Keep the write side (fishing.py's --dest-dataset) and the diff
+        # side (_view_fqn's dest_dataset) in sync. Without this the
+        # wrapper's args.dest_dataset would only affect where diffs LOOK,
+        # while fishing.py falls back to its own default for where it
+        # WRITES -- masked as long as both defaults resolve through
+        # DIT_DEST_DATASET to the same value, but breaks the moment
+        # anyone passes --dest-dataset explicitly.
+        "--dest-dataset", dest_dataset,
     ])
     return out
 
@@ -471,6 +546,7 @@ def _run_binding(
     experiment_id: str,
     snapshot_fqns: _CrossVersionSnapshotFQNs,
     suffix: str,
+    dest_dataset: str,
     modes: Sequence[str],
     pipeline_dir: str,
     fishing_extra_args: list[str],
@@ -497,6 +573,7 @@ def _run_binding(
             fishing_extra_args,
             snapshot_fqns=snapshot_fqns, suffix=suffix,
             experiment_id=experiment_id,
+            dest_dataset=dest_dataset,
             modes=modes,
         )
         # fishing.py's argparse-based CLI: no click, no --help discovery
@@ -666,6 +743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             experiment_id=args.experiment_id,
             snapshot_fqns=snapshot_fqns,
             suffix=suffix_by_binding[name],
+            dest_dataset=args.dest_dataset,
             modes=args.modes,
             pipeline_dir=args.pipeline_dir,
             fishing_extra_args=fishing_extra_args,
@@ -692,6 +770,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.dry_run:
         logger.info("--dry-run set; skipping pairwise diffs.")
+        return 1 if failed_bindings else 0
+
+    # Single-binding case: no pairs to diff. Say so explicitly rather
+    # than producing an empty summary + clean exit 0 that reads like
+    # "compared and identical" but never ran a comparison. Same shape
+    # as fishing.py's compare_all handles the single-mode case.
+    if len(args.bindings) < 2:
+        only_name = args.bindings[0][0]
+        logger.info(
+            "only one binding selected (%s -> suffix %s) -- no pair to diff. "
+            "Its output views under `%s.%s` are ready for a follow-up run or "
+            "manual inspection. Add a second --binding to trigger a comparison.",
+            only_name, suffix_by_binding[only_name], PROJECT, args.dest_dataset,
+        )
         return 1 if failed_bindings else 0
 
     results = _run_diffs(
