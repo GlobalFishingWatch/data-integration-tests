@@ -143,6 +143,45 @@ def test_snapshot_source_does_not_snapshot_spatial_measures() -> None:
     assert helper.call_count == 7  # not 8
 
 
+def test_snapshot_source_preserves_cross_org_project_in_source_fqns() -> None:
+    """Regression pin for the pre-fix behavior where user-supplied
+    ``--internal-ds gfw-int-vms-v3.some_internal`` was split on ``.`` and
+    re-prefixed with ``PROJECT``, silently snapshotting from
+    ``world-fishing-827.some_internal.research_messages`` instead of the
+    user's actual FQN. Best case that produced a mid-run 404; worst case
+    it snapshotted the wrong data from a same-named dataset in the
+    default project. Now the wrapper uses the knobs verbatim, matching
+    fishing.py's ``_run_slice``.
+
+    Cross-org sources are already real (encounters/vms.py targets
+    gfw-int-vms-v3) and snapshot_into_experiment carries a ``project``
+    param for the write side."""
+    with patch(
+        "workflows.pipe_events.cross_version_fishing.dit_bq.snapshot_into_experiment",
+    ) as helper:
+        helper.side_effect = lambda src, **kw: f"dest:{src}"
+        mod._snapshot_source(_args(
+            internal_ds="gfw-int-vms-v3.some_internal",
+            published_ds="gfw-int-vms-v3.some_published",
+            pipe_regions_layers="other-project.pipe_regions_layers",
+        ))
+    sources = [call.args[0] for call in helper.call_args_list]
+    # Every source snapshotted FROM the user-supplied cross-org project.
+    assert "gfw-int-vms-v3.some_internal.research_messages" in sources
+    assert "gfw-int-vms-v3.some_internal.segment_vessel" in sources
+    assert "gfw-int-vms-v3.some_published.segs_activity" in sources
+    assert "gfw-int-vms-v3.some_published.product_vessel_info_summary" in sources
+    assert "gfw-int-vms-v3.some_published.identity_core" in sources
+    assert "gfw-int-vms-v3.some_published.identity_authorization" in sources
+    assert "other-project.pipe_regions_layers.event_regions" in sources
+    # The wrapper's own PROJECT (world-fishing-827) must NOT leak into
+    # any source FQN when the user passed a cross-org project.
+    assert not any(s.startswith("world-fishing-827.") for s in sources), (
+        f"world-fishing-827 leaked into cross-org sources: "
+        f"{[s for s in sources if s.startswith('world-fishing-827.')]}"
+    )
+
+
 def test_snapshot_source_returns_dataclass_with_helper_outputs() -> None:
     """Return value composes the helper's returned FQNs into the dataclass --
     each field is the helper's return value for the matching source."""
