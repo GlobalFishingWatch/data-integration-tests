@@ -35,6 +35,16 @@ def _args(**overrides: Any) -> argparse.Namespace:
         commit_sha="abc1234",
         experiment_id="exp01",
         run_id="rid01",
+        # Per-table FQN overrides (E4). Default None so dataset-derivation
+        # applies. Tests that exercise the override path set them explicitly.
+        source_research_messages_fqn=None,
+        source_segs_activity_fqn=None,
+        source_segment_vessel_fqn=None,
+        source_product_vessel_info_summary_fqn=None,
+        source_identity_core_fqn=None,
+        source_identity_authorization_fqn=None,
+        source_spatial_measures_fqn=None,
+        source_event_regions_fqn=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -207,6 +217,178 @@ def test_run_slice_raises_on_nonzero_rc():
             assert "rc=1" in str(e)
         else:
             raise AssertionError("expected SystemExit on non-zero docker rc")
+
+
+# --------------------------------------------------------------------------
+# E4: Source-table FQN resolvers
+# --------------------------------------------------------------------------
+
+# ((helper_fn, override_kw, fallback_expected), ...) — one entry per source
+# table. Fallback strings mirror the _args() defaults; keep them in sync if
+# the defaults ever change.
+_HELPER_CASES = [
+    (
+        mod._research_messages_table,
+        "source_research_messages_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_internal.research_messages",
+    ),
+    (
+        mod._segs_activity_table,
+        "source_segs_activity_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.segs_activity",
+    ),
+    (
+        mod._segment_vessel_table,
+        "source_segment_vessel_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_internal.segment_vessel",
+    ),
+    (
+        mod._product_vessel_info_summary_table,
+        "source_product_vessel_info_summary_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.product_vessel_info_summary",
+    ),
+    (
+        mod._identity_core_table,
+        "source_identity_core_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.identity_core",
+    ),
+    (
+        mod._identity_authorization_table,
+        "source_identity_authorization_fqn",
+        "world-fishing-827.pipe_ais_test_202408290000_published.identity_authorization",
+    ),
+    (
+        mod._spatial_measures_table,
+        "source_spatial_measures_fqn",
+        # Version literal (_20201105) baked into fallback -- pipe-events'
+        # release cadence owns this, not the workflow. Override the full FQN
+        # via --source-spatial-measures-fqn to pin a different version.
+        "world-fishing-827.pipe_static.spatial_measures_20201105",
+    ),
+    (
+        mod._event_regions_table,
+        "source_event_regions_fqn",
+        "world-fishing-827.pipe_regions_layers.event_regions",
+    ),
+]
+
+
+def test_research_messages_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[0]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+def test_segs_activity_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[1]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+def test_segment_vessel_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[2]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+def test_product_vessel_info_summary_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[3]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+def test_identity_core_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[4]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+def test_identity_authorization_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[5]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+def test_spatial_measures_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[6]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    # Version literal (_20201105) stays baked into the fallback.
+    assert helper(_args()) == fallback
+
+
+def test_event_regions_helper_honours_per_table_override():
+    helper, kw, fallback = _HELPER_CASES[7]
+    assert helper(_args(**{kw: "proj.ds.alt"})) == "proj.ds.alt"
+    assert helper(_args()) == fallback
+
+
+def test_helpers_treat_empty_string_as_unset():
+    """Truthiness check (matches port_visits M4 discipline): "" MUST fall
+    back to dataset-derivation -- otherwise a caller accidentally passing
+    e.g. --source-research-messages-fqn '' (shell expansion of an unset
+    variable) would generate an invalid docker CLI arg opaquely."""
+    for helper, kw, fallback in _HELPER_CASES:
+        assert helper(_args(**{kw: ""})) == fallback
+
+
+def test_run_slice_uses_pvis_override_at_both_call_sites():
+    """product_vessel_info_summary is referenced at BOTH the filter step's
+    -pvesselinfo AND the auth step's -allvessels -- one flag governs both.
+    A future refactor splitting these into two knobs would let one binding
+    read a snapshot while the other read live, defeating cross-version. This
+    test pins that they always agree."""
+    captured = _run_slice_steps(
+        _args(source_product_vessel_info_summary_fqn="proj.ds.pvis_override"),
+    )
+    filt_pvis = [
+        s[s.index("-pvesselinfo") + 1]
+        for _, s, _ in captured
+        if "incremental_filter_events" in s
+    ]
+    auth_allvessels = [
+        s[s.index("-allvessels") + 1]
+        for _, s, _ in captured
+        if "auth_and_regions_fishing_events" in s
+    ]
+    assert filt_pvis == ["proj.ds.pvis_override", "proj.ds.pvis_override"]
+    assert auth_allvessels == ["proj.ds.pvis_override"]
+
+
+def test_stem_and_explicit_fqn_produce_identical_step_args():
+    """Backward-compat pin: an invocation with the default dataset knobs
+    produces byte-identical _run_slice step-args to one that explicitly
+    overrides all 8 FQNs to the resolved values. Guards against a future
+    edit that changes the fallback derivation on either side (helper or
+    _run_slice) without updating the other."""
+    via_datasets = _run_slice_steps(_args())
+    via_explicit = _run_slice_steps(_args(
+        source_research_messages_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_internal.research_messages"
+        ),
+        source_segs_activity_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_published.segs_activity"
+        ),
+        source_segment_vessel_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_internal.segment_vessel"
+        ),
+        source_product_vessel_info_summary_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_published."
+            "product_vessel_info_summary"
+        ),
+        source_identity_core_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_published.identity_core"
+        ),
+        source_identity_authorization_fqn=(
+            "world-fishing-827.pipe_ais_test_202408290000_published.identity_authorization"
+        ),
+        source_spatial_measures_fqn=(
+            "world-fishing-827.pipe_static.spatial_measures_20201105"
+        ),
+        source_event_regions_fqn=(
+            "world-fishing-827.pipe_regions_layers.event_regions"
+        ),
+    ))
+    assert via_datasets == via_explicit
 
 
 # --------------------------------------------------------------------------

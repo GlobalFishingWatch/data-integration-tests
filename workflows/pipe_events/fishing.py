@@ -240,6 +240,94 @@ def _product_events_view(args: argparse.Namespace, suffix: str, mode: str) -> st
 
 
 # --------------------------------------------------------------------------
+# Source-table FQN resolvers (E4 of pipe-events cross-version arc)
+#
+# Each helper returns the resolved FQN of one input consumed by the docker
+# chain. Per-table override (``--source-<basename>-fqn``) wins; otherwise the
+# fallback derives from the dataset knobs (``--internal-ds`` /
+# ``--published-ds`` / ``--pipe-static`` / ``--pipe-regions-layers``) for
+# byte-identical back-compat with pre-E4 callers.
+#
+# Truthiness check on the override -- treating ``""`` as unset matches the
+# port_visits M4 discipline and avoids generating invalid SQL if a caller
+# accidentally passes an empty flag (e.g. shell expansion of an unset
+# variable). ``cross_version_fishing.py`` (E5) uses these overrides to point
+# each binding at snapshots in ``tech_great_expectations`` that don't follow
+# the ``<stem>_internal`` / ``<stem>_published`` shape.
+# --------------------------------------------------------------------------
+
+def _research_messages_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source research_messages table."""
+    if args.source_research_messages_fqn:
+        return args.source_research_messages_fqn
+    return f"{args.internal_ds}.research_messages"
+
+
+def _segs_activity_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source segs_activity table. See ``_research_messages_table``."""
+    if args.source_segs_activity_fqn:
+        return args.source_segs_activity_fqn
+    return f"{args.published_ds}.segs_activity"
+
+
+def _segment_vessel_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source segment_vessel table. See ``_research_messages_table``."""
+    if args.source_segment_vessel_fqn:
+        return args.source_segment_vessel_fqn
+    return f"{args.internal_ds}.segment_vessel"
+
+
+def _product_vessel_info_summary_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source product_vessel_info_summary table.
+
+    Called at BOTH call sites in ``_run_slice`` -- the filter step's
+    ``-pvesselinfo`` AND the auth step's ``-allvessels`` -- so one override
+    governs both. The pin that they always agree is load-bearing for
+    cross-version: splitting them would let one binding read a snapshot while
+    the other read live, defeating the comparison.
+    """
+    if args.source_product_vessel_info_summary_fqn:
+        return args.source_product_vessel_info_summary_fqn
+    return f"{args.published_ds}.product_vessel_info_summary"
+
+
+def _identity_core_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source identity_core table. See ``_research_messages_table``."""
+    if args.source_identity_core_fqn:
+        return args.source_identity_core_fqn
+    return f"{args.published_ds}.identity_core"
+
+
+def _identity_authorization_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source identity_authorization table. See ``_research_messages_table``."""
+    if args.source_identity_authorization_fqn:
+        return args.source_identity_authorization_fqn
+    return f"{args.published_ds}.identity_authorization"
+
+
+def _spatial_measures_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source spatial_measures table.
+
+    The version suffix ``_20201105`` is baked into the fallback; the FQN flag
+    overrides the full FQN when pinning to a different version or to a
+    snapshot. No ``--spatial-measures-version`` knob -- the version is a
+    table-name literal owned by pipe-events' release cadence, not a workflow
+    policy. When pipe-events publishes e.g. ``spatial_measures_20260101``
+    upstream, bump the default in this single line.
+    """
+    if args.source_spatial_measures_fqn:
+        return args.source_spatial_measures_fqn
+    return f"{args.pipe_static}.spatial_measures_20201105"
+
+
+def _event_regions_table(args: argparse.Namespace) -> str:
+    """Resolved FQN of the source event_regions table. See ``_research_messages_table``."""
+    if args.source_event_regions_fqn:
+        return args.source_event_regions_fqn
+    return f"{args.pipe_regions_layers}.event_regions"
+
+
+# --------------------------------------------------------------------------
 # The 4-step docker chain (one slice)
 # --------------------------------------------------------------------------
 
@@ -302,7 +390,7 @@ def _run_slice(
                 "incremental_events",
                 "-start", slice_start.isoformat(),
                 "-end", slice_end.isoformat(),
-                "-messages", f"{args.internal_ds}.research_messages",
+                "-messages", _research_messages_table(args),
                 "-sfield", sfield,
                 "-dest", dest_ds,
                 "-dest_tbl_prefix", f"{prefix}_{sfield}",
@@ -320,9 +408,9 @@ def _run_slice(
                 "--table_description", f"Filtered fishing events based on {sfield}",
                 "incremental_filter_events",
                 "-sfield", sfield,
-                "-segsact", f"{args.published_ds}.segs_activity",
-                "-segvessel", f"{args.internal_ds}.segment_vessel",
-                "-pvesselinfo", f"{args.published_ds}.product_vessel_info_summary",
+                "-segsact", _segs_activity_table(args),
+                "-segvessel", _segment_vessel_table(args),
+                "-pvesselinfo", _product_vessel_info_summary_table(args),
                 "-mtbl", f"{dest_ds}.{prefix}_{sfield}_merged",
                 "-dest", dest_ds,
                 "-dest_tbl_prefix", f"{prefix}_{sfield}",
@@ -340,11 +428,11 @@ def _run_slice(
             "auth_and_regions_fishing_events",
             "-source_fishing", f"{dest_ds}.{prefix}_nnet_score_filtered",
             "-source_nl", f"{dest_ds}.{prefix}_night_loitering_filtered",
-            "-idcore", f"{args.published_ds}.identity_core",
-            "-idauth", f"{args.published_ds}.identity_authorization",
-            "-measures", f"{args.pipe_static}.spatial_measures_20201105",
-            "-regions", f"{args.pipe_regions_layers}.event_regions",
-            "-allvessels", f"{args.published_ds}.product_vessel_info_summary",
+            "-idcore", _identity_core_table(args),
+            "-idauth", _identity_authorization_table(args),
+            "-measures", _spatial_measures_table(args),
+            "-regions", _event_regions_table(args),
+            "-allvessels", _product_vessel_info_summary_table(args),
             "-dest", f"{dest_ds}.{prefix}_fishing_events_v",
             "-dest_view", f"{dest_ds}.{prefix}_fishing_events",
             "-rdate", slice_end.isoformat(),
@@ -500,6 +588,44 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="pipe_static dataset (spatial_measures_*).")
     p.add_argument("--pipe-regions-layers", default=DEFAULT_PIPE_REGIONS_LAYERS,
                    help="pipe_regions_layers dataset (event_regions).")
+    # Per-table FQN overrides (E4 of pipe-events cross-version arc). Default
+    # None so absence triggers dataset-derivation in the helpers; explicit
+    # FQNs win. cross_version_fishing.py (E5) uses these to point at
+    # snapshots in tech_great_expectations that don't follow the
+    # <stem>_internal / <stem>_published shape. Empty string is treated as
+    # unset (matches port_visits M4 discipline).
+    p.add_argument("--source-research-messages-fqn", default=None,
+                   help="Fully-qualified `<project>.<dataset>.<table>` for the research_messages "
+                        "input (step 1 `-messages`); overrides --internal-ds-based derivation "
+                        "for this table only. The basename does not have to be `research_messages` "
+                        "-- the workflow treats whatever table you pass as the equivalent input.")
+    p.add_argument("--source-segs-activity-fqn", default=None,
+                   help="Fully-qualified FQN for the segs_activity input (step 2 `-segsact`); "
+                        "overrides --published-ds-based derivation for this table only.")
+    p.add_argument("--source-segment-vessel-fqn", default=None,
+                   help="Fully-qualified FQN for the segment_vessel input (step 2 `-segvessel`); "
+                        "overrides --internal-ds-based derivation for this table only.")
+    p.add_argument("--source-product-vessel-info-summary-fqn", default=None,
+                   help="Fully-qualified FQN for the product_vessel_info_summary input "
+                        "(step 2 `-pvesselinfo` AND step 3 `-allvessels` -- one flag governs "
+                        "both call sites); overrides --published-ds-based derivation for this "
+                        "table only.")
+    p.add_argument("--source-identity-core-fqn", default=None,
+                   help="Fully-qualified FQN for the identity_core input (step 3 `-idcore`); "
+                        "overrides --published-ds-based derivation for this table only.")
+    p.add_argument("--source-identity-authorization-fqn", default=None,
+                   help="Fully-qualified FQN for the identity_authorization input "
+                        "(step 3 `-idauth`); overrides --published-ds-based derivation for "
+                        "this table only.")
+    p.add_argument("--source-spatial-measures-fqn", default=None,
+                   help="Fully-qualified FQN for the spatial_measures input (step 3 `-measures`); "
+                        "overrides the --pipe-static-based fallback of "
+                        "`{pipe_static}.spatial_measures_20201105`. The version suffix is baked "
+                        "into the fallback; pass the full FQN here to pin a different version "
+                        "or a snapshot.")
+    p.add_argument("--source-event-regions-fqn", default=None,
+                   help="Fully-qualified FQN for the event_regions input (step 3 `-regions`); "
+                        "overrides --pipe-regions-layers-based derivation for this table only.")
     p.add_argument("--start", default=DEFAULT_START,
                    help="Inclusive start date (half-open window [start, end)).")
     p.add_argument("--end", default=DEFAULT_END,
@@ -591,7 +717,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("run_id: %s  commit_sha: %s%s",
                 args.run_id, args.commit_sha,
                 " (UNREVIEWED)" if args.unreviewed else "")
-    logger.info("internal_ds: %s  published_ds: %s", args.internal_ds, args.published_ds)
+    # Log every RESOLVED source FQN (E4): tells the truth about what the run
+    # actually reads even when cross_version_fishing.py has swapped datasets
+    # underneath via per-table FQN overrides. Replaces the pre-E4 stem-only
+    # log (which would be misleading for cross-version runs reading from
+    # tech_great_expectations snapshots).
+    logger.info("source research_messages:            %s", _research_messages_table(args))
+    logger.info("source segs_activity:                %s", _segs_activity_table(args))
+    logger.info("source segment_vessel:               %s", _segment_vessel_table(args))
+    logger.info("source product_vessel_info_summary:  %s", _product_vessel_info_summary_table(args))
+    logger.info("source identity_core:                %s", _identity_core_table(args))
+    logger.info("source identity_authorization:       %s", _identity_authorization_table(args))
+    logger.info("source spatial_measures:             %s", _spatial_measures_table(args))
+    logger.info("source event_regions:                %s", _event_regions_table(args))
     logger.info("date window (half-open): [%s, %s), tail_days=%d",
                 args.start, args.end, args.tail_days)
 
