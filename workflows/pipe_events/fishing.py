@@ -598,34 +598,41 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Fully-qualified `<project>.<dataset>.<table>` for the research_messages "
                         "input (step 1 `-messages`); overrides --internal-ds-based derivation "
                         "for this table only. The basename does not have to be `research_messages` "
-                        "-- the workflow treats whatever table you pass as the equivalent input.")
+                        "-- the workflow treats whatever table you pass as the equivalent input. "
+                        f"Default: {DEFAULT_INTERNAL_DS}.research_messages.")
     p.add_argument("--source-segs-activity-fqn", default=None,
                    help="Fully-qualified FQN for the segs_activity input (step 2 `-segsact`); "
-                        "overrides --published-ds-based derivation for this table only.")
+                        "overrides --published-ds-based derivation for this table only. "
+                        f"Default: {DEFAULT_PUBLISHED_DS}.segs_activity.")
     p.add_argument("--source-segment-vessel-fqn", default=None,
                    help="Fully-qualified FQN for the segment_vessel input (step 2 `-segvessel`); "
-                        "overrides --internal-ds-based derivation for this table only.")
+                        "overrides --internal-ds-based derivation for this table only. "
+                        f"Default: {DEFAULT_INTERNAL_DS}.segment_vessel.")
     p.add_argument("--source-product-vessel-info-summary-fqn", default=None,
                    help="Fully-qualified FQN for the product_vessel_info_summary input "
                         "(step 2 `-pvesselinfo` AND step 3 `-allvessels` -- one flag governs "
                         "both call sites); overrides --published-ds-based derivation for this "
-                        "table only.")
+                        "table only. "
+                        f"Default: {DEFAULT_PUBLISHED_DS}.product_vessel_info_summary.")
     p.add_argument("--source-identity-core-fqn", default=None,
                    help="Fully-qualified FQN for the identity_core input (step 3 `-idcore`); "
-                        "overrides --published-ds-based derivation for this table only.")
+                        "overrides --published-ds-based derivation for this table only. "
+                        f"Default: {DEFAULT_PUBLISHED_DS}.identity_core.")
     p.add_argument("--source-identity-authorization-fqn", default=None,
                    help="Fully-qualified FQN for the identity_authorization input "
                         "(step 3 `-idauth`); overrides --published-ds-based derivation for "
-                        "this table only.")
+                        "this table only. "
+                        f"Default: {DEFAULT_PUBLISHED_DS}.identity_authorization.")
     p.add_argument("--source-spatial-measures-fqn", default=None,
                    help="Fully-qualified FQN for the spatial_measures input (step 3 `-measures`); "
-                        "overrides the --pipe-static-based fallback of "
-                        "`{pipe_static}.spatial_measures_20201105`. The version suffix is baked "
-                        "into the fallback; pass the full FQN here to pin a different version "
-                        "or a snapshot.")
+                        "overrides the --pipe-static-based derivation for this table only. The "
+                        "version suffix is baked into the fallback; pass the full FQN here to "
+                        "pin a different version or a snapshot. "
+                        f"Default: {DEFAULT_PIPE_STATIC}.spatial_measures_20201105.")
     p.add_argument("--source-event-regions-fqn", default=None,
                    help="Fully-qualified FQN for the event_regions input (step 3 `-regions`); "
-                        "overrides --pipe-regions-layers-based derivation for this table only.")
+                        "overrides --pipe-regions-layers-based derivation for this table only. "
+                        f"Default: {DEFAULT_PIPE_REGIONS_LAYERS}.event_regions.")
     p.add_argument("--start", default=DEFAULT_START,
                    help="Inclusive start date (half-open window [start, end)).")
     p.add_argument("--end", default=DEFAULT_END,
