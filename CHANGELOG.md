@@ -9,6 +9,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 ### 2026-10-22
 
 #### Fixed
+- **pipe-anchorages temp-dataset overlay now covers every BigQuery read.** Patch `21aed7a5` gave the staging dataset to `ReadMessages` but not to the `ReadNamedAnchorages` side input in `port_state_transitions/main.py`. The first v5 staging smoke failed on it in every mode: Beam tried to create its own temp dataset and got `bigquery.datasets.create` denied. Patch `905dc761` covers all three reads, and the in-image self-check now fails the build unless every `ReadFromBigQuery.from_query` in both pipelines passes the staging dataset. Rebuilt and pushed `dit/pipe-anchorages:main-b36aed6-temp-dataset-905dc761` and `:pipeline-4690-14b4be8-temp-dataset-905dc761`; the `21aed7a5` images are superseded.
 - **`workflows/port_visits/ais.py` now mounts the `gcp` credentials volume on every docker call.** A published-image run (`docker run`, no `--build-from-source`) had no GCP credentials inside the container; only the compose path mounted them, through pipe-anchorages' own compose file. The v5 overlay image can only run that way, so a laptop v5 run could not authenticate. Same `gcp:/root/.config` spec as encounters, pipe-events and pipe-segment; cloud mode still drops it. Pipeline argv and cache keys are unchanged.
 
 #### Changed

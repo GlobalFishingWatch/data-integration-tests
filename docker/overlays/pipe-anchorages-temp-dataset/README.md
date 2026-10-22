@@ -20,7 +20,9 @@ The v4.6.4 CLI's `--temp_dataset` only ever existed on DIT's local patch branch.
 `temp_dataset.patch`, against pipe-anchorages main (b36aed6):
 
 - adds `src/pipe_anchorages/_dit_overlay.py`: `temp_dataset_kwargs()` returns `{"temp_dataset": DatasetReference(...)}` when `DIT_BQ_TEMP_DATASET=<project>.<dataset>` is set, `{}` otherwise;
-- adds `**temp_dataset_kwargs()` to `read_from_bigquery_kwargs` in `pipelines/port_state_transitions/main.py` and `pipelines/port_visits/main.py`.
+- adds `**temp_dataset_kwargs()` to `read_from_bigquery_kwargs` of every BigQuery read: `ReadMessages` and `ReadNamedAnchorages` in `pipelines/port_state_transitions/main.py`, and `ReadPortStateTransitions` in `pipelines/port_visits/main.py`.
+
+The first version of the patch (`21aed7a5`) missed `ReadNamedAnchorages`, a side input. The first v5 staging smoke (2026-10-22, run `89744c79850f`) failed on it in every mode: Beam tried to create `beam_temp_dataset_<hex>` and got `bigquery.datasets.create` denied. Images tagged `-temp-dataset-21aed7a5` are broken for Dataflow; do not use them.
 
 Unset, the image behaves exactly like the commit it was built from. The argument is set at pipeline construction and pickled into the source, which the workers split, so the overlay image must be **both** the submitter (`--image-tag`) and the worker (`--worker-image`). `workflows/port_visits/ais.py --pipeline-cli v5` sets the variable through the docker runner's `container_env` from `--bq-temp-dataset`.
 
@@ -45,10 +47,12 @@ Built so far (2026-10-22, PIPELINE-4690):
 
 | side | commit | image | digest |
 |---|---|---|---|
-| baseline | pipe-anchorages main b36aed6 | `dit/pipe-anchorages:main-b36aed6-temp-dataset-21aed7a5` | `sha256:ebdd9fd4f9b78596534961197ef6ff060247ea81fa7dfaf919ae84a920a28c07` |
-| candidate | PR #176 head 14b4be8 | `dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-21aed7a5` | `sha256:e06d29ee20a96e7c5d5b6937484618830a9b843b4d44c9ad14569010bdb76ff9` |
+| baseline | pipe-anchorages main b36aed6 | `dit/pipe-anchorages:main-b36aed6-temp-dataset-905dc761` | `sha256:31e39bead44142e683f8cf9d54f5a06d8e288ee2ce87e96e1cde3253de2185c8` |
+| candidate | PR #176 head 14b4be8 | `dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` | `sha256:9dd605712c24bbdcb720493dc426c0ac6888929beba0ffc501feb96f3db4c9cb` |
 
-The build fails if the patch does not apply (`git apply --check`), and after building runs `verify_overlay.py` inside the image. That self-check asserts the variable is honoured, Beam forwards `temp_dataset` to the export source, the source then skips dataset creation, and both pipelines import the helper. It also checks the `pipe-anchorages` console script.
+Superseded, broken for Dataflow (patch `21aed7a5` missed `ReadNamedAnchorages`): `main-b36aed6-temp-dataset-21aed7a5` (`sha256:ebdd9fd4…a28c07`) and `pipeline-4690-14b4be8-temp-dataset-21aed7a5` (`sha256:e06d29ee…b76ff9`).
+
+The build fails if the patch does not apply (`git apply --check`), and after building runs `verify_overlay.py` inside the image. That self-check asserts the variable is honoured, Beam forwards `temp_dataset` to the export source, the source then skips dataset creation, and both pipelines import the helper. It also asserts that every `ReadFromBigQuery.from_query` in both pipelines passes the patched kwargs, with the expected read count per pipeline (2 and 1), so a read added upstream fails the build instead of the Dataflow job. It also checks the `pipe-anchorages` console script.
 
 ## Retire it
 
