@@ -6,6 +6,13 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-10-22
+
+#### Added
+- **`--pipeline-cli {v4,v5}` on `workflows/port_visits/ais.py`** ([PIPELINE-4699](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4699)). pipe-anchorages main replaced the v4.6.4 CLI the workflow was written against, so no current pipe-anchorages code could be tested. `v4` (default) is byte-identical to before: verified by capturing every docker call `_run_slice` makes under both runners, with and without `--thinned-message-table`, against main's copy of the workflow. `v5` emits `port-state-transitions` / `port-visits` with the `--bq-in-*` / `--bq-out-*` flags; converts the workflow's inclusive `--end` to the CLI's exclusive `--end-date` (a one-day slice becomes `[d, d+1)`, since the CLI rejects `end <= start`); drops `--wait_for_job` and `--temp_dataset`; and passes labels, `--project` and `--temp_location` on the docker/DirectRunner path too. Both emitted v5 commands were run through the real pipe-anchorages CLI with mocked BigQuery clients. v5 runs carry `pipeline_cli` in their cache key; v4 keys are unchanged. 19 tests in `tests/test_port_visits_v5_cli.py`.
+- **pipe-anchorages temp-dataset overlay** (`docker/overlays/pipe-anchorages-temp-dataset/`). Upstream has no way to name Beam's BigQuery staging dataset, and no Beam or Dataflow setting can substitute (verified against Beam v2.76.0 source and production job metadata). A small test-only patch reads `DIT_BQ_TEMP_DATASET` and passes `temp_dataset` to both pipelines' readers. `ais.py --pipeline-cli v5` sets that variable in the container from `--bq-temp-dataset`. `build.sh <repo> <commit> <label> [--push]` builds `gcr.io/world-fishing-827/dit/pipe-anchorages:<label>-<commit7>-temp-dataset-<patch8>` from the commit's own source and runs a self-check inside the image. Not proposed upstream.
+- **`--binding-image-tag NAME=IMAGE` on `workflows/port_visits/cross_version_ais.py`**: a per-binding submitter image, needed for v5 because the overlay must also run the submission (the staging dataset is set at pipeline construction). Mirrors `--binding-worker-image`.
+
 ### 2026-08-12
 
 #### Added
