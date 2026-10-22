@@ -197,6 +197,14 @@ DEFAULT_PIPELINE_CLI = PIPELINE_CLI_V4
 #: Beam's ReadFromBigQuery (v5 only; see docker/overlays/pipe-anchorages-temp-dataset/).
 TEMP_DATASET_ENV = "DIT_BQ_TEMP_DATASET"
 
+#: Laptop-mode GCP credentials: the ``gcp`` docker named volume holding the
+#: gcloud config / ADC, mounted at the image's ``$HOME/.config`` (root). Same
+#: spec as encounters, pipe-events and pipe-segment. Without it a published-
+#: image ``docker run`` has no credentials; only the compose path
+#: (``--build-from-source``) mounted it, via pipe-anchorages' compose file.
+#: Cloud mode (``DIT_CLOUD_MODE``) drops it in ``dit.runners.docker``.
+GCP_VOLUME = "gcp:/root/.config"
+
 # Labels on every pipe-anchorages job. pipe-anchorages requires --labels to be
 # non-None (v4: cloud_to_labels in transforms/sink.py iterates without a None
 # guard; v5: --labels is a required option). Mirrors composer's
@@ -539,12 +547,13 @@ def _run_slice(
 
 
 def _docker_run_kwargs(args: argparse.Namespace) -> dict:
-    """Keyword arguments for ``dit_docker.run``. v4 calls are unchanged; v5
-    calls also hand the BigQuery staging dataset to the DIT overlay patch
-    inside the container (upstream has no option for it)."""
+    """Keyword arguments for ``dit_docker.run``. Every call mounts the GCP
+    credentials volume; v5 calls also hand the BigQuery staging dataset to the
+    DIT overlay patch inside the container (upstream has no option for it)."""
     kwargs: dict = {
         "entrypoint": "pipe-anchorages",
         "build_from_source": args.build_from_source,
+        "volumes": [GCP_VOLUME],
     }
     if _pipeline_cli(args) == PIPELINE_CLI_V5:
         kwargs["container_env"] = {TEMP_DATASET_ENV: args.bq_temp_dataset}

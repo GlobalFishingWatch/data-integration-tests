@@ -170,6 +170,18 @@ def test_v5_hands_the_temp_dataset_to_the_overlay_through_the_container_env():
         assert kwargs["entrypoint"] == "pipe-anchorages"
 
 
+@pytest.mark.parametrize("cli", ["v4", "v5"])
+@pytest.mark.parametrize("build_from_source", [False, True])
+def test_every_docker_call_mounts_the_gcp_credentials_volume(cli, build_from_source):
+    # A published-image `docker run` (the only way to run the v5 overlay) has
+    # no credentials otherwise; encounters / pipe-events use the same spec.
+    cli_args = ["--pipeline-cli", cli, *(["--build-from-source"] if build_from_source else [])]
+    calls = _calls(_args(*cli_args))
+    assert calls
+    for _, kwargs in calls:
+        assert kwargs["volumes"] == [mod.GCP_VOLUME] == ["gcp:/root/.config"]
+
+
 # --------------------------------------------------------------------------
 # worker cap
 # --------------------------------------------------------------------------

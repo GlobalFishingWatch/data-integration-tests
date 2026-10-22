@@ -8,6 +8,9 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ### 2026-10-22
 
+#### Fixed
+- **`workflows/port_visits/ais.py` now mounts the `gcp` credentials volume on every docker call.** A published-image run (`docker run`, no `--build-from-source`) had no GCP credentials inside the container; only the compose path mounted them, through pipe-anchorages' own compose file. The v5 overlay image can only run that way, so a laptop v5 run could not authenticate. Same `gcp:/root/.config` spec as encounters, pipe-events and pipe-segment; cloud mode still drops it. Pipeline argv and cache keys are unchanged.
+
 #### Changed
 - **Dataflow temp and staging paths move under `gs://<bucket>/dit/`, for every workflow.** The default bucket `pipe-temp-us-central-ttl7` is also production's Dataflow bucket. dit wrote under exactly production's `dataflow_temp/` and `dataflow_staging/` prefixes, a default inherited from the original pipe-gaps port and chosen for the service account's write permissions. Now `dit.dataflow_paths` builds `gs://<bucket>/dit/dataflow_temp` and `gs://<bucket>/dit/dataflow_staging`. They are used by `dit.runners.dataflow` (pipe-gaps' two workflows), `port_visits/ais.py`, `encounters/ais.py` (and so `vms.py`), and `pipe_segment/identity_match_key.py`. pipe-segment previously hard-coded the bucket and now also honours `DIT_DATAFLOW_TEMP_BUCKET`. Same bucket and permissions, no new IAM. The bucket is a runner-only knob, so no cache key changes. 8 tests in `tests/test_dataflow_paths.py`.
 
