@@ -22,7 +22,7 @@ from workflows.port_visits import cross_version_ais as xv
 def _args(*cli: str, runner: str = "dataflow", thinned: str | None = None):
     argv = ["--runner", runner, *cli]
     if thinned:
-        argv += ["--thinned-message-table", thinned]
+        argv += ["--steps", mod.STEP_VISITS, "--thinned-message-table", thinned]
     args = mod.parse_args(argv)
     # Normally stamped by main() from the resolved run context.
     args.run_id = "rid01"

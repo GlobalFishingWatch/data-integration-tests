@@ -174,10 +174,23 @@ def parse_modes(raw: str, *, choices: Sequence[str]) -> list[str]:
     naming the valid choices -- a typo'd mode silently running nothing would
     look exactly like a passing run.
     """
+    return parse_choice_list(raw, choices=choices, flag="--modes", noun="mode")
+
+
+def parse_choice_list(
+    raw: str, *, choices: Sequence[str], flag: str, noun: str,
+) -> list[str]:
+    """Parse a comma-separated selection from ``choices`` (e.g. ``--steps``).
+
+    Same rules as :func:`parse_modes`, which delegates here: the result is in
+    ``choices`` order, duplicates collapse, surrounding whitespace is
+    tolerated, and an empty or unknown selection raises ``SystemExit`` naming
+    ``flag`` and the valid choices.
+    """
     requested = [m.strip() for m in raw.split(",") if m.strip()]
     if not requested:
         raise SystemExit(
-            f"error: --modes must name at least one mode; valid: {','.join(choices)}"
+            f"error: {flag} must name at least one {noun}; valid: {','.join(choices)}"
         )
     choices_set = set(choices)
     requested_set = set(requested)
@@ -185,7 +198,7 @@ def parse_modes(raw: str, *, choices: Sequence[str]) -> list[str]:
     unknown = [m for m in requested if m not in choices_set]
     if unknown:
         raise SystemExit(
-            f"error: unknown mode(s) {','.join(unknown)}; "
+            f"error: unknown {noun}(s) {','.join(unknown)}; "
             f"valid: {','.join(choices)}"
         )
     return [m for m in choices if m in requested_set]

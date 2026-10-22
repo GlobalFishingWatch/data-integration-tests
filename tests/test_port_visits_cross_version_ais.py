@@ -47,6 +47,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         source_messages_fqn=None,
         source_segment_info_fqn=None,
         source_segs_activity_fqn=None,
+        steps=list(mod.AIS_SELECTABLE_STEPS),
         thinned_message_table=None,
         pin_expiration_days=7,
         pin_max_gb=1000.0,
@@ -137,6 +138,26 @@ def test_invalid_reuse_pin_is_rejected() -> None:
         ])
 
 
+def test_steps_default_to_both_in_pipeline_order() -> None:
+    args, _ = mod.parse_args([
+        "--experiment-id", "e", "--binding", "before=main",
+        "--steps", "port_visits,thin_port_messages",
+    ])
+    assert args.steps == [mod.STEP_THIN, mod.STEP_VISITS]
+
+
+@pytest.mark.parametrize(("extra", "message"), [
+    (["--steps", "port_visits"], "pass --thinned-message-table"),
+    (["--thinned-message-table", "p.d.t"], "needs --steps port_visits"),
+    (["--steps", "raw_port_events"], "unknown step"),
+])
+def test_step_selections_without_a_clear_input_are_rejected(extra, message) -> None:
+    """The same rules as ais.py (shared validate_steps): skipping step 1 needs
+    an input table, and the input table is meaningless when step 1 runs."""
+    with pytest.raises(SystemExit, match=message):
+        mod.parse_args(["--experiment-id", "e", "--binding", "before=main", *extra])
+
+
 def test_a_non_positive_pin_cap_is_rejected() -> None:
     with pytest.raises(SystemExit, match="--pin-max-gb must be > 0"):
         mod.parse_args([
@@ -165,10 +186,12 @@ def test_pin_specs_window_messages_and_copy_the_rest_whole() -> None:
     assert {s.role for s in specs.values()} == {"cross_version"}
 
 
-def test_pin_specs_with_thinned_table_pin_it_instead_of_messages() -> None:
-    """A thinned run skips step 1, the only reader of messages_positions, so
-    copying it would only cost (a month of prod messages is ~3.6 TB)."""
-    specs = {s.field: s for s in mod._pin_specs(_args(thinned_message_table="p.d.thinned"))}
+def test_pin_specs_for_port_visits_alone_pin_the_thinned_input_not_messages() -> None:
+    """Without step 1, the only reader of messages_positions, copying it would
+    only cost (a month of prod messages is ~3.6 TB)."""
+    specs = {s.field: s for s in mod._pin_specs(_args(
+        steps=[mod.STEP_VISITS], thinned_message_table="p.d.thinned",
+    ))}
 
     assert set(specs) == {"thinned", "segment_info", "segs_activity"}
     thinned = specs["thinned"]
@@ -177,6 +200,13 @@ def test_pin_specs_with_thinned_table_pin_it_instead_of_messages() -> None:
     assert thinned.window == dit_bq.SourceWindow(
         column="timestamp", start=date(2020, 1, 1), end=date(2021, 1, 1),
     )
+
+
+def test_pin_specs_for_thin_port_messages_alone_pin_only_messages() -> None:
+    """Step 1 reads neither segment_info nor segs_activity."""
+    specs = mod._pin_specs(_args(steps=[mod.STEP_THIN]))
+
+    assert [s.field for s in specs] == ["messages_positions"]
 
 
 def test_pin_specs_use_per_table_source_overrides() -> None:
@@ -304,6 +334,49 @@ def test_ais_args_for_binding_threads_thinned_and_omits_unpinned_messages() -> N
 
 def test_ais_args_for_binding_omits_thinned_when_absent() -> None:
     assert "--thinned-message-table" not in _binding_args([])
+
+
+def test_ais_args_for_binding_forwards_steps_and_drops_user_steps() -> None:
+    """The wrapper owns --steps: it decides what was pinned and what is
+    diffed, so a user extra must not desync the bindings from either."""
+    out = mod._ais_args_for_binding(
+        ["--steps", "port_visits"],
+        pinned=_pinned(segment_info=None, segs_activity=None),
+        suffix="exp01-before",
+        experiment_id="exp01",
+        binding_name="before",
+        modes=mod.AIS_SELECTABLE_MODES,
+        steps=[mod.STEP_THIN],
+    )
+    assert out.count("--steps") == 1
+    assert out[out.index("--steps") + 1] == "thin_port_messages"
+    # Step 1 alone: only its own input reaches ais.py.
+    assert "--source-messages-fqn" in out
+    assert "--source-segment-info-fqn" not in out
+    assert "--source-segs-activity-fqn" not in out
+
+
+def test_diff_for_thin_port_messages_compares_port_events_on_its_key() -> None:
+    with patch.object(mod.dit_compare, "compare_tables", return_value=0) as compare:
+        mod._diff_pair(
+            dest_dataset="ds", a_suffix="e-before", b_suffix="e-after",
+            mode="1_bf", step=mod.STEP_THIN,
+        )
+    (a, b), kwargs = compare.call_args
+    assert a == f"{mod.PROJECT}.ds.port_events_e-before_1_bf"
+    assert b == f"{mod.PROJECT}.ds.port_events_e-after_1_bf"
+    assert kwargs["keys"] == ["identifier", "timestamp"]
+
+
+def test_diff_for_port_visits_compares_visits_on_visit_id() -> None:
+    with patch.object(mod.dit_compare, "compare_tables", return_value=0) as compare:
+        mod._diff_pair(
+            dest_dataset="ds", a_suffix="e-before", b_suffix="e-after",
+            mode="1_bf", step=mod.STEP_VISITS,
+        )
+    (a, _), kwargs = compare.call_args
+    assert a == f"{mod.PROJECT}.ds.port_visits_e-before_1_bf"
+    assert kwargs["keys"] == ["visit_id"]
 
 
 def test_ais_args_for_binding_drops_user_thinned_message_table() -> None:
