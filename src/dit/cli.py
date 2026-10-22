@@ -7,10 +7,12 @@ also be invoked directly from a pytest target.
 """
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import os
 import signal
 import sys
+import types
 from pathlib import Path
 
 import click
@@ -178,6 +180,32 @@ def _ensure_workflows_root_on_path(workflow_path: Path) -> None:
             return
 
 
+def _exec_workflow_module(spec: importlib.machinery.ModuleSpec) -> types.ModuleType:
+    """Execute a workflow file's module, registered in ``sys.modules`` only while it loads.
+
+    ``@dataclasses.dataclass`` looks its class's module up in ``sys.modules`` when
+    annotations are strings (``from __future__ import annotations``), so a module that
+    is not registered fails at import with ``'NoneType' object has no attribute
+    '__dict__'``. That broke ``dit run`` for every workflow defining such a dataclass
+    (both cross-version wrappers and pipe-segment's identity-match-key, found
+    2026-10-22). The registration is removed again afterwards, and any module already
+    registered under the same name is restored, so the module's runtime status is
+    unchanged: notably cloudpickle keeps pickling workflow-defined objects by value
+    rather than by a module reference Dataflow workers could not import.
+    """
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(spec.name, None)
+        else:
+            sys.modules[spec.name] = previous
+    return module
+
+
 @main.command(
     "run",
     context_settings={
@@ -204,8 +232,7 @@ def run(workflow_path: Path, workflow_args: tuple[str, ...]) -> None:
         click.echo(f"could not load workflow at {workflow_path}", err=True)
         sys.exit(2)
 
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = _exec_workflow_module(spec)
 
     workflow_main = getattr(module, "main", None)
     if workflow_main is None:
