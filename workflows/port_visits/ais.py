@@ -162,6 +162,16 @@ DEFAULT_START = "2020-01-01"   # inclusive
 DEFAULT_END = "2020-12-31"     # inclusive
 DEFAULT_TAIL_DAYS = 3
 
+# Dataflow autoscaling ceiling. Without one, Dataflow scales up to the project's
+# quota, and world-fishing-827 is also the execution project of prod's
+# core.ais.v5.backfill, so an uncapped dit run competes with prod for regional
+# CPU and IP quota. The default fits the 2020 staging cohort (142 ssvid); pass a
+# larger value for production slices (e.g. 16 for one month of AIS). Prod runs
+# the full-history port-visits step with 100 (core.ais.v3) or 250 (v5 backfill).
+# Making this a shared knob across all workflows, and choosing the right scale
+# per job, are follow-ups under the DIT epic PIPELINE-4698.
+DEFAULT_MAX_NUM_WORKERS = 4
+
 DEFAULT_IMAGE_TAG = "gfw/pipe-anchorages:v4.6.4"
 
 # Dataflow worker container image -- needs pipe_anchorages installed (workers
@@ -202,6 +212,11 @@ _STATIC_LABELS = (
 def _pipeline_cli(args: argparse.Namespace) -> str:
     """The CLI generation to emit; defaults to v4 for Namespaces built without it."""
     return getattr(args, "pipeline_cli", DEFAULT_PIPELINE_CLI)
+
+
+def _max_num_workers(args: argparse.Namespace) -> int:
+    """The Dataflow worker cap; defaults for Namespaces built without it."""
+    return getattr(args, "max_num_workers", DEFAULT_MAX_NUM_WORKERS)
 
 
 def _exclusive_end(inclusive_end: date) -> str:
@@ -341,6 +356,8 @@ def _dataflow_pipeline_options(
         f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
+        # Bound autoscaling; see DEFAULT_MAX_NUM_WORKERS.
+        f"--max_num_workers={_max_num_workers(args)}",
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
     ]
@@ -910,6 +927,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--end", default=DEFAULT_END, help="Inclusive end date.")
     p.add_argument("--tail-days", type=int, default=DEFAULT_TAIL_DAYS,
                    help="Number of tail days for bfd / bftruncate iteration.")
+    p.add_argument("--max-num-workers", type=int, default=DEFAULT_MAX_NUM_WORKERS,
+                   help=f"Dataflow autoscaling ceiling per job (default {DEFAULT_MAX_NUM_WORKERS}, "
+                        "sized for the 2020 staging cohort; e.g. 16 for one month of production "
+                        "AIS). Dataflow runner only. Does not affect output, so it is not part "
+                        "of the cache key.")
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
                    help="Dataflow worker container image with pipe_anchorages installed; "
@@ -962,6 +984,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Negative values produce nonsensical iteration counts and invert "
             "the daily-tail date range."
         )
+    if args.max_num_workers < 1:
+        raise SystemExit(f"--max-num-workers must be >= 1; got {args.max_num_workers}.")
 
     repo_dir = os.getcwd()
 

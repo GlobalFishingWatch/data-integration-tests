@@ -171,6 +171,51 @@ def test_v5_hands_the_temp_dataset_to_the_overlay_through_the_container_env():
 
 
 # --------------------------------------------------------------------------
+# worker cap
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cli", ["v4", "v5"])
+def test_dataflow_jobs_are_capped_at_the_staging_default(cli):
+    for (_, argv), _ in _calls(_args("--pipeline-cli", cli)):
+        assert _flag(argv, "--max_num_workers") == str(mod.DEFAULT_MAX_NUM_WORKERS)
+    assert mod.DEFAULT_MAX_NUM_WORKERS == 4
+
+
+def test_the_worker_cap_can_be_raised_for_production_slices():
+    for (_, argv), _ in _calls(_args("--pipeline-cli", "v5", "--max-num-workers", "16")):
+        assert _flag(argv, "--max_num_workers") == "16"
+
+
+def test_the_docker_runner_gets_no_worker_cap():
+    for (_, argv), _ in _calls(_args(runner="docker")):
+        assert _flag(argv, "--max_num_workers") is None
+
+
+def test_the_worker_cap_is_not_part_of_the_cache_key():
+    four = mod.canonical_params_dict(_args(), mod.MODE_BF)
+    sixteen = mod.canonical_params_dict(_args("--max-num-workers", "16"), mod.MODE_BF)
+
+    assert four == sixteen
+
+
+def test_a_worker_cap_below_one_is_rejected():
+    with pytest.raises(SystemExit, match="--max-num-workers must be >= 1"):
+        mod.main(["--max-num-workers", "0", "--skip-pipelines", "--skip-comparisons"])
+
+
+def test_cross_version_forwards_the_worker_cap_to_every_binding():
+    argv = xv._ais_args_for_binding(
+        ["--max-num-workers", "16"],
+        snapshot_fqns=xv._CrossVersionSnapshotFQNs(
+            messages_positions="p.d.m", segment_info="p.d.si", segs_activity="p.d.sa",
+        ),
+        suffix="s", experiment_id="e", binding_name="after", modes=[mod.MODE_BF],
+    )
+
+    assert argv[argv.index("--max-num-workers") + 1] == "16"
+
+
+# --------------------------------------------------------------------------
 # cache key
 # --------------------------------------------------------------------------
 

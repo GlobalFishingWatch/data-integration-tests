@@ -86,6 +86,17 @@ Trigger: a DIT integration test was needed for pipe-anchorages PR #176 (PIPELINE
 
 **Sections moved (this commit).** `workflows/port_visits/ais.py` (docstring, `PIPELINE_CLI_*`, `TEMP_DATASET_ENV`, `_STATIC_LABELS`, `_thin_argv` / `_visits_argv` / `_docker_run_kwargs`, v5 DirectRunner options, `--pipeline-cli`, cache key). `workflows/port_visits/cross_version_ais.py` (`--binding-image-tag`). New `docker/overlays/pipe-anchorages-temp-dataset/` (patch, `build.sh`, `verify_overlay.py`, README). New `tests/test_port_visits_v5_cli.py` (19 tests). `docs/pipeline-contract.md` pipe-anchorages column + v5 note; `docs/conventions.md`; README (epic, Features, Roadmap 7a/7b); CHANGELOG; this file (epic reference in Repo orientation).
 
+**5. Prod-impact review before the first run, and a worker cap.** A pre-run review found nothing in this path that can write to a prod table, image or DAG:
+- images go only to `gcr.io/world-fishing-827/dit/`;
+- outputs go to `world-fishing-827.tech_great_expectations`;
+- the only deletes are on the run's own output table.
+
+It did find two shared-resource exposures:
+
+(a) `ais.py` emitted no `--max_num_workers`, and `world-fishing-827` is also the execution project of prod's `core.ais.v5.backfill`, so an uncapped run could take regional Dataflow quota from prod. `ais.py` now caps at `--max-num-workers` (default 4 for the 2020 staging cohort; 16 suggested for one month of prod AIS). A shared knob across all workflows and per-job scale heuristics are follow-up tickets.
+
+(b) dit's default `DIT_DATAFLOW_TEMP_BUCKET=pipe-temp-us-central-ttl7` writes under exactly composer's prod `dataflow_temp` / `dataflow_staging` prefixes. That default dates from the pipe-gaps port (2026-05-08: "the test SA's GCS write permissions are on pipe-temp-us-central-ttl7"; it matched pipe-gaps' own `historical-backfill` config). It was chosen for permissions and never discussed as an isolation question. Every dit Dataflow workflow inherits it. Not changed here.
+
 **Images built and pushed (2026-10-22), both self-checked inside the image, Beam 2.76.0:**
 - baseline (pipe-anchorages main b36aed6): `gcr.io/world-fishing-827/dit/pipe-anchorages:main-b36aed6-temp-dataset-21aed7a5` @ `sha256:ebdd9fd4f9b78596534961197ef6ff060247ea81fa7dfaf919ae84a920a28c07`
 - candidate (PR #176 head 14b4be8): `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-21aed7a5` @ `sha256:e06d29ee20a96e7c5d5b6937484618830a9b843b4d44c9ad14569010bdb76ff9`
