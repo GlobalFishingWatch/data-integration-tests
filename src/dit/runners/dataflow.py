@@ -25,6 +25,8 @@ import threading
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
+
 logger = logging.getLogger(__name__)
 
 # Splits Beam submission from waiting so concurrent invocations serialise the
@@ -115,8 +117,8 @@ def run(
     * ``service_account`` / ``region`` / ``temp_bucket`` / ``subnetwork`` /
       ``bq_temp_dataset`` -- Dataflow knobs. **Function parameters, not
       module-level constants** (decision 5 in the plan). ``temp_bucket`` is
-      expanded to ``temp_location=gs://<bucket>/dataflow_temp`` and
-      ``staging_location=gs://<bucket>/dataflow_staging``.
+      expanded to ``temp_location=gs://<bucket>/dit/dataflow_temp`` and
+      ``staging_location=gs://<bucket>/dit/dataflow_staging``.
     * ``pipeline_builder`` -- callable that, given a merged options mapping,
       returns a built ``gfw.common.beam.pipeline.Pipeline``-shaped object
       (must expose ``_pre_hooks``, ``_post_hooks``, ``apply_dag()``, and
@@ -154,8 +156,8 @@ def run(
     parsed.setdefault("runner", "DataflowRunner")
     parsed.setdefault("service_account_email", service_account)
     parsed.setdefault("region", region)
-    parsed.setdefault("temp_location", f"gs://{temp_bucket}/dataflow_temp")
-    parsed.setdefault("staging_location", f"gs://{temp_bucket}/dataflow_staging")
+    parsed.setdefault("temp_location", dataflow_temp_location(temp_bucket))
+    parsed.setdefault("staging_location", dataflow_staging_location(temp_bucket))
     parsed.setdefault("subnetwork", subnetwork)
     if image_tag:
         parsed.setdefault("sdk_container_image", image_tag)

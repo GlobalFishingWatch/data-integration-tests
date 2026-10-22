@@ -160,7 +160,7 @@ def test_v5_directrunner_gets_project_and_temp_location():
     args = _args("--pipeline-cli", "v5", runner="docker")
     for (_, argv), _ in _calls(args):
         assert f"--project={mod.PROJECT}" in argv
-        assert _flag(argv, "--temp_location") == f"gs://{args.dataflow_temp_bucket}/dataflow_temp"
+        assert _flag(argv, "--temp_location") == f"gs://{args.dataflow_temp_bucket}/dit/dataflow_temp"
 
 
 def test_v5_hands_the_temp_dataset_to_the_overlay_through_the_container_env():

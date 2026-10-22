@@ -14,6 +14,7 @@ dit is a **testing-shaped consumer** of GFW infrastructure. Reading from prod ta
 - Top-level image namespaces inside `gcr.io/world-fishing-827/` that belong to canonical pipelines: `anchorages_pipeline/`, `encounters_pipeline/`, `advanced_fishing_detection/`, etc. The project is the same; the namespace is reserved.
 - Production Composer DAGs.
 - Release branches of pipeline repos.
+- Production's own prefixes in shared GCS buckets. The default Dataflow bucket (`DIT_DATAFLOW_TEMP_BUCKET=pipe-temp-us-central-ttl7`) is also production's, and production writes directly under `dataflow_temp/` and `dataflow_staging/`. Every dit job writes under `gs://<bucket>/dit/` instead. Build those paths only through `dit.dataflow_paths`, never by hand. Since 2026-10-22.
 
 **In scope (explicit exception):**
 

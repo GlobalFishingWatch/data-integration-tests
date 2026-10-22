@@ -25,6 +25,9 @@
 
 # Dataflow region and matching GCS bucket / subnetwork. The defaults match
 # the SA's GCS write permissions (pipe-temp-us-central-ttl7 in us-central1).
+# That bucket is shared with production, so every dit job writes its temp and
+# staging objects under gs://<bucket>/dit/ (dit.dataflow_paths), never under
+# production's own dataflow_temp/ and dataflow_staging/ prefixes.
 # export DIT_DATAFLOW_REGION="us-central1"
 # export DIT_DATAFLOW_TEMP_BUCKET="pipe-temp-us-central-ttl7"
 # export DIT_DATAFLOW_SUBNETWORK="regions/us-central1/subnetworks/gfw-internal-us-central1"

@@ -96,9 +96,11 @@ from typing import Iterator, Optional, Sequence
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
+from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
+    DEFAULT_DATAFLOW_TEMP_BUCKET,
     EXPERIMENT_ID_RE,
     add_experiment_id_arg,
     resolve_run_context,
@@ -666,8 +668,8 @@ def _segment_args(
         # stage to). example_segment.sh sets the same gs://pipe-temp-us-
         # central-ttl7 bucket for both runners. Moving this out of the
         # ``runner == "dataflow"`` branch matches that.
-        "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
-        "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
+        f"--temp_location={dataflow_temp_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
+        f"--staging_location={dataflow_staging_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
     ]
     if include_satellite_offsets:
         # Pre-condition: _snapshot_source populated both satellite fields when
@@ -728,8 +730,8 @@ def _segment_identity_args(
         f"--project={PROJECT}",
         f"--runner={runner}",
         # See _segment_args for the temp_location/staging_location rationale.
-        "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
-        "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
+        f"--temp_location={dataflow_temp_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
+        f"--staging_location={dataflow_staging_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
     ]
     if runner == "dataflow":
         args.extend([
@@ -771,8 +773,8 @@ def _segment_info_args(
         f"--project={PROJECT}",
         f"--runner={runner}",
         # See _segment_args for the temp_location/staging_location rationale.
-        "--temp_location=gs://pipe-temp-us-central-ttl7/dataflow_temp",
-        "--staging_location=gs://pipe-temp-us-central-ttl7/dataflow_staging",
+        f"--temp_location={dataflow_temp_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
+        f"--staging_location={dataflow_staging_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
     ]
     if runner == "dataflow":
         args.extend([
