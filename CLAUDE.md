@@ -72,6 +72,10 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-22 — port-visits docker calls mount the `gcp` credentials volume
+
+Found while preparing the first PIPELINE-4690 staging smoke (`--pipeline-cli v5` with the overlay image). `_docker_run_kwargs` in `workflows/port_visits/ais.py` passed no `volumes`, so a published-image `docker run` started without credentials. Earlier laptop port-visits runs all used `--build-from-source`, whose compose service mounts `gcp:/root/.config/` itself, so the gap never showed. The v5 overlay is a published image by construction, so it could not run from the laptop. Fix: `GCP_VOLUME` on every call, the spec encounters, pipe-events and pipe-segment already use; `dit.runners.docker` still drops it in cloud mode. A new test pins the mount for both CLIs and both docker paths. CHANGELOG § 2026-10-22 gains a `Fixed` entry. Lesson: a workflow test should assert the credentials mount, not only the argv.
+
 ### 2026-10-22 — All Dataflow GCS paths under `gs://<bucket>/dit/` (`dit.dataflow_paths`)
 
 Follow-up to the prod-impact review below. dit's default bucket `pipe-temp-us-central-ttl7` is production's Dataflow bucket too, and dit wrote under exactly production's `dataflow_temp/` and `dataflow_staging/` prefixes. The owner chose a `dit/` prefix over a separate bucket. It needs no new permissions, since the service account's write access is bucket-wide. It makes dit's objects separable for inspection, cleanup and cost attribution.
