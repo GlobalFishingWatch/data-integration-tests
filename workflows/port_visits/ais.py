@@ -20,9 +20,25 @@ There is no ``_4_mutate_recover`` mode here -- that was pipe-gaps' Bug A
 trigger and doesn't apply to port-visits.
 
 Date semantics: ``--start`` and ``--end`` are **inclusive on both ends**,
-matching the pipe-anchorages CLI. (Pipe-gaps' workflow uses half-open dates,
+matching the pipe-anchorages v4 CLI. (Pipe-gaps' workflow uses half-open dates,
 matching detect-gaps' CLI; the wart is unavoidable given the downstream
 tools' contracts.)
+
+Two pipe-anchorages CLI generations (``--pipeline-cli``, PIPELINE-4699):
+
+* ``v4`` (default): the v4.6.4 CLI production still pins --
+  ``thin_port_messages`` / ``port_visits``, underscore flags, inclusive
+  ``--end_date``, ``--wait_for_job``, ``--temp_dataset`` (honoured only by
+  DIT's patched branch, never upstream).
+* ``v5``: the gfw-common CLI on pipe-anchorages main --
+  ``port-state-transitions`` / ``port-visits``, ``--bq-in-*`` / ``--bq-out-*``
+  flags, **exclusive** ``--end-date`` (the workflow keeps its inclusive
+  ``--start/--end`` and passes ``end + 1 day``), required ``--labels`` on every
+  runner, no ``--wait_for_job`` (gfw-common's Pipeline waits). Upstream has no
+  way to name the BigQuery staging dataset, so v5 runs need a DIT overlay
+  image (``docker/overlays/pipe-anchorages-temp-dataset/``) as both submitter
+  (``--image-tag``) and worker (``--worker-image``); the workflow hands the
+  dataset to it through the ``DIT_BQ_TEMP_DATASET`` container env var.
 
 The default ``--runner=dataflow`` submits to Dataflow from inside the
 container (the same pattern composer uses). ``--runner=docker`` runs
@@ -146,6 +162,16 @@ DEFAULT_START = "2020-01-01"   # inclusive
 DEFAULT_END = "2020-12-31"     # inclusive
 DEFAULT_TAIL_DAYS = 3
 
+# Dataflow autoscaling ceiling. Without one, Dataflow scales up to the project's
+# quota, and world-fishing-827 is also the execution project of prod's
+# core.ais.v5.backfill, so an uncapped dit run competes with prod for regional
+# CPU and IP quota. The default fits the 2020 staging cohort (142 ssvid); pass a
+# larger value for production slices (e.g. 16 for one month of AIS). Prod runs
+# the full-history port-visits step with 100 (core.ais.v3) or 250 (v5 backfill).
+# Making this a shared knob across all workflows, and choosing the right scale
+# per job, are follow-ups under the DIT epic PIPELINE-4698.
+DEFAULT_MAX_NUM_WORKERS = 4
+
 DEFAULT_IMAGE_TAG = "gfw/pipe-anchorages:v4.6.4"
 
 # Dataflow worker container image -- needs pipe_anchorages installed (workers
@@ -159,6 +185,43 @@ DEFAULT_WORKER_IMAGE = (
 # Comparison contract for port-visits (truncate shape, no SCD-2).
 COMPARE_KEYS = ("visit_id",)
 COMPARE_VIEW_SUFFIX = ""
+
+# pipe-anchorages CLI generations this workflow can drive (see module docstring).
+PIPELINE_CLI_V4 = "v4"
+PIPELINE_CLI_V5 = "v5"
+PIPELINE_CLIS = (PIPELINE_CLI_V4, PIPELINE_CLI_V5)
+DEFAULT_PIPELINE_CLI = PIPELINE_CLI_V4
+
+#: Container env var the DIT overlay patch reads to pass ``temp_dataset`` to
+#: Beam's ReadFromBigQuery (v5 only; see docker/overlays/pipe-anchorages-temp-dataset/).
+TEMP_DATASET_ENV = "DIT_BQ_TEMP_DATASET"
+
+# Labels on every pipe-anchorages job. pipe-anchorages requires --labels to be
+# non-None (v4: cloud_to_labels in transforms/sink.py iterates without a None
+# guard; v5: --labels is a required option). Mirrors composer's
+# LabelsConfig.as_dataflow_cli_arguments shape.
+_STATIC_LABELS = (
+    "--labels=environment=integration_test",
+    "--labels=resource_creator=dit",
+    "--labels=project=core_pipeline",
+    "--labels=workflow=port_visits_ais",
+    "--labels=stage=testing",
+)
+
+
+def _pipeline_cli(args: argparse.Namespace) -> str:
+    """The CLI generation to emit; defaults to v4 for Namespaces built without it."""
+    return getattr(args, "pipeline_cli", DEFAULT_PIPELINE_CLI)
+
+
+def _max_num_workers(args: argparse.Namespace) -> int:
+    """The Dataflow worker cap; defaults for Namespaces built without it."""
+    return getattr(args, "max_num_workers", DEFAULT_MAX_NUM_WORKERS)
+
+
+def _exclusive_end(inclusive_end: date) -> str:
+    """The v5 CLI's exclusive ``--end-date`` for an inclusive last day."""
+    return (inclusive_end + timedelta(days=1)).isoformat()
 
 
 # --------------------------------------------------------------------------
@@ -285,7 +348,7 @@ def _dataflow_pipeline_options(
     slice_start: date,
     slice_end: date,
 ) -> list[str]:
-    return [
+    options = [
         "--runner=DataflowRunner",
         f"--project={PROJECT}",
         f"--region={args.dataflow_region}",
@@ -293,17 +356,17 @@ def _dataflow_pipeline_options(
         f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
         f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
         f"--subnetwork={args.dataflow_subnetwork}",
+        # Bound autoscaling; see DEFAULT_MAX_NUM_WORKERS.
+        f"--max_num_workers={_max_num_workers(args)}",
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
-        "--wait_for_job",
-        # pipe-anchorages requires --labels to be non-None
-        # (cloud_to_labels in transforms/sink.py iterates without a None guard).
-        # Mirrors composer's LabelsConfig.as_dataflow_cli_arguments shape.
-        "--labels=environment=integration_test",
-        "--labels=resource_creator=dit",
-        "--labels=project=core_pipeline",
-        "--labels=workflow=port_visits_ais",
-        "--labels=stage=testing",
+    ]
+    # v5 removed --wait_for_job (gfw-common's Pipeline waits for batch jobs).
+    if _pipeline_cli(args) == PIPELINE_CLI_V4:
+        options.append("--wait_for_job")
+    return [
+        *options,
+        *_STATIC_LABELS,
         *_dynamic_labels(
             args, step=step, mode=mode,
             iteration=iteration, total_iterations=total_iterations,
@@ -312,8 +375,21 @@ def _dataflow_pipeline_options(
     ]
 
 
-def _directrunner_pipeline_options() -> list[str]:
-    return ["--runner=DirectRunner", "--wait_for_job"]
+def _directrunner_pipeline_options(
+    args: Optional[argparse.Namespace] = None, **label_kwargs
+) -> list[str]:
+    """DirectRunner options. v4 keeps its historical two-flag shape; v5 needs
+    labels (required option) plus a project and temp_location, which Beam's
+    BigQuery read needs on any runner."""
+    if args is None or _pipeline_cli(args) == PIPELINE_CLI_V4:
+        return ["--runner=DirectRunner", "--wait_for_job"]
+    return [
+        "--runner=DirectRunner",
+        f"--project={PROJECT}",
+        f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
+        *_STATIC_LABELS,
+        *_dynamic_labels(args, **label_kwargs),
+    ]
 
 
 def _pipeline_options(
@@ -326,13 +402,14 @@ def _pipeline_options(
     slice_start: date,
     slice_end: date,
 ) -> list[str]:
+    label_kwargs = dict(
+        step=step, mode=mode,
+        iteration=iteration, total_iterations=total_iterations,
+        slice_start=slice_start, slice_end=slice_end,
+    )
     return (
-        _dataflow_pipeline_options(
-            args, step=step, mode=mode,
-            iteration=iteration, total_iterations=total_iterations,
-            slice_start=slice_start, slice_end=slice_end,
-        ) if args.runner == "dataflow"
-        else _directrunner_pipeline_options()
+        _dataflow_pipeline_options(args, **label_kwargs) if args.runner == "dataflow"
+        else _directrunner_pipeline_options(args, **label_kwargs)
     )
 
 
@@ -434,34 +511,113 @@ def _run_slice(
         )
         thinned_input = args.thinned_message_table
     else:
-        thin_args = [
-            "thin_port_messages",
-            f"--start_date={slice_start.isoformat()}",
-            f"--end_date={slice_end.isoformat()}",
-            f"--anchorage_table={args.named_anchorages}",
-            f"--input_table={_messages_table(args)}",
-            f"--output_table={_thinned_table(args, suffix, mode)}",
-            f"--temp_dataset={args.bq_temp_dataset}",
-            *_pipeline_options(
-                args, step="thin_port_messages", mode=mode,
-                iteration=iteration, total_iterations=total_iterations,
-                slice_start=slice_start, slice_end=slice_end,
-            ),
-        ]
+        thin_args = _thin_argv(
+            args, suffix=suffix, mode=mode, slice_start=slice_start, slice_end=slice_end,
+            iteration=iteration, total_iterations=total_iterations,
+        )
         logger.info("thin_port_messages %s [%s, %s] iter=%d/%d",
                     mode, slice_start, slice_end, iteration, total_iterations)
-        rc = dit_docker.run(
-            args.image_tag, thin_args,
-            entrypoint="pipe-anchorages",
-            build_from_source=args.build_from_source,
-        )
+        rc = dit_docker.run(args.image_tag, thin_args, **_docker_run_kwargs(args))
         if rc != 0:
             raise SystemExit(
                 f"thin_port_messages failed (rc={rc}, mode={mode}, slice=[{slice_start}, {slice_end}])"
             )
         thinned_input = _thinned_table(args, suffix, mode)
 
-    visits_args = [
+    visits_args = _visits_argv(
+        args, suffix=suffix, mode=mode, thinned_input=thinned_input, slice_end=slice_end,
+        iteration=iteration, total_iterations=total_iterations,
+    )
+    logger.info("port_visits %s [%s, %s] iter=%d/%d",
+                mode, args.start, slice_end, iteration, total_iterations)
+    rc = dit_docker.run(args.image_tag, visits_args, **_docker_run_kwargs(args))
+    if rc != 0:
+        raise SystemExit(
+            f"port_visits failed (rc={rc}, mode={mode}, slice_end={slice_end})"
+        )
+
+
+def _docker_run_kwargs(args: argparse.Namespace) -> dict:
+    """Keyword arguments for ``dit_docker.run``. v4 calls are unchanged; v5
+    calls also hand the BigQuery staging dataset to the DIT overlay patch
+    inside the container (upstream has no option for it)."""
+    kwargs: dict = {
+        "entrypoint": "pipe-anchorages",
+        "build_from_source": args.build_from_source,
+    }
+    if _pipeline_cli(args) == PIPELINE_CLI_V5:
+        kwargs["container_env"] = {TEMP_DATASET_ENV: args.bq_temp_dataset}
+    return kwargs
+
+
+def _thin_argv(
+    args: argparse.Namespace,
+    *,
+    suffix: str,
+    mode: str,
+    slice_start: date,
+    slice_end: date,
+    iteration: int,
+    total_iterations: int,
+) -> list[str]:
+    """argv for step 1 (``thin_port_messages`` / ``port-state-transitions``)
+    over the inclusive slice ``[slice_start, slice_end]``."""
+    options = _pipeline_options(
+        args, step="thin_port_messages", mode=mode,
+        iteration=iteration, total_iterations=total_iterations,
+        slice_start=slice_start, slice_end=slice_end,
+    )
+    if _pipeline_cli(args) == PIPELINE_CLI_V5:
+        return [
+            "port-state-transitions",
+            f"--start-date={slice_start.isoformat()}",
+            f"--end-date={_exclusive_end(slice_end)}",
+            f"--bq-in-named-anchorages={args.named_anchorages}",
+            f"--bq-in-messages={_messages_table(args)}",
+            f"--bq-out-port-state-transitions={_thinned_table(args, suffix, mode)}",
+            *options,
+        ]
+    return [
+        "thin_port_messages",
+        f"--start_date={slice_start.isoformat()}",
+        f"--end_date={slice_end.isoformat()}",
+        f"--anchorage_table={args.named_anchorages}",
+        f"--input_table={_messages_table(args)}",
+        f"--output_table={_thinned_table(args, suffix, mode)}",
+        f"--temp_dataset={args.bq_temp_dataset}",
+        *options,
+    ]
+
+
+def _visits_argv(
+    args: argparse.Namespace,
+    *,
+    suffix: str,
+    mode: str,
+    thinned_input: str,
+    slice_end: date,
+    iteration: int,
+    total_iterations: int,
+) -> list[str]:
+    """argv for step 2 (``port_visits`` / ``port-visits``), a full recompute
+    over ``[args.start, slice_end]`` inclusive, as in production."""
+    options = _pipeline_options(
+        args, step="port_visits", mode=mode,
+        iteration=iteration, total_iterations=total_iterations,
+        slice_start=_parse_date(args.start), slice_end=slice_end,
+    )
+    if _pipeline_cli(args) == PIPELINE_CLI_V5:
+        return [
+            "port-visits",
+            f"--start-date={args.start}",
+            f"--end-date={_exclusive_end(slice_end)}",
+            f"--bq-in-port-state-transitions={thinned_input}",
+            f"--bq-in-segment-info={_segment_info_table(args)}",
+            f"--bq-out-port-visits={_visits_table(args, suffix, mode)}",
+            f"--bad-segs={_bad_segs_sql(args)}",
+            *options,
+        ]
+    return [
         "port_visits",
         f"--start_date={args.start}",
         f"--end_date={slice_end.isoformat()}",
@@ -470,23 +626,8 @@ def _run_slice(
         f"--output_table={_visits_table(args, suffix, mode)}",
         f"--bad_segs={_bad_segs_sql(args)}",
         f"--temp_dataset={args.bq_temp_dataset}",
-        *_pipeline_options(
-            args, step="port_visits", mode=mode,
-            iteration=iteration, total_iterations=total_iterations,
-            slice_start=_parse_date(args.start), slice_end=slice_end,
-        ),
+        *options,
     ]
-    logger.info("port_visits %s [%s, %s] iter=%d/%d",
-                mode, args.start, slice_end, iteration, total_iterations)
-    rc = dit_docker.run(
-        args.image_tag, visits_args,
-        entrypoint="pipe-anchorages",
-        build_from_source=args.build_from_source,
-    )
-    if rc != 0:
-        raise SystemExit(
-            f"port_visits failed (rc={rc}, mode={mode}, slice_end={slice_end})"
-        )
 
 
 # --------------------------------------------------------------------------
@@ -633,6 +774,11 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     }
     if mode in _MODES_USING_TAIL:
         params["tail_days"] = args.tail_days
+    # v5 drives a different pipeline CLI (and an overlay image), so its rows
+    # must not satisfy v4 lookups. Added only for v5 so every existing v4 key
+    # stays byte-identical.
+    if _pipeline_cli(args) == PIPELINE_CLI_V5:
+        params["pipeline_cli"] = PIPELINE_CLI_V5
     return params
 
 
@@ -742,7 +888,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET,
                    help="Pre-existing BQ dataset for Beam EXPORT staging; "
                         "env-var fallback DIT_BQ_TEMP_DATASET (defaults to "
-                        "${PROJECT}.${DIT_DEST_DATASET}).")
+                        "${PROJECT}.${DIT_DEST_DATASET}). v4 passes it as --temp_dataset; "
+                        "v5 passes it to the overlay image as the DIT_BQ_TEMP_DATASET "
+                        "container env var.")
+    p.add_argument("--pipeline-cli", choices=PIPELINE_CLIS, default=DEFAULT_PIPELINE_CLI,
+                   help="pipe-anchorages CLI generation to drive. v4 (default): the v4.6.4 "
+                        "CLI production pins (thin_port_messages / port_visits). v5: the CLI on "
+                        "pipe-anchorages main (port-state-transitions / port-visits, exclusive "
+                        "--end-date, required labels); needs a DIT overlay image as --image-tag "
+                        "and --worker-image, see docker/overlays/pipe-anchorages-temp-dataset/.")
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
                    help=f"Staging dataset stem (default {DEFAULT_SOURCE_DATASET_STEM}); "
                         "_internal and _published are appended to derive the three source "
@@ -773,6 +927,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--end", default=DEFAULT_END, help="Inclusive end date.")
     p.add_argument("--tail-days", type=int, default=DEFAULT_TAIL_DAYS,
                    help="Number of tail days for bfd / bftruncate iteration.")
+    p.add_argument("--max-num-workers", type=int, default=DEFAULT_MAX_NUM_WORKERS,
+                   help=f"Dataflow autoscaling ceiling per job (default {DEFAULT_MAX_NUM_WORKERS}, "
+                        "sized for the 2020 staging cohort; e.g. 16 for one month of production "
+                        "AIS). Dataflow runner only. Does not affect output, so it is not part "
+                        "of the cache key.")
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
                    help="Dataflow worker container image with pipe_anchorages installed; "
@@ -825,6 +984,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Negative values produce nonsensical iteration counts and invert "
             "the daily-tail date range."
         )
+    if args.max_num_workers < 1:
+        raise SystemExit(f"--max-num-workers must be >= 1; got {args.max_num_workers}.")
 
     repo_dir = os.getcwd()
 
@@ -894,7 +1055,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("source segment_info: %s", _segment_info_table(args))
     logger.info("source segs_activity: %s", _segs_activity_table(args))
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
-    logger.info("runner: %s", args.runner)
+    logger.info("runner: %s  pipeline_cli: %s", args.runner, args.pipeline_cli)
 
     # Per-mode FQN to compare. Default to this run's freshly-suffixed visits
     # tables; the cache wrapper overwrites each with the cached FQN on a hit.

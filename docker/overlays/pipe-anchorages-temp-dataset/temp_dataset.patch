@@ -1,0 +1,76 @@
+diff --git a/src/pipe_anchorages/_dit_overlay.py b/src/pipe_anchorages/_dit_overlay.py
+new file mode 100644
+index 0000000..4136d8e
+--- /dev/null
++++ b/src/pipe_anchorages/_dit_overlay.py
+@@ -0,0 +1,28 @@
++"""DIT test-only overlay: NOT part of pipe-anchorages.
++
++Applied by the data integration tests (DIT) to images they build under
++gcr.io/world-fishing-827/dit/ (see data-integration-tests,
++docker/overlays/pipe-anchorages-temp-dataset/). Never merged upstream.
++
++Beam's ReadFromBigQuery stages every query result in a temporary dataset it
++creates unless it is given one; DIT's service account may not create datasets.
++When DIT_BQ_TEMP_DATASET is set (``<project>.<dataset>``), the reads stage in
++that existing dataset instead. Unset, nothing changes.
++"""
++
++import os
++
++from apache_beam.io.gcp.internal.clients.bigquery import DatasetReference
++
++ENV = "DIT_BQ_TEMP_DATASET"
++
++
++def temp_dataset_kwargs() -> dict:
++    """Extra ReadFromBigQuery kwargs naming the staging dataset, or {} when unset."""
++    value = os.environ.get(ENV, "")
++    if not value:
++        return {}
++    project, _, dataset = value.partition(".")
++    if not project or not dataset:
++        raise ValueError(f"{ENV} must be <project>.<dataset>; got {value!r}")
++    return {"temp_dataset": DatasetReference(projectId=project, datasetId=dataset)}
+diff --git a/src/pipe_anchorages/pipelines/port_state_transitions/main.py b/src/pipe_anchorages/pipelines/port_state_transitions/main.py
+index 0ed1124..ab92fb8 100644
+--- a/src/pipe_anchorages/pipelines/port_state_transitions/main.py
++++ b/src/pipe_anchorages/pipelines/port_state_transitions/main.py
+@@ -16,6 +16,7 @@ from gfw.common.beam.transforms import ReadFromBigQuery, WriteToBigQueryWrapper
+ from gfw.common.bigquery.helper import BigQueryHelper
+ from gfw.common.query import Query
+ 
++from pipe_anchorages._dit_overlay import temp_dataset_kwargs
+ from pipe_anchorages import common as cmn
+ from pipe_anchorages.pipelines.port_state_transitions.config import PortStateTransitionsConfig
+ from pipe_anchorages.pipelines.port_state_transitions.table_config import (
+@@ -114,7 +115,7 @@ def run(
+                 ).with_env(config.jinja_env),
+                 label="ReadMessages",
+                 read_from_bigquery_factory=read_from_bigquery_factory,
+-                read_from_bigquery_kwargs={"bigquery_job_labels": config.labels},
++                read_from_bigquery_kwargs={"bigquery_job_labels": config.labels, **temp_dataset_kwargs()},
+             ),
+         ],
+         core=FindPortStateTransitions(
+diff --git a/src/pipe_anchorages/pipelines/port_visits/main.py b/src/pipe_anchorages/pipelines/port_visits/main.py
+index ed78669..8f20e0c 100644
+--- a/src/pipe_anchorages/pipelines/port_visits/main.py
++++ b/src/pipe_anchorages/pipelines/port_visits/main.py
+@@ -14,6 +14,7 @@ from gfw.common.bigquery.helper import BigQueryHelper
+ from gfw.common.datetime import datetime_from_date
+ from gfw.common.query import Query
+ 
++from pipe_anchorages._dit_overlay import temp_dataset_kwargs
+ from pipe_anchorages import common as cmn
+ from pipe_anchorages.pipelines.port_visits.config import PortVisitsConfig
+ from pipe_anchorages.pipelines.port_visits.table_config import (
+@@ -107,7 +108,7 @@ def run(
+                 ).with_env(config.jinja_env),
+                 label="ReadPortStateTransitions",
+                 read_from_bigquery_factory=read_from_bigquery_factory,
+-                read_from_bigquery_kwargs={"bigquery_job_labels": config.labels},
++                read_from_bigquery_kwargs={"bigquery_job_labels": config.labels, **temp_dataset_kwargs()},
+             ),
+         ],
+         core=DetectPortVisits(

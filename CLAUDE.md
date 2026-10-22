@@ -4,6 +4,8 @@
 
 This repo houses `dit`, the cross-pipeline integration-test framework for GFW data pipelines (currently `pipe-gaps`, `anchorages_pipeline`/port-visits, `pipe-events`/fishing).
 
+**Jira epic: [PIPELINE-4698](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4698) (DIT development).** dit is still a POC. File new dit work items under this epic and reference their keys in Plan-changelog entries.
+
 Read these in order before coding:
 
 1. [`docs/architecture.md`](docs/architecture.md) — visual reference: repo ownership, run modes, workflow flows, Cloud Build runtime, image namespace. Mermaid diagrams; renders on GitHub.
@@ -69,6 +71,39 @@ Notes:
 ## Plan changelog
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
+
+### 2026-10-22 — pipe-anchorages v5 CLI (`--pipeline-cli`) + temp-dataset overlay; epic PIPELINE-4698 (PIPELINE-4699, PIPELINE-4700)
+
+Trigger: a DIT integration test was needed for pipe-anchorages PR #176 (PIPELINE-4690, one record per vessel and instant in `CreateInOutEvents`), and the port-visits workflows turned out unable to run any current pipe-anchorages code.
+
+**1. The CLI drift, and why nobody noticed.** pipe-anchorages main (b36aed6) is 191 commits past v4.6.4, which production still pins. The restructure replaced `thin_port_messages` / `port_visits` with `port-state-transitions` / `port-visits`, underscore flags with `--bq-in-*` / `--bq-out-*`, made `--end-date` exclusive (`end <= start` raises), made `--labels` required and removed `--wait_for_job`. dit encodes each pipeline's argv by hand, mirroring the production DAG, so it tracked the prod pin and silently fell behind main. How dit should stay in sync is now a spike (PIPELINE-4700); the stopgap is that whoever needs the test edits dit (PIPELINE-4699).
+
+**2. `--pipeline-cli {v4,v5}`, default v4.** Additive switch rather than a replacement, because production and every existing dit run are still v4. v4 output is pinned byte-identical: a scratch harness captured every `dit_docker.run` call `_run_slice` makes under main's and the new `ais.py` (both runners, with and without `--thinned-message-table`) and found them identical. The workflow keeps its inclusive `--start/--end` contract; v5 converts at the boundary (`end + 1 day`), so a one-day slice is `[d, d+1)`. Both emitted v5 commands were run through the real CLI with `--mock-bq-clients`. Internal step ids (`thin_port_messages`, `port_visits`) stay the same for job names and labels, so v4 and v5 jobs are found by the same label filters. Cache key gains `pipeline_cli` only for v5.
+
+**3. Temp dataset: overlay, deliberately not upstreamed (user decision).** Beam's query reads stage results in a temp dataset; unless the transform gets `temp_dataset=`, Beam creates `beam_temp_dataset_<hex>`, which `automated-testing@` may not. Verified there is no other lever: Beam v2.76.0 has no pipeline option or env var for it (only the transform argument; the Python Dataflow runner's job-environment `dataset` is hard-coded and unused); production confirms every Beam query job creates its own fresh `beam_temp_dataset_<hex>` (96 of 96 for core.ais.v3 over three days); no GFW pipeline exposes it. Options weighed: (a) in-process DAG-factory injection like pipe-gaps (`dit.runners.dataflow`), rejected as fragile because it couples dit's venv to each pipeline's dependencies and to internal `run()` kwargs; (b) an overlay patch, chosen; (c) an upstream option, rejected for now. The overlay reads `DIT_BQ_TEMP_DATASET` at pipeline construction, so it must be both submitter and worker image; `ais.py` sets it via `container_env`. **Convention variant recorded:** the encounters overlay copies patched files over a *published* image; this one builds from the commit's own source (`git archive` + `git apply` + `docker build --target prod`), because PR branches have no published image and building baseline and candidate the same way keeps the A/B symmetric. `docs/conventions.md` overlay section updated.
+
+**4. Plan items found to need no new code.** A port-visits-only run already exists (`--thinned-message-table`). Cross-org-safe source pinning already exists as `dit.bq.derived_source_into_experiment(materialise=True)` (CTAS + expiry); production sources are in another org, so `snapshot_into_experiment` cannot pin them. A full-row multiset comparison would belong upstream in `table_identical_checks` (working agreement), and TIC's keyed `summary` already warns on duplicate keys, which is itself the expected signal for this A/B (the baseline has duplicate `visit_id`s); recorded as an open TIC follow-up rather than built here.
+
+**Sections moved (this commit).** `workflows/port_visits/ais.py` (docstring, `PIPELINE_CLI_*`, `TEMP_DATASET_ENV`, `_STATIC_LABELS`, `_thin_argv` / `_visits_argv` / `_docker_run_kwargs`, v5 DirectRunner options, `--pipeline-cli`, cache key). `workflows/port_visits/cross_version_ais.py` (`--binding-image-tag`). New `docker/overlays/pipe-anchorages-temp-dataset/` (patch, `build.sh`, `verify_overlay.py`, README). New `tests/test_port_visits_v5_cli.py` (19 tests). `docs/pipeline-contract.md` pipe-anchorages column + v5 note; `docs/conventions.md`; README (epic, Features, Roadmap 7a/7b); CHANGELOG; this file (epic reference in Repo orientation).
+
+**5. Prod-impact review before the first run, and a worker cap.** A pre-run review found nothing in this path that can write to a prod table, image or DAG:
+- images go only to `gcr.io/world-fishing-827/dit/`;
+- outputs go to `world-fishing-827.tech_great_expectations`;
+- the only deletes are on the run's own output table.
+
+It did find two shared-resource exposures:
+
+(a) `ais.py` emitted no `--max_num_workers`, and `world-fishing-827` is also the execution project of prod's `core.ais.v5.backfill`, so an uncapped run could take regional Dataflow quota from prod. `ais.py` now caps at `--max-num-workers` (default 4 for the 2020 staging cohort; 16 suggested for one month of prod AIS). A shared knob across all workflows and per-job scale heuristics are follow-up tickets.
+
+(b) dit's default `DIT_DATAFLOW_TEMP_BUCKET=pipe-temp-us-central-ttl7` writes under exactly composer's prod `dataflow_temp` / `dataflow_staging` prefixes. That default dates from the pipe-gaps port (2026-05-08: "the test SA's GCS write permissions are on pipe-temp-us-central-ttl7"; it matched pipe-gaps' own `historical-backfill` config). It was chosen for permissions and never discussed as an isolation question. Every dit Dataflow workflow inherits it. Not changed here.
+
+**Images built and pushed (2026-10-22), both self-checked inside the image, Beam 2.76.0:**
+- baseline (pipe-anchorages main b36aed6): `gcr.io/world-fishing-827/dit/pipe-anchorages:main-b36aed6-temp-dataset-21aed7a5` @ `sha256:ebdd9fd4f9b78596534961197ef6ff060247ea81fa7dfaf919ae84a920a28c07`
+- candidate (PR #176 head 14b4be8): `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-21aed7a5` @ `sha256:e06d29ee20a96e7c5d5b6937484618830a9b843b4d44c9ad14569010bdb76ff9`
+
+Push gotcha: with gcloud's default `auth/impersonate_service_account=dq-monitoring@`, the docker credential helper pushes as that SA and gets `uploadArtifacts` denied; push with `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=` (personal account).
+
+**Sections NOT moved.** No Dataflow run yet (user scope for this round: code, tickets, images). Whether `automated-testing@` can still pull from `gcr.io/world-fishing-827/dit/` (granted for the 2026-05-21 PIPELINE-1465 run) is unverified. `docs/plan.md` § Next steps not reconciled with README Roadmap 7a/7b.
 
 ### 2026-07-31 — Worker cap on encounters; the job-name gap that blocks an encounters cross-version workflow; two operational lessons from a full-year run
 

@@ -34,8 +34,10 @@ Steps:
    worktree with M4's per-table FQN flags (``--source-messages-fqn``,
    ``--source-segment-info-fqn``, ``--source-segs-activity-fqn``) pointing
    at the canonical snapshots; a binding-scoped ``--suffix``; and optionally
-   a per-binding ``--worker-image`` (from ``--binding-worker-image NAME=IMAGE``).
-   Each subprocess's stdout/stderr is line-prefixed ``[<binding>] `` so
+   a per-binding ``--worker-image`` (from ``--binding-worker-image NAME=IMAGE``)
+   and submitter ``--image-tag`` (from ``--binding-image-tag NAME=IMAGE``;
+   required for ``--pipeline-cli v5`` runs, whose DIT overlay image must also
+   be the submitter). Each subprocess's stdout/stderr is line-prefixed ``[<binding>] `` so
    parallel runs interleave readably.
 4. For each mode in ``--modes`` and each pair of bindings, compare the
    corresponding ``port_visits_<exp>-<binding>_<mode>`` tables on ``visit_id``.
@@ -130,6 +132,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                    help="`name=image` pair, repeatable. Overrides --worker-image (passed to ais.py) for that one binding. "
                         "Lets cross-version actually exercise per-binding worker code, which the default static --worker-image does not. "
                         "Bindings without an override use ais.py's default.")
+    p.add_argument("--binding-image-tag", action="append", default=[],
+                   dest="binding_image_tags",
+                   help="`name=image` pair, repeatable. Overrides --image-tag (the SUBMITTER image "
+                        "ais.py runs to build and submit the Beam graph) for that one binding. Needed "
+                        "with --pipeline-cli v5, where the DIT overlay image must also be the "
+                        "submitter: the BigQuery staging dataset is set at pipeline construction. "
+                        "Bindings without an override use ais.py's --image-tag.")
     p.add_argument("--thinned-message-table", default=None,
                    help="Fully-qualified BQ table holding pre-thinned port messages. When set, "
                         "the wrapper snapshots it into the experiment's snapshot dataset at "
@@ -150,13 +159,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     args.modes = parse_modes(args.modes, choices=AIS_SELECTABLE_MODES)
     args.pin_source_at = _parse_iso8601(args.pin_source_at)
     args.binding_worker_images = dict(_parse_binding(b) for b in args.binding_worker_images)
+    args.binding_image_tags = dict(_parse_binding(b) for b in args.binding_image_tags)
     _binding_names = {n for n, _ in args.bindings}
-    _unknown = set(args.binding_worker_images) - _binding_names
-    if _unknown:
-        raise SystemExit(
-            f"--binding-worker-image references unknown binding(s): {sorted(_unknown)}; "
-            f"declared bindings: {sorted(_binding_names)}"
-        )
+    for flag, overrides in (
+        ("--binding-worker-image", args.binding_worker_images),
+        ("--binding-image-tag", args.binding_image_tags),
+    ):
+        _unknown = set(overrides) - _binding_names
+        if _unknown:
+            raise SystemExit(
+                f"{flag} references unknown binding(s): {sorted(_unknown)}; "
+                f"declared bindings: {sorted(_binding_names)}"
+            )
     return args, ais_extra_args
 
 
@@ -340,9 +354,14 @@ def _ais_args_for_binding(
     binding_name: str,
     modes: Sequence[str],
     worker_image: Optional[str] = None,
+    image_tag: Optional[str] = None,
 ) -> list[str]:
     """Strip user-supplied overrides for fields the wrapper owns, then
     re-inject the wrapper's values.
+
+    ``--image-tag`` (the submitter image) follows the same rule as
+    ``--worker-image``: dropped from the extras and re-injected only when the
+    wrapper has a per-binding value (``--binding-image-tag``).
 
     M5 of canonical-dataset migration: replaces the prior
     ``--source-dataset-stem snap_stem`` pass-through with M4's per-table
@@ -376,6 +395,8 @@ def _ais_args_for_binding(
     }
     if worker_image is not None:
         drop_kvs = drop_kvs | {"--worker-image"}
+    if image_tag is not None:
+        drop_kvs = drop_kvs | {"--image-tag"}
     out: list[str] = []
     skip_next = False
     for arg in extra_args:
@@ -410,6 +431,8 @@ def _ais_args_for_binding(
     ])
     if worker_image is not None:
         out.extend(["--worker-image", worker_image])
+    if image_tag is not None:
+        out.extend(["--image-tag", image_tag])
     if snapshot_fqns.thinned is not None:
         out.extend(["--thinned-message-table", snapshot_fqns.thinned])
     return out
@@ -440,6 +463,7 @@ def _run_binding(
     ais_extra_args: list[str],
     dry_run: bool,
     worker_image: Optional[str] = None,
+    image_tag: Optional[str] = None,
 ) -> int:
     worktree_dir = tempfile.mkdtemp(prefix=f"dit-xv-{name}-")
     try:
@@ -455,11 +479,14 @@ def _run_binding(
             experiment_id=experiment_id, binding_name=name,
             modes=modes,
             worker_image=worker_image,
+            image_tag=image_tag,
         )
         cmd = [sys.executable, str(AIS_WORKFLOW), *argv]
         logger.info("binding %s: invoking %s", name, " ".join(shlex.quote(c) for c in cmd))
         if worker_image is not None:
             logger.info("binding %s: --worker-image override -> %s", name, worker_image)
+        if image_tag is not None:
+            logger.info("binding %s: --image-tag override -> %s", name, image_tag)
 
         if dry_run:
             logger.info("binding %s: --dry-run set; skipping ais.py invocation", name)
@@ -601,6 +628,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ais_extra_args=ais_extra_args,
             dry_run=args.dry_run,
             worker_image=args.binding_worker_images.get(name),
+            image_tag=args.binding_image_tags.get(name),
         )
         return name, rc
 
