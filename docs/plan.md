@@ -201,6 +201,8 @@ def snapshot_dataset(
 
 `snapshot_dataset` snapshots every table in `source_dataset` (or just `tables` if specified) into an existing `dest_dataset`. Idempotent — skips tables already present in dest; raises if dest dataset is missing. Returns the fully-qualified ids of the snapshots it created.
 
+**Superseded for source pinning (2026-10-22).** Snapshots fail twice over: BigQuery refuses a snapshot of a table in another organisation (production sources are in org `115316357079`, `world-fishing-827` in `433637338589`), and a snapshot with an expiration needs `bigquery.tables.deleteSnapshot`, which no DIT identity has on `tech_great_expectations`. `pin_source_into_experiment(source_table, *, experiment_id, role, pinned_at, window=None, expiration_days=7, max_bytes=10**12, dry_run=False, project=…) -> str` pins by copying instead: `CREATE TABLE <dest> LIKE <src> OPTIONS(…) AS SELECT * FROM <src> WHERE <window or TRUE>`. `LIKE` keeps the source's partitioning and clustering; labels, description and partition expiration are overridden. The copy is dry-run and refused above `max_bytes`, and the job carries the same `maximum_bytes_billed`. The name ends in `_<window|all>_<pin stamp>`; `pinned_source_fqn` recomputes it and `require_pinned_source` checks an earlier run's copy before reuse. Time travel was rejected as the pin: on a table modified inside its time-travel window, any `FOR SYSTEM_TIME AS OF` read loses partition pruning (a dry run of one day of prod `messages_positions` estimates 470.9 GB instead of 15.5 GB). Consumer so far: `workflows/port_visits/cross_version_ais.py`.
+
 ### `dit.dates`
 
 ```python
@@ -271,7 +273,7 @@ Five tracks. 1–3 are independent and parallelisable; 4 depends on 2+3; 5 depen
 3. Compares all three pairs with `dit.compare.compare_tables(..., keys=["visit_id"], view_suffix="")`.
 4. Returns 0 if all three match.
 
-Optional: `--thinned-message-table=<FQN>` skips step 1 (`thin_port_messages`) entirely and points step 2 (`port_visits`) at the supplied table. Used when the change under test lives only in step 2 — saves the dominant cost of running the thin step over full AIS data. `cross_version_ais.py` exposes the same flag at the wrapper level and snapshots the source table at `--pin-source-at` so both bindings see byte-identical input.
+Optional: `--thinned-message-table=<FQN>` skips step 1 (`thin_port_messages`) entirely and points step 2 (`port_visits`) at the supplied table. Used when the change under test lives only in step 2 — saves the dominant cost of running the thin step over full AIS data. `cross_version_ais.py` exposes the same flag at the wrapper level and pins a copy of the table over the run's dates so both bindings see byte-identical input (and then skips pinning `messages_positions`, which no binding reads).
 
 `workflows/port_visits/vms.py` does the same with VMS-shape orchestration: 4-day window `[d-W, d)`, VMS-flavored param values from `params.yaml`. The two scripts share `params.yaml` and a local `_make_phase_call()` helper inside `workflows/port_visits/`. Code duplication between `ais.py` and `vms.py` is **deliberate** — two copies are not a framework; framework decisions wait for the third consumer (pipe-events in Phase 3).
 
@@ -303,7 +305,7 @@ A capability not in the original Phase 1-7 numbering, emerged from the PIPELINE-
 
 **Where it goes beyond the original plan:**
 
-- Treats source-data drift as a first-class concern. Phase 7 ("golden-table regression") didn't address how to keep input stable across compared runs; snapshots solve that.
+- Treats source-data drift as a first-class concern. Phase 7 ("golden-table regression") didn't address how to keep input stable across compared runs; snapshots solve that. (2026-10-22: snapshots never worked after the June canonical-dataset migration and cannot cross organisations; `cross_version_ais.py` now pins with copies, `dit.bq.pin_source_into_experiment`. See the `dit.bq` contract above.)
 - Provides the foundation for PR-tier CI (compare against baseline) and reference caching (Phase 7's golden-table becomes implementable on top of this).
 
 **What it explicitly does NOT include yet:**

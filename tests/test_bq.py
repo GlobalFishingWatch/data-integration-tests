@@ -9,14 +9,21 @@ visited.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from dit.bq import (
+    DEFAULT_PIN_MAX_BYTES,
+    SourceWindow,
     derived_source_into_experiment,
+    format_pin_stamp,
+    parse_pin_stamp,
+    pin_source_into_experiment,
+    pinned_source_fqn,
+    require_pinned_source,
     snapshot_dataset,
     snapshot_into_experiment,
     snapshot_table,
@@ -592,3 +599,196 @@ def test_derived_source_into_experiment_custom_project_threads_through() -> None
     assert dest.startswith("gfw-int-vms-v3.tech_great_expectations.")
     sql = _captured_sql(client)
     assert "`gfw-int-vms-v3.tech_great_expectations.dit_exp_exp1_outage_pre_filtered_research_messages`" in sql
+
+
+# -- pin_source_into_experiment ---------------------------------------------
+
+_PINNED_AT = datetime(2026, 10, 22, 17, 15, 0, tzinfo=timezone.utc)
+_WINDOW = SourceWindow(column="timestamp", start=date(2026, 9, 1), end=date(2026, 10, 1))
+
+
+def _make_pin_client_mock(estimate: int = 5 * 10**9) -> MagicMock:
+    """First ``query`` call is the dry run (returns ``estimate`` bytes), the
+    second the copy itself."""
+    client = MagicMock()
+    client.query.return_value.total_bytes_processed = estimate
+    client.query.return_value.result.return_value = None
+    return client
+
+
+def _pin(client: MagicMock, **overrides) -> str:
+    kwargs = dict(
+        experiment_id="pipeline-4690",
+        role="cross_version",
+        pinned_at=_PINNED_AT,
+        window=_WINDOW,
+    )
+    kwargs.update(overrides)
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        return pin_source_into_experiment(
+            "gfw-int-pipe-v3.pipe_ais_v3_internal.messages_positions", **kwargs,
+        )
+
+
+def test_pin_stamp_round_trips_and_is_lowercase() -> None:
+    stamp = format_pin_stamp(_PINNED_AT)
+    assert stamp == "20261022t171500z"
+    assert parse_pin_stamp(stamp) == _PINNED_AT
+    assert parse_pin_stamp(stamp.upper()) == _PINNED_AT
+
+
+def test_pin_stamp_rejects_naive_and_malformed_input() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        format_pin_stamp(datetime(2026, 10, 22, 17, 15))
+    with pytest.raises(ValueError, match="invalid pin stamp"):
+        parse_pin_stamp("2026-10-22T17:15:00Z")
+
+
+def test_source_window_predicate_and_name() -> None:
+    """DATE(column) prunes TIMESTAMP and DATE partition columns alike and
+    matches the pipelines' own filters; the end is exclusive."""
+    assert _WINDOW.predicate() == (
+        "DATE(timestamp) >= '2026-09-01' AND DATE(timestamp) < '2026-10-01'"
+    )
+    assert _WINDOW.name_part() == "20260901_20261001"
+    with pytest.raises(ValueError, match="must be after start"):
+        SourceWindow(column="timestamp", start=date(2026, 9, 1), end=date(2026, 9, 1))
+
+
+def test_pinned_source_fqn_encodes_window_and_stamp() -> None:
+    windowed = pinned_source_fqn(
+        "gfw-int-pipe-v3.pipe_ais_v3_internal.messages_positions",
+        experiment_id="pipeline-4690", role="cross_version",
+        pinned_at=_PINNED_AT, window=_WINDOW,
+    )
+    whole = pinned_source_fqn(
+        "global-fishing-watch.pipe_ais_v3_published.segs_activity",
+        experiment_id="pipeline-4690", role="cross_version", pinned_at=_PINNED_AT,
+    )
+    assert windowed == (
+        "world-fishing-827.tech_great_expectations."
+        "dit_exp_pipeline_4690_cross_version_messages_positions_20260901_20261001_20261022t171500z"
+    )
+    assert whole == (
+        "world-fishing-827.tech_great_expectations."
+        "dit_exp_pipeline_4690_cross_version_segs_activity_all_20261022t171500z"
+    )
+
+
+def test_pin_emits_create_table_like_with_overrides() -> None:
+    """LIKE keeps partitioning and clustering; labels and description are
+    replaced (LIKE would otherwise carry the source's), partition expiration
+    cleared, and no IF NOT EXISTS (a name collision means a reused stamp)."""
+    client = _make_pin_client_mock()
+    dest = _pin(client)
+
+    assert client.query.call_count == 2
+    dry_sql = client.query.call_args_list[0].args[0]
+    sql = client.query.call_args_list[1].args[0]
+    assert dry_sql == sql
+    source = "gfw-int-pipe-v3.pipe_ais_v3_internal.messages_positions"
+    assert sql.startswith(f"CREATE TABLE `{dest}` LIKE `{source}` ")
+    assert "IF NOT EXISTS" not in sql
+    assert "expiration_timestamp=TIMESTAMP('2026-06-15T12:00:00+00:00')" in sql
+    assert "partition_expiration_days=NULL" in sql
+    assert "('dit_artifact', 'source_pin')" in sql
+    assert "('dit_experiment_id', 'pipeline-4690')" in sql
+    assert "('dit_role', 'cross_version')" in sql
+    assert "('dit_pin', '20261022t171500z')" in sql
+    assert "('dit_source_table', 'messages_positions')" in sql
+    assert "Source: gfw-int-pipe-v3.pipe_ais_v3_internal.messages_positions" in sql
+    assert sql.endswith(
+        "AS SELECT * FROM `gfw-int-pipe-v3.pipe_ais_v3_internal.messages_positions` "
+        "WHERE DATE(timestamp) >= '2026-09-01' AND DATE(timestamp) < '2026-10-01'"
+    )
+
+
+def test_pin_description_names_the_job_it_submits() -> None:
+    client = _make_pin_client_mock()
+    _pin(client)
+
+    copy_call = client.query.call_args_list[1]
+    job_id = copy_call.kwargs["job_id"]
+    assert job_id.startswith("dit_pin_")
+    assert copy_call.kwargs["job_retry"] is None  # a retry cannot reuse the id
+    assert f"copy job world-fishing-827:{job_id}." in copy_call.args[0]
+
+
+def test_pin_without_window_copies_the_whole_table() -> None:
+    client = _make_pin_client_mock()
+    dest = _pin(client, window=None)
+
+    sql = client.query.call_args_list[1].args[0]
+    assert dest.endswith("_messages_positions_all_20261022t171500z")
+    assert sql.endswith("WHERE TRUE")
+    assert "Rows: all (no filter)" in sql
+
+
+def test_pin_dry_runs_first_and_caps_the_copy_job() -> None:
+    client = _make_pin_client_mock()
+    _pin(client, max_bytes=2 * 10**12)
+
+    dry_config = client.query.call_args_list[0].kwargs["job_config"]
+    copy_config = client.query.call_args_list[1].kwargs["job_config"]
+    assert dry_config.dry_run is True
+    assert copy_config.dry_run is not True
+    assert copy_config.maximum_bytes_billed == 2 * 10**12
+
+
+def test_pin_default_cap_is_one_terabyte() -> None:
+    assert DEFAULT_PIN_MAX_BYTES == 10**12
+
+
+def test_pin_above_the_cap_raises_before_creating_anything() -> None:
+    client = _make_pin_client_mock(estimate=3_646_137_592_813)  # a month of prod messages
+    with pytest.raises(ValueError, match="3646.1 GB, above the 1000.0 GB cap"):
+        _pin(client)
+    assert client.query.call_count == 1  # the dry run only
+
+
+def test_pin_dry_run_creates_nothing() -> None:
+    client = _make_pin_client_mock()
+    dest = _pin(client, dry_run=True)
+
+    assert client.query.call_count == 1
+    assert client.query.call_args.kwargs["job_config"].dry_run is True
+    assert dest.endswith("_20261022t171500z")
+
+
+def test_pin_escapes_quotes_in_the_description_and_labels() -> None:
+    client = _make_pin_client_mock()
+    _pin(client, role="it's")
+
+    sql = client.query.call_args_list[1].args[0]
+    assert "role: it\\'s" in sql
+    assert "('dit_role', 'it_s')" in sql
+
+
+# -- require_pinned_source ---------------------------------------------------
+
+
+def test_require_pinned_source_accepts_a_labelled_copy() -> None:
+    client = MagicMock()
+    client.get_table.return_value = SimpleNamespace(labels={"dit_artifact": "source_pin"})
+    with patch("google.cloud.bigquery.Client", return_value=client):
+        assert require_pinned_source("p.d.t") == "p.d.t"
+    client.get_table.assert_called_once_with("p.d.t")
+
+
+def test_require_pinned_source_rejects_missing_and_foreign_tables() -> None:
+    from google.cloud.exceptions import NotFound
+
+    client = MagicMock()
+    client.get_table.side_effect = NotFound("gone")
+    with patch("google.cloud.bigquery.Client", return_value=client):
+        with pytest.raises(ValueError, match="does not exist"):
+            require_pinned_source("p.d.t")
+
+    client = MagicMock()
+    client.get_table.return_value = SimpleNamespace(labels={"project": "ais"})
+    with patch("google.cloud.bigquery.Client", return_value=client):
+        with pytest.raises(ValueError, match="not a DIT source pin"):
+            require_pinned_source("p.d.t")
