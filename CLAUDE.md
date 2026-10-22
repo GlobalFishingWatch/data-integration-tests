@@ -72,6 +72,22 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-22 — All Dataflow GCS paths under `gs://<bucket>/dit/` (`dit.dataflow_paths`)
+
+Follow-up to the prod-impact review below. dit's default bucket `pipe-temp-us-central-ttl7` is production's Dataflow bucket too, and dit wrote under exactly production's `dataflow_temp/` and `dataflow_staging/` prefixes. The owner chose a `dit/` prefix over a separate bucket. It needs no new permissions, since the service account's write access is bucket-wide. It makes dit's objects separable for inspection, cleanup and cost attribution.
+
+**Shape.** One import-light module, `dit.dataflow_paths` (`GCS_PREFIX = "dit"`, `dataflow_temp_location(bucket)`, `dataflow_staging_location(bucket)`). It is the only place these paths are built. Consumers:
+- `dit.runners.dataflow`, which serves the in-process pipe-gaps workflows;
+- `port_visits/ais.py`;
+- `encounters/ais.py`, which `vms.py` reuses;
+- `pipe_segment/identity_match_key.py`.
+
+pipe-segment hard-coded the bucket and now goes through `dit.workflow.DEFAULT_DATAFLOW_TEMP_BUCKET`, so it honours `DIT_DATAFLOW_TEMP_BUCKET` like the others. That is the one behaviour change beyond the prefix. The prefix is a constant, not a knob: making it configurable would reopen the question it closes.
+
+**Not affected.** Cache keys: the bucket is a runner-only attribute everywhere. The kaniko worker-image builds and Cloud Build use their own buckets and paths. Prod-boundary rule added to `docs/conventions.md`.
+
+**Sections moved (this commit).** New `src/dit/dataflow_paths.py`, `tests/test_dataflow_paths.py` (8 tests: helper, port-visits v4/v5, encounters both runners, pipe-segment both runners, in-process runner); the four consumers; `docs/conventions.md` § Prod-infra boundary; `.envrc.example`; README infra-knobs bullet; CHANGELOG `#### Changed`.
+
 ### 2026-10-22 — pipe-anchorages v5 CLI (`--pipeline-cli`) + temp-dataset overlay; epic PIPELINE-4698 (PIPELINE-4699, PIPELINE-4700)
 
 Trigger: a DIT integration test was needed for pipe-anchorages PR #176 (PIPELINE-4690, one record per vessel and instant in `CreateInOutEvents`), and the port-visits workflows turned out unable to run any current pipe-anchorages code.
@@ -95,7 +111,7 @@ It did find two shared-resource exposures:
 
 (a) `ais.py` emitted no `--max_num_workers`, and `world-fishing-827` is also the execution project of prod's `core.ais.v5.backfill`, so an uncapped run could take regional Dataflow quota from prod. `ais.py` now caps at `--max-num-workers` (default 4 for the 2020 staging cohort; 16 suggested for one month of prod AIS). A shared knob across all workflows and per-job scale heuristics are follow-up tickets.
 
-(b) dit's default `DIT_DATAFLOW_TEMP_BUCKET=pipe-temp-us-central-ttl7` writes under exactly composer's prod `dataflow_temp` / `dataflow_staging` prefixes. That default dates from the pipe-gaps port (2026-05-08: "the test SA's GCS write permissions are on pipe-temp-us-central-ttl7"; it matched pipe-gaps' own `historical-backfill` config). It was chosen for permissions and never discussed as an isolation question. Every dit Dataflow workflow inherits it. Not changed here.
+(b) dit's default `DIT_DATAFLOW_TEMP_BUCKET=pipe-temp-us-central-ttl7` writes under exactly composer's prod `dataflow_temp` / `dataflow_staging` prefixes. That default dates from the pipe-gaps port (2026-05-08: "the test SA's GCS write permissions are on pipe-temp-us-central-ttl7"; it matched pipe-gaps' own `historical-backfill` config). It was chosen for permissions and never discussed as an isolation question. Every dit Dataflow workflow inherits it. Addressed in the next entry (`dit/` prefix).
 
 **Images built and pushed (2026-10-22), both self-checked inside the image, Beam 2.76.0:**
 - baseline (pipe-anchorages main b36aed6): `gcr.io/world-fishing-827/dit/pipe-anchorages:main-b36aed6-temp-dataset-21aed7a5` @ `sha256:ebdd9fd4f9b78596534961197ef6ff060247ea81fa7dfaf919ae84a920a28c07`

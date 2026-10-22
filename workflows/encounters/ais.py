@@ -114,6 +114,7 @@ from typing import Optional, Sequence
 from dit import compare as dit_compare
 from dit import dates as dit_dates
 from dit import workflow as dit_workflow
+from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
@@ -467,7 +468,7 @@ def _pipeline_options(
         # module docstring for why the latter needs the overlay image.
         return [
             f"--project={PROJECT}",
-            f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
+            f"--temp_location={dataflow_temp_location(args.dataflow_temp_bucket)}",
             f"--temp_dataset={args.bq_temp_dataset}",
             "--runner=DirectRunner",
             "--wait_for_job",
@@ -478,9 +479,9 @@ def _pipeline_options(
         f"--project={PROJECT}",
         f"--region={args.dataflow_region}",
         f"--service_account_email={args.service_account}",
-        f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
+        f"--temp_location={dataflow_temp_location(args.dataflow_temp_bucket)}",
         f"--temp_dataset={args.bq_temp_dataset}",
-        f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
+        f"--staging_location={dataflow_staging_location(args.dataflow_temp_bucket)}",
         f"--subnetwork={args.dataflow_subnetwork}",
         # Bound autoscaling. Without this a wide run (all vessels over a year)
         # scales freely; prod caps this same step at 50

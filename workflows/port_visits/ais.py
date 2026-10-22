@@ -69,6 +69,7 @@ from dit import compare as dit_compare
 from dit import dates as dit_dates
 from dit import workflow as dit_workflow
 from dit.cache import CacheKey, resolve_worker_image_to_digest, sha1_of_workflow_file
+from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
@@ -353,8 +354,8 @@ def _dataflow_pipeline_options(
         f"--project={PROJECT}",
         f"--region={args.dataflow_region}",
         f"--service_account_email={args.service_account}",
-        f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
-        f"--staging_location=gs://{args.dataflow_temp_bucket}/dataflow_staging",
+        f"--temp_location={dataflow_temp_location(args.dataflow_temp_bucket)}",
+        f"--staging_location={dataflow_staging_location(args.dataflow_temp_bucket)}",
         f"--subnetwork={args.dataflow_subnetwork}",
         # Bound autoscaling; see DEFAULT_MAX_NUM_WORKERS.
         f"--max_num_workers={_max_num_workers(args)}",
@@ -386,7 +387,7 @@ def _directrunner_pipeline_options(
     return [
         "--runner=DirectRunner",
         f"--project={PROJECT}",
-        f"--temp_location=gs://{args.dataflow_temp_bucket}/dataflow_temp",
+        f"--temp_location={dataflow_temp_location(args.dataflow_temp_bucket)}",
         *_STATIC_LABELS,
         *_dynamic_labels(args, **label_kwargs),
     ]
