@@ -14,6 +14,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 - **`workflows/port_visits/ais.py` now mounts the `gcp` credentials volume on every docker call.** A published-image run (`docker run`, no `--build-from-source`) had no GCP credentials inside the container; only the compose path mounted them, through pipe-anchorages' own compose file. The v5 overlay image can only run that way, so a laptop v5 run could not authenticate. Same `gcp:/root/.config` spec as encounters, pipe-events and pipe-segment; cloud mode still drops it. Pipeline argv and cache keys are unchanged.
 
 #### Changed
+- **`--thinned-message-table` now needs `--steps port_visits`** on `workflows/port_visits/ais.py` and `cross_version_ais.py`. Before, the table alone made the workflow skip step 1; the skip is now explicit, and the old invocation fails with a pointer to `--steps`.
 - **`workflows/port_visits/cross_version_ais.py` pins its sources by copying them at run start; `--pin-source-at` is removed.** Snapshot pinning never worked after the June canonical-dataset migration: a snapshot with an expiration needs `bigquery.tables.deleteSnapshot`, which neither `automated-testing@` nor operator accounts have on `tech_great_expectations` (Cloud Build `5153fd50`), and BigQuery refuses snapshots across organisations anyway. The wrapper now copies, via `dit.bq.pin_source_into_experiment`:
   - `messages_positions` over `[--start, --end]` (new wrapper flags, forwarded to every binding, defaults from `ais.py`);
   - `segment_info` and `segs_activity` whole;
@@ -23,6 +24,12 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 - **Dataflow temp and staging paths move under `gs://<bucket>/dit/`, for every workflow.** The default bucket `pipe-temp-us-central-ttl7` is also production's Dataflow bucket. dit wrote under exactly production's `dataflow_temp/` and `dataflow_staging/` prefixes, a default inherited from the original pipe-gaps port and chosen for the service account's write permissions. Now `dit.dataflow_paths` builds `gs://<bucket>/dit/dataflow_temp` and `gs://<bucket>/dit/dataflow_staging`. They are used by `dit.runners.dataflow` (pipe-gaps' two workflows), `port_visits/ais.py`, `encounters/ais.py` (and so `vms.py`), and `pipe_segment/identity_match_key.py`. pipe-segment previously hard-coded the bucket and now also honours `DIT_DATAFLOW_TEMP_BUCKET`. Same bucket and permissions, no new IAM. The bucket is a runner-only knob, so no cache key changes. 8 tests in `tests/test_dataflow_paths.py`.
 
 #### Added
+- **`--steps` on `workflows/port_visits/ais.py` and `cross_version_ais.py`.** Selects the pipeline steps to run, in pipeline order: `thin_port_messages,port_visits` (the default, unchanged behaviour), `port_visits` alone (requires `--thinned-message-table` as its input, e.g. production's `raw_port_events`), or `thin_port_messages` alone. The modes, and the cross-version bindings, compare the last selected step's output: visits on `visit_id`, or the thinned tables (`port_events_<suffix>_<mode>`) on `(identifier, timestamp)`. That key was unique in every mode of the 2026-10-22 staging smoke but is not guaranteed. Details:
+  - The cache key gains `steps` only for a subset, so default keys are byte-identical. Each source is in the key only when a selected step reads it.
+  - The cross-version wrapper pins exactly what the selected steps read.
+  - `dit.workflow.parse_choice_list` generalises `parse_modes` for such flags.
+
+  20 tests (`tests/test_port_visits_steps.py` and the wrapper's); suite 598 → 618.
 - **`dit.bq.pin_source_into_experiment`: source pinning by copy.** Runs `CREATE TABLE <dest> LIKE <src> OPTIONS(…) AS SELECT * FROM <src> WHERE <window or TRUE>` into `tech_great_expectations`:
   - **`LIKE`** keeps the source's partitioning, clustering and `require_partition_filter` (verified across organisations). Labels and description are replaced, not merged with the source's, and `partition_expiration_days` is cleared, so a source keeping 365 days of partitions cannot expire an older copy as it lands.
   - **Name:** `dit_exp_<exp>_<role>_<table>_<window|all>_<pin stamp>`.

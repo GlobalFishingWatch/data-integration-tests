@@ -31,6 +31,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         source_segment_info_fqn=None,
         source_segs_activity_fqn=None,
         named_anchorages="world-fishing-827.anchorages.named_anchorages_v1",
+        steps=list(mod.SELECTABLE_STEPS),
         thinned_message_table=None,
         dest_dataset="tech_great_expectations",
         # Submitter image identity (Fix 1): build_from_source decides whether
@@ -216,10 +217,13 @@ def test_bad_segs_sql_honours_per_table_override():
 
 def test_canonical_params_dict_thinned_table_changes_key():
     # --thinned-message-table changes what step 2 reads -> must be in the key.
-    a = mod.canonical_params_dict(_args(thinned_message_table=None), mod.MODE_BF)
-    b = mod.canonical_params_dict(
-        _args(thinned_message_table="proj.ds.pre_thinned"), mod.MODE_BF
+    a = mod.canonical_params_dict(
+        _args(steps=[mod.STEP_VISITS], thinned_message_table="proj.ds.pre_thinned"), mod.MODE_BF
     )
+    b = mod.canonical_params_dict(
+        _args(steps=[mod.STEP_VISITS], thinned_message_table="proj.ds.other_thinned"), mod.MODE_BF
+    )
+    assert a["thinned_message_table"] == "proj.ds.pre_thinned"
     assert a != b
 
 
@@ -459,10 +463,10 @@ def test_run_with_cache_miss_records_visits_and_port_events():
 
 
 def test_run_with_cache_miss_external_thinned_table_records_only_visits():
-    # When --thinned-message-table is set, step 1 is skipped and the workflow
-    # creates no thinned table of its own; only the visits table is recorded
-    # (the external thinned table belongs to the caller, not us).
-    args = _args(thinned_message_table="proj.ds.external_thinned")
+    # With --steps port_visits, step 1 is skipped and the workflow creates no
+    # thinned table of its own; only the visits table is recorded (the
+    # external thinned table belongs to the caller, not us).
+    args = _args(steps=[mod.STEP_VISITS], thinned_message_table="proj.ds.external_thinned")
     suffix = "exp01_abc1234_aabbcc"
     execute_fn = MagicMock()
     with (

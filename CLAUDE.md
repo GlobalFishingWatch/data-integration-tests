@@ -72,6 +72,23 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-22 — `--steps` on the port-visits workflows (explicit step selection)
+
+**Problem.** Both port-visits workflows always ran both steps. The only way to skip step 1 was the implicit hint `--thinned-message-table`. Step 1 could not run alone, and its output was never compared.
+
+**Owner decision.** The owner's long-term picture is separate workflows per stage. Workflow configuration is still too verbose to make that cheap before the planned refactor, and configurable workflows stay useful after it. So: reuse the existing workflows, with a `--steps` flag.
+
+**Design.**
+- **Step names** follow DIT's standard `thin_port_messages` / `port_visits` (owner: the BQ table is `raw_port_events`, but the step is `thin_port_messages`).
+- **Comparison.** A run compares its last selected step's output, so the cache's one comparison table per mode still holds and default runs are unchanged. Comparing step 1's output inside a both-steps run would need the cache to return two tables per mode; not done.
+- **Step 1 key:** `(identifier, timestamp)`, the owner's choice. It is not proven unique (two messages of one segment in one second), but it is good enough for QA. Unique in all three modes of the 2026-10-22 staging smoke (333,367 rows each).
+- **Input-table rules.** `validate_steps` (shared with the wrapper) rejects step 2 alone without `--thinned-message-table`, and the table alongside step 1. That breaks the old implicit invocation on purpose.
+- **Cache key.** Step-aware like the modes: each source only when a selected step reads it; `steps` only for subsets. Default keys are byte-identical (test-pinned).
+- **Pinning.** The wrapper's `_pin_specs` becomes the per-step rule, replacing the thinned-table special case from the pinning change.
+- **Parser.** `dit.workflow.parse_choice_list` generalises `parse_modes` so `--steps` errors name `--steps`.
+
+**Sections moved.** `workflows/port_visits/ais.py` (docstring, `STEP_*`, `THIN_COMPARE_KEYS`, `COMPARE_KEYS_BY_STEP`, `validate_steps`, `_output_table`, `_run_slice`, `canonical_params_dict`, `_run_with_cache`, `compare_all`, `--steps`); `workflows/port_visits/cross_version_ais.py` (`--steps`, `_pin_specs`, `_PinnedSources`, `_ais_args_for_binding`, diffs); `src/dit/workflow.py`; new `tests/test_port_visits_steps.py`; `docs/plan.md` § port-visits; `docs/pipeline-contract.md` § step-skipping; README Features; CHANGELOG.
+
 ### 2026-10-22 — Source pinning by copy (`dit.bq.pin_source_into_experiment`); `cross_version_ais.py` first consumer
 
 **Problem.** Snapshot pinning was blocked twice over, and has never worked since the June canonical-dataset migration:

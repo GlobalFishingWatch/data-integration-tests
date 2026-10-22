@@ -21,16 +21,16 @@ Example: validate PIPELINE-1465 by comparing v4.6.4 against the fix branch::
 Steps:
 
 1. Verify every binding's git ref exists in ``$PROJECTS/anchorages_pipeline``.
-2. Pin the inputs with ``dit.bq.pin_source_into_experiment``: copy them into
+2. Pin what the selected ``--steps`` read with
+   ``dit.bq.pin_source_into_experiment``: copy it into
    ``<project>.tech_great_expectations`` (default 7-day TTL), keeping the
    sources' partitioning and clustering:
 
-   * ``messages_positions`` over ``[--start, --end]`` (the only range step 1
-     reads), skipped with ``--thinned-message-table``, whose runs never read
-     it;
-   * ``segment_info`` and ``segs_activity`` whole (step 2 joins and filters
-     them without a date range);
-   * the optional ``--thinned-message-table`` over ``[--start, --end]``.
+   * ``thin_port_messages``: ``messages_positions`` over ``[--start, --end]``
+     (the only range it reads);
+   * ``port_visits``: ``segment_info`` and ``segs_activity`` whole (it joins
+     and filters them without a date range), and without step 1 its input
+     ``--thinned-message-table`` over ``[--start, --end]``.
 
    Every copy's name ends in the pin stamp (the run's start time in UTC,
    e.g. ``20261022t171500z``). ``--reuse-pin <stamp>`` reuses an earlier
@@ -49,8 +49,11 @@ Steps:
    be the submitter). Each subprocess's stdout/stderr is line-prefixed ``[<binding>] `` so
    parallel runs interleave readably.
 4. For each mode in ``--modes`` and each pair of bindings, compare the
-   corresponding ``port_visits_<exp>-<binding>_<mode>`` tables on ``visit_id``.
-   Pairs touching a binding that failed (rc != 0) are SKIPPED, not diffed.
+   corresponding outputs of the last selected step:
+   ``port_visits_<exp>-<binding>_<mode>`` on ``visit_id``, or with ``--steps
+   thin_port_messages`` ``port_events_<exp>-<binding>_<mode>`` on
+   ``(identifier, timestamp)``. Pairs touching a binding that failed
+   (rc != 0) are SKIPPED, not diffed.
 
 The overall exit code is non-zero iff any binding failed; an individual
 binding failure does not abort siblings.
@@ -90,13 +93,15 @@ from typing import Optional, Sequence
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
-from dit.workflow import parse_modes
+from dit.workflow import parse_choice_list, parse_modes
 
-# ais.py owns the canonical mode set and date defaults; import them so the
-# two can't drift.
+# ais.py owns the canonical mode and step sets, date defaults, step rules and
+# comparison keys; import them so the two can't drift.
+from workflows.port_visits.ais import COMPARE_KEYS_BY_STEP, STEP_THIN, STEP_VISITS, validate_steps
 from workflows.port_visits.ais import DEFAULT_END as AIS_DEFAULT_END
 from workflows.port_visits.ais import DEFAULT_START as AIS_DEFAULT_START
 from workflows.port_visits.ais import SELECTABLE_MODES as AIS_SELECTABLE_MODES
+from workflows.port_visits.ais import SELECTABLE_STEPS as AIS_SELECTABLE_STEPS
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +143,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                         f"pinned messages. Default {AIS_DEFAULT_END}.")
     p.add_argument("--modes", default=DEFAULT_MODES,
                    help=f"Comma-separated mode names whose output tables get diffed pairwise. Default {DEFAULT_MODES}.")
+    p.add_argument("--steps", default=",".join(AIS_SELECTABLE_STEPS),
+                   help=f"Comma-separated pipeline steps every binding runs (ais.py's --steps; "
+                        f"default {','.join(AIS_SELECTABLE_STEPS)}). Decides what is pinned and "
+                        f"which output is diffed (the last step's). {STEP_VISITS} alone needs "
+                        f"--thinned-message-table.")
     p.add_argument("--pipeline-dir", default=DEFAULT_PIPELINE_DIR,
                    help="anchorages_pipeline checkout used for git worktrees.")
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
@@ -179,17 +189,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                         "submitter: the BigQuery staging dataset is set at pipeline construction. "
                         "Bindings without an override use ais.py's --image-tag.")
     p.add_argument("--thinned-message-table", default=None,
-                   help="Fully-qualified BQ table holding pre-thinned port messages. When set, "
-                        "the wrapper pins it over [--start, --end] like the sources, then passes "
-                        "the pinned copy to every binding's ais.py as --thinned-message-table. "
-                        "Each binding's step 1 (thin_port_messages) is then SKIPPED -- saves the "
-                        "dominant cost when the change under test is in step 2 only -- and "
-                        "messages_positions is not pinned, since no binding reads it. The wrapper "
-                        "exclusively owns this knob in cross-version runs: any user-supplied "
-                        "--thinned-message-table in extras is ALWAYS dropped (even when this "
-                        "wrapper flag is unset), so the user can't inject an unpinned table "
-                        "and bypass the pin. To skip step 1 in a cross-version run, set "
-                        "this wrapper flag.")
+                   help="Fully-qualified BQ table holding pre-thinned port messages (e.g. "
+                        "production's raw_port_events); only with --steps port_visits. The wrapper "
+                        "pins it over [--start, --end], then passes the pinned copy to every "
+                        "binding's ais.py as --thinned-message-table, so no binding runs step 1 "
+                        "(thin_port_messages) -- saves the dominant cost when the change under "
+                        "test is in step 2 only -- and messages_positions is not pinned. The "
+                        "wrapper exclusively owns this knob in cross-version runs: any "
+                        "user-supplied --thinned-message-table in extras is ALWAYS dropped (even "
+                        "when this wrapper flag is unset), so the user can't inject an unpinned "
+                        "table and bypass the pin.")
     args, ais_extra_args = p.parse_known_args(argv)
     if args.pin_source_at is not None:
         raise SystemExit(
@@ -201,6 +210,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     # was accepted, so a typo silently produced zero diff pairs (which
     # reads identically to "everything matched").
     args.modes = parse_modes(args.modes, choices=AIS_SELECTABLE_MODES)
+    args.steps = parse_choice_list(
+        args.steps, choices=AIS_SELECTABLE_STEPS, flag="--steps", noun="step",
+    )
+    validate_steps(args.steps, args.thinned_message_table)
     args.start = _parse_date("--start", args.start)
     args.end = _parse_date("--end", args.end)
     if args.end < args.start:
@@ -287,15 +300,16 @@ class _PinnedSources:
     `_ais_args_for_binding`, which forwards `start` / `end` too, so a
     binding cannot run over dates its copies don't hold.
 
-    `messages_positions` is None with `--thinned-message-table`: those runs
-    skip step 1, the only reader of it. Frozen so nothing changes the pins
+    A field is None when no selected step reads it: `messages_positions`
+    without step 1, `segment_info` / `segs_activity` without step 2, and
+    `thinned` unless step 2 runs alone. Frozen so nothing changes the pins
     between pinning and the `ais.py` invocations.
     """
     start: date
     end: date
-    segment_info: str
-    segs_activity: str
     messages_positions: Optional[str] = None
+    segment_info: Optional[str] = None
+    segs_activity: Optional[str] = None
     thinned: Optional[str] = None
 
 
@@ -321,21 +335,27 @@ def _source_tables(args: argparse.Namespace) -> tuple[str, str, str]:
 
 
 def _pin_specs(args: argparse.Namespace) -> list[_PinSpec]:
-    """The sources a run pins. `segment_info` and `segs_activity` are copied
-    whole: step 2 joins and filters them without a date range."""
+    """What the selected steps read, so what a run pins: step 1 reads
+    `messages_positions` over the run's dates; step 2 reads `segment_info` and
+    `segs_activity` whole (no date range) and, without step 1, the
+    `--thinned-message-table` over the run's dates."""
     messages, segment_info, segs_activity = _source_tables(args)
     window = dit_bq.SourceWindow(
         column=_WINDOW_COLUMN, start=args.start, end=args.end + timedelta(days=1),
     )
-    windowed_input = (
-        _PinSpec("thinned", args.thinned_message_table, _THINNED_PIN_ROLE, window)
-        if args.thinned_message_table
-        else _PinSpec("messages_positions", messages, _SOURCE_PIN_ROLE, window)
+    thin_reads = [_PinSpec("messages_positions", messages, _SOURCE_PIN_ROLE, window)]
+    external_thinned = (
+        [] if STEP_THIN in args.steps
+        else [_PinSpec("thinned", args.thinned_message_table, _THINNED_PIN_ROLE, window)]
     )
-    return [
-        windowed_input,
+    visits_reads = [
+        *external_thinned,
         _PinSpec("segment_info", segment_info, _SOURCE_PIN_ROLE, None),
         _PinSpec("segs_activity", segs_activity, _SOURCE_PIN_ROLE, None),
+    ]
+    return [
+        *(thin_reads if STEP_THIN in args.steps else []),
+        *(visits_reads if STEP_VISITS in args.steps else []),
     ]
 
 
@@ -392,11 +412,15 @@ def _ais_args_for_binding(
     experiment_id: str,
     binding_name: str,
     modes: Sequence[str],
+    steps: Sequence[str] = AIS_SELECTABLE_STEPS,
     worker_image: Optional[str] = None,
     image_tag: Optional[str] = None,
 ) -> list[str]:
     """Strip user-supplied overrides for fields the wrapper owns, then
     re-inject the wrapper's values.
+
+    ``steps`` must be the selection ``pinned`` was built for: each source
+    flag is emitted only when it was pinned.
 
     ``--image-tag`` (the submitter image) follows the same rule as
     ``--worker-image``: dropped from the extras and re-injected only when the
@@ -431,7 +455,8 @@ def _ais_args_for_binding(
         "--thinned-message-table",
         # --modes is the wrapper's own flag (it selects which modes to run
         # AND which to diff); a user extra must not desync the two halves.
-        "--modes",
+        # --steps likewise also decides what is pinned and diffed.
+        "--modes", "--steps",
     }
     if worker_image is not None:
         drop_kvs = drop_kvs | {"--worker-image"}
@@ -453,11 +478,11 @@ def _ais_args_for_binding(
         # Per-table FQN overrides (M4 of canonical-dataset migration) point
         # ais.py at the pinned copies in tech_great_expectations. Each
         # binding reads the SAME copies so any output divergence is
-        # attributable to pipeline code, not source-data drift.
-        "--source-segment-info-fqn", pinned.segment_info,
-        "--source-segs-activity-fqn", pinned.segs_activity,
+        # attributable to pipeline code, not source-data drift. Each one is
+        # emitted below only when a selected step reads it.
         "--start", pinned.start.isoformat(),
         "--end", pinned.end.isoformat(),
+        "--steps", ",".join(steps),
         # Forward the mode selection so each binding RUNS only the modes we
         # will diff. Before ais.py grew --modes, a --modes subset narrowed the
         # diff set only -- every binding still ran all three, so the flag
@@ -473,12 +498,15 @@ def _ais_args_for_binding(
         out.extend(["--worker-image", worker_image])
     if image_tag is not None:
         out.extend(["--image-tag", image_tag])
-    # messages_positions is unpinned (None) exactly when a thinned table is:
-    # step 1, its only reader, is then skipped.
-    if pinned.messages_positions is not None:
-        out.extend(["--source-messages-fqn", pinned.messages_positions])
-    if pinned.thinned is not None:
-        out.extend(["--thinned-message-table", pinned.thinned])
+    pinned_flags = (
+        ("--source-messages-fqn", pinned.messages_positions),
+        ("--source-segment-info-fqn", pinned.segment_info),
+        ("--source-segs-activity-fqn", pinned.segs_activity),
+        ("--thinned-message-table", pinned.thinned),
+    )
+    out.extend(
+        token for flag, fqn in pinned_flags if fqn is not None for token in (flag, fqn)
+    )
     return out
 
 
@@ -503,6 +531,7 @@ def _run_binding(
     pinned: _PinnedSources,
     suffix: str,
     modes: Sequence[str],
+    steps: Sequence[str],
     pipeline_dir: str,
     ais_extra_args: list[str],
     dry_run: bool,
@@ -522,6 +551,7 @@ def _run_binding(
             pinned=pinned, suffix=suffix,
             experiment_id=experiment_id, binding_name=name,
             modes=modes,
+            steps=steps,
             worker_image=worker_image,
             image_tag=image_tag,
         )
@@ -570,17 +600,23 @@ def _run_binding(
 # Pairwise diffs
 # --------------------------------------------------------------------------
 
-def _visits_table(dest_dataset: str, suffix: str, mode: str) -> str:
-    return f"{PROJECT}.{dest_dataset}.port_visits_{suffix}_{mode}"
+#: Output table prefix per step, as ais.py names them.
+_OUTPUT_PREFIX_BY_STEP = {STEP_THIN: "port_events", STEP_VISITS: "port_visits"}
+
+
+def _output_table(dest_dataset: str, suffix: str, mode: str, step: str) -> str:
+    """A binding's output of ``step`` for ``mode``."""
+    return f"{PROJECT}.{dest_dataset}.{_OUTPUT_PREFIX_BY_STEP[step]}_{suffix}_{mode}"
 
 
 def _diff_pair(
-    *, dest_dataset: str, a_suffix: str, b_suffix: str, mode: str,
+    *, dest_dataset: str, a_suffix: str, b_suffix: str, mode: str, step: str,
 ) -> int:
+    """Diff two bindings' outputs of ``step`` on that step's key."""
     return dit_compare.compare_tables(
-        _visits_table(dest_dataset, a_suffix, mode),
-        _visits_table(dest_dataset, b_suffix, mode),
-        keys=["visit_id"],
+        _output_table(dest_dataset, a_suffix, mode, step),
+        _output_table(dest_dataset, b_suffix, mode, step),
+        keys=list(COMPARE_KEYS_BY_STEP[step]),
         view_suffix="",
     )
 
@@ -591,10 +627,12 @@ _SKIPPED = -1  # sentinel rc for diff pairs we couldn't run
 def _run_diffs(
     *,
     modes: list[str],
+    step: str,
     suffix_by_binding: dict[str, str],
     dest_dataset: str,
     failed_bindings: set[str],
 ) -> dict[tuple[str, str, str], int]:
+    """Diff every pair of bindings' ``step`` outputs, per mode."""
     results: dict[tuple[str, str, str], int] = {}
     bindings = list(suffix_by_binding.keys())
     for mode in modes:
@@ -610,6 +648,7 @@ def _run_diffs(
                 a_suffix=suffix_by_binding[a],
                 b_suffix=suffix_by_binding[b],
                 mode=mode,
+                step=step,
             )
             results[(mode, a, b)] = rc
             verdict = "IDENTICAL" if rc == 0 else f"DIFFERENT (table-check rc={rc})"
@@ -649,9 +688,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("date range (inclusive): %s -> %s", args.start, args.end)
     logger.info("bindings: %s", args.bindings)
     logger.info("modes: %s", args.modes)
+    logger.info("steps: %s", ",".join(args.steps))
     logger.info("pipeline_dir: %s", args.pipeline_dir)
-    logger.info("sources: %s (copies in %s.tech_great_expectations)",
-                ", ".join(_source_tables(args)), PROJECT)
+    logger.info("pinning: %s (copies in %s.tech_great_expectations)",
+                ", ".join(spec.source_table for spec in _pin_specs(args)), PROJECT)
 
     _verify_refs(args.pipeline_dir, args.bindings)
     pinned = _pin_sources(args, pinned_at, reuse=reuse)
@@ -671,6 +711,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pinned=pinned,
             suffix=suffix_by_binding[name],
             modes=args.modes,
+            steps=args.steps,
             pipeline_dir=args.pipeline_dir,
             ais_extra_args=ais_extra_args,
             dry_run=args.dry_run,
@@ -702,6 +743,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     results = _run_diffs(
         modes=args.modes,
+        step=args.steps[-1],
         suffix_by_binding=suffix_by_binding,
         dest_dataset=args.dest_dataset,
         failed_bindings=failed_bindings,

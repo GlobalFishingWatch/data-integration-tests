@@ -19,6 +19,21 @@ end):
 There is no ``_4_mutate_recover`` mode here -- that was pipe-gaps' Bug A
 trigger and doesn't apply to port-visits.
 
+Steps (``--steps``, default both, in pipeline order):
+
+* ``thin_port_messages``: messages -> thinned port messages (production's
+  ``raw_port_events``), written to ``port_events_<suffix>_<mode>``.
+* ``port_visits``: thinned port messages -> visits, written to
+  ``port_visits_<suffix>_<mode>``.
+
+``--steps port_visits`` skips step 1 and requires ``--thinned-message-table``
+as step 2's input, e.g. production's ``raw_port_events`` for a change that
+lives in step 2 only. ``--steps thin_port_messages`` runs step 1 alone. The
+modes compare the output of the LAST selected step: visits on ``visit_id``,
+or thinned messages on ``(identifier, timestamp)``. That key was unique in
+every mode of the 2026-10-22 staging smoke; it is not guaranteed (a segment
+could hold two messages in one second), but it serves for QA.
+
 Date semantics: ``--start`` and ``--end`` are **inclusive on both ends**,
 matching the pipe-anchorages v4 CLI. (Pipe-gaps' workflow uses half-open dates,
 matching detect-gaps' CLI; the wart is unavoidable given the downstream
@@ -76,6 +91,7 @@ from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
     add_modes_arg,
+    parse_choice_list,
     parse_modes,
     resolve_run_context,
 )
@@ -107,6 +123,12 @@ _MODES_USING_TAIL = frozenset({MODE_BFD, MODE_BFTRUNCATE})
 #: Modes selectable via --modes, in canonical order.
 SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
 
+# Step names (DIT's standard, from the v4 CLI; also used in Dataflow job
+# names and the dit_step label). Selectable via --steps, in pipeline order.
+STEP_THIN = "thin_port_messages"
+STEP_VISITS = "port_visits"
+SELECTABLE_STEPS = (STEP_THIN, STEP_VISITS)
+
 
 # --------------------------------------------------------------------------
 # Constants / defaults
@@ -119,8 +141,8 @@ REPO_NAME = "anchorages-pipeline"
 # composition). The full step name is used in the dit_step label, which has
 # more room.
 _JOB_STEP_NAMES = {
-    "thin_port_messages": "thin",
-    "port_visits": "visits",
+    STEP_THIN: "thin",
+    STEP_VISITS: "visits",
 }
 
 # Per-user infra knobs identical to both workflows (--dest-dataset,
@@ -186,6 +208,14 @@ DEFAULT_WORKER_IMAGE = (
 # Comparison contract for port-visits (truncate shape, no SCD-2).
 COMPARE_KEYS = ("visit_id",)
 COMPARE_VIEW_SUFFIX = ""
+
+# Comparison key of the thinned port messages (step 1's output). Not proven
+# unique -- a segment could hold two messages in one second -- but unique in
+# every mode of the 2026-10-22 staging smoke and good enough for QA.
+THIN_COMPARE_KEYS = ("identifier", "timestamp")
+
+#: Comparison key per step output; a run compares its last step's output.
+COMPARE_KEYS_BY_STEP = {STEP_THIN: THIN_COMPARE_KEYS, STEP_VISITS: COMPARE_KEYS}
 
 # pipe-anchorages CLI generations this workflow can drive (see module docstring).
 PIPELINE_CLI_V4 = "v4"
@@ -482,6 +512,38 @@ def _visits_table(args: argparse.Namespace, suffix: str, mode: str) -> str:
     return f"{PROJECT}.{args.dest_dataset}.port_visits_{suffix}_{mode}"
 
 
+def validate_steps(steps: Sequence[str], thinned_message_table: Optional[str]) -> None:
+    """Reject step selections whose step-2 input is missing or ambiguous.
+
+    Skipping step 1 needs ``--thinned-message-table`` as step 2's input, and
+    running step 1 makes that table meaningless (step 2 reads step 1's
+    output), so it is an error rather than silently ignored. Shared with
+    ``cross_version_ais.py``, which validates its own ``--steps`` the same way.
+    """
+    if STEP_THIN not in steps and not thinned_message_table:
+        raise SystemExit(
+            f"--steps {','.join(steps)} skips {STEP_THIN}: pass "
+            f"--thinned-message-table as {STEP_VISITS}' input"
+        )
+    if STEP_THIN in steps and thinned_message_table:
+        raise SystemExit(
+            f"--thinned-message-table replaces {STEP_THIN}'s output; it needs "
+            f"--steps {STEP_VISITS}"
+        )
+
+
+def _last_step(args: argparse.Namespace) -> str:
+    """The step whose output a run produces and compares."""
+    return args.steps[-1]
+
+
+def _output_table(args: argparse.Namespace, suffix: str, mode: str) -> str:
+    """This run's comparison target for ``mode``: the last step's output."""
+    if _last_step(args) == STEP_VISITS:
+        return _visits_table(args, suffix, mode)
+    return _thinned_table(args, suffix, mode)
+
+
 # --------------------------------------------------------------------------
 # Slice runner: thin -> visits
 # --------------------------------------------------------------------------
@@ -506,13 +568,15 @@ def _run_slice(
     number of slices the mode will run. Both flow into the Dataflow job name
     (as ``-N-M`` suffix) and BQ labels for per-iteration provenance.
 
-    When ``args.thinned_message_table`` is set, step 1 is SKIPPED and step 2
-    reads from that table instead of the per-mode ``port_events_<suffix>_<mode>``
-    table the workflow would normally produce. This is the supported way to
-    run dit against a change that lives only in step 2 -- avoids re-thinning
-    AIS data that step 1 has already produced upstream (e.g. in prod).
+    Only the steps in ``args.steps`` run. Without step 1 (``--steps
+    port_visits``), step 2 reads ``args.thinned_message_table`` instead of the
+    per-mode ``port_events_<suffix>_<mode>`` table the workflow would normally
+    produce. This is the supported way to run dit against a change that lives
+    only in step 2 -- avoids re-thinning AIS data that step 1 has already
+    produced upstream (e.g. in prod). Without step 2 (``--steps
+    thin_port_messages``), the slice ends after step 1.
     """
-    if args.thinned_message_table:
+    if STEP_THIN not in args.steps:
         logger.info(
             "thin_port_messages SKIPPED for mode=%s slice=[%s, %s] iter=%d/%d -- using external table %s",
             mode, slice_start, slice_end, iteration, total_iterations,
@@ -532,6 +596,9 @@ def _run_slice(
                 f"thin_port_messages failed (rc={rc}, mode={mode}, slice=[{slice_start}, {slice_end}])"
             )
         thinned_input = _thinned_table(args, suffix, mode)
+
+    if STEP_VISITS not in args.steps:
+        return
 
     visits_args = _visits_argv(
         args, suffix=suffix, mode=mode, thinned_input=thinned_input, slice_end=slice_end,
@@ -573,7 +640,7 @@ def _thin_argv(
     """argv for step 1 (``thin_port_messages`` / ``port-state-transitions``)
     over the inclusive slice ``[slice_start, slice_end]``."""
     options = _pipeline_options(
-        args, step="thin_port_messages", mode=mode,
+        args, step=STEP_THIN, mode=mode,
         iteration=iteration, total_iterations=total_iterations,
         slice_start=slice_start, slice_end=slice_end,
     )
@@ -612,7 +679,7 @@ def _visits_argv(
     """argv for step 2 (``port_visits`` / ``port-visits``), a full recompute
     over ``[args.start, slice_end]`` inclusive, as in production."""
     options = _pipeline_options(
-        args, step="port_visits", mode=mode,
+        args, step=STEP_VISITS, mode=mode,
         iteration=iteration, total_iterations=total_iterations,
         slice_start=_parse_date(args.start), slice_end=slice_end,
     )
@@ -754,9 +821,11 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     cache row regardless of which knob they used), the named-anchorages
     reference, the **submitter image identity** (see
     :func:`_submitter_image_identity` -- the pipeline-construction code that
-    builds/submits the Beam graph; mode-independent), and -- when set --
-    ``thinned_message_table`` (skips step 1 and reads pre-thinned messages from
-    that table, which changes what step 2 sees). Excludes plumbing (datasets,
+    builds/submits the Beam graph; mode-independent), the selected steps
+    (only when not both), and -- with ``--steps port_visits`` --
+    ``thinned_message_table`` (step 2 reads pre-thinned messages from that
+    table, which changes what step 2 sees). Each source is in the key only
+    when a selected step reads it. Excludes plumbing (datasets,
     regions, SAs), naming (experiment_id, suffix, binding), and runner-only
     knobs (worker_image is in the key via ``worker_image_digest`` on the
     CacheKey itself; ``parallel`` doesn't affect output). NOTE: ``image_tag``
@@ -771,17 +840,29 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     # own snapshot FQNs) must NOT. Storing resolved FQNs answers both.
     # M4 of canonical-dataset migration: cache-key shape change. First run
     # after merge misses; subsequent runs converge.
+    #
+    # Step-aware like the modes: a field is in the key only when a selected
+    # step reads it (step 1: messages + named anchorages; step 2: segment_info,
+    # segs_activity, and the external thinned table when step 1 is skipped).
+    # With both steps every field is present and the key is unchanged.
     params: dict = {
         "mode": mode,
         "start": args.start,
         "end": args.end,
-        "source_messages_fqn": _messages_table(args),
-        "source_segment_info_fqn": _segment_info_table(args),
-        "source_segs_activity_fqn": _segs_activity_table(args),
-        "named_anchorages": args.named_anchorages,
-        "thinned_message_table": args.thinned_message_table,
         **_submitter_image_identity(args),
     }
+    if STEP_THIN in args.steps:
+        params["source_messages_fqn"] = _messages_table(args)
+        params["named_anchorages"] = args.named_anchorages
+    if STEP_VISITS in args.steps:
+        params["source_segment_info_fqn"] = _segment_info_table(args)
+        params["source_segs_activity_fqn"] = _segs_activity_table(args)
+        params["thinned_message_table"] = args.thinned_message_table
+    # The steps decide which table a row's output is, so a subset must not
+    # share a row with a full run. Added only for subsets, so every
+    # both-steps key stays byte-identical.
+    if list(args.steps) != list(SELECTABLE_STEPS):
+        params["steps"] = list(args.steps)
     if mode in _MODES_USING_TAIL:
         params["tail_days"] = args.tail_days
     # v5 drives a different pipeline CLI (and an overlay image), so its rows
@@ -809,23 +890,23 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
     Builds the mode-aware :class:`CacheKey` and threads the per-run
     :class:`RunContext` (stamped on ``args`` in :func:`main`) + the
     port-visits workflow/pipeline identity into the generic wrapper. Returns
-    the visits-table FQN to compare (cached on hit, freshly computed on miss).
+    the FQN of the last step's output to compare (cached on hit, freshly
+    computed on miss).
 
-    The two-step chain (thin_port_messages -> port_visits) produces TWO tables
-    per mode: the visits table (the comparison target, passed as ``output_fqn``)
-    and the per-mode thinned ``port_events_<suffix>_<mode>`` intermediate. Both
-    are recorded on the cache row so ``cancel_run`` cleans up both -- otherwise
-    the intermediate is orphaned. EXCEPTION: when ``--thinned-message-table`` is
-    set, step 1 is skipped and the workflow does NOT create a thinned table (it
-    reads the user's external one), so there's nothing of ours to record /
-    clean up -- we record only the visits table in that case.
+    With both steps, the chain (thin_port_messages -> port_visits) produces TWO
+    tables per mode: the visits table (the comparison target, passed as
+    ``output_fqn``) and the per-mode thinned ``port_events_<suffix>_<mode>``
+    intermediate. Both are recorded on the cache row so ``cancel_run`` cleans
+    up both -- otherwise the intermediate is orphaned. With one step there is
+    one table of ours: the thinned table for ``--steps thin_port_messages``,
+    the visits table for ``--steps port_visits`` (whose input is the caller's
+    ``--thinned-message-table``, never a cleanup target).
     """
     cache_key = _build_cache_key(args, mode)
-    output_fqn = _visits_table(args, suffix, mode)
-    # Only OUR thinned table is a cleanup target; the external one (when
-    # --thinned-message-table is set) belongs to the caller, never us.
+    output_fqn = _output_table(args, suffix, mode)
     extra_output_tables = (
-        () if args.thinned_message_table else (_thinned_table(args, suffix, mode),)
+        (_thinned_table(args, suffix, mode),) if list(args.steps) == list(SELECTABLE_STEPS)
+        else ()
     )
     return dit_workflow.run_with_cache(
         execute_fn,
@@ -845,13 +926,19 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
 # Comparisons
 # --------------------------------------------------------------------------
 
-def compare_all(mode_fqns: dict[str, str], modes: Sequence[str]) -> int:
-    """Pairwise-compare the selected modes' visits tables.
+def compare_all(
+    mode_fqns: dict[str, str],
+    modes: Sequence[str],
+    keys: Sequence[str] = COMPARE_KEYS,
+) -> int:
+    """Pairwise-compare the selected modes' output tables on ``keys``.
 
     ``mode_fqns`` maps each mode label to the FQN to compare -- the
     cached-or-fresh table returned by the cache wrapper (a cache hit reuses a
     prior run's UUID-suffixed table, so the FQN is NOT derivable from the
-    current run's ``suffix`` alone).
+    current run's ``suffix`` alone). The tables are the last selected step's
+    output, and ``keys`` its key (``COMPARE_KEYS_BY_STEP``); the default is
+    the visits key.
     """
     # Pairs over the SELECTED modes only -- comparing against a mode that
     # never ran would diff an absent table and report a spurious difference.
@@ -874,7 +961,7 @@ def compare_all(mode_fqns: dict[str, str], modes: Sequence[str]) -> int:
         rc = dit_compare.compare_tables(
             mode_fqns[a],
             mode_fqns[b],
-            keys=COMPARE_KEYS,
+            keys=keys,
             view_suffix=COMPARE_VIEW_SUFFIX,
         )
         logger.info("compare %s vs %s -> rc=%s", a, b, rc)
@@ -955,15 +1042,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Optional binding label (e.g. 'before', 'after') used by the "
                         "cross-version wrapper. Surfaces in Dataflow job names and BQ labels "
                         "(dit_binding=<name>). Empty when running standalone.")
+    p.add_argument("--steps", default=",".join(SELECTABLE_STEPS),
+                   help=f"Comma-separated pipeline steps to run, in pipeline order "
+                        f"(default {','.join(SELECTABLE_STEPS)}). {STEP_VISITS} alone needs "
+                        f"--thinned-message-table as its input; {STEP_THIN} alone stops after "
+                        f"step 1. The modes compare the last step's output: visits on "
+                        f"{','.join(COMPARE_KEYS)}, thinned messages on "
+                        f"{','.join(THIN_COMPARE_KEYS)}.")
     p.add_argument("--thinned-message-table", default=None,
-                   help="Fully-qualified BQ table holding pre-thinned port messages. When set, "
-                        "step 1 (thin_port_messages) is SKIPPED and step 2 (port_visits) reads "
-                        "directly from this table instead of the per-mode port_events_<suffix>_<mode> "
-                        "the workflow would otherwise produce. Useful when the change under test "
-                        "is in step 2 only (e.g. PORT_GAP_BEGIN anchorage fixes) -- saves the "
-                        "dominant cost of running the thin step on full AIS data. Cross-version "
-                        "runs should provide a snapshotted FQN (cross_version_ais.py pins this "
-                        "automatically when given a prod-side FQN).")
+                   help="Fully-qualified BQ table holding pre-thinned port messages (e.g. "
+                        "production's raw_port_events), read by step 2 (port_visits) instead of "
+                        "the per-mode port_events_<suffix>_<mode>. Only with --steps port_visits. "
+                        "Useful when the change under test is in step 2 only (e.g. PORT_GAP_BEGIN "
+                        "anchorage fixes) -- saves the dominant cost of running the thin step on "
+                        "full AIS data. Cross-version runs pin it (cross_version_ais.py copies "
+                        "it at run start).")
     p.add_argument("--require-clean", action="store_true",
                    help="Error on a dirty tree instead of auto-snapshotting "
                         "(for CI / strict-provenance callers).")
@@ -981,6 +1074,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Validate before any cloud call: a typo'd mode that silently ran
     # nothing would look exactly like a passing run.
     args.modes = parse_modes(args.modes, choices=SELECTABLE_MODES)
+    args.steps = parse_choice_list(
+        args.steps, choices=SELECTABLE_STEPS, flag="--steps", noun="step",
+    )
+    validate_steps(args.steps, args.thinned_message_table)
     return args
 
 
@@ -1061,19 +1158,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("suffix: %s", suffix)
     logger.info("run_id: %s  commit_sha: %s  worker_image_tag: %s  launched_by: %s",
                 args.run_id, args.commit_sha, args.worker_image_tag, args.launched_by)
-    logger.info("source messages:     %s", _messages_table(args))
-    logger.info("source segment_info: %s", _segment_info_table(args))
-    logger.info("source segs_activity: %s", _segs_activity_table(args))
+    logger.info("steps: %s (comparing %s output on %s)", ",".join(args.steps),
+                _last_step(args), ",".join(COMPARE_KEYS_BY_STEP[_last_step(args)]))
+    if STEP_THIN in args.steps:
+        logger.info("source messages:     %s", _messages_table(args))
+    else:
+        logger.info("thinned input:       %s", args.thinned_message_table)
+    if STEP_VISITS in args.steps:
+        logger.info("source segment_info: %s", _segment_info_table(args))
+        logger.info("source segs_activity: %s", _segs_activity_table(args))
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
     logger.info("runner: %s  pipeline_cli: %s", args.runner, args.pipeline_cli)
 
-    # Per-mode FQN to compare. Default to this run's freshly-suffixed visits
-    # tables; the cache wrapper overwrites each with the cached FQN on a hit.
+    # Per-mode FQN to compare. Default to this run's freshly-suffixed output
+    # tables (the last step's); the cache wrapper overwrites each with the
+    # cached FQN on a hit.
     # This default is also what the --skip-pipelines (compare-only) path uses:
     # the user pre-populated those tables, so we compare them directly without
     # consulting the cache.
     mode_fqns: dict[str, str] = {
-        mode: _visits_table(args, suffix, mode)
+        mode: _output_table(args, suffix, mode)
         for mode in (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
     }
 
@@ -1112,7 +1216,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.skip_comparisons:
         return 0
-    return compare_all(mode_fqns, args.modes)
+    return compare_all(mode_fqns, args.modes, keys=COMPARE_KEYS_BY_STEP[_last_step(args)])
 
 
 if __name__ == "__main__":
