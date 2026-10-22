@@ -72,6 +72,21 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-22 — `--no-cache`: the run cache and determinism checks
+
+**Problem.** Planning the PIPELINE-4690 September run turned up a conflict. The plan included a determinism re-run on the same pinned inputs, but such a rerun has the same cache key as the first run, so `run_with_cache` returns the first run's table and the check compares a table with itself.
+
+The workaround I first proposed was two concurrent bindings of the same ref, which both miss the cache. The owner asked whether that is a race to prevent. It is: the bindings don't collide (plain INSERTs, separate suffixes and run ids; lookups take the newest row by `started_at`), but a binding that starts after the other has written its row hits the cache and passes vacuously, and the wrapper's verdict cannot tell. A check whose value is catching problems must not depend on timing.
+
+**Decision.** Add a bypass:
+- `dit.workflow.add_no_cache_arg` + `run_with_cache(use_cache=...)`, wired into all three run-cache consumers (the third consumer makes a shared helper due).
+- The run is still recorded: `dit_runs` is also the cleanup registry for `cancel_run`, so skipping the write would orphan tables. As the newest row for its key, it is what later lookups return.
+- `cross_version_ais.py` forwards `--no-cache` through its pass-through extras, with no wrapper code change.
+
+Recorded in `docs/run-cache.md` § known limitations: the cache presumes the pipeline is deterministic, and a nondeterministic pipeline makes it unsound.
+
+**Sections moved.** `src/dit/workflow.py` § (d); the three workflows' parsers and `_run_with_cache` adapters; `tests/test_workflow.py`, `tests/test_port_visits_ais.py` (+ `no_cache` on three test namespaces); `docs/run-cache.md`; README Features (run cache) and § Source data targets (legacy sharded `raw_port_events` row); CHANGELOG.
+
 ### 2026-10-22 — `--steps` on the port-visits workflows (explicit step selection)
 
 **Problem.** Both port-visits workflows always ran both steps. The only way to skip step 1 was the implicit hint `--thinned-message-table`. Step 1 could not run alone, and its output was never compared.

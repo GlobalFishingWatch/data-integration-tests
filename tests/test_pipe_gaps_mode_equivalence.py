@@ -45,6 +45,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         # Per-`main()` context normally set inside main():
         run_id="rid01",
         experiment_id="exp01",
+        no_cache=False,
         pipeline_commit="abc1234",
         unreviewed=False,
         pipeline_commit_parent=None,

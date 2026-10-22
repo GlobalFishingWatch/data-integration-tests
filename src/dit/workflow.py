@@ -409,6 +409,22 @@ def resolve_run_context(
 # (d) run_with_cache — the generic cache wrapper
 # --------------------------------------------------------------------------
 
+def add_no_cache_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--no-cache``: recompute instead of reusing a cached output.
+
+    Shared by the three run-cache consumers (pipe-gaps mode_equivalence and
+    outage_recovery, port-visits ais). Without it, a repeat run with the same
+    cache key returns the earlier run's table, so a determinism check (same
+    code, same input, run twice) would compare a table with itself.
+    """
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Skip the run-cache lookup and recompute every mode, e.g. to check "
+             "that a repeat run on the same inputs gives the same output. The run "
+             "is still recorded in dit_runs (cleanup and provenance).",
+    )
+
+
 def run_with_cache(
     execute_fn: Callable[..., None],
     *,
@@ -421,6 +437,7 @@ def run_with_cache(
     execute_kwargs: dict[str, Any],
     extra_output_tables: Sequence[str] = (),
     log_label: str = "",
+    use_cache: bool = True,
 ) -> str:
     """Wrap an ``execute_*`` call with cache lookup + record-on-miss.
 
@@ -451,6 +468,10 @@ def run_with_cache(
     row is a legitimate hit for a repeat run of the same uncommitted code.
     ``unreviewed_code`` is informational only.
 
+    ``use_cache=False`` (``--no-cache``) skips the lookup and always
+    recomputes; the row is still written, so cleanup and provenance see the
+    run, and as the newest row for its key it is what later lookups return.
+
     The caller builds the :class:`CacheKey` (using its own
     ``canonical_params_dict`` + workflow-file sha1) and passes it in, so this
     wrapper has no dependency on a workflow-specific argparse namespace.
@@ -461,7 +482,9 @@ def run_with_cache(
     # padded to match the historical aligned "mode=<...> key=" log shape.
     label = f"mode={log_label:<16} " if log_label else ""
 
-    cached = read_cache(computed_key)
+    cached = read_cache(computed_key) if use_cache else None
+    if not use_cache:
+        logger.info("cache BYPASS %skey=%s (--no-cache); recomputing", label, key_short)
     if cached is not None:
         # Empty output_tables on a "succeeded" row is a degenerate state
         # (shouldn't happen given our write path, but guard against it

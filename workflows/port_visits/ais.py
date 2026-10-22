@@ -91,6 +91,7 @@ from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
     add_modes_arg,
+    add_no_cache_arg,
     parse_choice_list,
     parse_modes,
     resolve_run_context,
@@ -919,6 +920,7 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
         execute_kwargs={"args": args, "suffix": suffix},
         extra_output_tables=extra_output_tables,
         log_label=mode,
+        use_cache=not args.no_cache,
     )
 
 
@@ -1038,6 +1040,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--suffix", default=None,
                    help="Output-table suffix; auto-generated from git HEAD when omitted.")
     add_experiment_id_arg(p)
+    add_no_cache_arg(p)
     p.add_argument("--binding-name", default="",
                    help="Optional binding label (e.g. 'before', 'after') used by the "
                         "cross-version wrapper. Surfaces in Dataflow job names and BQ labels "
