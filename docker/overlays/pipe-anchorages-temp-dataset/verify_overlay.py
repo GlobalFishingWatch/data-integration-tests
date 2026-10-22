@@ -2,10 +2,15 @@
 
 Asserts: (1) unset env -> no extra kwargs; (2) env set -> a DatasetReference; (3) Beam's
 ReadFromBigQuery forwards it to the EXPORT source, whose _setup_temporary_dataset then
-returns without creating anything; (4) both patched pipelines import the helper.
+returns without creating anything; (4) both patched pipelines import the helper; (5) every
+BigQuery read in both pipelines passes it. (5) was added after the first v5 staging smoke
+(2026-10-22): the patch covered ReadMessages but not ReadNamedAnchorages, so Beam tried to
+create its own temp dataset and the job failed on bigquery.datasets.create.
 """
 
+import inspect
 import os
+import re
 
 import pipe_anchorages.pipelines.port_state_transitions.main as pst_main
 import pipe_anchorages.pipelines.port_visits.main as pv_main
@@ -43,5 +48,19 @@ source._setup_temporary_dataset(_NoCreate())
 
 for module in (pst_main, pv_main):
     assert module.temp_dataset_kwargs is _dit_overlay.temp_dataset_kwargs, module.__name__
+
+# Every read must stage in the given dataset: one patched kwargs dict per from_query call,
+# and no other way into Beam's ReadFromBigQuery. A new upstream read fails the build here.
+EXPECTED_READS = {pst_main: 2, pv_main: 1}  # ReadMessages + ReadNamedAnchorages; ReadPortStateTransitions
+for module, expected in EXPECTED_READS.items():
+    src = inspect.getsource(module)
+    reads = len(re.findall(r"ReadFromBigQuery\.from_query\(", src))
+    kwargs_args = re.findall(r"read_from_bigquery_kwargs=\{[^}]*\}", src)
+    patched = [k for k in kwargs_args if "**temp_dataset_kwargs()" in k]
+    assert reads == expected, f"{module.__name__}: {reads} from_query reads, expected {expected}"
+    assert len(kwargs_args) == reads == len(patched), (
+        f"{module.__name__}: {reads} reads, {len(kwargs_args)} kwargs, {len(patched)} patched"
+    )
+    assert not re.search(r"beam\.io\.ReadFromBigQuery|io\.ReadFromBigQuery\(", src), module.__name__
 
 print("overlay self-check OK")

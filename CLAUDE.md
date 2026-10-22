@@ -72,6 +72,14 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-22 — Overlay patch missed a read; self-check now counts every read
+
+The first v5 staging smoke (run `89744c79850f`, candidate image `-temp-dataset-21aed7a5`) failed in all three modes at the first job. `port_state_transitions/main.py` has two BigQuery reads: `ReadMessages` (source) and `ReadNamedAnchorages` (side input). Patch `21aed7a5` covered only the first, so Beam created `beam_temp_dataset_<hex>` for the second and `automated-testing@` was denied `bigquery.datasets.create`. The old self-check only asserted that each pipeline imports the helper, which a half-patched file passes. Patch `905dc761` covers all three reads (2 in port-state-transitions, 1 in port-visits). `verify_overlay.py` now requires every `ReadFromBigQuery.from_query` in both modules to pass `**temp_dataset_kwargs()`, with the expected read count per module, and was confirmed to fail on the broken image. Images rebuilt and pushed:
+- baseline: `gcr.io/world-fishing-827/dit/pipe-anchorages:main-b36aed6-temp-dataset-905dc761` @ `sha256:31e39bead44142e683f8cf9d54f5a06d8e288ee2ce87e96e1cde3253de2185c8`
+- candidate: `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` @ `sha256:9dd605712c24bbdcb720493dc426c0ac6888929beba0ffc501feb96f3db4c9cb`
+
+The same run confirmed two things the 2026-10-22 entries below left open: Dataflow staging uploads under `gs://pipe-temp-us-central-ttl7/dit/` succeed, and workers pull the overlay image from `gcr.io/world-fishing-827/dit/` (jobs reached the BigQuery read). The image-digest lookup for the run cache fails under the default `dq-monitoring@` gcloud identity and falls back to the tag, as designed. **Sections moved.** `docker/overlays/pipe-anchorages-temp-dataset/` (patch, `verify_overlay.py`, README image table); CHANGELOG `Fixed`. The `21aed7a5` image list in the v5 CLI entry below is superseded.
+
 ### 2026-10-22 — port-visits docker calls mount the `gcp` credentials volume
 
 Found while preparing the first PIPELINE-4690 staging smoke (`--pipeline-cli v5` with the overlay image). `_docker_run_kwargs` in `workflows/port_visits/ais.py` passed no `volumes`, so a published-image `docker run` started without credentials. Earlier laptop port-visits runs all used `--build-from-source`, whose compose service mounts `gcp:/root/.config/` itself, so the gap never showed. The v5 overlay is a published image by construction, so it could not run from the laptop. Fix: `GCP_VOLUME` on every call, the spec encounters, pipe-events and pipe-segment already use; `dit.runners.docker` still drops it in cloud mode. A new test pins the mount for both CLIs and both docker paths. CHANGELOG § 2026-10-22 gains a `Fixed` entry. Lesson: a workflow test should assert the credentials mount, not only the argv.

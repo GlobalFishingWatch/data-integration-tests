@@ -33,7 +33,7 @@ index 0000000..4136d8e
 +        raise ValueError(f"{ENV} must be <project>.<dataset>; got {value!r}")
 +    return {"temp_dataset": DatasetReference(projectId=project, datasetId=dataset)}
 diff --git a/src/pipe_anchorages/pipelines/port_state_transitions/main.py b/src/pipe_anchorages/pipelines/port_state_transitions/main.py
-index 0ed1124..ab92fb8 100644
+index 0ed1124..3170a49 100644
 --- a/src/pipe_anchorages/pipelines/port_state_transitions/main.py
 +++ b/src/pipe_anchorages/pipelines/port_state_transitions/main.py
 @@ -16,6 +16,7 @@ from gfw.common.beam.transforms import ReadFromBigQuery, WriteToBigQueryWrapper
@@ -53,6 +53,15 @@ index 0ed1124..ab92fb8 100644
              ),
          ],
          core=FindPortStateTransitions(
+@@ -132,7 +133,7 @@ def run(
+             ).with_env(config.jinja_env),
+             label="ReadNamedAnchorages",
+             read_from_bigquery_factory=read_from_bigquery_factory,
+-            read_from_bigquery_kwargs={"bigquery_job_labels": config.labels},
++            read_from_bigquery_kwargs={"bigquery_job_labels": config.labels, **temp_dataset_kwargs()},
+         ),
+         sinks=(
+             WriteToBigQueryWrapper(
 diff --git a/src/pipe_anchorages/pipelines/port_visits/main.py b/src/pipe_anchorages/pipelines/port_visits/main.py
 index ed78669..8f20e0c 100644
 --- a/src/pipe_anchorages/pipelines/port_visits/main.py
