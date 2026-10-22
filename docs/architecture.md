@@ -129,7 +129,7 @@ sequenceDiagram
 
 ### 3b. Cross-version (PIPELINE-1465-shaped — landed today)
 
-Multiple pipeline versions against a pinned source snapshot, diff to surface behaviour change. Bindings run in parallel; per-binding `--worker-image` lets each binding exercise different worker code.
+Multiple pipeline versions against pinned source copies, diff to surface behaviour change. Bindings run in parallel; per-binding `--worker-image` lets each binding exercise different worker code.
 
 ```mermaid
 sequenceDiagram
@@ -142,8 +142,8 @@ sequenceDiagram
     participant TIC as table-check
 
     U->>XV: dit run<br/>--binding before=[ref-A]<br/>--binding after=[ref-B]<br/>--binding-worker-image after=[built-img]
-    XV->>BQ: snapshot source @ --pin-source-at
-    Note over BQ: dit_exp_[exp-id]_{internal,published}<br/>(7-day TTL)
+    XV->>BQ: pin sources: CREATE TABLE ... LIKE ... AS SELECT (run start)
+    Note over BQ: tech_great_expectations.dit_exp_[exp-id]_cross_version_[table]_[window]_[pin]<br/>(7-day TTL)
 
     par bindings run concurrently (ThreadPoolExecutor)
         XV->>Git: worktree add at ref A

@@ -218,7 +218,8 @@ def test_a_worker_cap_below_one_is_rejected():
 def test_cross_version_forwards_the_worker_cap_to_every_binding():
     argv = xv._ais_args_for_binding(
         ["--max-num-workers", "16"],
-        snapshot_fqns=xv._CrossVersionSnapshotFQNs(
+        pinned=xv._PinnedSources(
+            start=date(2020, 1, 1), end=date(2020, 12, 31),
             messages_positions="p.d.m", segment_info="p.d.si", segs_activity="p.d.sa",
         ),
         suffix="s", experiment_id="e", binding_name="after", modes=[mod.MODE_BF],
@@ -246,7 +247,8 @@ def test_v5_cache_key_params_differ_from_v4():
 # cross_version_ais: per-binding submitter image
 # --------------------------------------------------------------------------
 
-_SNAPSHOTS = xv._CrossVersionSnapshotFQNs(
+_PINNED = xv._PinnedSources(
+    start=date(2020, 1, 1), end=date(2020, 12, 31),
     messages_positions="p.d.m", segment_info="p.d.si", segs_activity="p.d.sa",
 )
 
@@ -254,7 +256,7 @@ _SNAPSHOTS = xv._CrossVersionSnapshotFQNs(
 def test_binding_image_tag_replaces_a_user_supplied_image_tag():
     argv = xv._ais_args_for_binding(
         ["--image-tag", "user/image:1", "--pipeline-cli", "v5"],
-        snapshot_fqns=_SNAPSHOTS, suffix="s", experiment_id="e", binding_name="after",
+        pinned=_PINNED, suffix="s", experiment_id="e", binding_name="after",
         modes=[mod.MODE_BF], image_tag="dit/overlay:after",
     )
 
@@ -266,7 +268,7 @@ def test_binding_image_tag_replaces_a_user_supplied_image_tag():
 def test_without_binding_image_tag_the_user_image_tag_passes_through():
     argv = xv._ais_args_for_binding(
         ["--image-tag", "user/image:1"],
-        snapshot_fqns=_SNAPSHOTS, suffix="s", experiment_id="e", binding_name="before",
+        pinned=_PINNED, suffix="s", experiment_id="e", binding_name="before",
         modes=[mod.MODE_BF],
     )
 
@@ -276,6 +278,6 @@ def test_without_binding_image_tag_the_user_image_tag_passes_through():
 def test_binding_image_tag_for_an_unknown_binding_is_rejected():
     with pytest.raises(SystemExit, match="--binding-image-tag references unknown"):
         xv.parse_args([
-            "--experiment-id", "e", "--pin-source-at", "2026-10-22T00:00:00Z",
+            "--experiment-id", "e",
             "--binding", "before=main", "--binding-image-tag", "after=dit/overlay:x",
         ])

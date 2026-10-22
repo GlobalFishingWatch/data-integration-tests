@@ -1,8 +1,8 @@
 """Cross-version experiment for pipe-anchorages port-visits (AIS).
 
-Pins the source data via BQ snapshots at a fixed timestamp, runs
+Pins the source data by copying it at run start, runs
 ``workflows/port_visits/ais.py`` once per pipeline-version binding (with each
-binding pointed at the snapshotted inputs), and then diffs corresponding output
+binding pointed at the pinned copies), and then diffs corresponding output
 tables pairwise across bindings. Diff results are reported but do not fail the
 run — the *point* of cross-version testing is to surface behaviour change, so
 a non-empty diff is information, not error.
@@ -11,7 +11,7 @@ Example: validate PIPELINE-1465 by comparing v4.6.4 against the fix branch::
 
     dit run workflows/port_visits/cross_version_ais.py \\
         --experiment-id pipeline-1465 \\
-        --pin-source-at 2026-05-15T10:00:00Z \\
+        --start 2020-01-01 --end 2020-12-31 \\
         --binding before=v4.6.4 \\
         --binding after=fix/PIPELINE-1465_port_visit_start_location \\
         --binding-worker-image after=gcr.io/world-fishing-827/pipe-anchorages-1465-after:latest \\
@@ -21,19 +21,28 @@ Example: validate PIPELINE-1465 by comparing v4.6.4 against the fix branch::
 Steps:
 
 1. Verify every binding's git ref exists in ``$PROJECTS/anchorages_pipeline``.
-2. ``dit.bq.snapshot_into_experiment`` the three workflow input tables
-   (``messages_positions``, ``segment_info``, ``segs_activity``) from the source
-   stem at ``--pin-source-at`` into the canonical
-   ``<project>.tech_great_expectations`` dataset as
-   ``dit_exp_<sanitised(exp)>_cross_version_<source_basename>`` tables with
-   per-table ``expiration_timestamp`` (default 7-day TTL). M5 of
-   canonical-dataset migration: no per-experiment dataset creation; all
-   snapshots live in ``tech_great_expectations``.
+2. Pin the inputs with ``dit.bq.pin_source_into_experiment``: copy them into
+   ``<project>.tech_great_expectations`` (default 7-day TTL), keeping the
+   sources' partitioning and clustering:
+
+   * ``messages_positions`` over ``[--start, --end]`` (the only range step 1
+     reads), skipped with ``--thinned-message-table``, whose runs never read
+     it;
+   * ``segment_info`` and ``segs_activity`` whole (step 2 joins and filters
+     them without a date range);
+   * the optional ``--thinned-message-table`` over ``[--start, --end]``.
+
+   Every copy's name ends in the pin stamp (the run's start time in UTC,
+   e.g. ``20261022t171500z``). ``--reuse-pin <stamp>`` reuses an earlier
+   run's copies instead, e.g. on a retry. Pinning replaced BigQuery
+   snapshots in 2026-10: BigQuery refuses a snapshot of a table in another
+   organisation, and no DIT identity may create one with an expiration.
 3. For each binding (in parallel by default; ``--sequential-bindings`` opts out):
    ``git worktree add`` a temp dir at the ref, invoke ``ais.py`` from that
    worktree with M4's per-table FQN flags (``--source-messages-fqn``,
    ``--source-segment-info-fqn``, ``--source-segs-activity-fqn``) pointing
-   at the canonical snapshots; a binding-scoped ``--suffix``; and optionally
+   at the pinned copies; the pinned ``--start`` / ``--end``; a
+   binding-scoped ``--suffix``; and optionally
    a per-binding ``--worker-image`` (from ``--binding-worker-image NAME=IMAGE``)
    and submitter ``--image-tag`` (from ``--binding-image-tag NAME=IMAGE``;
    required for ``--pipeline-cli v5`` runs, whose DIT overlay image must also
@@ -46,9 +55,10 @@ Steps:
 The overall exit code is non-zero iff any binding failed; an individual
 binding failure does not abort siblings.
 
-``--dry-run`` skips the ``ais.py`` invocations and the diff phase but still
-performs snapshotting and worktree setup/teardown — useful
-for validating the orchestration without burning Dataflow cost.
+``--dry-run`` skips the ``ais.py`` invocations and the diff phase, and only
+dry-runs the copies (reporting their bytes against the ``--pin-max-gb`` cap),
+but still performs worktree setup/teardown — useful for validating the
+orchestration without burning Dataflow or BigQuery cost.
 
 Note on cross-version semantics: ``ais.py``'s default ``--worker-image`` is a
 fixed published path (e.g. ``pipe-anchorages:v4.6.4``). Without
@@ -74,7 +84,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -82,7 +92,10 @@ from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit.workflow import parse_modes
 
-# ais.py owns the canonical mode set; import it so the two can't drift.
+# ais.py owns the canonical mode set and date defaults; import them so the
+# two can't drift.
+from workflows.port_visits.ais import DEFAULT_END as AIS_DEFAULT_END
+from workflows.port_visits.ais import DEFAULT_START as AIS_DEFAULT_START
 from workflows.port_visits.ais import SELECTABLE_MODES as AIS_SELECTABLE_MODES
 
 logger = logging.getLogger(__name__)
@@ -94,7 +107,8 @@ DEFAULT_SOURCE_DATASET_STEM = "pipe_ais_test_202408290000"
 DEFAULT_MODES = "1_bf,2_bfd,3_bftruncate"
 DEFAULT_PROJECTS_DIR = os.environ.get("PROJECTS") or str(Path(__file__).resolve().parents[2].parent)
 DEFAULT_PIPELINE_DIR = os.path.join(DEFAULT_PROJECTS_DIR, "anchorages_pipeline")
-DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
+DEFAULT_PIN_EXPIRATION_DAYS = 7
+DEFAULT_PIN_MAX_GB = dit_bq.DEFAULT_PIN_MAX_BYTES / 1e9
 
 AIS_WORKFLOW = Path(__file__).with_name("ais.py")
 
@@ -108,23 +122,48 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
         description="Cross-version experiment for pipe-anchorages port-visits.",
     )
     p.add_argument("--experiment-id", required=True,
-                   help="Slug for the experiment; appears in snapshot dataset name and output-table suffixes.")
-    p.add_argument("--pin-source-at", required=True,
-                   help="ISO 8601 timestamp for the source-data snapshot (e.g. 2026-05-15T10:00:00Z).")
+                   help="Slug for the experiment; appears in pinned-copy names and output-table suffixes.")
+    # Removed 2026-10: a copy cannot be taken at a past time without time
+    # travel, and time travel loses partition pruning on tables modified
+    # inside their time-travel window. Rejected explicitly, so an old
+    # invocation fails here rather than leaking into ais.py's extras.
+    p.add_argument("--pin-source-at", help=argparse.SUPPRESS)
     p.add_argument("--binding", action="append", required=True, dest="bindings",
                    help="`name=ref` pair, repeatable. Both must be valid git refs in --pipeline-dir.")
+    p.add_argument("--start", default=AIS_DEFAULT_START,
+                   help=f"Inclusive start date, forwarded to every binding and used to window the "
+                        f"pinned messages. Default {AIS_DEFAULT_START}.")
+    p.add_argument("--end", default=AIS_DEFAULT_END,
+                   help=f"Inclusive end date, forwarded to every binding and used to window the "
+                        f"pinned messages. Default {AIS_DEFAULT_END}.")
     p.add_argument("--modes", default=DEFAULT_MODES,
                    help=f"Comma-separated mode names whose output tables get diffed pairwise. Default {DEFAULT_MODES}.")
     p.add_argument("--pipeline-dir", default=DEFAULT_PIPELINE_DIR,
                    help="anchorages_pipeline checkout used for git worktrees.")
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
-                   help="Source dataset stem to snapshot from (the workflow's --source-dataset-stem default).")
+                   help="Source dataset stem (in world-fishing-827) to pin from; the --source-*-fqn "
+                        "flags override single tables.")
+    p.add_argument("--source-messages-fqn", default=None,
+                   help="Source messages_positions table to pin, e.g. a production table in another "
+                        "organisation. Default: derived from --source-dataset-stem.")
+    p.add_argument("--source-segment-info-fqn", default=None,
+                   help="Source segment_info table to pin. Default: derived from --source-dataset-stem.")
+    p.add_argument("--source-segs-activity-fqn", default=None,
+                   help="Source segs_activity table to pin. Default: derived from --source-dataset-stem.")
     p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                    help="BQ dataset holding the output tables produced by each binding's ais.py run.")
-    p.add_argument("--snapshot-expiration-days", type=int, default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
-                   help="default_table_expiration for the created snapshot datasets, in days.")
+    p.add_argument("--reuse-pin", default=None, metavar="STAMP",
+                   help="Reuse the pinned copies of an earlier run with the same --experiment-id, "
+                        "--start, --end and sources instead of copying again. STAMP is the pin "
+                        "stamp that run logged (e.g. 20261022t171500z). Fails if any copy is missing.")
+    p.add_argument("--pin-expiration-days", type=int, default=DEFAULT_PIN_EXPIRATION_DAYS,
+                   help=f"Days until the pinned copies expire. Default {DEFAULT_PIN_EXPIRATION_DAYS}.")
+    p.add_argument("--pin-max-gb", type=float, default=DEFAULT_PIN_MAX_GB,
+                   help=f"Refuse to pin a source whose copy would process more than this many GB "
+                        f"(10^9 bytes), checked by a dry run. Default {DEFAULT_PIN_MAX_GB:g}.")
     p.add_argument("--dry-run", action="store_true",
-                   help="Skip ais.py invocations and pairwise diffs; still creates datasets / snapshots / worktrees.")
+                   help="Skip ais.py invocations and pairwise diffs; dry-run the copies only "
+                        "(nothing is created); still sets up and tears down worktrees.")
     p.add_argument("--sequential-bindings", action="store_true",
                    help="Run bindings serially instead of the default (parallel). Useful when debugging a single binding's logs without interleave.")
     p.add_argument("--binding-worker-image", action="append", default=[],
@@ -141,23 +180,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                         "Bindings without an override use ais.py's --image-tag.")
     p.add_argument("--thinned-message-table", default=None,
                    help="Fully-qualified BQ table holding pre-thinned port messages. When set, "
-                        "the wrapper snapshots it into the experiment's snapshot dataset at "
-                        "--pin-source-at (mirroring how source datasets are pinned), then passes "
-                        "the snapshot FQN to every binding's ais.py as --thinned-message-table. "
+                        "the wrapper pins it over [--start, --end] like the sources, then passes "
+                        "the pinned copy to every binding's ais.py as --thinned-message-table. "
                         "Each binding's step 1 (thin_port_messages) is then SKIPPED -- saves the "
-                        "dominant cost when the change under test is in step 2 only. The wrapper "
+                        "dominant cost when the change under test is in step 2 only -- and "
+                        "messages_positions is not pinned, since no binding reads it. The wrapper "
                         "exclusively owns this knob in cross-version runs: any user-supplied "
                         "--thinned-message-table in extras is ALWAYS dropped (even when this "
                         "wrapper flag is unset), so the user can't inject an unpinned table "
-                        "and bypass the snapshot. To skip step 1 in a cross-version run, set "
+                        "and bypass the pin. To skip step 1 in a cross-version run, set "
                         "this wrapper flag.")
     args, ais_extra_args = p.parse_known_args(argv)
+    if args.pin_source_at is not None:
+        raise SystemExit(
+            "--pin-source-at was removed: sources are now pinned by copying them at run "
+            "start. Drop the flag; to reuse an earlier run's copies, pass --reuse-pin <stamp>."
+        )
     args.bindings = [_parse_binding(b) for b in args.bindings]
     # Validate against ais.py's selectable modes -- previously any string
     # was accepted, so a typo silently produced zero diff pairs (which
     # reads identically to "everything matched").
     args.modes = parse_modes(args.modes, choices=AIS_SELECTABLE_MODES)
-    args.pin_source_at = _parse_iso8601(args.pin_source_at)
+    args.start = _parse_date("--start", args.start)
+    args.end = _parse_date("--end", args.end)
+    if args.end < args.start:
+        raise SystemExit(f"--end {args.end} is before --start {args.start}")
+    if args.reuse_pin is not None:
+        try:
+            dit_bq.parse_pin_stamp(args.reuse_pin)
+        except ValueError as exc:
+            raise SystemExit(f"--reuse-pin: {exc}") from exc
+    if args.pin_max_gb <= 0:
+        raise SystemExit(f"--pin-max-gb must be > 0; got {args.pin_max_gb}")
     args.binding_worker_images = dict(_parse_binding(b) for b in args.binding_worker_images)
     args.binding_image_tags = dict(_parse_binding(b) for b in args.binding_image_tags)
     _binding_names = {n for n, _ in args.bindings}
@@ -183,14 +237,11 @@ def _parse_binding(spec: str) -> tuple[str, str]:
     return name, ref
 
 
-def _parse_iso8601(s: str) -> datetime:
-    # Accept both "...Z" and explicit offsets.
+def _parse_date(flag: str, s: str) -> date:
     try:
-        if s.endswith("Z"):
-            return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
-        return datetime.fromisoformat(s)
+        return date.fromisoformat(s)
     except ValueError as exc:
-        raise SystemExit(f"--pin-source-at: invalid ISO 8601 timestamp {s!r}: {exc}") from exc
+        raise SystemExit(f"{flag}: invalid date {s!r}; expected YYYY-MM-DD") from exc
 
 
 # --------------------------------------------------------------------------
@@ -214,131 +265,119 @@ def _verify_refs(pipeline_dir: str, bindings: list[tuple[str, str]]) -> None:
 
 
 # --------------------------------------------------------------------------
-# Snapshot tables (canonical-dataset shape, M5 of canonical-dataset migration)
+# Pin the sources (copies in tech_great_expectations, dit.bq.pin_source_into_experiment)
 # --------------------------------------------------------------------------
 
-# Roles used by dit.bq.snapshot_into_experiment. The naming convention
-# `dit_exp_<sanitised(experiment_id)>_<role>_<source_table_name>` produces
-# distinct FQNs per source table; keeping the source snapshots and the
-# optional thinned snapshot in DIFFERENT roles also prevents name
-# collisions when a caller supplies a --thinned-message-table whose
-# basename happens to match one of the three source basenames.
-_SOURCE_SNAPSHOT_ROLE = "cross_version"
-_THINNED_SNAPSHOT_ROLE = "cross_version_thinned"
+# Roles in the pinned-copy names. Keeping the sources and the optional
+# thinned table in DIFFERENT roles prevents a name collision when a caller
+# supplies a --thinned-message-table whose basename matches a source's
+# (e.g. "messages_positions").
+_SOURCE_PIN_ROLE = "cross_version"
+_THINNED_PIN_ROLE = "cross_version_thinned"
+
+# Time column of messages_positions and of the thinned table. Both
+# pipe-anchorages CLIs read them by DATE(timestamp) over the run's dates.
+_WINDOW_COLUMN = "timestamp"
 
 
 @dataclasses.dataclass(frozen=True)
-class _CrossVersionSnapshotFQNs:
-    """The four (or three, when no `--thinned-message-table` is supplied)
-    canonical snapshot FQNs that `_snapshot_source` produces, threaded
-    through `_run_binding` -> `_ais_args_for_binding` so each binding's
-    `ais.py` invocation reads from the canonical-dataset snapshots
-    instead of from the stem-derived source.
+class _PinnedSources:
+    """What every binding reads: the pinned copies and the inclusive date
+    range the windowed copies cover. Threaded through `_run_binding` ->
+    `_ais_args_for_binding`, which forwards `start` / `end` too, so a
+    binding cannot run over dates its copies don't hold.
 
-    Frozen so callers can't accidentally mutate the FQNs between snapshot
-    creation and `ais.py` invocation. M5 of canonical-dataset migration.
+    `messages_positions` is None with `--thinned-message-table`: those runs
+    skip step 1, the only reader of it. Frozen so nothing changes the pins
+    between pinning and the `ais.py` invocations.
     """
-    messages_positions: str
+    start: date
+    end: date
     segment_info: str
     segs_activity: str
+    messages_positions: Optional[str] = None
     thinned: Optional[str] = None
 
 
-def _snapshot_source(args: argparse.Namespace) -> _CrossVersionSnapshotFQNs:
-    """Snapshot the three port-visits source tables (and the optional
-    `--thinned-message-table`) at `--pin-source-at` into the canonical
-    `tech_great_expectations` dataset via `dit.bq.snapshot_into_experiment`.
-    Returns the dest FQNs as a frozen dataclass for threading downstream.
+@dataclasses.dataclass(frozen=True)
+class _PinSpec:
+    """One source to pin: the `_PinnedSources` field it fills, the table to
+    copy, its role, and its window (None = whole table)."""
+    field: str
+    source_table: str
+    role: str
+    window: Optional[dit_bq.SourceWindow]
 
-    M5 of canonical-dataset migration: replaces the prior per-experiment
-    `dit_exp_<exp>_{internal,published}` dataset-creation path. All
-    snapshots now land as tables in `<project>.tech_great_expectations`
-    with per-table `expiration_timestamp` (set by `snapshot_into_experiment`
-    via `expiration_days`). No `bigquery.Client.create_dataset` call,
-    no IAM friction with the narrowly-scoped Cloud Build SA.
 
-    KNOWN FOOTGUN inherited from M1's `snapshot_into_experiment`:
-    `if_existing="skip"` (the helper's default) makes per-source-table
-    re-runs idempotent BUT silently keeps the prior snapshot if the
-    same `--experiment-id` is re-run with a different `--pin-source-at`.
-    `--experiment-id` is REQUIRED in this workflow (no auto-generated
-    default, unlike ais.py's `solo_<6-hex>` fallback) -- use a fresh
-    experiment id per distinct pin timestamp; the 7-day TTL on each
-    snapshot table cleans up afterwards. The explicit fail-fast
-    path remains `--thinned-message-table` (uses
-    `if_existing="fail"` so a colliding name raises rather than reads
-    the wrong pin). Full write-up + recommended `if_existing="verify_as_of"`
-    resolution in `dit.bq.snapshot_table`'s docstring.
+def _source_tables(args: argparse.Namespace) -> tuple[str, str, str]:
+    """(messages_positions, segment_info, segs_activity) FQNs to pin: each
+    `--source-*-fqn` override, else derived from `--source-dataset-stem`."""
+    stem = args.source_dataset_stem
+    return (
+        args.source_messages_fqn or f"{PROJECT}.{stem}_internal.messages_positions",
+        args.source_segment_info_fqn or f"{PROJECT}.{stem}_published.segment_info",
+        args.source_segs_activity_fqn or f"{PROJECT}.{stem}_published.segs_activity",
+    )
+
+
+def _pin_specs(args: argparse.Namespace) -> list[_PinSpec]:
+    """The sources a run pins. `segment_info` and `segs_activity` are copied
+    whole: step 2 joins and filters them without a date range."""
+    messages, segment_info, segs_activity = _source_tables(args)
+    window = dit_bq.SourceWindow(
+        column=_WINDOW_COLUMN, start=args.start, end=args.end + timedelta(days=1),
+    )
+    windowed_input = (
+        _PinSpec("thinned", args.thinned_message_table, _THINNED_PIN_ROLE, window)
+        if args.thinned_message_table
+        else _PinSpec("messages_positions", messages, _SOURCE_PIN_ROLE, window)
+    )
+    return [
+        windowed_input,
+        _PinSpec("segment_info", segment_info, _SOURCE_PIN_ROLE, None),
+        _PinSpec("segs_activity", segs_activity, _SOURCE_PIN_ROLE, None),
+    ]
+
+
+def _pin_sources(
+    args: argparse.Namespace, pinned_at: datetime, *, reuse: bool,
+) -> _PinnedSources:
+    """Pin every `_pin_specs` source under the stamp of `pinned_at`, or with
+    `reuse`, check that an earlier run's copies under that stamp exist.
+
+    All copies share one stamp, so `--reuse-pin <stamp>` can recompute
+    every name. A reused copy must match this run's experiment id, role,
+    window and source table name, since all of them are in the name.
     """
-    # Source FQNs derived from the source-dataset stem: stays as the
-    # cross_version_ais.py CLI surface (workflow author still picks a
-    # cohort to snapshot FROM). What changes is the DEST shape -- canonical
-    # tech_great_expectations tables, not per-experiment datasets.
-    src_messages = (
-        f"{PROJECT}.{args.source_dataset_stem}_internal.messages_positions"
-    )
-    src_segment_info = (
-        f"{PROJECT}.{args.source_dataset_stem}_published.segment_info"
-    )
-    src_segs_activity = (
-        f"{PROJECT}.{args.source_dataset_stem}_published.segs_activity"
-    )
-
-    dst_messages = dit_bq.snapshot_into_experiment(
-        src_messages,
-        experiment_id=args.experiment_id,
-        role=_SOURCE_SNAPSHOT_ROLE,
-        as_of=args.pin_source_at,
-        expiration_days=args.snapshot_expiration_days,
-        project=PROJECT,
-    )
-    dst_segment_info = dit_bq.snapshot_into_experiment(
-        src_segment_info,
-        experiment_id=args.experiment_id,
-        role=_SOURCE_SNAPSHOT_ROLE,
-        as_of=args.pin_source_at,
-        expiration_days=args.snapshot_expiration_days,
-        project=PROJECT,
-    )
-    dst_segs_activity = dit_bq.snapshot_into_experiment(
-        src_segs_activity,
-        experiment_id=args.experiment_id,
-        role=_SOURCE_SNAPSHOT_ROLE,
-        as_of=args.pin_source_at,
-        expiration_days=args.snapshot_expiration_days,
-        project=PROJECT,
-    )
-
-    # Optional --thinned-message-table snapshot. Distinct role so the dest
-    # name can't collide with a source-table snapshot even if the user's
-    # thinned-table basename happens to match (e.g. "messages_positions").
-    # if_existing="fail" preserves the fail-fast contract from the prior
-    # _snapshot_thinned_table -- a re-run with the same --experiment-id
-    # but a different --pin-source-at raises rather than silently reading
-    # the prior snapshot's pin.
-    thinned_fqn: Optional[str] = None
-    if args.thinned_message_table:
-        thinned_fqn = dit_bq.snapshot_into_experiment(
-            args.thinned_message_table,
+    def pin(spec: _PinSpec) -> str:
+        if reuse:
+            return dit_bq.require_pinned_source(
+                dit_bq.pinned_source_fqn(
+                    spec.source_table,
+                    experiment_id=args.experiment_id,
+                    role=spec.role,
+                    pinned_at=pinned_at,
+                    window=spec.window,
+                    project=PROJECT,
+                ),
+                project=PROJECT,
+            )
+        return dit_bq.pin_source_into_experiment(
+            spec.source_table,
             experiment_id=args.experiment_id,
-            role=_THINNED_SNAPSHOT_ROLE,
-            as_of=args.pin_source_at,
-            expiration_days=args.snapshot_expiration_days,
-            if_existing="fail",
+            role=spec.role,
+            pinned_at=pinned_at,
+            window=spec.window,
+            expiration_days=args.pin_expiration_days,
+            max_bytes=int(args.pin_max_gb * 1e9),
+            dry_run=args.dry_run,
             project=PROJECT,
         )
-        logger.info(
-            "snapshotted external thinned table %s -> %s (as_of=%s)",
-            args.thinned_message_table, thinned_fqn,
-            args.pin_source_at.isoformat(),
-        )
 
-    return _CrossVersionSnapshotFQNs(
-        messages_positions=dst_messages,
-        segment_info=dst_segment_info,
-        segs_activity=dst_segs_activity,
-        thinned=thinned_fqn,
-    )
+    pinned = {spec.field: pin(spec) for spec in _pin_specs(args)}
+    for field, fqn in pinned.items():
+        logger.info("pinned %s: %s", field, fqn)
+    return _PinnedSources(start=args.start, end=args.end, **pinned)
 
 
 # --------------------------------------------------------------------------
@@ -348,7 +387,7 @@ def _snapshot_source(args: argparse.Namespace) -> _CrossVersionSnapshotFQNs:
 def _ais_args_for_binding(
     extra_args: list[str],
     *,
-    snapshot_fqns: _CrossVersionSnapshotFQNs,
+    pinned: _PinnedSources,
     suffix: str,
     experiment_id: str,
     binding_name: str,
@@ -363,22 +402,22 @@ def _ais_args_for_binding(
     ``--worker-image``: dropped from the extras and re-injected only when the
     wrapper has a per-binding value (``--binding-image-tag``).
 
-    M5 of canonical-dataset migration: replaces the prior
-    ``--source-dataset-stem snap_stem`` pass-through with M4's per-table
-    FQN flags (``--source-messages-fqn`` / ``--source-segment-info-fqn``
-    / ``--source-segs-activity-fqn``). The snapshots live in
-    ``tech_great_expectations`` (not in a ``<stem>_internal`` /
-    ``<stem>_published`` shape that ``--source-dataset-stem`` could
-    address), so per-table FQNs are the only way to route ais.py at them.
+    The pinned copies live in ``tech_great_expectations`` (not in a
+    ``<stem>_internal`` / ``<stem>_published`` shape that
+    ``--source-dataset-stem`` could address), so M4's per-table FQN flags
+    (``--source-messages-fqn`` / ``--source-segment-info-fqn`` /
+    ``--source-segs-activity-fqn``) are the only way to route ais.py at
+    them. ``--start`` / ``--end`` come from the pin too: the windowed
+    copies hold only those dates.
 
     ``--suffix`` controls table names; ``--experiment-id`` +
     ``--binding-name`` flow into Dataflow job names and BQ labels.
     ``--worker-image`` is dropped only when a wrapper-supplied value is
     present -- otherwise ais.py's default wins (no override, no drop).
     """
-    # --thinned-message-table and --source-* are ALWAYS dropped in
-    # cross-version runs -- the wrapper exclusively owns these knobs (it
-    # snapshotted the inputs and knows the canonical dest FQNs). A
+    # --thinned-message-table, --source-* and the dates are ALWAYS dropped
+    # in cross-version runs -- the wrapper exclusively owns these knobs (it
+    # pinned the inputs and knows the copies' FQNs and window). A
     # user-supplied --source-messages-fqn (etc.) in extra_args could
     # otherwise leak an unpinned table into one binding, defeating the
     # cross-version pin.
@@ -387,6 +426,7 @@ def _ais_args_for_binding(
         "--source-messages-fqn",
         "--source-segment-info-fqn",
         "--source-segs-activity-fqn",
+        "--start", "--end",
         "--suffix", "--experiment-id", "--binding-name",
         "--thinned-message-table",
         # --modes is the wrapper's own flag (it selects which modes to run
@@ -411,13 +451,13 @@ def _ais_args_for_binding(
         out.append(arg)
     out.extend([
         # Per-table FQN overrides (M4 of canonical-dataset migration) point
-        # ais.py at the M1-helper-produced snapshots in
-        # tech_great_expectations. Each binding reads from the SAME
-        # snapshots so any output divergence is attributable to pipeline
-        # code, not source-data drift.
-        "--source-messages-fqn", snapshot_fqns.messages_positions,
-        "--source-segment-info-fqn", snapshot_fqns.segment_info,
-        "--source-segs-activity-fqn", snapshot_fqns.segs_activity,
+        # ais.py at the pinned copies in tech_great_expectations. Each
+        # binding reads the SAME copies so any output divergence is
+        # attributable to pipeline code, not source-data drift.
+        "--source-segment-info-fqn", pinned.segment_info,
+        "--source-segs-activity-fqn", pinned.segs_activity,
+        "--start", pinned.start.isoformat(),
+        "--end", pinned.end.isoformat(),
         # Forward the mode selection so each binding RUNS only the modes we
         # will diff. Before ais.py grew --modes, a --modes subset narrowed the
         # diff set only -- every binding still ran all three, so the flag
@@ -433,8 +473,12 @@ def _ais_args_for_binding(
         out.extend(["--worker-image", worker_image])
     if image_tag is not None:
         out.extend(["--image-tag", image_tag])
-    if snapshot_fqns.thinned is not None:
-        out.extend(["--thinned-message-table", snapshot_fqns.thinned])
+    # messages_positions is unpinned (None) exactly when a thinned table is:
+    # step 1, its only reader, is then skipped.
+    if pinned.messages_positions is not None:
+        out.extend(["--source-messages-fqn", pinned.messages_positions])
+    if pinned.thinned is not None:
+        out.extend(["--thinned-message-table", pinned.thinned])
     return out
 
 
@@ -456,7 +500,7 @@ def _run_binding(
     name: str,
     ref: str,
     experiment_id: str,
-    snapshot_fqns: _CrossVersionSnapshotFQNs,
+    pinned: _PinnedSources,
     suffix: str,
     modes: Sequence[str],
     pipeline_dir: str,
@@ -475,7 +519,7 @@ def _run_binding(
 
         argv = _ais_args_for_binding(
             ais_extra_args,
-            snapshot_fqns=snapshot_fqns, suffix=suffix,
+            pinned=pinned, suffix=suffix,
             experiment_id=experiment_id, binding_name=name,
             modes=modes,
             worker_image=worker_image,
@@ -594,23 +638,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args, ais_extra_args = parse_args(argv)
 
+    reuse = args.reuse_pin is not None
+    pinned_at = (
+        dit_bq.parse_pin_stamp(args.reuse_pin) if reuse
+        else datetime.now(timezone.utc).replace(microsecond=0)
+    )
     logger.info("experiment_id: %s", args.experiment_id)
-    logger.info("pin_source_at: %s", args.pin_source_at.isoformat())
+    logger.info("pin stamp: %s (%s)", dit_bq.format_pin_stamp(pinned_at),
+                "reusing an earlier run's copies" if reuse else "new copies")
+    logger.info("date range (inclusive): %s -> %s", args.start, args.end)
     logger.info("bindings: %s", args.bindings)
     logger.info("modes: %s", args.modes)
     logger.info("pipeline_dir: %s", args.pipeline_dir)
-    logger.info("source stem: %s (canonical dest: %s.tech_great_expectations)",
-                args.source_dataset_stem, PROJECT)
+    logger.info("sources: %s (copies in %s.tech_great_expectations)",
+                ", ".join(_source_tables(args)), PROJECT)
 
     _verify_refs(args.pipeline_dir, args.bindings)
-    # M5 of canonical-dataset migration: _snapshot_source now returns a
-    # frozen dataclass of per-table canonical FQNs in tech_great_expectations
-    # (including the optional --thinned-message-table snapshot as a
-    # None-able field), replacing the prior `snap_stem` string + the
-    # separate `_snapshot_thinned_table` call. The dataclass threads
-    # through _run_binding -> _ais_args_for_binding which emits the M4
-    # per-table FQN flags on each ais.py invocation.
-    snapshot_fqns = _snapshot_source(args)
+    pinned = _pin_sources(args, pinned_at, reuse=reuse)
+    if not reuse and not args.dry_run:
+        logger.info("to rerun on these copies, pass --reuse-pin %s",
+                    dit_bq.format_pin_stamp(pinned_at))
 
     # Each binding gets a deterministic suffix the diff step can address.
     suffix_by_binding = {
@@ -621,7 +668,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rc = _run_binding(
             name=name, ref=ref,
             experiment_id=args.experiment_id,
-            snapshot_fqns=snapshot_fqns,
+            pinned=pinned,
             suffix=suffix_by_binding[name],
             modes=args.modes,
             pipeline_dir=args.pipeline_dir,

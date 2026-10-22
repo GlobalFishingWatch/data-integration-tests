@@ -14,6 +14,7 @@ The behaviours worth protecting:
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import patch
 
 import pytest
@@ -252,7 +253,8 @@ def test_pipe_events_compare_all_still_propagates_divergence() -> None:
 # --------------------------------------------------------------------------
 
 def _xv_fqns():
-    return xv_mod._CrossVersionSnapshotFQNs(
+    return xv_mod._PinnedSources(
+        start=date(2020, 1, 1), end=date(2020, 12, 31),
         messages_positions="dst.m",
         segment_info="dst.si",
         segs_activity="dst.sa",
@@ -265,7 +267,7 @@ def test_cross_version_forwards_modes_to_ais() -> None:
     on the expensive half. It must now reach ais.py."""
     out = xv_mod._ais_args_for_binding(
         [],
-        snapshot_fqns=_xv_fqns(),
+        pinned=_xv_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
         binding_name="before",
@@ -280,7 +282,7 @@ def test_cross_version_drops_user_supplied_modes() -> None:
     otherwise desync them -- bindings running one set while we diff another."""
     out = xv_mod._ais_args_for_binding(
         ["--modes", "2_bfd"],
-        snapshot_fqns=_xv_fqns(),
+        pinned=_xv_fqns(),
         suffix="exp01-before",
         experiment_id="exp01",
         binding_name="before",
@@ -296,7 +298,6 @@ def test_cross_version_validates_modes_against_ais() -> None:
     with pytest.raises(SystemExit):
         xv_mod.parse_args([
             "--experiment-id", "exp01",
-            "--pin-source-at", "2026-05-15T10:00:00Z",
             "--binding", "before=v1",
             "--modes", "nope",
         ])

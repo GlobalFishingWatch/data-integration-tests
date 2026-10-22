@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import random
+import re
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Sequence
 
@@ -14,6 +17,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROJECT = "world-fishing-827"
 CANONICAL_DATASET = "tech_great_expectations"
 
+#: Default ceiling on the bytes one pinned copy may process: 1 TB (10**12
+#: bytes). ``pin_source_into_experiment`` dry-runs the copy and refuses
+#: above it, and gives the job the same value as ``maximum_bytes_billed``.
+DEFAULT_PIN_MAX_BYTES = 10**12
+
+#: ``strftime`` format of a pin stamp, as it appears in pinned table names
+#: and in the ``dit_pin`` label (labels must be lowercase).
+PIN_STAMP_FORMAT = "%Y%m%dt%H%M%Sz"
+
+#: Value of the ``dit_artifact`` label on every pinned copy.
+PIN_ARTIFACT_LABEL = "source_pin"
+
 
 def _utc_now() -> datetime:
     """Indirection over ``datetime.now(timezone.utc)`` for testability.
@@ -23,6 +38,31 @@ def _utc_now() -> datetime:
     emitted DDL deterministic.
     """
     return datetime.now(timezone.utc)
+
+
+def _experiment_table_fqn(
+    source_table: str,
+    *,
+    experiment_id: str,
+    role: str,
+    project: str,
+    name_suffix: Sequence[str] = (),
+) -> str:
+    """Canonical dest FQN shared by the ``*_into_experiment`` helpers::
+
+        <project>.tech_great_expectations.dit_exp_<sanitised(experiment_id)>_<sanitised(role)>_<source_table_name>[_<suffix>...]
+
+    Sanitisation replaces ``-`` with ``_`` in ``experiment_id`` and ``role``;
+    ``source_table_name`` is the last ``.``-separated part of ``source_table``.
+    """
+    sanitised_experiment_id = experiment_id.replace("-", "_")
+    sanitised_role = role.replace("-", "_")
+    source_table_name = source_table.rsplit(".", 1)[-1]
+    name = "_".join([
+        "dit_exp", sanitised_experiment_id, sanitised_role, source_table_name,
+        *name_suffix,
+    ])
+    return f"{project}.{CANONICAL_DATASET}.{name}"
 
 
 def drop_tables(prefix: str, *, project: str = DEFAULT_PROJECT) -> None:
@@ -318,12 +358,8 @@ def snapshot_into_experiment(
     deferred — see ``docs/snapshot-dataset-migration-2026-06.md`` (it's
     a follow-up PR after the migration completes).
     """
-    sanitised_experiment_id = experiment_id.replace("-", "_")
-    sanitised_role = role.replace("-", "_")
-    source_table_name = source_table.rsplit(".", 1)[-1]
-    dest_table = (
-        f"{project}.{CANONICAL_DATASET}."
-        f"dit_exp_{sanitised_experiment_id}_{sanitised_role}_{source_table_name}"
+    dest_table = _experiment_table_fqn(
+        source_table, experiment_id=experiment_id, role=role, project=project,
     )
     expiration = _utc_now() + timedelta(days=expiration_days)
 
@@ -398,12 +434,8 @@ def derived_source_into_experiment(
     the cross-org dodge path (e.g. when both source and dest must live in
     the same org for downstream consumers).
     """
-    sanitised_experiment_id = experiment_id.replace("-", "_")
-    sanitised_role = role.replace("-", "_")
-    source_table_name = source_table.rsplit(".", 1)[-1]
-    dest_table = (
-        f"{project}.{CANONICAL_DATASET}."
-        f"dit_exp_{sanitised_experiment_id}_{sanitised_role}_{source_table_name}"
+    dest_table = _experiment_table_fqn(
+        source_table, experiment_id=experiment_id, role=role, project=project,
     )
     expiration = _utc_now() + timedelta(days=expiration_days)
 
@@ -425,4 +457,285 @@ def derived_source_into_experiment(
     )
     client = bigquery.Client(project=project)
     client.query(sql).result()
+    return dest_table
+
+
+# --------------------------------------------------------------------------
+# Source pinning by copy
+# --------------------------------------------------------------------------
+#
+# Pins a source by copying it into tech_great_expectations at run start,
+# replacing BigQuery snapshots, which fail twice over: they cannot cross
+# organisations (production sources sit in a different org than
+# world-fishing-827), and a snapshot with an expiration needs
+# bigquery.tables.deleteSnapshot, which no DIT identity has. A copy only
+# reads the source (cross-org reads work) and needs bigquery.tables.create.
+# It uses no time travel, which loses partition pruning on tables modified
+# inside their time-travel window. `CREATE TABLE ... LIKE` keeps the
+# source's partitioning and clustering, so pipelines read the copy as
+# cheaply as the source.
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceWindow:
+    """Half-open date window ``[start, end)`` on ``column`` of a source table.
+
+    The predicate is ``DATE(column) >= start AND DATE(column) < end``, the
+    form the pipelines use themselves. It prunes partitions of TIMESTAMP and
+    DATE partition columns alike.
+    """
+
+    column: str
+    start: date
+    end: date
+
+    def __post_init__(self) -> None:
+        if self.end <= self.start:
+            raise ValueError(
+                f"SourceWindow end {self.end} must be after start {self.start}"
+            )
+
+    def predicate(self) -> str:
+        return (
+            f"DATE({self.column}) >= '{self.start.isoformat()}' "
+            f"AND DATE({self.column}) < '{self.end.isoformat()}'"
+        )
+
+    def name_part(self) -> str:
+        return f"{self.start:%Y%m%d}_{self.end:%Y%m%d}"
+
+
+def format_pin_stamp(pinned_at: datetime) -> str:
+    """``pinned_at`` (timezone-aware) in UTC, formatted as ``PIN_STAMP_FORMAT``."""
+    if pinned_at.tzinfo is None:
+        raise ValueError(f"pinned_at must be timezone-aware, got {pinned_at!r}")
+    return pinned_at.astimezone(timezone.utc).strftime(PIN_STAMP_FORMAT)
+
+
+def parse_pin_stamp(stamp: str) -> datetime:
+    """Inverse of ``format_pin_stamp``; accepts either case."""
+    try:
+        parsed = datetime.strptime(stamp.lower(), PIN_STAMP_FORMAT)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid pin stamp {stamp!r}; expected the form 20261022t171500z"
+        ) from exc
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def pinned_source_fqn(
+    source_table: str,
+    *,
+    experiment_id: str,
+    role: str,
+    pinned_at: datetime,
+    window: SourceWindow | None = None,
+    project: str = DEFAULT_PROJECT,
+) -> str:
+    """Dest FQN of a pinned copy of ``source_table``::
+
+        <project>.tech_great_expectations.dit_exp_<experiment_id>_<role>_<source_table_name>
+            _<window>_<pin stamp>
+
+    (one name, wrapped here).
+
+    ``<window>`` is ``<start>_<end>`` as ``YYYYMMDD`` (end exclusive), or
+    ``all`` without a window. The pin stamp distinguishes copies of a table
+    that has no window but still changes (e.g. ``segs_activity``), and the
+    window distinguishes copies of one table over different ranges. Pure:
+    callers reusing an earlier run's copies recompute the names from the
+    same inputs.
+    """
+    return _experiment_table_fqn(
+        source_table,
+        experiment_id=experiment_id,
+        role=role,
+        project=project,
+        name_suffix=(
+            window.name_part() if window is not None else "all",
+            format_pin_stamp(pinned_at),
+        ),
+    )
+
+
+def _label_value(value: str) -> str:
+    """``value`` as a valid BigQuery label value: lowercase letters, digits,
+    ``_`` and ``-``, at most 63 characters."""
+    return re.sub(r"[^a-z0-9_-]", "_", value.lower())[:63]
+
+
+def _sql_string_literal(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    return f"'{escaped}'"
+
+
+def _pin_ddl(
+    *,
+    source_table: str,
+    dest_table: str,
+    predicate: str,
+    labels: Sequence[tuple[str, str]],
+    description: str,
+    expiration: datetime,
+) -> str:
+    """``CREATE TABLE ... LIKE ... AS SELECT`` for a pinned copy.
+
+    ``LIKE`` copies the source's partitioning, clustering and options. The
+    options that would mislead on a copy are overridden: ``labels`` and
+    ``description`` are replaced, not merged, and ``partition_expiration_days``
+    is cleared, since a source keeping e.g. 365 days of partitions would
+    otherwise drop an older window's partitions as they land.
+    """
+    label_list = ", ".join(
+        f"({_sql_string_literal(k)}, {_sql_string_literal(v)})" for k, v in labels
+    )
+    return (
+        f"CREATE TABLE `{dest_table}` LIKE `{source_table}` "
+        f"OPTIONS("
+        f"expiration_timestamp=TIMESTAMP('{expiration.isoformat()}'), "
+        f"partition_expiration_days=NULL, "
+        f"labels=[{label_list}], "
+        f"description={_sql_string_literal(description)}) "
+        f"AS SELECT * FROM `{source_table}` WHERE {predicate}"
+    )
+
+
+def pin_source_into_experiment(
+    source_table: str,
+    *,
+    experiment_id: str,
+    role: str,
+    pinned_at: datetime,
+    window: SourceWindow | None = None,
+    expiration_days: int = 7,
+    max_bytes: int = DEFAULT_PIN_MAX_BYTES,
+    dry_run: bool = False,
+    project: str = DEFAULT_PROJECT,
+) -> str:
+    """Copy ``source_table`` (or its ``window``) into
+    ``<project>.tech_great_expectations`` and return the copy's FQN
+    (``pinned_source_fqn``).
+
+    The copy is what a run reads instead of the moving source, so runs that
+    share it see identical inputs. Its data is the source as of the start
+    of the copy job; ``pinned_at`` only names the copy and groups the copies
+    of one run, so callers pass the same ``pinned_at`` to every source they
+    pin. Copies of several sources start seconds apart.
+
+    The copy keeps the source's partitioning and clustering, and carries:
+
+    * ``expiration_timestamp`` = now + ``expiration_days``;
+    * labels ``dit_artifact=source_pin``, ``dit_experiment_id``,
+      ``dit_role``, ``dit_pin`` (the pin stamp) and ``dit_source_table``;
+    * a description naming the source FQN, the filter, the pin and the copy
+      job id (chosen before submission so the description can name it).
+
+    Without a window the whole table is copied (``WHERE TRUE``). BigQuery
+    rejects that for sources that require a partition filter, which forces a
+    window exactly where a full copy would be expensive.
+
+    Cost guard: the copy statement is dry-run first and refused with
+    ``ValueError`` if it would process more than ``max_bytes``; the job
+    also carries ``max_bytes`` as ``maximum_bytes_billed``. ``dry_run=True``
+    stops after the check and creates nothing.
+
+    There is no ``IF NOT EXISTS``: the pin stamp makes every run's names
+    new, so an existing table means a reused stamp and the create fails.
+    To reuse an earlier run's copies, recompute their names with
+    ``pinned_source_fqn`` and check them with ``require_pinned_source``.
+    """
+    dest_table = pinned_source_fqn(
+        source_table,
+        experiment_id=experiment_id,
+        role=role,
+        pinned_at=pinned_at,
+        window=window,
+        project=project,
+    )
+    expiration = _utc_now() + timedelta(days=expiration_days)
+    job_id = f"dit_pin_{uuid.uuid4().hex}"
+    predicate = window.predicate() if window is not None else "TRUE"
+    labels = (
+        ("dit_artifact", PIN_ARTIFACT_LABEL),
+        ("dit_experiment_id", _label_value(experiment_id)),
+        ("dit_role", _label_value(role)),
+        ("dit_pin", format_pin_stamp(pinned_at)),
+        ("dit_source_table", _label_value(source_table.rsplit(".", 1)[-1])),
+    )
+    description = "\n".join([
+        "DIT pinned copy of a source table (data integration tests).",
+        f"Source: {source_table}",
+        f"Rows: WHERE {predicate}" if window is not None else "Rows: all (no filter)",
+        f"Pinned at: {pinned_at.isoformat()}; the data is as of the start of "
+        f"copy job {project}:{job_id}.",
+        f"Experiment: {experiment_id}; role: {role}",
+        f"Expires: {expiration.isoformat()}",
+    ])
+    sql = _pin_ddl(
+        source_table=source_table,
+        dest_table=dest_table,
+        predicate=predicate,
+        labels=labels,
+        description=description,
+        expiration=expiration,
+    )
+
+    client = bigquery.Client(project=project)
+    estimate = int(
+        client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False),
+        ).total_bytes_processed
+        or 0
+    )
+    logger.info(
+        "pinning %s -> %s (%s): dry run estimates %.1f GB (cap %.1f GB)",
+        source_table, dest_table, predicate, estimate / 1e9, max_bytes / 1e9,
+    )
+    if estimate > max_bytes:
+        raise ValueError(
+            f"pinning {source_table} would process {estimate / 1e9:.1f} GB, above "
+            f"the {max_bytes / 1e9:.1f} GB cap. Narrow the window, or raise the cap "
+            f"deliberately."
+        )
+    if dry_run:
+        logger.info("dry run: %s not created", dest_table)
+        return dest_table
+
+    # job_retry=None: the description names job_id, and BigQuery cannot
+    # retry a job under the same id.
+    client.query(
+        sql,
+        job_id=job_id,
+        job_retry=None,
+        job_config=bigquery.QueryJobConfig(maximum_bytes_billed=max_bytes),
+    ).result()
+    return dest_table
+
+
+def require_pinned_source(dest_table: str, *, project: str = DEFAULT_PROJECT) -> str:
+    """Return ``dest_table`` if it exists and carries the
+    ``dit_artifact=source_pin`` label; raise ``ValueError`` otherwise.
+
+    For reusing an earlier run's copies: the caller recomputes their names
+    with ``pinned_source_fqn`` and checks each one here before any run reads
+    it, so a missing or foreign table fails before any Dataflow job starts.
+    """
+    from google.cloud.exceptions import NotFound
+
+    client = bigquery.Client(project=project)
+    try:
+        table = client.get_table(dest_table)
+    except NotFound as exc:
+        raise ValueError(
+            f"pinned copy {dest_table} does not exist: it expired, or the pin "
+            f"stamp, window, role or experiment id differ from the run that "
+            f"created it"
+        ) from exc
+    artifact = (table.labels or {}).get("dit_artifact")
+    if artifact != PIN_ARTIFACT_LABEL:
+        raise ValueError(
+            f"{dest_table} exists but is not a DIT source pin "
+            f"(label dit_artifact={artifact!r})"
+        )
     return dest_table
