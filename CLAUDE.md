@@ -72,11 +72,36 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-23 — Worker sizing defaults always mirror production; cost hint for staging runs
+
+**Owner rule (on PR #87, answering its open question).** Sizing defaults ALWAYS mirror production, in every Dataflow workflow, not only in production-baseline mode. Per step, from production's composer snapshot for the production step each workflow step mirrors. Overrides are nudged, especially for non-production data, without prompting or blocking; an explicit CLI value still wins. Worker caps are not part of this and stay as decided in #85. This supersedes "unset by default" from the entry below.
+
+**Values** (composer-dags-production origin/main 0a644da, `tests/render_dags/snapshots/`, read as data):
+- **Port visits**, both steps: e2-highmem-4 / 50 GB (`core_ais_v5.py` `port_visits.detect_port_events` and `detect_port_visits`; `core_ais_v3.py` and `core_vms_v5_daily.py` agree).
+- **Encounters**, both steps: e2-highmem-4 / 50 GB (`core_ais_v5.py` `encounters.detect_daily_encounters` and `merge_encounters`; `core_ais_v3.py` and both VMS DAGs agree). `vms.py` shares the constant.
+- **pipe-gaps**: e2-custom-2-3072 / 25 GB, the daily detect (`core_ais_v3.py` `detect_gaps.raw_gaps`, `core_ais_v5.py` `gaps.detect_raw_gaps`; plain values in `dags/core/ais/{v3,v5}.py`). **Branch choice:** `core.ais.v5.backfill` resolves a Jinja conditional per data year (`'e2-highmem-2' if data_interval_start.year >= 2025 else 'e2-standard-2'`, 50 GB; the snapshot, at 2026-01-01, shows e2-highmem-2). dit mirrors the daily step instead because its worker cap (#85) already mirrors that step, so cap and sizing describe one production task, and a single static default cannot follow a per-year choice. The cost: e2-custom-2-3072 has 3 GB for 2 vCPUs, less than gfw-common's e2-standard-2 (8 GB) that dit ran on before. A full-year production-scale run (dit's `1_bf` and outage stages are backfill-shaped) may need the backfill's values, passed as flags. Open question for the owner.
+- **pipe-segment**: `segment` and `segment_identity` e2-standard-4 / 50 GB (`segment.segment`, `segment.segment_identity_daily` in `core_ais_v3.py`, `core_vms_v3_last_4days_daily.py`, `core_vms_v5_daily.py`). `segment_info` none: production passes no Dataflow options to `segment.segment_info`.
+- **The production-baseline target** keeps its own sizing fields (same values as port visits today). They pin what that one production run used, independent of the general default.
+
+**The nudge.**
+- Each flag's help shows the per-step defaults ("Default, mirroring production: …") and suggests a smaller value for non-production data.
+- A Dataflow run whose resolved sizing keeps any production-mirrored field (flag absent, step default set) while reading the AIS staging cohort logs one `cost hint:` warning, built by the pure `production_sizing_hint` (`log_production_sizing_hint` logs it). "Non-production" is the `pipe_ais_test_*` dataset prefix (`is_staging_source`), the only non-production target README § Source data targets names. VMS and AIS prod are production data, so they get no hint.
+- `cross_version_ais.py` checks the tables it pins *from*, because its bindings read the pinned copies, whose names no longer show the cohort. It reads the bindings' `--runner` from the extras (`_extra_runner`) so DirectRunner runs get no hint. Production-baseline runs read production's inputs and get none.
+
+**Emitted options** (capture harness, 32 lists, against `feat/shared-worker-cap`):
+- Port visits (both CLIs, both steps), encounters (AIS and VMS, both steps) and the three cross-version binding steps gain `--no_use_public_ips --worker_machine_type=e2-highmem-4 --disk_size_gb=50`.
+- pipe-gaps' runner calls gain `--machine_type=e2-custom-2-3072 --disk_size_gb=25` after the cap.
+- pipe-segment's `segment_identity` gains `--worker_machine_type=e2-standard-4 --disk_size_gb=50`.
+- The production-baseline binding's ais.py argv gains `--worker-machine-type e2-highmem-4 --disk-size-gb 50`.
+- DirectRunner lists, pipe-segment's `segment` and `segment_info`, and the default cross-version ais.py argv are unchanged.
+
+**Sections moved.** `src/dit/workflow.py` § (a3) (comment; `add_worker_sizing_args(parser, *, defaults, help_detail)` with `_describe_defaults`; new `STAGING_DATASET_PREFIX`, `is_staging_source`, `production_sizing_hint`, `log_production_sizing_hint`); `STEP_WORKER_SIZING` in `workflows/port_visits/ais.py` (+ `_source_tables_read`, per-step `args.worker_sizings`, `args.cli_worker_sizing`), `workflows/encounters/ais.py` (+ `resolve_step_sizings`, shared with `vms.py`), `workflows/pipe_segment/identity_match_key.py`; `DEFAULT_WORKER_SIZING` / `STEP_WORKER_SIZING` in `workflows/pipe_gaps/mode_equivalence.py` (shared with `outage_recovery.py`); `workflows/port_visits/cross_version_ais.py` (`_binding_sizings`, `_extra_runner`, hint, help); `tests/test_worker_ips_and_sizing.py` (118); `tests/test_max_num_workers.py` (pinned lists); CHANGELOG § 2026-10-23 `#### Changed`; README Features; `docs/conventions.md` § Runner-only Dataflow knobs; `docs/production-baseline-2026-10.md`.
+
 ### 2026-10-23 — Private worker IPs on every Dataflow job; optional worker sizing; production's sizing in production-baseline mode
 
 **Trigger.** The composer-snapshot drift check (draft PR #86, PIPELINE-4700 spike) compared DIT's port-visits argv with production's. `gcloud dataflow jobs describe` then showed how the jobs actually ran: production on e2-highmem-4, 50 GB, private IPs; DIT's v4 CLI on Dataflow's defaults (n1-standard-1, 30 GB, **public** IPs); DIT's v5 CLI on gfw-common's (e2-standard-2, 25 GB, private). The owner decided two items on #86:
 - **(4)** emit `--no_use_public_ips` for every DIT Dataflow run;
-- **(2b + 2c)** mirror production's sizing in production-baseline mode, and add optional `--worker-machine-type` / `--disk-size-gb` flags, unset by default, everywhere else.
+- **(2b + 2c)** mirror production's sizing in production-baseline mode, and add optional `--worker-machine-type` / `--disk-size-gb` flags, unset by default, everywhere else. (The "unset by default" half was superseded the same day: defaults now mirror production everywhere, see the entry above.)
 
 **What the audit found.**
 - **pipe-segment** already emitted `--no_use_public_ips` on all three steps, and `segment` hard-coded e2-standard-4 / 50 GB (production's `segment.segment` runs the same in core.ais.v3; so does `segment_identity_daily`, which DIT does not mirror).

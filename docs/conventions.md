@@ -20,7 +20,13 @@ dit is a **testing-shaped consumer** of GFW infrastructure. Reading from prod ta
 
 ## Runner-only Dataflow knobs
 
-The worker cap (`--max-num-workers`), the worker machine type (`--worker-machine-type`) and the boot disk size (`--disk-size-gb`) change how fast a job runs and whether it runs out of memory. **Output must not depend on them.** So they are never part of a cache key, and a workflow whose output changes with them has a bug. Each goes through its `dit.workflow` helpers (`add_max_num_workers_arg` / `worker_cap`, `add_worker_sizing_args` / `resolve_worker_sizing` / `worker_sizing_options`), and each resolves the same way: the explicit flag wins, else the workflow's default. Sizing is unset by default, so the pipeline CLI's own default applies; pipe-segment's `segment` step keeps its e2-standard-4 / 50 GB, and `cross_version_ais.py --baseline-production` defaults to the production target's sizing. Since 2026-10-23.
+The worker cap (`--max-num-workers`), the worker machine type (`--worker-machine-type`) and the boot disk size (`--disk-size-gb`) change how fast a job runs and whether it runs out of memory. **Output must not depend on them.** So they are never part of a cache key, and a workflow whose output changes with them has a bug. Each goes through its `dit.workflow` helpers (`add_max_num_workers_arg` / `worker_cap`, `add_worker_sizing_args` / `resolve_worker_sizing` / `worker_sizing_options`), and each resolves the same way: the explicit flag wins, else the workflow's default. Since 2026-10-23.
+
+**Sizing defaults mirror production; overrides are encouraged for non-production data.**
+- Every Dataflow workflow defaults each step's machine type and disk to production's for the production step it mirrors. They live in a per-step `STEP_WORKER_SIZING` constant in the workflow, hand-written with a citation of composer-dags-production's rendered snapshot (`tests/render_dags/snapshots/<dag>.py`, task id, commit), until PIPELINE-4700 reads them as data. A step production runs without sizing options gets none (`WorkerSizing()`).
+- Where production's value is a Jinja conditional, the constant's comment says which branch it mirrors and why.
+- A new workflow follows the same rule. Worker caps do not: they keep their own defaults (above).
+- Production machine types cost more per worker-hour than a staging run needs. Pass a smaller `--worker-machine-type` / `--disk-size-gb` for non-production data: every flag's help says so, and a Dataflow run that keeps a production-mirrored field while reading the AIS staging cohort logs a `cost hint:` warning (`dit.workflow.log_production_sizing_hint`). The hint never prompts or blocks.
 
 **In scope (explicit exception):**
 
