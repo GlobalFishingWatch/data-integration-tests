@@ -6,6 +6,23 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-10-23
+
+#### Added
+- **`--baseline-production` on `workflows/port_visits/cross_version_ais.py`: compare a candidate with production's own output ([PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703)).** With `--baseline-production ais-v5-datalake --production-date D`, only the bindings run, usually just the PR. Each is diffed on `visit_id` against the table production wrote for D. Production is not re-run.
+  - **Pins:** the run finds production's Dataflow job for D (the latest `Done` one; retries reuse the name). It pins production's inputs as time-travel views as of the job's creation, and production's output as of the time the job finished. Views copy nothing and work across organisations. `--production-inputs-as-of` / `--production-output-as-of` override the times.
+  - **Fixed run shape:** the bindings run what production runs: `--steps port_visits`, `--modes 1_bf`, full history (2012-01-01) to D. Unset, these flags take those values; set to anything else, they are an error. Input overrides and `--reuse-pin` are rejected.
+  - **Refuses to start** when any pin leaves its source's time-travel window within `--production-margin-hours` (default 6), or when an input was modified while production ran. The run logs the deadline. For the v5 datalake target it is production's job start + 48 h, set by `segment_info`.
+  - **New library pieces:**
+    - `dit.production.find_dataflow_job`;
+    - `dit.bq.pin_view_into_experiment` (`CREATE VIEW IF NOT EXISTS … FOR SYSTEM_TIME AS OF`, labelled `dit_artifact=source_pin_view`, cost-capped like the copies);
+    - `dit.bq.check_time_travel` and `dit.bq.table_last_modified`.
+
+    `require_pinned_source` accepts view pins.
+  - **Default behaviour:** `--start`, `--end`, `--modes` and `--steps` now default to `None` internally and are filled in after parsing, so production mode can tell a typed value from a default. Runs without `--baseline-production` behave exactly as before.
+
+  Dry-run verified against production's 2026-10-20 run (job `2026-10-23_00_46_26-2424624824928045608`). Estimated full reads through the views: 1150.5 GB of thinned input, 69.6 GB `segment_info`, 103.4 GB `segs_activity`, and 443.0 GB of production output, so a live run needs `--pin-max-gb 1300`. 37 new tests; suite 624 → 661 (on top of `--no-cache`, #82). Runbook and caveats: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
+
 ### 2026-10-22
 
 #### Fixed
