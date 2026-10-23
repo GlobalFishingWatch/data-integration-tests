@@ -117,6 +117,12 @@ Targets 2 and 3 are **cross-organisation**: `gfw-int-vms-v3` and `gfw-int-pipe-v
 
 The 48 h window of `segment_info` makes such a run time-boxed: it must finish within about two days of production's job starting. Targets, tables and sizes: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
 
+**Reference tables, whatever the target.** Some inputs are small, versioned, production reference tables that no cohort mirrors; workflows read them directly, and their defaults should track the version production reads:
+- `workflows/port_visits/ais.py --named-anchorages` (step 1) defaults to `global-fishing-watch.anchorages.named_anchorages_v20260302`, the version production v5 reads (`dags/core/ais/v5.py`): 172,123 anchorages, US, unpartitioned. Until 2026-10-23 the default was `world-fishing-827.anchorages.named_anchorages_v20240117` (166,497 rows; same fields). Read access for `automated-testing@` to `global-fishing-watch.anchorages` is **unverified**; its access to `global-fishing-watch.pipe_ais_v3_published` is verified. If the first step-1 run under that identity (Cloud Build, or the Dataflow workers) fails reading anchorages, suspect an IAM grant before the workflow; meanwhile, pass the old table with `--named-anchorages`.
+- `workflows/encounters/ais.py --spatial-measures-fqn` reads a static production reference table (see its help).
+
+Keeping these defaults in sync is manual today; detecting such drift automatically is [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700).
+
 ### Target 1 inventory — the AIS staging cohort
 
 `pipe_ais_test_202408290000` is a synthetic AIS-staging dataset in `world-fishing-827` mirroring a representative slice of the prod pipeline. It is deliberately tiny: **142 distinct ssvid over 2020**, which is what makes it cheap — and also what limits it (see the sparsity note below).

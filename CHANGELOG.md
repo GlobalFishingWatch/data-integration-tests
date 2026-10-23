@@ -23,6 +23,13 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
   Dry-run verified against production's 2026-10-20 run (job `2026-10-23_00_46_26-2424624824928045608`). Estimated full reads through the views: 1150.5 GB of thinned input, 69.6 GB `segment_info`, 103.4 GB `segs_activity`, and 443.0 GB of production output, so a live run needs `--pin-max-gb 1300`. 37 new tests; suite 624 → 661 (on top of `--no-cache`, #82). Runbook and caveats: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
 
+#### Changed
+- **Port visits' default named-anchorages table is now `global-fishing-watch.anchorages.named_anchorages_v20260302`**, the version production v5 reads (composer-dags-production `dags/core/ais/v5.py`, origin/main 0a644da). It was `world-fishing-827.anchorages.named_anchorages_v20240117`, the latest version when the workflow was written. Owner decision on draft PR #86 (item 6). Applies to `workflows/port_visits/ais.py --named-anchorages`, and so to every `cross_version_ais.py` binding that runs step 1 (`thin_port_messages`); `--named-anchorages` still takes any table.
+  - **Cache:** the table is part of step 1's cache key, so the first run with step 1 after this misses the cache and recomputes. That is expected; `--steps port_visits` runs are unaffected.
+  - **Checked (free metadata reads, 2026-10-23):** the new table exists, 172,123 rows (166,497 in the old one), US, unpartitioned, same fields in a different column order.
+  - **Open risk:** read access for `automated-testing@` to `global-fishing-watch.anchorages` is unverified; its access to `global-fishing-watch.pipe_ais_v3_published` is verified. Until a run under that identity confirms it, a step-1 failure reading anchorages points at an IAM grant; pass the old table with `--named-anchorages` meanwhile.
+  - Example of source drift that [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700) should detect automatically. One new test in `tests/test_port_visits_ais.py`; suite 661 → 662.
+
 ### 2026-10-22
 
 #### Fixed

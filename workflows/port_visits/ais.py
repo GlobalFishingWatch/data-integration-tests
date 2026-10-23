@@ -179,8 +179,15 @@ DEFAULT_SOURCE_SEGS_ACTIVITY_FQN = (
     f"{PROJECT}.{DEFAULT_SOURCE_DATASET_STEM}_published.segs_activity"
 )
 
-# Global anchorages reference (not staging-specific).
-DEFAULT_NAMED_ANCHORAGES = f"{PROJECT}.anchorages.named_anchorages_v20240117"
+# Global anchorages reference (not staging-specific), read by step 1. The
+# version production v5 reads: composer-dags-production origin/main 0a644da,
+# dags/core/ais/v5.py (NAMED_ANCHORAGES) and the rendered snapshot
+# tests/render_dags/snapshots/core_ais_v5.py, task port_visits.detect_port_events
+# (--anchorage_table). Until 2026-10-23 dit defaulted to
+# world-fishing-827.anchorages.named_anchorages_v20240117, the latest version
+# when the workflow was written; keeping it in sync by hand is the source drift
+# PIPELINE-4700 wants automated.
+DEFAULT_NAMED_ANCHORAGES = "global-fishing-watch.anchorages.named_anchorages_v20260302"
 
 DEFAULT_START = "2020-01-01"   # inclusive
 DEFAULT_END = "2020-12-31"     # inclusive
@@ -1020,7 +1027,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "input (used by --bad-segs filtering); overrides --source-dataset-stem-based "
                         "derivation for this table only. "
                         f"Default: stem-derived ({DEFAULT_SOURCE_SEGS_ACTIVITY_FQN}).")
-    p.add_argument("--named-anchorages", default=DEFAULT_NAMED_ANCHORAGES)
+    p.add_argument("--named-anchorages", default=DEFAULT_NAMED_ANCHORAGES,
+                   help=f"Named-anchorages reference table step 1 reads. Default: "
+                        f"{DEFAULT_NAMED_ANCHORAGES}, the version production v5 reads. "
+                        f"Part of step 1's cache key.")
     p.add_argument("--start", default=DEFAULT_START,
                    help="Inclusive start date (also pipeline data_available_from).")
     p.add_argument("--end", default=DEFAULT_END, help="Inclusive end date.")

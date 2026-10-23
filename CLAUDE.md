@@ -72,6 +72,19 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-23 — Port visits' named-anchorages default synced to production v5 (`named_anchorages_v20260302`; PIPELINE-4700 example)
+
+**Trigger.** The composer-snapshot comparison (draft PR #86, PIPELINE-4700 spike) found that production v5's step 1 reads `global-fishing-watch.anchorages.named_anchorages_v20260302` (`dags/core/ais/v5.py`, and `dags/core/vms/v5/config.py`), while DIT defaulted to `world-fishing-827.anchorages.named_anchorages_v20240117`, the latest version when the port-visits workflow was written. Production v3 still reads v20240117 (from `global-fishing-watch`). The owner's call on #86 item 6: it is a sync / drift question, so (a) sync now, and (b) track the automation (warnings when sources differ, a sync mechanism) under [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700), where this bump is recorded as the worked example.
+
+**Decision.** Bump `DEFAULT_NAMED_ANCHORAGES` in `workflows/port_visits/ais.py`, its only home: no other workflow, test fixture or doc held the value (`cross_version_ais.py` takes `ais.py`'s default, and the tests use their own fixture tables). The constant is now a literal FQN, since the table is in another project. Checked with free `bq show` reads: 172,123 rows (old: 166,497), US, unpartitioned, the same 19 fields in a different column order.
+
+**Consequences recorded rather than worked around.**
+- Step 1's cache key contains the table, so the first step-1 run after the bump misses the cache. Expected; `--steps port_visits` runs (incl. production-baseline mode) do not read it.
+- `automated-testing@`'s read access to `global-fishing-watch.anchorages` is unverified (its access to `global-fishing-watch.pipe_ais_v3_published` is verified). Not probed with another identity, by the working rule. A step-1 read failure under that identity points at an IAM grant; the old table stays reachable through `--named-anchorages`.
+- The table is a production reference input that no cohort mirrors, like encounters' spatial measures; README § Source data targets now lists such reference tables, so the next drift is discoverable.
+
+**Sections moved.** `workflows/port_visits/ais.py` (`DEFAULT_NAMED_ANCHORAGES` and its citation, `--named-anchorages` help); `tests/test_port_visits_ais.py` (+1); README § Source data targets (new "Reference tables" paragraph); CHANGELOG § 2026-10-23 `#### Changed`.
+
 ### 2026-10-23 — Production baseline: candidate vs production's own output (PIPELINE-4703)
 
 A third comparison shape next to mode equivalence and cross-version. The bindings run on exactly what production read, and their output is diffed against what production wrote, without re-running production. The owner decided four points:
