@@ -71,7 +71,9 @@ production's Dataflow job for D, and pins with time-travel views
   against on ``visit_id``.
 
 It runs what production runs (``--steps port_visits``, ``--modes 1_bf``,
-``--start`` at the history start, ``--end D``) and refuses to start unless
+``--start`` at the history start, ``--end D``), on production's worker sizing
+(the target's machine type and disk; ``--worker-machine-type`` /
+``--disk-size-gb`` override either), and refuses to start unless
 every pin stays inside its source's time-travel window for
 ``--production-margin-hours`` more, or if an input changed while production
 ran. Example, PR #176 against the AIS v5 datalake run for 2026-10-20::
@@ -120,7 +122,20 @@ from typing import Optional, Sequence
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit import production as dit_production
-from dit.workflow import max_num_workers_ceiling, parse_choice_list, parse_modes
+from dit.workflow import (
+    DISK_SIZE_GB_FLAG,
+    UNSET_WORKER_SIZING,
+    WORKER_MACHINE_TYPE_FLAG,
+    WorkerSizing,
+    add_worker_sizing_args,
+    log_worker_sizings,
+    max_num_workers_ceiling,
+    parse_choice_list,
+    parse_modes,
+    resolve_worker_sizing,
+    worker_sizing_argv,
+    worker_sizing_from_args,
+)
 
 # ais.py owns the canonical mode and step sets, date defaults, step rules and
 # comparison keys; import them so the two can't drift.
@@ -192,15 +207,30 @@ class ProductionTarget:
     segs_activity_table: str
     history_start: date
     deployed_version: str
+    worker_machine_type: str
+    disk_size_gb: int
 
     def job_name(self, production_date: date) -> str:
         return f"{self.job_name_prefix}{production_date:%Y%m%d}"
+
+    @property
+    def worker_sizing(self) -> WorkerSizing:
+        """Production's worker sizing, which every binding mirrors unless
+        ``--worker-machine-type`` / ``--disk-size-gb`` say otherwise."""
+        return WorkerSizing(
+            machine_type=self.worker_machine_type, disk_size_gb=self.disk_size_gb,
+        )
 
 
 #: From composer-dags-production origin/main 0a644da (2026-10-22):
 #: dags/core/ais/v5.py (project, Versions.PORT_VISITS) and
 #: gfw/pipes/core/port_visits/v4.py (port_visits over 2012-01-01..D, full
-#: recompute, WRITE_TRUNCATE).
+#: recompute, WRITE_TRUNCATE). Worker sizing from the rendered snapshot
+#: tests/render_dags/snapshots/core_ais_v5.py, task
+#: port_visits.detect_port_visits (--worker_machine_type=e2-highmem-4,
+#: --disk_size_gb=50): PortVisitsConfig.worker_machine_type in
+#: gfw/pipes/core/port_visits/v4.py and DataflowConfig.disk_size_gb in
+#: gfw/common/config/dataflow.py.
 PRODUCTION_TARGETS = {
     target.name: target
     for target in (
@@ -215,6 +245,8 @@ PRODUCTION_TARGETS = {
             segs_activity_table="gfw-int-ais-datalake.summarized_positions_v1.segs_activity",
             history_start=date(2012, 1, 1),
             deployed_version="pipe-anchorages v4.6.4",
+            worker_machine_type="e2-highmem-4",
+            disk_size_gb=50,
         ),
     )
 }
@@ -324,6 +356,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                    help=f"Refuse to start unless the pinned production data stays readable through "
                         f"time travel for at least this many more hours. Default "
                         f"{DEFAULT_PRODUCTION_MARGIN_HOURS:g}.")
+    # The wrapper owns the sizing (rather than passing it through as an extra)
+    # so --baseline-production can default it to the target's and the values
+    # are validated before anything is pinned.
+    add_worker_sizing_args(
+        p, help_detail="Forwarded to every binding's ais.py. With --baseline-production "
+                       "the default is production's own sizing; an explicit value wins.",
+    )
     args, ais_extra_args = p.parse_known_args(argv)
     if args.pin_source_at is not None:
         raise SystemExit(
@@ -361,6 +400,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     # Every binding's ais.py inherits DIT_MAX_NUM_WORKERS_CEILING (and gets any
     # --max-num-workers as an extra); check the env var before anything is pinned.
     max_num_workers_ceiling()
+    # Field by field: the flag > the production target's sizing > unset.
+    args.worker_sizing = resolve_worker_sizing(
+        worker_sizing_from_args(args),
+        PRODUCTION_TARGETS[args.baseline_production].worker_sizing
+        if args.baseline_production is not None else UNSET_WORKER_SIZING,
+    )
     args.binding_worker_images = dict(_parse_binding(b) for b in args.binding_worker_images)
     args.binding_image_tags = dict(_parse_binding(b) for b in args.binding_image_tags)
     _binding_names = {n for n, _ in args.bindings}
@@ -740,9 +785,14 @@ def _ais_args_for_binding(
     steps: Sequence[str] = AIS_SELECTABLE_STEPS,
     worker_image: Optional[str] = None,
     image_tag: Optional[str] = None,
+    worker_sizing: WorkerSizing = UNSET_WORKER_SIZING,
 ) -> list[str]:
     """Strip user-supplied overrides for fields the wrapper owns, then
     re-inject the wrapper's values.
+
+    ``worker_sizing`` is the wrapper's resolved sizing (its own flags, else
+    the production target's), emitted as ais.py's ``--worker-machine-type`` /
+    ``--disk-size-gb`` for each field that is set.
 
     ``steps`` must be the selection ``pinned`` was built for: each source
     flag is emitted only when it was pinned.
@@ -782,6 +832,9 @@ def _ais_args_for_binding(
         # AND which to diff); a user extra must not desync the two halves.
         # --steps likewise also decides what is pinned and diffed.
         "--modes", "--steps",
+        # The wrapper's own sizing flags (parse_args consumes them, so they
+        # reach here only from a direct caller).
+        WORKER_MACHINE_TYPE_FLAG, DISK_SIZE_GB_FLAG,
     }
     if worker_image is not None:
         drop_kvs = drop_kvs | {"--worker-image"}
@@ -823,6 +876,7 @@ def _ais_args_for_binding(
         out.extend(["--worker-image", worker_image])
     if image_tag is not None:
         out.extend(["--image-tag", image_tag])
+    out.extend(worker_sizing_argv(worker_sizing))
     pinned_flags = (
         ("--source-messages-fqn", pinned.messages_positions),
         ("--source-segment-info-fqn", pinned.segment_info),
@@ -862,6 +916,7 @@ def _run_binding(
     dry_run: bool,
     worker_image: Optional[str] = None,
     image_tag: Optional[str] = None,
+    worker_sizing: WorkerSizing = UNSET_WORKER_SIZING,
 ) -> int:
     worktree_dir = tempfile.mkdtemp(prefix=f"dit-xv-{name}-")
     try:
@@ -879,6 +934,7 @@ def _run_binding(
             steps=steps,
             worker_image=worker_image,
             image_tag=image_tag,
+            worker_sizing=worker_sizing,
         )
         cmd = [sys.executable, str(AIS_WORKFLOW), *argv]
         logger.info("binding %s: invoking %s", name, " ".join(shlex.quote(c) for c in cmd))
@@ -1075,6 +1131,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("modes: %s", args.modes)
     logger.info("steps: %s", ",".join(args.steps))
     logger.info("pipeline_dir: %s", args.pipeline_dir)
+    log_worker_sizings({"every binding": args.worker_sizing})
 
     _verify_refs(args.pipeline_dir, args.bindings)
     pinned = _pin(args)
@@ -1097,6 +1154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dry_run=args.dry_run,
             worker_image=args.binding_worker_images.get(name),
             image_tag=args.binding_image_tags.get(name),
+            worker_sizing=args.worker_sizing,
         )
         return name, rc
 

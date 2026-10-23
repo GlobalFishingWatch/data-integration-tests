@@ -267,7 +267,7 @@ def _port_visits_options(*cli):
 
 @pytest.mark.parametrize("cli", ["v4", "v5"])
 def test_port_visits_default_options_are_unchanged(cli):
-    assert _port_visits_options("--pipeline-cli", cli)[:10] == [
+    assert _port_visits_options("--pipeline-cli", cli)[:11] == [
         "--runner=DataflowRunner",
         "--project=world-fishing-827",
         "--region=us-central1",
@@ -275,6 +275,7 @@ def test_port_visits_default_options_are_unchanged(cli):
         "--temp_location=gs://b/dit/dataflow_temp",
         "--staging_location=gs://b/dit/dataflow_staging",
         "--subnetwork=net",
+        "--no_use_public_ips",  # added 2026-10-23, tests/test_worker_ips_and_sizing.py
         "--max_num_workers=4",
         f"--sdk_container_image={port_visits.DEFAULT_WORKER_IMAGE}",
         "--job_name=dit-anchorages-pipeline-thin-exp-1-bf-1-1",
@@ -297,7 +298,7 @@ def _encounters_options(module, *cli, runner="dataflow"):
 
 @pytest.mark.parametrize("module", [encounters_ais, encounters_vms])
 def test_encounters_default_options_are_unchanged(module):
-    assert _encounters_options(module)[:11] == [
+    assert _encounters_options(module)[:12] == [
         "--runner=DataflowRunner",
         "--project=world-fishing-827",
         "--region=us-central1",
@@ -306,6 +307,7 @@ def test_encounters_default_options_are_unchanged(module):
         "--temp_dataset=p.tmp",
         "--staging_location=gs://b/dit/dataflow_staging",
         "--subnetwork=net",
+        "--no_use_public_ips",  # added 2026-10-23, tests/test_worker_ips_and_sizing.py
         "--max_num_workers=50",
         f"--sdk_container_image={encounters_ais.DEFAULT_WORKER_IMAGE}",
         "--job_name=dit-encounters-createraw-exp-1-bf-1-1",

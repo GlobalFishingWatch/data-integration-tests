@@ -62,6 +62,12 @@ through ``dit.runners.docker`` -- the Dataflow submission is opaque to the
 runner, which only owns the docker process and waits for it via
 ``--wait_for_job`` inside the pipeline.
 
+Dataflow jobs always run with private worker IPs (``--no_use_public_ips``,
+as production; without it the v4 CLI falls back to Dataflow's public IPs).
+``--worker-machine-type`` / ``--disk-size-gb`` are emitted only when given;
+unset, the CLI's own default applies (v4: Dataflow's n1-standard-1 and 30 GB;
+v5: gfw-common's e2-standard-2 and 25 GB).
+
 This is the **abstraction-validation step** for Phase 2: first real exercise
 of ``dit.compare.compare_tables(view_suffix="", keys=["visit_id"])``
 (truncate shape, not SCD-2) and the docker runner's ``entrypoint`` extension
@@ -88,17 +94,24 @@ from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
+    NO_PUBLIC_IPS_OPTION,
+    UNSET_WORKER_SIZING,
+    WorkerSizing,
     add_experiment_id_arg,
     add_infra_args,
     add_max_num_workers_arg,
     add_modes_arg,
     add_no_cache_arg,
+    add_worker_sizing_args,
     log_worker_caps,
+    log_worker_sizings,
     max_num_workers_options,
     parse_choice_list,
     parse_modes,
     resolve_run_context,
     worker_cap,
+    worker_sizing_from_args,
+    worker_sizing_options,
 )
 
 logger = logging.getLogger(__name__)
@@ -264,6 +277,12 @@ def _max_num_workers(args: argparse.Namespace) -> int:
     return getattr(args, "max_num_workers", DEFAULT_MAX_NUM_WORKERS)
 
 
+def _worker_sizing(args: argparse.Namespace) -> WorkerSizing:
+    """The worker sizing (``--worker-machine-type``, ``--disk-size-gb``);
+    unset for Namespaces built without it."""
+    return getattr(args, "worker_sizing", UNSET_WORKER_SIZING)
+
+
 def _exclusive_end(inclusive_end: date) -> str:
     """The v5 CLI's exclusive ``--end-date`` for an inclusive last day."""
     return (inclusive_end + timedelta(days=1)).isoformat()
@@ -401,8 +420,12 @@ def _dataflow_pipeline_options(
         f"--temp_location={dataflow_temp_location(args.dataflow_temp_bucket)}",
         f"--staging_location={dataflow_staging_location(args.dataflow_temp_bucket)}",
         f"--subnetwork={args.dataflow_subnetwork}",
+        # Private worker IPs, as production; see dit.workflow (a3).
+        NO_PUBLIC_IPS_OPTION,
         # Bound autoscaling; see DEFAULT_MAX_NUM_WORKERS.
         *max_num_workers_options(_max_num_workers(args)),
+        # Machine type and disk, only when set (both CLIs have their own default).
+        *worker_sizing_options(_worker_sizing(args)),
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
     ]
@@ -834,7 +857,8 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
     when a selected step reads it. Excludes plumbing (datasets,
     regions, SAs), naming (experiment_id, suffix, binding), and runner-only
     knobs (worker_image is in the key via ``worker_image_digest`` on the
-    CacheKey itself; ``parallel`` doesn't affect output). NOTE: ``image_tag``
+    CacheKey itself; ``parallel``, the worker cap and the worker sizing don't
+    affect output). NOTE: ``image_tag``
     is NOT a pure runner-only knob -- it IS the submitter image, so its
     identity is folded in via ``_submitter_image_identity`` above.
     """
@@ -1036,6 +1060,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help_detail="The default is sized for the 2020 staging cohort; e.g. 16 for one "
                     "month of production AIS, 100 for production's full-history step.",
     )
+    add_worker_sizing_args(
+        p, help_detail="Production runs both steps on e2-highmem-4 with 50 GB; "
+                       "cross_version_ais.py --baseline-production passes those.",
+    )
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
                    help="Dataflow worker container image with pipe_anchorages installed; "
@@ -1089,6 +1117,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
     args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
     args.max_num_workers = args.worker_cap.workers
+    # No default sizing of its own: unset flags emit nothing.
+    args.worker_sizing = worker_sizing_from_args(args)
     return args
 
 
@@ -1179,6 +1209,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
     logger.info("runner: %s  pipeline_cli: %s", args.runner, args.pipeline_cli)
     log_worker_caps({"every job": args.worker_cap})
+    log_worker_sizings({"every job": args.worker_sizing})
 
     # Per-mode FQN to compare. Default to this run's freshly-suffixed output
     # tables (the last step's); the cache wrapper overwrites each with the

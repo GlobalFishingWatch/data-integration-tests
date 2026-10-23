@@ -30,16 +30,21 @@ from dit.job_names import make_job_name
 from dit.runners import dataflow as dit_dataflow
 from dit.runners import docker as dit_docker
 from dit.workflow import (
+    WorkerSizing,
     add_experiment_id_arg,
     add_infra_args,
     add_max_num_workers_arg,
     add_modes_arg,
     add_no_cache_arg,
+    add_worker_sizing_args,
     log_worker_caps,
+    log_worker_sizings,
     max_num_workers_options,
     parse_modes,
     resolve_run_context,
     worker_cap,
+    worker_sizing_from_args,
+    worker_sizing_options,
 )
 
 # Pipeline repo name; used to namespace auto-snapshot refs
@@ -128,6 +133,22 @@ MAX_NUM_WORKERS_HELP_DETAIL = (
     "The default matches production's daily detect step, and replaces "
     "gfw-common's own default of 100."
 )
+
+# Worker IPs and sizing. Every DIT Dataflow job runs with private worker IPs
+# (dit.workflow (a3)). pipe-gaps already does without any option from dit:
+# gfw-common's Pipeline.default_options() sets use_public_ips=False (every
+# version pipe-gaps' ~=0.10 pin resolves to, v0.10 through v0.23), and Beam's
+# PipelineOptions.from_dictionary renders that as --no_use_public_ips. dit
+# passes nothing that overrides it, so it emits nothing here; a test pins
+# that. dit.runners.dataflow could only add the flag-name key
+# no_use_public_ips=True, the form Beam documents as discarded in a mapping.
+#
+# --worker-machine-type / --disk-size-gb (unset: gfw-common's e2-standard-2
+# and 25 GB). gfw-common merges options by option name, so the machine type
+# goes in as Beam's alias --machine_type: that parses to the same key as
+# gfw-common's default and replaces it, rather than sitting beside it.
+GFW_COMMON_MACHINE_TYPE_OPTION = "--machine_type"
+WORKER_SIZING_HELP_DETAIL = "Unset: gfw-common's e2-standard-2 and 25 GB apply."
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
@@ -224,6 +245,7 @@ def _make_config(
     job_name: Optional[str] = None,
     labels: Optional[Sequence[str]] = None,
     max_num_workers: Optional[int] = None,
+    worker_sizing: WorkerSizing | None = None,
 ) -> SimpleNamespace:
     # `labels` (a list of "key=value" strings) is seeded into unknown_parsed_args
     # so it flows into Beam's GoogleCloudOptions.labels via the PipelineFactory
@@ -256,6 +278,7 @@ def _make_config(
     # Runner-only: emitted by _run_pipeline (Dataflow only), stripped before
     # DetectGapsConfig.from_namespace in _build_pipeline_for.
     cfg.max_num_workers = max_num_workers
+    cfg.worker_sizing = worker_sizing or WorkerSizing()
     return cfg
 
 
@@ -327,6 +350,7 @@ def _build_pipeline_for(cfg: SimpleNamespace):
             "worker_image",
             "job_name",
             "max_num_workers",
+            "worker_sizing",
         }
         cfg_attrs = {k: v for k, v in vars(cfg).items() if k not in runner_only_attrs}
         df_cfg = SimpleNamespace(**cfg_attrs)
@@ -369,9 +393,16 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
                 "is local-only and cannot be pulled by Dataflow workers."
             )
         rc = dit_dataflow.run(
-            # The worker cap, if any. Reaches gfw-common's Pipeline through
-            # the options mapping, overriding its own default of 100.
-            args=max_num_workers_options(cfg.max_num_workers),
+            # The worker cap and sizing, if any. They reach gfw-common's
+            # Pipeline through the options mapping and override its own
+            # defaults. Nothing for worker IPs: gfw-common's default is
+            # already private (see the note above GFW_COMMON_MACHINE_TYPE_OPTION).
+            args=[
+                *max_num_workers_options(cfg.max_num_workers),
+                *worker_sizing_options(
+                    cfg.worker_sizing, machine_type_option=GFW_COMMON_MACHINE_TYPE_OPTION,
+                ),
+            ],
             image_tag=cfg.worker_image,
             service_account=cfg.service_account,
             region=cfg.dataflow_region,
@@ -559,7 +590,8 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
 
     Excludes plumbing (service accounts, regions, datasets), naming
     (experiment_id, suffix), and runner-only knobs (image_tag, parallel,
-    skip_pipelines, max_num_workers) — none of which affect the output content.
+    skip_pipelines, max_num_workers, worker_machine_type, disk_size_gb) —
+    none of which affect the output content.
     """
     params: dict[str, Any] = {
         "mode": mode,
@@ -669,6 +701,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add_max_num_workers_arg(
         p, default=DEFAULT_MAX_NUM_WORKERS, help_detail=MAX_NUM_WORKERS_HELP_DETAIL,
     )
+    add_worker_sizing_args(p, help_detail=WORKER_SIZING_HELP_DETAIL)
     # --bq-temp-dataset is workflow-local; not part of add_infra_args.
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
@@ -698,6 +731,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
     args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
     args.max_num_workers = args.worker_cap.workers
+    args.worker_sizing = worker_sizing_from_args(args)
     return args
 
 
@@ -736,6 +770,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
     log_worker_caps({"every job": args.worker_cap})
+    log_worker_sizings({"every job": args.worker_sizing})
 
     source_messages = args.source_messages
     source_segments = args.source_segments
@@ -763,6 +798,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_image=args.worker_image or None,
         labels=dit_labels,
         max_num_workers=args.max_num_workers,
+        worker_sizing=args.worker_sizing,
     )
 
     base = f"{PROJECT}.{args.dest_dataset}.three_way_{suffix}"
