@@ -6,18 +6,20 @@ design):
 1. **Cache** — workflows query for a prior successful run of the same
    ``(pipeline_commit, worker_image, workflow_file, params)`` tuple and
    reuse its output tables instead of recomputing.
-2. **Registry** — every run records the Dataflow job IDs + BQ tables it
-   produced, so ``make dit-cancel`` can clean them up after a Cloud Build
-   cancellation.
+2. **Registry** — every run records the BQ tables it produced, so
+   ``make dit-cancel`` can clean them up after a Cloud Build cancellation.
+   Its Dataflow jobs are found by the ``dit_run_id`` label, not by the row
+   (``dataflow_job_ids`` is always empty; see :func:`cancel_run`).
 3. **Provenance** — "which commit produced this table?" is one BQ query.
 
 This module is the dit-side library; workflows call it from their
 ``execute_*`` helpers. The actual BQ table is created via
 ``migrations/001_dit_meta_runs.sql``.
 
-Scaffolding status (2026-05-22): the pure functions are implemented;
-BQ-touching functions raise ``NotImplementedError`` with TODO markers.
-See `docs/run-cache-impl.md` for the implementation plan.
+Status: the run-cache arc (milestones M1-M6) is complete. This module holds
+the pure functions, the BQ read and write paths and the cleanup control
+plane (M1-M5); the M6 SIGTERM trap lives in ``dit.cli`` and
+``dit.runstate``. See `docs/run-cache-impl.md` for the milestone record.
 """
 
 from __future__ import annotations

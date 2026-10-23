@@ -8,6 +8,14 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ### 2026-10-23
 
+#### Verified
+- **Production baseline, first live run.** PIPELINE-4690's PR (pipe-anchorages #176) was compared with production's own output for 2026-10-20, over the full history (Cloud Build `7781dd48`).
+  - It ran from DIT `main`, as `automated-testing@`.
+  - The time-travel views pinned production's inputs and output across organisations, and the Dataflow job read through them.
+  - The diff ran against the output view.
+  - The result is DIFFERENT, consistent with #176: production's 2,801 duplicate rows are gone, and 2,715 shared visits changed. Numbers are in `docs/production-baseline-2026-10.md`.
+- **pipe-anchorages determinism on September 2026:** three runs of the PR, two of them with `--no-cache` (Cloud Build `8a1348d1`), are IDENTICAL.
+
 #### Added
 - **`--baseline-production` on `workflows/port_visits/cross_version_ais.py`: compare a candidate with production's own output ([PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703)).** With `--baseline-production ais-v5-datalake --production-date D`, only the bindings run, usually just the PR. Each is diffed on `visit_id` against the table production wrote for D. Production is not re-run.
   - **Pins:** the run finds production's Dataflow job for D (the latest `Done` one; retries reuse the name). It pins production's inputs as time-travel views as of the job's creation, and production's output as of the time the job finished. Views copy nothing and work across organisations. `--production-inputs-as-of` / `--production-output-as-of` override the times.
