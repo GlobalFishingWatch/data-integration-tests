@@ -128,6 +128,7 @@ from dit.workflow import (
     WORKER_MACHINE_TYPE_FLAG,
     WorkerSizing,
     add_worker_sizing_args,
+    log_production_sizing_hint,
     log_worker_sizings,
     max_num_workers_ceiling,
     parse_choice_list,
@@ -150,6 +151,7 @@ from workflows.port_visits.ais import DEFAULT_END as AIS_DEFAULT_END
 from workflows.port_visits.ais import DEFAULT_START as AIS_DEFAULT_START
 from workflows.port_visits.ais import SELECTABLE_MODES as AIS_SELECTABLE_MODES
 from workflows.port_visits.ais import SELECTABLE_STEPS as AIS_SELECTABLE_STEPS
+from workflows.port_visits.ais import STEP_WORKER_SIZING as AIS_STEP_WORKER_SIZING
 
 logger = logging.getLogger(__name__)
 
@@ -360,8 +362,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     # so --baseline-production can default it to the target's and the values
     # are validated before anything is pinned.
     add_worker_sizing_args(
-        p, help_detail="Forwarded to every binding's ais.py. With --baseline-production "
-                       "the default is production's own sizing; an explicit value wins.",
+        p, defaults=None,
+        help_detail="Forwarded to every binding's ais.py. Default: ais.py's, which mirrors "
+                    "production per step; with --baseline-production, the production "
+                    "target's.",
     )
     args, ais_extra_args = p.parse_known_args(argv)
     if args.pin_source_at is not None:
@@ -400,9 +404,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     # Every binding's ais.py inherits DIT_MAX_NUM_WORKERS_CEILING (and gets any
     # --max-num-workers as an extra); check the env var before anything is pinned.
     max_num_workers_ceiling()
-    # Field by field: the flag > the production target's sizing > unset.
+    # Field by field: the flag > the production target's sizing > unset, which
+    # leaves each binding's ais.py on its own production-mirrored default.
+    args.cli_worker_sizing = worker_sizing_from_args(args)
     args.worker_sizing = resolve_worker_sizing(
-        worker_sizing_from_args(args),
+        args.cli_worker_sizing,
         PRODUCTION_TARGETS[args.baseline_production].worker_sizing
         if args.baseline_production is not None else UNSET_WORKER_SIZING,
     )
@@ -889,6 +895,28 @@ def _ais_args_for_binding(
     return out
 
 
+def _binding_sizings(args: argparse.Namespace) -> dict[str, WorkerSizing]:
+    """What every binding's ais.py runs each selected step on: the wrapper's
+    resolved sizing, else ais.py's production-mirrored step default."""
+    return {
+        step: resolve_worker_sizing(args.worker_sizing, AIS_STEP_WORKER_SIZING[step])
+        for step in args.steps
+    }
+
+
+def _extra_runner(extra_args: Sequence[str]) -> str:
+    """The ``--runner`` the bindings' ais.py gets from the extras (last one
+    wins, as in argparse); ais.py's default ``dataflow`` when absent."""
+    # Each arg with the one after it (None after the last).
+    pairs = zip(extra_args, [*extra_args[1:], None], strict=False)
+    values = [
+        arg.split("=", 1)[1] if arg.startswith("--runner=") else following
+        for arg, following in pairs
+        if arg.startswith("--runner=") or (arg == "--runner" and following is not None)
+    ]
+    return values[-1] if values else "dataflow"
+
+
 def _stream_prefixed(stream, prefix: str, sink) -> None:
     """Reader thread: copies lines from ``stream`` to ``sink`` with ``prefix``.
     Python's stdout is GIL-protected at the per-write level, so concurrent
@@ -1131,7 +1159,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("modes: %s", args.modes)
     logger.info("steps: %s", ",".join(args.steps))
     logger.info("pipeline_dir: %s", args.pipeline_dir)
-    log_worker_sizings({"every binding": args.worker_sizing})
+    binding_sizings = _binding_sizings(args)
+    log_worker_sizings({f"every binding's {step}": s for step, s in binding_sizings.items()})
+    if _extra_runner(ais_extra_args) == "dataflow":
+        # The bindings read pinned copies, which no longer look like staging
+        # tables, so the hint is given here, on the sources pinned from.
+        log_production_sizing_hint(
+            args.cli_worker_sizing, binding_sizings,
+            [spec.source_table for spec in _pin_specs(args)],
+        )
 
     _verify_refs(args.pipeline_dir, args.bindings)
     pinned = _pin(args)
