@@ -72,6 +72,30 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-23 — Shared Dataflow worker cap (`--max-num-workers`) on every Dataflow workflow (PIPELINE-4701)
+
+Follow-up to point 5(a) of the 2026-10-22 pipe-anchorages v5 entry: `world-fishing-827` also runs production Dataflow, so the cap had to become one knob, not two hand-written flags.
+
+**What the audit found.** Not every "uncapped" workflow really was uncapped:
+- **pipe-gaps** (both workflows) submits in-process, and gfw-common's `Pipeline.default_options()` sets `max_num_workers: 100`. Checked at v0.10.0, v0.17.0 and v0.23.0, which covers what pipe-gaps' `~=0.10` pin can resolve to. So those runs were capped at 100 all along, by a library default nobody in dit chose.
+- **pipe-segment** hard-coded `--max_num_workers` 50 / 50 / 20 for `segment` / `segment_identity` / `segment_info`, with no flag.
+- **pipe-events** runs BigQuery SQL, not Dataflow; it is out of scope.
+
+**Design.**
+- **One helper set in `dit.workflow` § (a2):** `add_max_num_workers_arg(parser, *, default, help_detail)`, the argparse type `max_num_workers_type` and `max_num_workers_options(n)`. The type raises `SystemExit` like `validate_experiment_id`, so a bad value fails at parse time. That kept port visits' existing `>= 1` test unchanged, and the check moved out of its `main()`.
+- **Emission** is `*max_num_workers_options(...)` in the place each literal used to be, so the option order is unchanged.
+- **pipe-gaps' in-process path** passes the token as the runner's `args`. The runner signature stays the plan's contract. `_parse_args` turns the token into an option, `_build_pipeline_for` merges it into `unknown_parsed_args`, and that overrides gfw-common's 100. The cap must also join `runner_only_attrs`, because gfw-common's `from_namespace` is `cls(**vars(ns))` and a stray attribute crashes `DetectGapsConfig`. A test checks both through the real runner with stubbed Beam, gfw-common and pipe_gaps.
+- **Never raise a default** (owner rule). Port visits stays 4, encounters 50. pipe-gaps defaults to unset, so dit still emits nothing and 100 still applies. pipe-segment defaults to unset as well: each step keeps its cap, and a set flag replaces all three. A capture harness over all 18 option lists (both port-visits CLIs and runners, encounters AIS and VMS, the three pipe-segment steps, both pipe-gaps runner calls) diffed byte-identical against `origin/main`, and tests pin the cap's value and position.
+- **Cache keys:** the cap is runner-only. No `canonical_params_dict` reads it; tested for every mode of port visits and both pipe-gaps workflows.
+- **No `DIT_MAX_NUM_WORKERS`:** a silent environment variable could raise caps unnoticed. A test sets one and checks that every default is unchanged.
+
+**Proposed, not applied (owner decides; PR description).** Production caps, from composer-dags-production `origin/main` 0a644da rendered snapshots:
+- pipe-gaps detect: 50 in core.ais.v3, core.ais.v5 and core.ais.testing.detect_gaps.daily; 100 in core.vms.v5.daily; 200 in core.ais.v5.backfill. Proposal: default 50, which halves today's implicit 100.
+- pipe-segment: production's `segment` and `segment_identity_daily` run with 50, matching dit; production passes no Dataflow options to `segment_info`. No change proposed.
+- Port visits: 100 in core.ais.v3 and v5, 250 in the v5 backfill, 400 in core.vms.v5.daily. Encounters: 50 in core.ais.v3 and v5, 400 in core.vms.v5.daily. Both keep their dit defaults.
+
+**Sections moved.** `src/dit/workflow.py` (module docstring, new § (a2)); `workflows/port_visits/ais.py`; `workflows/encounters/{ais,vms}.py`; `workflows/pipe_gaps/{mode_equivalence,outage_recovery}.py` (`DEFAULT_MAX_NUM_WORKERS`, `MAX_NUM_WORKERS_HELP_DETAIL`, `_make_config`, `_build_pipeline_for`, `_run_pipeline`, `base_cfg`); `workflows/pipe_segment/identity_match_key.py` (`STEP_MAX_NUM_WORKERS`, `_step_max_num_workers`, the three argv builders, `_run_binding`); new `tests/test_max_num_workers.py` (47); `docs/conventions.md` § Prod-infra boundary; README Features; CHANGELOG § 2026-10-23 `#### Changed`.
+
 ### 2026-10-23 — Production baseline: candidate vs production's own output (PIPELINE-4703)
 
 A third comparison shape next to mode equivalence and cross-version. The bindings run on exactly what production read, and their output is diffed against what production wrote, without re-running production. The owner decided four points:

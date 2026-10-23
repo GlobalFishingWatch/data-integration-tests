@@ -15,6 +15,7 @@ dit is a **testing-shaped consumer** of GFW infrastructure. Reading from prod ta
 - Production Composer DAGs.
 - Release branches of pipeline repos.
 - Production's own prefixes in shared GCS buckets. The default Dataflow bucket (`DIT_DATAFLOW_TEMP_BUCKET=pipe-temp-us-central-ttl7`) is also production's, and production writes directly under `dataflow_temp/` and `dataflow_staging/`. Every dit job writes under `gs://<bucket>/dit/` instead. Build those paths only through `dit.dataflow_paths`, never by hand. Since 2026-10-22.
+- Production's regional Dataflow quota in `world-fishing-827`, which also runs production jobs. Every Dataflow workflow takes `--max-num-workers` through `dit.workflow.add_max_num_workers_arg` and emits it only through `max_num_workers_options`. A new workflow picks its own default and never raises an existing one; there is deliberately no env var for it. Since 2026-10-23 (PIPELINE-4701).
 
 **In scope (explicit exception):**
 

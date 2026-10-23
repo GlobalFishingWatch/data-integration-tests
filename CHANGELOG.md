@@ -23,6 +23,15 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
   Dry-run verified against production's 2026-10-20 run (job `2026-10-23_00_46_26-2424624824928045608`). Estimated full reads through the views: 1150.5 GB of thinned input, 69.6 GB `segment_info`, 103.4 GB `segs_activity`, and 443.0 GB of production output, so a live run needs `--pin-max-gb 1300`. 37 new tests; suite 624 → 661 (on top of `--no-cache`, #82). Runbook and caveats: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
 
+#### Changed
+- **`--max-num-workers` is one shared flag on every Dataflow workflow ([PIPELINE-4701](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4701)).** `world-fishing-827` is also the execution project of production Dataflow jobs, so an unbounded dit run could take regional quota from them. The flag, its validation and its emission now live in `dit.workflow` (`add_max_num_workers_arg`, `max_num_workers_options`); each workflow passes its own default. No default changed, and default runs emit byte-identical Beam options (checked with a capture harness over all 18 option lists, and pinned by tests):
+  - `port_visits/ais.py`: 4 (unchanged). `cross_version_ais.py` still forwards the flag to every binding.
+  - `encounters/ais.py` and `vms.py`: 50 (unchanged). Values below 1 are now rejected here too.
+  - `pipe_gaps/mode_equivalence.py` and `outage_recovery.py`: **new flag**, unset by default. Unset, dit emits no cap and gfw-common's `Pipeline` default applies: 100 workers, as before. Set, it overrides that default through the in-process runner. DirectRunner (`--runner docker`) runs get no cap.
+  - `pipe_segment/identity_match_key.py`: **new flag**, unset by default. Unset, each step keeps its hard-coded cap (`segment` 50, `segment_identity` 50, `segment_info` 20); set, it replaces all three.
+
+  Dataflow runner only, and never part of a cache key (tested for every cached workflow and mode). No `DIT_MAX_NUM_WORKERS` env var, on purpose: a silent environment variable could raise a cap unnoticed. Non-integers and values below 1 fail at argument parsing, before any cloud call. 47 new tests in `tests/test_max_num_workers.py`; suite 661 → 708.
+
 ### 2026-10-22
 
 #### Fixed
