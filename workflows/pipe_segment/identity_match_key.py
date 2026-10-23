@@ -103,6 +103,8 @@ from dit.workflow import (
     DEFAULT_DATAFLOW_TEMP_BUCKET,
     EXPERIMENT_ID_RE,
     add_experiment_id_arg,
+    add_max_num_workers_arg,
+    max_num_workers_options,
     resolve_run_context,
 )
 
@@ -208,6 +210,23 @@ DOWNSTREAM_OUTPUT_TABLES = (
     "segment_info",
 )
 
+# Dataflow worker cap per step. segment and segment_identity match production
+# (segment.segment and segment.segment_identity_daily run with 50 in core.ais.v3
+# and core.vms.v5.daily). Production passes no Dataflow options to
+# segment_info, so its 20 is dit's own. --max-num-workers (unset by default)
+# replaces all three for one run (PIPELINE-4701).
+STEP_MAX_NUM_WORKERS = {
+    "segment": 50,
+    "segment_identity": 50,
+    "segment_info": 20,
+}
+
+
+def _step_max_num_workers(step: str, override: int | None) -> int:
+    """The cap for ``step``: ``--max-num-workers`` when set, else the step's own."""
+    return STEP_MAX_NUM_WORKERS[step] if override is None else override
+
+
 # Compare-key map per output table. Verified against pipe_segment/schemas/
 # (segment_schema.py, message_schema.py) and segment_identity/pipeline.py.
 # Each row in the date-partitioned tables is uniquely identified by these
@@ -310,6 +329,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--service-account",
                    default="automated-testing@world-fishing-827.iam.gserviceaccount.com",
                    help="Service account for Dataflow runs.")
+    step_caps = ", ".join(f"{step} {cap}" for step, cap in STEP_MAX_NUM_WORKERS.items())
+    add_max_num_workers_arg(
+        p, default=None,
+        help_detail=f"Set, it replaces the cap of all three steps. Unset, each step keeps "
+                    f"its own: {step_caps}.",
+    )
     args = p.parse_args(argv)
 
     args.bindings = [_parse_binding(b) for b in args.bindings]
@@ -618,6 +643,7 @@ def _segment_args(
     ssvid_filter_query: Optional[str],
     service_account: str,
     include_satellite_offsets: bool,
+    max_num_workers: Optional[int] = None,
 ) -> list[str]:
     """CLI args for `pipe-segment segment`.
 
@@ -695,7 +721,7 @@ def _segment_args(
             "--setup_file=./setup.py",
             "--wait_for_job",
             "--region=us-central1",
-            "--max_num_workers=50",
+            *max_num_workers_options(_step_max_num_workers("segment", max_num_workers)),
             "--worker_machine_type=e2-standard-4",
             "--disk_size_gb=50",
             "--experiments=use_runner_v2",
@@ -718,6 +744,7 @@ def _segment_identity_args(
     runner: str,
     worker_image: Optional[str],
     service_account: str,
+    max_num_workers: Optional[int] = None,
 ) -> list[str]:
     """CLI args for `pipe-segment segment_identity`."""
     start, end = date_range
@@ -738,7 +765,7 @@ def _segment_identity_args(
             "--setup_file=./setup.py",
             "--wait_for_job",
             "--region=us-central1",
-            "--max_num_workers=50",
+            *max_num_workers_options(_step_max_num_workers("segment_identity", max_num_workers)),
             "--no_use_public_ips",
             "--network=gfw-internal-network",
             "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
@@ -756,6 +783,7 @@ def _segment_info_args(
     runner: str,
     worker_image: Optional[str],
     service_account: str,
+    max_num_workers: Optional[int] = None,
 ) -> list[str]:
     """CLI args for `pipe-segment segment_info`.
 
@@ -781,7 +809,7 @@ def _segment_info_args(
             "--setup_file=./setup.py",
             "--wait_for_job",
             "--region=us-central1",
-            "--max_num_workers=20",
+            *max_num_workers_options(_step_max_num_workers("segment_info", max_num_workers)),
             "--no_use_public_ips",
             "--network=gfw-internal-network",
             "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
@@ -933,6 +961,7 @@ def _run_binding(
             ssvid_filter_query=args.ssvid_filter_query,
             service_account=args.service_account,
             include_satellite_offsets=args.include_satellite_offsets,
+            max_num_workers=args.max_num_workers,
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -953,6 +982,7 @@ def _run_binding(
             runner=args.runner,
             worker_image=image_tag,
             service_account=args.service_account,
+            max_num_workers=args.max_num_workers,
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -969,6 +999,7 @@ def _run_binding(
             runner=args.runner,
             worker_image=image_tag,
             service_account=args.service_account,
+            max_num_workers=args.max_num_workers,
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,

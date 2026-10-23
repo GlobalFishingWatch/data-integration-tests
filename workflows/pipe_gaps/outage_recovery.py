@@ -157,7 +157,9 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
+    add_max_num_workers_arg,
     add_no_cache_arg,
+    max_num_workers_options,
     resolve_run_context,
 )
 
@@ -166,10 +168,12 @@ from workflows.pipe_gaps.mode_equivalence import (
     DEFAULT_BQ_TEMP_DATASET,
     DEFAULT_FILTER_GOOD_SEG,
     DEFAULT_IMAGE_TAG,
+    DEFAULT_MAX_NUM_WORKERS,
     DEFAULT_MIN_GAP_LENGTH,
     DEFAULT_N_HOURS_BEFORE,
     DEFAULT_WINDOW_PERIOD_D,
     DEFAULT_WORKER_IMAGE,
+    MAX_NUM_WORKERS_HELP_DETAIL,
     PIPELINE_NAME,
     PROJECT,
     REPO_NAME,
@@ -505,6 +509,7 @@ def _make_config(
     worker_image: Optional[str] = None,
     job_name: Optional[str] = None,
     labels: Optional[Sequence[str]] = None,
+    max_num_workers: Optional[int] = None,
 ) -> SimpleNamespace:
     """Build a DetectGapsConfig-shaped namespace.
 
@@ -540,6 +545,8 @@ def _make_config(
     cfg.dataflow_subnetwork = dataflow_subnetwork
     cfg.worker_image = worker_image
     cfg.job_name = job_name
+    # Runner-only, as in mode_equivalence._make_config.
+    cfg.max_num_workers = max_num_workers
     return cfg
 
 
@@ -599,6 +606,7 @@ def _build_pipeline_for(cfg: SimpleNamespace):
             "dataflow_subnetwork",
             "worker_image",
             "job_name",
+            "max_num_workers",
         }
         cfg_attrs = {k: v for k, v in vars(cfg).items() if k not in runner_only_attrs}
         df_cfg = SimpleNamespace(**cfg_attrs)
@@ -645,7 +653,8 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
                 "DEFAULT_WORKER_IMAGE)."
             )
         rc = dit_dataflow.run(
-            args=[],
+            # The worker cap, if any; see mode_equivalence._run_pipeline.
+            args=max_num_workers_options(cfg.max_num_workers),
             image_tag=cfg.worker_image,
             service_account=cfg.service_account,
             region=cfg.dataflow_region,
@@ -840,6 +849,7 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
     ``--source-*`` + pin-at timestamp produce the same snapshot CONTENT
     regardless of where the snapshot table lives (canonical-dataset
     shape: snapshots are tables in ``tech_great_expectations``).
+    ``--max-num-workers`` is runner-only and not in the key either.
     """
     params: dict[str, Any] = {
         "mode": mode,
@@ -1117,6 +1127,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                          "gains a `synthetic_outage=true` marker (recovery mode only "
                          "-- the oracle's output is invariant to the flag)."))
     add_infra_args(p)
+    add_max_num_workers_arg(
+        p, default=DEFAULT_MAX_NUM_WORKERS, help_detail=MAX_NUM_WORKERS_HELP_DETAIL,
+    )
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE)
@@ -1337,6 +1350,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dataflow_subnetwork=args.dataflow_subnetwork or None,
         worker_image=args.worker_image or None,
         labels=dit_labels,
+        max_num_workers=args.max_num_workers,
     )
 
     base = f"{PROJECT}.{args.dest_dataset}.outage_{suffix}"

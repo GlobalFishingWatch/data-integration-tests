@@ -120,7 +120,9 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
+    add_max_num_workers_arg,
     add_modes_arg,
+    max_num_workers_options,
     parse_modes,
     resolve_run_context,
 )
@@ -486,7 +488,7 @@ def _pipeline_options(
         # Bound autoscaling. Without this a wide run (all vessels over a year)
         # scales freely; prod caps this same step at 50
         # (detect_encounters_config.max_num_workers in composer-dags).
-        f"--max_num_workers={args.max_num_workers}",
+        *max_num_workers_options(args.max_num_workers),
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
         "--wait_for_job",
@@ -711,9 +713,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "env-var fallback DIT_BQ_TEMP_DATASET (defaults to "
                         "${PROJECT}.${DIT_DEST_DATASET}). Needs an image that "
                         "exposes --temp_dataset; see the module docstring.")
-    p.add_argument("--max-num-workers", type=int, default=DEFAULT_MAX_NUM_WORKERS,
-                   help=f"Dataflow autoscaling ceiling, mirroring prod's cap for this "
-                        f"step. Default: {DEFAULT_MAX_NUM_WORKERS}")
+    add_max_num_workers_arg(
+        p, default=DEFAULT_MAX_NUM_WORKERS,
+        help_detail="The default mirrors production's cap for both encounters steps.",
+    )
     p.add_argument("--build-from-source", action="store_true",
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one. Recommended on laptop: "

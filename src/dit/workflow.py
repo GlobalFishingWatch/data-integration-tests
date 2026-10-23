@@ -5,7 +5,8 @@ Both ``workflows/pipe_gaps/mode_equivalence.py`` and
 pipeline-specific logic:
 
 * per-user infra knobs (DIT_* env-backed defaults + the argparse flags that
-  override them);
+  override them), plus the Dataflow worker cap (``--max-num-workers``, a
+  per-workflow default with no env var);
 * the ``--experiment-id`` slug (validation, auto-default, argparse flag);
 * the ``main()`` preamble that resolves the committed pipeline ref, classifies
   it as reviewed/unreviewed, ensures a worker image exists, and stamps the
@@ -109,6 +110,70 @@ def add_infra_args(parser: argparse.ArgumentParser) -> None:
     """
     add_dataset_args(parser)
     add_dataflow_args(parser)
+
+
+# --------------------------------------------------------------------------
+# (a2) Dataflow worker cap (PIPELINE-4701)
+# --------------------------------------------------------------------------
+# world-fishing-827 is also the execution project of production Dataflow jobs
+# (e.g. core.ais.v5.backfill), so an uncapped dit run competes with production
+# for regional CPU and IP quota. Every Dataflow workflow takes --max-num-workers
+# through these helpers, each with its own default (None = dit emits no cap).
+# The cap is runner-only: it never changes output, so it stays out of every
+# cache key. Deliberately no DIT_* env-var fallback: a silent environment
+# variable could raise a cap without anyone noticing.
+
+MAX_NUM_WORKERS_FLAG = "--max-num-workers"
+
+
+def max_num_workers_type(value: str) -> int:
+    """argparse ``type`` for ``--max-num-workers``: an integer of at least 1.
+
+    Raises ``SystemExit`` with the reason, like :func:`validate_experiment_id`,
+    so a bad value fails before any cloud call.
+    """
+    try:
+        workers = int(value)
+    except ValueError:
+        raise SystemExit(
+            f"error: {MAX_NUM_WORKERS_FLAG} must be an integer; got {value!r}."
+        ) from None
+    if workers < 1:
+        raise SystemExit(f"error: {MAX_NUM_WORKERS_FLAG} must be >= 1; got {workers}.")
+    return workers
+
+
+def add_max_num_workers_arg(
+    parser: argparse.ArgumentParser,
+    *,
+    default: int | None,
+    help_detail: str = "",
+) -> None:
+    """Add ``--max-num-workers`` (the Dataflow autoscaling ceiling per job).
+
+    ``default`` is the workflow's own cap, or ``None`` when the workflow
+    emits none of its own. Emit the parsed value with
+    :func:`max_num_workers_options`. ``help_detail`` says what the default is
+    sized for, or what applies when it is ``None``.
+    """
+    shown = "unset" if default is None else str(default)
+    parser.add_argument(
+        MAX_NUM_WORKERS_FLAG, type=max_num_workers_type, default=default,
+        help=(
+            f"Dataflow autoscaling ceiling per job (Beam's --max_num_workers). "
+            f"Default: {shown}. Dataflow runner only. It does not affect output, "
+            f"so it is not part of the cache key."
+            + (f" {help_detail}" if help_detail else "")
+        ),
+    )
+
+
+def max_num_workers_options(max_num_workers: int | None) -> list[str]:
+    """Beam option tokens for the cap: ``["--max_num_workers=N"]``, or ``[]``
+    when ``max_num_workers`` is ``None``."""
+    if max_num_workers is None:
+        return []
+    return [f"--max_num_workers={max_num_workers}"]
 
 
 # --------------------------------------------------------------------------
