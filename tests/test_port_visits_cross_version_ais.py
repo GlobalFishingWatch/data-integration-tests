@@ -336,6 +336,11 @@ def test_ais_args_for_binding_omits_thinned_when_absent() -> None:
     assert "--thinned-message-table" not in _binding_args([])
 
 
+def test_ais_args_for_binding_forwards_no_cache_to_every_binding() -> None:
+    """A determinism re-run on reused pins needs every binding to recompute."""
+    assert "--no-cache" in _binding_args(["--no-cache"])
+
+
 def test_ais_args_for_binding_forwards_steps_and_drops_user_steps() -> None:
     """The wrapper owns --steps: it decides what was pinned and what is
     diffed, so a user extra must not desync the bindings from either."""

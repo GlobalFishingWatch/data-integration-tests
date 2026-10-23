@@ -22,6 +22,7 @@ from workflows.pipe_gaps import outage_recovery as mod
 def _args(**overrides: Any) -> argparse.Namespace:
     base = dict(
         experiment_id="exp01",
+        no_cache=False,
         start="2020-01-01",
         backfill_end="2020-12-28",
         outage_start="2020-12-29",

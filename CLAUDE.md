@@ -104,10 +104,25 @@ The cost is a hard deadline: `global-fishing-watch.pipe_ais_v3_published` keeps 
 - New `src/dit/production.py` and `docs/production-baseline-2026-10.md`.
 - `src/dit/bq.py`: time-travel view section, plus `require_pinned_source` accepting view pins.
 - `workflows/port_visits/cross_version_ais.py`: `ProductionTarget` / `PRODUCTION_TARGETS`, five flags, `_apply_production_mode`, `_RUN_SHAPE_DEFAULTS`, `_pin_production` + `_pin`, `_run_production_diffs`, docstring.
-- Tests: `tests/test_production.py`, plus additions to `tests/test_bq.py` and `tests/test_port_visits_cross_version_ais.py` (+37; 618 → 655).
+- Tests: `tests/test_production.py`, plus additions to `tests/test_bq.py` and `tests/test_port_visits_cross_version_ais.py` (+37; 624 → 661 after merging #82).
 - README Features, Source data targets and Roadmap 7c; CHANGELOG 2026-10-23.
 
 **Sections NOT moved.** No live run. The first is PIPELINE-4690's PR #176 against production's run, gated on the owner's go-ahead (≤100 workers, `--pin-max-gb 1300`, inside the 48 h window). Whether `automated-testing@` may list production's Dataflow jobs and read dataset metadata in Cloud Build is untested: the dry run ran as the operator.
+
+### 2026-10-22 — `--no-cache`: the run cache and determinism checks
+
+**Problem.** Planning the PIPELINE-4690 September run turned up a conflict. The plan included a determinism re-run on the same pinned inputs, but such a rerun has the same cache key as the first run, so `run_with_cache` returns the first run's table and the check compares a table with itself.
+
+The workaround I first proposed was two concurrent bindings of the same ref, which both miss the cache. The owner asked whether that is a race to prevent. It is: the bindings don't collide (plain INSERTs, separate suffixes and run ids; lookups take the newest row by `started_at`), but a binding that starts after the other has written its row hits the cache and passes vacuously, and the wrapper's verdict cannot tell. A check whose value is catching problems must not depend on timing.
+
+**Decision.** Add a bypass:
+- `dit.workflow.add_no_cache_arg` + `run_with_cache(use_cache=...)`, wired into all three run-cache consumers (the third consumer makes a shared helper due).
+- The run is still recorded: `dit_runs` is also the cleanup registry for `cancel_run`, so skipping the write would orphan tables. As the newest row for its key, it is what later lookups return.
+- `cross_version_ais.py` forwards `--no-cache` through its pass-through extras, with no wrapper code change.
+
+Recorded in `docs/run-cache.md` § known limitations: the cache presumes the pipeline is deterministic, and a nondeterministic pipeline makes it unsound.
+
+**Sections moved.** `src/dit/workflow.py` § (d); the three workflows' parsers and `_run_with_cache` adapters; `tests/test_workflow.py`, `tests/test_port_visits_ais.py` (+ `no_cache` on three test namespaces); `docs/run-cache.md`; README Features (run cache) and § Source data targets (legacy sharded `raw_port_events` row); CHANGELOG.
 
 ### 2026-10-22 — `--steps` on the port-visits workflows (explicit step selection)
 

@@ -33,6 +33,7 @@ from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
     add_modes_arg,
+    add_no_cache_arg,
     parse_modes,
     resolve_run_context,
 )
@@ -603,6 +604,7 @@ def _run_with_cache(
         output_fqn=output_fqn,
         execute_kwargs=execute_kwargs,
         log_label=mode,
+        use_cache=not args.no_cache,
     )
 
 
@@ -628,6 +630,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--skip-open-gaps", action="store_true")
     p.add_argument("--suffix", default=None)
     add_experiment_id_arg(p)
+    add_no_cache_arg(p)
     p.add_argument("--require-clean", action="store_true",
                    help="Error on a dirty tree instead of auto-snapshotting "
                         "(for CI / strict-provenance callers).")

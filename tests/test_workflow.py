@@ -499,6 +499,48 @@ def test_run_with_cache_hit_returns_cached_and_skips_execute() -> None:
     assert result == "proj.ds.cached_table"
 
 
+def test_run_with_cache_without_cache_recomputes_despite_a_hit_and_records_the_run() -> None:
+    """--no-cache: a determinism re-run must actually run. With a lookup, a
+    repeat of the same key returns the earlier table and the comparison checks
+    a table against itself. The row is still written (cleanup, provenance)."""
+    execute_fn = MagicMock()
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=_cached_row()) as mock_read,
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True]),
+        patch.object(dit_workflow, "write_cache") as mock_write,
+        patch.object(dit_workflow, "expires_at_for",
+                     return_value=datetime(2026, 11, 1, tzinfo=timezone.utc)),
+    ):
+        result = dit_workflow.run_with_cache(
+            execute_fn,
+            ctx=_ctx(),
+            workflow="workflows/pipe_gaps/mode_equivalence.py",
+            pipeline="pipe-gaps",
+            experiment_id="exp01",
+            cache_key=_cache_key(),
+            output_fqn="proj.ds.fresh_table",
+            execute_kwargs={},
+            use_cache=False,
+        )
+    mock_read.assert_not_called()
+    execute_fn.assert_called_once_with()
+    mock_write.assert_called_once()
+    assert result == "proj.ds.fresh_table"
+
+
+@pytest.mark.parametrize("workflow", [
+    "workflows.pipe_gaps.mode_equivalence",
+    "workflows.pipe_gaps.outage_recovery",
+    "workflows.port_visits.ais",
+])
+def test_every_cache_consumer_offers_no_cache(workflow) -> None:
+    import importlib
+
+    mod = importlib.import_module(workflow)
+    assert mod.parse_args([]).no_cache is False
+    assert mod.parse_args(["--no-cache"]).no_cache is True
+
+
 def test_run_with_cache_miss_runs_executes_and_writes_row() -> None:
     execute_fn = MagicMock()
     with (
