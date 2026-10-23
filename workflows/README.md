@@ -9,9 +9,14 @@ mode-equivalence test.
 | Workflow | Pipeline | Runner | Compare shape | Cache |
 |---|---|---|---|---|
 | `pipe_gaps/mode_equivalence.py` | pipe-gaps (detect-gaps) | Beam **in-process** (`dit.runners.dataflow`) | SCD-2 (`_last_versions`, keyed by gap key) | yes (`dit_runs`) |
-| `port_visits/ais.py` | anchorages_pipeline (port-visits) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `visit_id`) | yes (`dit_runs`) |
+| `pipe_gaps/outage_recovery.py` | pipe-gaps (detect-gaps) | Beam **in-process** (`dit.runners.dataflow`) | SCD-2 (`_last_versions`, `gap_id` + `start_timestamp`): staged outage-and-recovery run vs a single-shot oracle | yes (`dit_runs`) |
+| `port_visits/ais.py` | anchorages_pipeline (port-visits) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `visit_id`; `(identifier, timestamp)` with `--steps thin_port_messages`) | yes (`dit_runs`) |
+| `port_visits/cross_version_ais.py` | anchorages_pipeline (port-visits) | N per-binding subprocess invocations of `ais.py`, each from a `git worktree` at that binding's ref; with `--baseline-production`, the candidate binding only, diffed against production's own output | truncate, same keys as `ais.py`, pairwise across bindings | via each binding's `ais.py` |
 | `pipe_events/fishing.py` | pipe-events (fishing events) | **BQ-SQL via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `event_id`) | no (deferred) |
 | `pipe_events/cross_version_fishing.py` | pipe-events (fishing events) | N per-binding subprocess invocations of `fishing.py` (each with its own **BQ-SQL via container** runtime, from a `git worktree` at that binding's ref) | truncate (`view_suffix=""`, `event_id`) across BOTH `_fishing_events` and `_product_events_fishing` views | no (deferred with `fishing.py`) |
+| `pipe_segment/identity_match_key.py` | pipe-segment (cross-version, gpsdio-segment match key) | Beam **via container** (`dit.runners.docker`), one binding at a time, each from a `git worktree` at that binding's ref | truncate (`view_suffix=""`), per-table keys (`COMPARE_KEYS`), pairwise across bindings | no |
+| `encounters/ais.py` | encounters_pipeline (encounters generation) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `encounter_id`) on both the raw and merged tables | no |
+| `encounters/vms.py` | encounters_pipeline (encounters generation, VMS) | same execution as `encounters/ais.py` (`ais.run(args)`); only defaults and help differ | same as `encounters/ais.py` | no |
 
 ## Framework-extraction decision (2026-05-29) — `dit.phases` DEFERRED
 
@@ -61,3 +66,23 @@ Beam pipeline, or another 1-day-slice pipeline). At that point the shared shape 
 proven by two real consumers and the abstraction stops being speculative. Until
 then the duplication is deliberate (decision 7, "duplicate until 3" — here, three
 is the count that told us *not* to extract).
+
+### Update (2026-10-23): revisit conditions met
+
+Both conditions now hold:
+
+- **Two consumers share a daily-window shape exactly.** `execute_bf` /
+  `execute_bfd` / `execute_bftruncate` in `encounters/ais.py` slice dates the same
+  way as in `port_visits/ais.py`: bf is one `[start, end]` slice; bfd backfills
+  `[start, end - tail_days]`, then runs one single-day slice per day through
+  `end`; bftruncate backfills `[start, end]`, then re-runs the last `tail_days`
+  days one at a time. Iteration counts (`1 + tail_days`) match too. Only the
+  per-slice `_run_slice` differs.
+- **A third cross-version wrapper exists.** `port_visits/cross_version_ais.py`,
+  `pipe_events/cross_version_fishing.py` and `pipe_segment/identity_match_key.py`
+  all verify binding refs, pin sources, run each binding from a `git worktree`
+  and diff outputs pairwise.
+
+Planned extraction order, one step at a time: `dit.cross_version` first, then the
+shared run scaffolding, then `dit.phases` (date slicing only; per-slice execution
+stays in each workflow), then `dit.cohorts`. Nothing is extracted yet.

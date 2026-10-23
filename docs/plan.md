@@ -9,25 +9,15 @@ Goal: a standalone repo at `/mnt/encrypted_data/git/data_integration_tests` that
 This ordering — refactor first, new consumer second — is the conservative path. The pipe-gaps test is already working code; lifting it forces only mechanical extraction. Port visits then becomes the first real test of whether the extracted helpers (`Runner`, `Compare`) generalise. If they don't, we find out before pipe-events is in the picture.
 
 User-confirmed decisions:
-- Phase 2 (port visits) ships **both AIS and VMS** workflows — production runs both.
+- Phase 2 (port visits) ships **both AIS and VMS** workflows — production runs both. (VMS deferred 2026-10-23, see § Phase 2.)
 - The `--runner=local` Python-import path **is dropped** in the migrated repo. Docker (DirectRunner-in-container) replaces it.
 - Pipeline docker images are **published on a registry**; workflows reference tagged images. Build-from-source is not the Phase 1 default.
 
-## Status at a glance (2026-05-15)
+## Status
 
-| Phase / capability | Status |
-|---|---|
-| Phase 1 — pipe-gaps port | **Code complete.** Real-BQ verification + Track 5 (pipe-gaps repo shim) pending. |
-| Phase 2 — port-visits | **AIS-staging verified 2026-05-15** (3/3 pairwise green on `visit_id`). VMS not started; AIS-full not started. |
-| Phase 3 — pipe-events port | **Code complete (2026-05-29).** Workflow + automated comparison landed; framework extraction deliberately deferred. Live e2e run + pipe-events-repo shim pending. |
-| Phase 4 — composer-dags param sync | Not started. |
-| Phase 5 — mutation library | Not started. |
-| Phase 6 — phase sharing / hash-based caching | Not started. |
-| Phase 7 — golden-table regression mode | Not started. |
-| **Cross-version experiments capability** | Landed mid-Phase 2; see § below. Validated end-to-end via the PIPELINE-1465 cross-version test. |
-| **Runtime & CI (Cloud Build)** | Designed; implementation pending. See § below. |
+This doc is the design record: architecture, decisions, API contracts and the scope of each phase. It does not track status. Since 2026-10-23 the single status source is [`README.md`](../README.md) § Roadmap (the phase table plus the operational list below it). The PR-trigger arc has its own sequencing plan, [`pr-triggers-2026-06.md`](pr-triggers-2026-06.md).
 
-Per-commit history of plan-doc evolution lives in `CLAUDE.md` § Plan changelog. User-facing change log lives in `CHANGELOG.md`. The **Next steps** section near the bottom of this doc is the rolling operational list.
+Per-commit history of plan-doc evolution lives in `CLAUDE.md` § Plan changelog. User-facing change log lives in `CHANGELOG.md`.
 
 ## Architecture: three-repo split
 
@@ -217,7 +207,7 @@ A workflow file is a Python module with a `main(argv: Sequence[str] | None = Non
 
 ## Phase 1 — Refactor: pipe-gaps moves to the shared repo
 
-**Status:** Code complete; Track 5 cutover + real-BQ byte-equivalence verification still pending.
+**Status:** see README § Roadmap, row 1.
 
 **Scope.** Stand up the new repo. Port `mode_equivalence.py` from `pipe-gaps/tests/integration/` to `data_integration_tests/workflows/pipe_gaps/`. Extract runners (`docker`, `dataflow`), `compare_tables`, and `_daterange_inclusive` into `dit/`. Drop `--runner=local`. Replace pipe-gaps' file with a shim. Verify the four-mode equivalence test produces output identical to a pre-move reference run.
 
@@ -263,7 +253,7 @@ Five tracks. 1–3 are independent and parallelisable; 4 depends on 2+3; 5 depen
 
 ## Phase 2 — Port visits
 
-**Status:** AIS-staging verified 2026-05-15 (3/3 pairwise green on `visit_id`). VMS workflow not started. AIS-full not started.
+**Status:** see README § Roadmap, row 2. Scope change 2026-10-23 (owner, "wrapping up port visits on DIT for now"): the VMS workflow and AIS-full are deferred, so `vms.py` and `params.yaml` below are not built.
 
 **Scope.** Build port-visits workflows for AIS and VMS, exercising the helpers extracted in Phase 1. This is the abstraction-validation step: if `dit.compare`'s `view_suffix=""` path doesn't work, or if `dit.runners.docker` can't accept a different image tag without surprise, Phase 1's design needs adjustment.
 
@@ -312,12 +302,12 @@ A capability not in the original Phase 1-7 numbering, emerged from the PIPELINE-
 
 - **Reference catalog (deferred V2).** Today's cross-version runs both bindings every time. The optimisation that caches main's output as a no-TTL reference and lets PRs run only the candidate side is sketched in the 2026-05-15 Plan changelog and explicitly deferred until the 12-hour-run cost becomes operationally painful.
 - **`--fail-on-diff` mode for PR gating.** Today's wrapper treats diff as information; PR-gating semantics flip this. One-flag addition when needed.
-- **Pipe-gaps parity.** `workflows/pipe_gaps/mode_equivalence.py` doesn't yet use the experiment-id-driven labels or structured job names. A cross-version workflow file for pipe-gaps would mirror `cross_version_ais.py` for the detect-gaps shape.
-- **`--temp_dataset` upstream.** Currently a local patch on `anchorages_pipeline@dit-temp-dataset-support`; the PIPELINE-1465 cross-version test uses synthetic branches that cherry-pick it. Upstream PR pending.
+- **Pipe-gaps cross-version workflow.** None exists. Job names and the cleanup label are at parity (see Open items); a cross-version workflow for pipe-gaps would mirror `cross_version_ais.py` for the detect-gaps shape.
+- **`--temp_dataset` for pipe-anchorages: no upstream PR (decision 2026-10-22, PIPELINE-4699).** The v4.6.4 CLI's `--temp_dataset` only ever existed on the local `anchorages_pipeline@dit-temp-dataset-support` branch, which the PIPELINE-1465 synthetic branches cherry-picked. For the v5 CLI, dit builds a test-only overlay image instead ([`docker/overlays/pipe-anchorages-temp-dataset/`](../docker/overlays/pipe-anchorages-temp-dataset/README.md)); it is never proposed upstream.
 
-## Runtime & CI (planned)
+## Runtime & CI
 
-Today the orchestrator runs on the user's laptop. Babysitting a 12-hour cross-version run is impractical (suspending the laptop kills the run). Design settled on **Cloud Build** for both ad-hoc and PR-triggered runs.
+Originally the orchestrator ran on the user's laptop. Babysitting a 12-hour cross-version run is impractical (suspending the laptop kills the run). Design settled on **Cloud Build** for both ad-hoc and PR-triggered runs. The ad-hoc path (items 1-3 below) landed 2026-05-15; items 4-6 are still open (status: README § Roadmap).
 
 **Why Cloud Build:** GFW already uses it (per `anchorages_pipeline/cloudbuild/`); 24h step timeout covers AIS-full; serverless billing (~$4/day worst case for a 24h run; dominated by Dataflow worker-hours anyway); native docker host; auth via build-step SA; triggerable three ways without code change (`gcloud builds submit` ad-hoc, GitHub webhook for PRs, Cloud Scheduler for nightly).
 
@@ -371,7 +361,7 @@ pipe-events is **structurally different from the other two consumers**, which is
 - The run-cache key's `worker_image_digest` is Dataflow-shaped and doesn't map to a build-from-source BQ-SQL run (code identity is `pipeline_commit` + the container image) → **defer caching for pipe-events** (ship uncached, like port-visits initially); settle the docker-runner cache-key shape separately.
 - `resolve_run_context` otherwise fits — `ensure_worker_image` no-ops for the docker runner, and it still records `pipeline_commit`/`unreviewed` for provenance.
 
-**Framework-extraction decision (2026-05-29) — DEFERRED, do not extract `dit.phases`.** Putting `execute_bf/bfd/bftruncate` from all three consumers side-by-side (Beam-in-process / Beam-via-container / BQ-SQL-via-container): the per-slice **execution** bodies are <20% similar (different runners, step counts — 1 vs 2 vs 4 — table-naming, and arg shapes). The genuinely-shared part is only the **date-slice arithmetic**, but even that diverges in the daily-window definition: pipe-gaps subtracts `backfill_days_w` to build each daily slice (`[d - W, d)`); port-visits and pipe-events use 1-day slices (`[d, d+1)` / single-day-end). A `dit.phases` yielding `(start, end)` slices would save ~6 lines per workflow at the cost of a leaky abstraction that must model three different daily-window conventions. **Verdict: keep the three `execute_*` explicit; revisit only if a fourth consumer shares one of the existing daily-window shapes exactly.** Full reasoning recorded in `workflows/README.md`. Three was the right number to decide — and the decision is "the shapes are different enough to keep them explicit."
+**Framework-extraction decision (2026-05-29) — DEFERRED, do not extract `dit.phases`.** Putting `execute_bf/bfd/bftruncate` from all three consumers side-by-side (Beam-in-process / Beam-via-container / BQ-SQL-via-container): the per-slice **execution** bodies are <20% similar (different runners, step counts — 1 vs 2 vs 4 — table-naming, and arg shapes). The genuinely-shared part is only the **date-slice arithmetic**, but even that diverges in the daily-window definition: pipe-gaps subtracts `backfill_days_w` to build each daily slice (`[d - W, d)`); port-visits and pipe-events use 1-day slices (`[d, d+1)` / single-day-end). A `dit.phases` yielding `(start, end)` slices would save ~6 lines per workflow at the cost of a leaky abstraction that must model three different daily-window conventions. **Verdict: keep the three `execute_*` explicit; revisit only if a fourth consumer shares one of the existing daily-window shapes exactly.** Full reasoning recorded in `workflows/README.md`. Three was the right number to decide — and the decision is "the shapes are different enough to keep them explicit." **Revisit conditions met (2026-10-23):** encounters' slicing is identical to port-visits', and a third cross-version wrapper exists. The planned extraction order is in `workflows/README.md`; nothing is extracted yet.
 
 **Open investigations — RESOLVED (2026-05-29).** (1) **Container entrypoint:** the image bakes `scripts/run` as ENTRYPOINT; the bash overrides it with `--entrypoint pipe` (the `pipe = pipe_events.cli:main` console script) and runs against the `pipeline` compose service. The dit workflow uses `dit_docker.run(entrypoint="pipe", service="pipeline", volumes=["gcp:/root/.config"])`. (2) **Output keys:** NOT SCD-2 — keyed by `event_id`, table-level versioning, compared via the latest-version view (see the Comparison shape correction above). (3) **Contract audit + adoption matrix:** updated in `docs/pipeline-contract.md` in the Phase 3 PR. **Estimated effort** was ~2–3 days; landed in one branch (commits A–E) after M5b.
 
@@ -385,20 +375,20 @@ pipe-events is **structurally different from the other two consumers**, which is
 
 **Phase 7 — Golden-table regression mode.** Per-workflow reference `_1_bf` table keyed by `(image-tag, params-hash, date-range)`; future runs assert byte-equivalence vs the golden table. Cheap PR-validation regression check; doesn't replace the four-mode test on `main`.
 
-## Next steps (rewritten 2026-05-22; cache rollout update)
+## Next steps (design intent only; status moved to README § Roadmap on 2026-10-23)
 
-The Cloud Build path validation + the framework's first real bug catch (`pipe-gaps:v0.9.6` mode-equivalence) closed the previous-iteration items 1, 2, and 4. The run cache (M1–M4 of 6) landed 2026-05-22 in PRs #16–#19; M5 and M6 are in flight. Rough priority order:
+This section used to be the rolling priority list (last rewritten 2026-05-22). It drifted from README § Roadmap, so status and priority now live only there, and the PR-trigger arc is sequenced in [`pr-triggers-2026-06.md`](pr-triggers-2026-06.md). Other docs refer to the items below by their 2026-05-22 numbers, so the numbers are kept; each item records what was designed, not where it stands.
 
-1. **Content-addressable run cache (`tech_great_expectations.dit_runs`).** ✓ **M1–M4 done.** Scaffolding + BQ read + BQ write (DML INSERT) + workflow integration in pipe-gaps. Remaining: **M5** (port-visits cache integration + `make dit-cancel` + `cancel_run`) and **M6** (SIGTERM trap inside `dit run` for live-cancel cleanup). Design: [`docs/run-cache.md`](run-cache.md); milestone tracker: [`docs/run-cache-impl.md`](run-cache-impl.md). Replaces the previously-aspirational Phase 7 "golden table" concept.
+1. **Content-addressable run cache (`tech_great_expectations.dit_runs`).** Scaffolding, BQ read, BQ write (DML INSERT), workflow integration, cleanup control plane (`cancel_run`, `make dit-cancel`) and the SIGTERM trap in `dit run`: milestones M1-M6. Design: [`docs/run-cache.md`](run-cache.md); milestone tracker: [`docs/run-cache-impl.md`](run-cache-impl.md). Replaces the previously-aspirational Phase 7 "golden table" concept.
 2. **`dit.report` module + GitHub Check Run integration.** New `dit.report.VerdictReport` dataclass (hoisted out of `dit.compare`'s return value), `dit.report.github.post_check_run(report, repo, sha, token)`. Posts a typed Check Run from inside the same Python process that ran the comparisons — no log parsing, no Cloud Function, no second CI system. Cloud Build env vars supply the PR head SHA; Secret Manager supplies a GitHub App token. Markdown-rendering `output.summary` carries the results table + run context.
 3. **Per-pipeline PR triggers.** Pipe-gaps first (most-verified), then anchorages, then events. Trigger config lives in each pipeline repo; references `cloudbuild-dit.yaml` from the dit checkout. Path filters (`src/**`, `transforms/**`) gate cheap PRs; `dit:run` label is the manual escape-hatch override. `ready_for_review` event handling so draft PRs don't fire. PR run composes the cache (#1) + reporter (#2): cache-lookup main's 1_bf, run the PR's 1_bf, diff, post Check Run.
 3.5. **LLM PR-relevance pre-filter** (negative-signal-only). GitHub Models step in each pipeline repo's PR-trigger workflow trims docstring-only / formatting-only / test-only PRs that path filters can't distinguish from real changes. Two-phase rollout (log-only audit → enforce only after zero false negatives over ≥50 PRs). Fail-open at every step; humans escalate via `dit:run` label, never via the LLM. Design sketch: [`docs/llm-pr-gating.md`](llm-pr-gating.md).
-4. **Track 5 cutover** — replace `pipe-gaps/tests/integration/mode_equivalence.py` with a thin shim importing from dit. Opportunistic; verification done.
-5. **`dit v0.1.0` release tag.** First versioned release; precondition for the long-term "pipeline repos own their own workflow files; import dit as a library" shape. The release commits dit to a semver-versioned public API surface.
-6. **Upstream the `--temp_dataset` pipe-anchorages PR.** Removes the synthetic-branch scaffolding; cross-version bindings collapse to "just use main and the fix branch directly".
-7. **VMS port-visits workflow** — `workflows/port_visits/vms.py`. Near-copy of `ais.py` with VMS-shape source datasets and VMS-specific param overrides from `composer-dags-production/dags/core/vms/`.
-8. **AIS-full port-visits cohort.** Multi-year data. First real motivation for Cloud Run jobs migration (Cloud Build's 30-concurrent-build slot ceiling becomes a real constraint once full-cohort PR runs are routine).
-9. **Phase 3 — pipe-events port** + framework-extraction decision based on three-consumer evidence.
+4. **Track 5 cutover** — replace `pipe-gaps/tests/integration/mode_equivalence.py` with a thin shim importing from dit.
+5. **`dit v0.1.0` release tag.** First versioned release; precondition for the long-term "pipeline repos own their own workflow files; import dit as a library" shape. The release commits dit to a semver-versioned public API surface. When to tag relative to the PR triggers is an open owner decision (see `pr-triggers-2026-06.md` T4 and the last item of README § Roadmap).
+6. **~~Upstream the `--temp_dataset` pipe-anchorages PR.~~** Dropped 2026-10-22: a test-only overlay image replaces it (see § Cross-version experiments capability).
+7. **VMS port-visits workflow** — `workflows/port_visits/vms.py`. Near-copy of `ais.py` with VMS-shape source datasets and VMS-specific param overrides from `composer-dags-production/dags/core/vms/`. Deferred 2026-10-23 (owner).
+8. **AIS-full port-visits cohort.** Multi-year data. First real motivation for Cloud Run jobs migration (Cloud Build's 30-concurrent-build slot ceiling becomes a real constraint once full-cohort PR runs are routine). Deferred 2026-10-23 (owner).
+9. **Phase 3 — pipe-events port** + framework-extraction decision based on three-consumer evidence. See § Phase 3.
 
 Longer-term, no committed timeline:
 
@@ -413,10 +403,10 @@ Longer-term, no committed timeline:
 - ✅ Image-tag convention: published images.
 - ✅ **`pipe-gaps` published image availability** (Phase 1 prereq): resolved by making `--build-from-source` the default for pipe-gaps' workflow.
 - ✅ **Port-visits expected-equivalence** (Phase 2 risk): AIS-staging is mode-equivalent on `visit_id` (verified 2026-05-15, 3/3 pairwise green).
-- ⚠️ **`table-check` distribution**: still manual install. Declare as a `data-integration-tests` install dependency when we publish dit.
-- ⚠️ **pipe-anchorages `--temp_dataset` PR**: local-only patch on `dit-temp-dataset-support`. PIPELINE-1465 cross-version test relies on synthetic branches that cherry-pick this; long-term solution is upstream merge.
-- ⚠️ **Runtime is the laptop.** See § Runtime & CI for the Cloud Build plan.
-- ⚠️ **Pipe-gaps labels/job-name parity.** `workflows/pipe_gaps/mode_equivalence.py` doesn't yet have the structured Dataflow job names + `dit_*` labels that `port-visits/ais.py` has. Workflow-level refactor pending (item 4 of Next steps).
+- ✅ **`table-check` distribution**: declared in `requirements.txt` as a git dependency on `table_identical_checks` (2026-05-15), so `pip install` brings it.
+- ✅ **pipe-anchorages `--temp_dataset`**: no upstream PR (decision 2026-10-22, PIPELINE-4699). The v4 patch stays a local branch; v5 runs use the test-only overlay image in `docker/overlays/pipe-anchorages-temp-dataset/`.
+- ✅ **Runtime is the laptop**: the Cloud Build ad-hoc path (`make dit-cloud`) landed 2026-05-15. PR triggers are still open; see § Runtime & CI.
+- ✅ **Pipe-gaps labels/job-name parity**: `workflows/pipe_gaps/mode_equivalence.py` builds its Dataflow job names with `dit.job_names.make_job_name` (2026-05-21, #10) and stamps the per-run labels `dit_run_id`, `dit_commit_sha`, `dit_worker_image_tag`, `dit_launched_by` (`_dit_run_labels`, 2026-05-29, #30), so `cancel_run` finds its jobs. Not at parity, and not needed for cleanup: port-visits' per-job labels (`dit_repo`, `dit_step`, `dit_experiment_id`, `dit_mode`, iteration and slice labels).
 
 ## Critical files referenced
 

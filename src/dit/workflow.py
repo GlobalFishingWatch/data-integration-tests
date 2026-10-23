@@ -1,8 +1,8 @@
 """Shared workflow-harness plumbing for dit integration-test workflows.
 
-Both ``workflows/pipe_gaps/mode_equivalence.py`` and
-``workflows/port_visits/ais.py`` need the same scaffolding around their
-pipeline-specific logic:
+Every workflow under ``workflows/`` uses this module (it was lifted out of
+``pipe_gaps/mode_equivalence.py`` and ``port_visits/ais.py``). They need the
+same scaffolding around their pipeline-specific logic:
 
 * per-user infra knobs (DIT_* env-backed defaults + the argparse flags that
   override them);
@@ -11,8 +11,9 @@ pipeline-specific logic:
   it as reviewed/unreviewed, ensures a worker image exists, and stamps the
   per-run lineage context (run id, dit commit, worker-image digest);
 * the run-cache wrapper that turns an ``execute_*`` call into a
-  cache-lookup-or-recompute (adopted by pipe-gaps only; port-visits has no
-  cache integration).
+  cache-lookup-or-recompute (adopted by pipe-gaps ``mode_equivalence`` and
+  ``outage_recovery`` and by port-visits ``ais``; the pipe-events,
+  pipe-segment and encounters workflows have no cache integration).
 
 Everything pipeline-specific (the phase/mode logic, output-table FQN builders,
 compare keys, ``DEFAULT_WORKER_IMAGE``, ``--bq-temp-dataset``,
@@ -99,13 +100,14 @@ def add_dataflow_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_infra_args(parser: argparse.ArgumentParser) -> None:
-    """Add the full infra-knob set used by the two Beam workflows.
+    """Add the full infra-knob set used by the Beam workflows.
 
     Composition of :func:`add_dataset_args` + :func:`add_dataflow_args`, so
     the namespace is identical to the pre-split helper: ``--dest-dataset``,
     ``--service-account``, ``--dataflow-region``, ``--dataflow-temp-bucket``,
-    ``--dataflow-subnetwork``. pipe-gaps and port-visits keep calling this;
-    pipe-events calls only :func:`add_dataset_args` (no Dataflow knobs).
+    ``--dataflow-subnetwork``. The pipe-gaps, port-visits ``ais`` and
+    encounters workflows call this; pipe-events calls only
+    :func:`add_dataset_args` (no Dataflow knobs).
     """
     add_dataset_args(parser)
     add_dataflow_args(parser)
@@ -158,9 +160,9 @@ def add_experiment_id_arg(parser: argparse.ArgumentParser) -> None:
 # (b2) Mode-subset selection
 # --------------------------------------------------------------------------
 # Shared by every mode-family workflow (pipe-gaps mode_equivalence,
-# port-visits ais, pipe-events fishing) plus port-visits cross_version_ais.
-# Four consumers, identical parse-and-validate needs -> shared, per the
-# duplicate-until-3 rule.
+# port-visits ais, pipe-events fishing, encounters ais/vms) plus the
+# cross_version_ais and cross_version_fishing wrappers. Identical
+# parse-and-validate needs -> shared, per the duplicate-until-3 rule.
 
 def parse_modes(raw: str, *, choices: Sequence[str]) -> list[str]:
     """Parse a comma-separated ``--modes`` value into a validated list.
@@ -316,8 +318,9 @@ def resolve_run_context(
     ``resolve_digest`` (default True): resolve the worker image to a
     content-addressable digest (falling back to the tag form on failure, with a
     warning). Set False for callers with no run-cache integration (e.g.
-    port-visits) — the digest is unused there, so skipping the ~1-2s gcloud
-    describe keeps the run-context resolution side-effect-free for them.
+    pipe-events, pipe-segment, encounters) — the digest is unused there, so
+    skipping the ~1-2s gcloud describe keeps the run-context resolution
+    side-effect-free for them.
 
     ``build_from_source`` (default False): the docker-runner caller is opting
     out of registry-image consumption (the runner will build the container
@@ -530,8 +533,9 @@ def run_with_cache(
         worker_image=ctx.worker_image,
         params=cache_key.params,
         output_tables=output_tables,
-        # TODO(M5): runner doesn't return Dataflow job IDs yet; cancel_run
-        # will need to find them via the dit_run_id label until then.
+        # Always empty: neither runner captures submitted job ids. cancel_run
+        # finds a run's jobs by the dit_run_id label instead (M5a), so the
+        # column is not needed for cleanup.
         dataflow_job_ids=[],
         cloud_build_id=os.environ.get("BUILD_ID"),
         started_at=started_at,
