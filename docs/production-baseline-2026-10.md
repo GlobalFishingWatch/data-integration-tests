@@ -1,7 +1,7 @@
 # Production baseline: a candidate against production's own output (2026-10)
 
 **Jira:** [PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703) (epic [PIPELINE-4698](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4698)).
-**Status:** code, unit tests and a dry run against production's 2026-10-20 run (2026-10-23). No live run yet.
+**Status:** code, unit tests and dry runs against production's 2026-10-20 run (2026-10-23): one on the laptop and one in Cloud Build as `automated-testing@` (build `947240a8`). No live run yet.
 **Entry point:** `workflows/port_visits/cross_version_ais.py --baseline-production <target> --production-date D`.
 
 ## What it does
@@ -50,6 +50,8 @@ One target today, hand-written from `composer-dags-production` origin/main 0a644
 | output | `gfw-int-ais-datalake.port_visits_v1.port_visits` | 168 h | 443.0 GB |
 
 The production output's schema (22 fields, MONTH-partitioned and clustered on `end_timestamp`) is identical to DIT's v4.6.4 and PR #176 outputs from the 2026-07..09 runs.
+
+All four tables are rewritten in place, not recreated: on 2026-10-23 they had been created between 2025-07 and 2026-07 and modified that day. Time travel cannot reach before a table's creation, so if production ever switched to recreating a table, its pins would only last until the next recreation.
 
 ## Timing
 

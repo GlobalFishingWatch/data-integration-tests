@@ -107,7 +107,7 @@ The cost is a hard deadline: `global-fishing-watch.pipe_ais_v3_published` keeps 
 - Tests: `tests/test_production.py`, plus additions to `tests/test_bq.py` and `tests/test_port_visits_cross_version_ais.py` (+37; 624 → 661 after merging #82).
 - README Features, Source data targets and Roadmap 7c; CHANGELOG 2026-10-23.
 
-**Sections NOT moved.** No live run. The first is PIPELINE-4690's PR #176 against production's run, gated on the owner's go-ahead (≤100 workers, `--pin-max-gb 1300`, inside the 48 h window). Whether `automated-testing@` may list production's Dataflow jobs and read dataset metadata in Cloud Build is untested: the dry run ran as the operator.
+**Sections NOT moved.** No live run. The first is PIPELINE-4690's PR #176 against production's run, gated on the owner's go-ahead (≤100 workers, `--pin-max-gb 1300`, inside the 48 h window). The Cloud Build identity is verified: a `--dry-run` in Cloud Build (`947240a8`, as `automated-testing@`, dit at this branch) listed production's job, read the three datasets' metadata and dry-ran all four time-travel reads, with the same estimates as the operator's run. That leaves view creation (already proven for copies) and Dataflow reading through the views. The four tables are rewritten in place, not recreated (created 2025-07 to 2026-07, modified daily), so production's daily runs do not break the time travel.
 
 ### 2026-10-22 — `--no-cache`: the run cache and determinism checks
 
