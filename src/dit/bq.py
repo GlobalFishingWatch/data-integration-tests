@@ -29,6 +29,12 @@ PIN_STAMP_FORMAT = "%Y%m%dt%H%M%Sz"
 #: Value of the ``dit_artifact`` label on every pinned copy.
 PIN_ARTIFACT_LABEL = "source_pin"
 
+#: Value of the ``dit_artifact`` label on every pinned time-travel view.
+PIN_VIEW_ARTIFACT_LABEL = "source_pin_view"
+
+#: BigQuery's time-travel window when a dataset does not set its own.
+DEFAULT_TIME_TRAVEL_HOURS = 168
+
 
 def _utc_now() -> datetime:
     """Indirection over ``datetime.now(timezone.utc)`` for testability.
@@ -715,7 +721,8 @@ def pin_source_into_experiment(
 
 def require_pinned_source(dest_table: str, *, project: str = DEFAULT_PROJECT) -> str:
     """Return ``dest_table`` if it exists and carries the
-    ``dit_artifact=source_pin`` label; raise ``ValueError`` otherwise.
+    ``dit_artifact=source_pin`` (copy) or ``source_pin_view`` (time-travel
+    view) label; raise ``ValueError`` otherwise.
 
     For reusing an earlier run's copies: the caller recomputes their names
     with ``pinned_source_fqn`` and checks each one here before any run reads
@@ -733,9 +740,166 @@ def require_pinned_source(dest_table: str, *, project: str = DEFAULT_PROJECT) ->
             f"created it"
         ) from exc
     artifact = (table.labels or {}).get("dit_artifact")
-    if artifact != PIN_ARTIFACT_LABEL:
+    if artifact not in (PIN_ARTIFACT_LABEL, PIN_VIEW_ARTIFACT_LABEL):
         raise ValueError(
             f"{dest_table} exists but is not a DIT source pin "
             f"(label dit_artifact={artifact!r})"
         )
+    return dest_table
+
+
+# --------------------------------------------------------------------------
+# Source pinning by time-travel view
+# --------------------------------------------------------------------------
+#
+# A copy pins a source as of "now". A production-baseline test (PIPELINE-4703)
+# must pin a source as of a moment in the PAST: the moment production read its
+# inputs, and the moment it finished writing its output. A view over
+# `SELECT * FROM src FOR SYSTEM_TIME AS OF <t>` does that without copying
+# anything and works across organisations. It stays readable only while <t>
+# is inside the source dataset's time-travel window (48 h to 168 h at GFW),
+# after which queries through it fail. Readers need access to the source
+# tables, since these are not authorized views.
+
+
+def table_last_modified(table_fqn: str, *, project: str = DEFAULT_PROJECT) -> datetime:
+    """``lastModifiedTime`` of ``table_fqn``, timezone-aware."""
+    return bigquery.Client(project=project).get_table(table_fqn).modified
+
+
+def check_time_travel(
+    source_table: str,
+    *,
+    as_of: datetime,
+    margin_hours: float,
+    project: str = DEFAULT_PROJECT,
+) -> datetime:
+    """Return when ``as_of`` leaves ``source_table``'s time-travel window,
+    and raise ``ValueError`` if that is less than ``margin_hours`` (the
+    expected run duration) away, so a run cannot outlive the pins it reads.
+
+    The window is the source dataset's ``max_time_travel_hours``
+    (``DEFAULT_TIME_TRAVEL_HOURS`` when unset).
+    """
+    if as_of.tzinfo is None:
+        raise ValueError(f"as_of must be timezone-aware, got {as_of!r}")
+    now = _utc_now()
+    if as_of > now:
+        raise ValueError(f"as_of {as_of.isoformat()} is in the future")
+    dataset = ".".join(source_table.split(".")[:2])
+    hours = bigquery.Client(project=project).get_dataset(dataset).max_time_travel_hours
+    window = timedelta(hours=int(hours) if hours else DEFAULT_TIME_TRAVEL_HOURS)
+    deadline = as_of + window
+    if now + timedelta(hours=margin_hours) >= deadline:
+        raise ValueError(
+            f"{source_table} as of {as_of.isoformat()} leaves time travel at "
+            f"{deadline.isoformat()} ({dataset} keeps {window}), less than the "
+            f"{margin_hours} h this run needs. Pin a newer production run, or copy "
+            f"the source manually while it is still readable."
+        )
+    return deadline
+
+
+def pin_view_into_experiment(
+    source_table: str,
+    *,
+    experiment_id: str,
+    role: str,
+    as_of: datetime,
+    window: SourceWindow | None = None,
+    expiration_days: int = 7,
+    max_bytes: int = DEFAULT_PIN_MAX_BYTES,
+    dry_run: bool = False,
+    project: str = DEFAULT_PROJECT,
+) -> str:
+    """Create a view of ``source_table`` (or its ``window``) as of ``as_of``
+    in ``<project>.tech_great_expectations`` and return its FQN
+    (``pinned_source_fqn``, stamped with ``as_of``).
+
+    The DDL is ``CREATE VIEW IF NOT EXISTS <fqn> OPTIONS(...) AS SELECT *
+    FROM <src> FOR SYSTEM_TIME AS OF TIMESTAMP(<as_of>) WHERE <window or
+    TRUE>``. ``IF NOT EXISTS`` is safe here, unlike for copies: source,
+    ``as_of`` and window are all in the name, so a view of that name always
+    has the same definition and reruns are idempotent.
+
+    Labels match the copies' (``dit_artifact=source_pin_view``); the
+    description names the source, the filter and ``as_of``.
+
+    Cost guard: the full read through the view is dry-run and refused with
+    ``ValueError`` above ``max_bytes``, so reading a large source in full is
+    a deliberate choice of cap. ``dry_run=True`` stops after the check and
+    creates nothing. Callers check ``check_time_travel`` first.
+
+    ``as_of`` must be whole seconds, the precision of the stamp in the name.
+    """
+    if as_of.microsecond:
+        raise ValueError(
+            f"as_of must be whole seconds (the pin stamp's precision), got {as_of.isoformat()}"
+        )
+    dest_table = pinned_source_fqn(
+        source_table,
+        experiment_id=experiment_id,
+        role=role,
+        pinned_at=as_of,
+        window=window,
+        project=project,
+    )
+    expiration = _utc_now() + timedelta(days=expiration_days)
+    predicate = window.predicate() if window is not None else "TRUE"
+    as_of_utc = as_of.astimezone(timezone.utc).isoformat()
+    select = (
+        f"SELECT * FROM `{source_table}` FOR SYSTEM_TIME AS OF TIMESTAMP('{as_of_utc}') "
+        f"WHERE {predicate}"
+    )
+    labels = (
+        ("dit_artifact", PIN_VIEW_ARTIFACT_LABEL),
+        ("dit_experiment_id", _label_value(experiment_id)),
+        ("dit_role", _label_value(role)),
+        ("dit_pin", format_pin_stamp(as_of)),
+        ("dit_source_table", _label_value(source_table.rsplit(".", 1)[-1])),
+    )
+    label_list = ", ".join(
+        f"({_sql_string_literal(k)}, {_sql_string_literal(v)})" for k, v in labels
+    )
+    description = "\n".join([
+        "DIT pinned time-travel view of a source table (data integration tests).",
+        f"Source: {source_table}",
+        f"Rows: WHERE {predicate}" if window is not None else "Rows: all (no filter)",
+        f"As of: {as_of_utc}",
+        f"Experiment: {experiment_id}; role: {role}",
+        f"Expires: {expiration.isoformat()} (unreadable earlier once {as_of_utc} "
+        f"leaves the source dataset's time-travel window)",
+    ])
+    sql = (
+        f"CREATE VIEW IF NOT EXISTS `{dest_table}` "
+        f"OPTIONS("
+        f"expiration_timestamp=TIMESTAMP('{expiration.isoformat()}'), "
+        f"labels=[{label_list}], "
+        f"description={_sql_string_literal(description)}) "
+        f"AS {select}"
+    )
+
+    client = bigquery.Client(project=project)
+    estimate = int(
+        client.query(
+            select,
+            job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False),
+        ).total_bytes_processed
+        or 0
+    )
+    logger.info(
+        "pinning view %s -> %s (as of %s, %s): a full read is estimated at "
+        "%.1f GB (cap %.1f GB)",
+        source_table, dest_table, as_of_utc, predicate, estimate / 1e9, max_bytes / 1e9,
+    )
+    if estimate > max_bytes:
+        raise ValueError(
+            f"reading {source_table} as of {as_of_utc} in full would process "
+            f"{estimate / 1e9:.1f} GB, above the {max_bytes / 1e9:.1f} GB cap. "
+            f"Raise the cap deliberately if the run needs the full read."
+        )
+    if dry_run:
+        logger.info("dry run: view %s not created", dest_table)
+        return dest_table
+    client.query(sql).result()
     return dest_table

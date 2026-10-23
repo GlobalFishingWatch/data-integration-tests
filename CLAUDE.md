@@ -72,6 +72,43 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-23 — Production baseline: candidate vs production's own output (PIPELINE-4703)
+
+A third comparison shape next to mode equivalence and cross-version. The bindings run on exactly what production read, and their output is diffed against what production wrote, without re-running production. The owner decided four points:
+- the target is the AIS v5 datalake;
+- the run covers full history;
+- it may use up to 100 workers;
+- it is a flag on `cross_version_ais.py`, not a new workflow.
+
+There is no separate self-check run of production's code.
+
+**Why time-travel views.** The pins must sit at two moments in the past: when production read its inputs, and when it finished writing.
+- Copies pin only "now".
+- Snapshots are blocked across organisations and by the missing `deleteSnapshot` on `tech_great_expectations`.
+- `FOR SYSTEM_TIME AS OF` views pin a past moment and copy nothing. Verified across orgs; one month of production `port_visits` through time travel prunes like a plain read.
+
+The cost is a hard deadline: `global-fishing-watch.pipe_ais_v3_published` keeps 48 h, so a run is time-boxed to production's job start + 48 h. `IF NOT EXISTS` is deliberate here, unlike for copies: the name holds source, window and `as_of`, so the definition is fixed by the name. That is also why `as_of` must be whole seconds, the precision of the stamp.
+
+**Why the Dataflow job, not table metadata, gives the times.** Production's step calls `update_table` (description and `lastModifiedTime`) on its output at job start, before `pipeline.run()`. Only the job's `Done` time marks a finished write.
+- T0 is the job's creation time and pins the inputs. T1 is its `Done` time and pins the output.
+- Retries reuse the job name, so the run takes the latest `Done` job.
+- An input modified in (T0, T1] makes T0 ambiguous, so the run refuses. Only the latest modification is visible, a documented gap.
+
+**Run shape is enforced, not suggested.** Production does one full recompute over 2012..D with `WRITE_TRUNCATE`, and open visits take `end_timestamp` and confidence from D. So `--steps`, `--modes`, `--start` and `--end` must match. To tell a typed value from a default, those four flags default to `None` and `_RUN_SHAPE_DEFAULTS` fills them after `_apply_production_mode`. A first cut compared values with their defaults and silently replaced an explicit `--start 2020-01-01`; the tests caught it.
+
+**Target spec is hand-written** (`ProductionTarget`, from composer-dags-production 0a644da). Reading it from composer as data is PIPELINE-4700's question. The target's inputs differ from the 2026-07..09 run's v3 sources: the thinned table and `segs_activity` come from `gfw-int-ais-datalake`, per `dags/core/ais/v5.py`. The production output's schema matched DIT's v4.6.4 and PR outputs field for field (22 fields, same partitioning and clustering).
+
+**Workflow-side workarounds: none.** The production run is found through Dataflow metadata, not through a pipeline-contract item. table-check's duplicate-key inflation (`_l2` re-joins on the key only) stays upstream; the doc carries the SQL breakdown as a runbook instead.
+
+**Sections moved (this commit).**
+- New `src/dit/production.py` and `docs/production-baseline-2026-10.md`.
+- `src/dit/bq.py`: time-travel view section, plus `require_pinned_source` accepting view pins.
+- `workflows/port_visits/cross_version_ais.py`: `ProductionTarget` / `PRODUCTION_TARGETS`, five flags, `_apply_production_mode`, `_RUN_SHAPE_DEFAULTS`, `_pin_production` + `_pin`, `_run_production_diffs`, docstring.
+- Tests: `tests/test_production.py`, plus additions to `tests/test_bq.py` and `tests/test_port_visits_cross_version_ais.py` (+37; 618 → 655).
+- README Features, Source data targets and Roadmap 7c; CHANGELOG 2026-10-23.
+
+**Sections NOT moved.** No live run. The first is PIPELINE-4690's PR #176 against production's run, gated on the owner's go-ahead (≤100 workers, `--pin-max-gb 1300`, inside the 48 h window). Whether `automated-testing@` may list production's Dataflow jobs and read dataset metadata in Cloud Build is untested: the dry run ran as the operator.
+
 ### 2026-10-22 — `--steps` on the port-visits workflows (explicit step selection)
 
 **Problem.** Both port-visits workflows always ran both steps. The only way to skip step 1 was the implicit hint `--thinned-message-table`. Step 1 could not run alone, and its output was never compared.

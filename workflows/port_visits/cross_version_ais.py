@@ -58,10 +58,36 @@ Steps:
 The overall exit code is non-zero iff any binding failed; an individual
 binding failure does not abort siblings.
 
+Production baseline (``--baseline-production``, PIPELINE-4703): instead of a
+baseline binding, compare each binding with the table production wrote.
+Production itself is not re-run. The run needs ``--production-date D``, finds
+production's Dataflow job for D, and pins with time-travel views
+(``dit.bq.pin_view_into_experiment``, no copies):
+
+* production's inputs as of the job's creation (its thinned table over
+  ``[history start, D]``, ``segment_info`` and ``segs_activity`` whole), which
+  every binding reads;
+* production's output as of the job's end, which every binding is diffed
+  against on ``visit_id``.
+
+It runs what production runs (``--steps port_visits``, ``--modes 1_bf``,
+``--start`` at the history start, ``--end D``) and refuses to start unless
+every pin stays inside its source's time-travel window for
+``--production-margin-hours`` more, or if an input changed while production
+ran. Example, PR #176 against the AIS v5 datalake run for 2026-10-20::
+
+    dit run workflows/port_visits/cross_version_ais.py \\
+        --experiment-id pipeline-4690-prod \\
+        --baseline-production ais-v5-datalake --production-date 2026-10-20 \\
+        --binding pr=<sha> --binding-worker-image pr=<image> \\
+        --binding-image-tag pr=<image> --pipeline-cli v5 \\
+        --pin-max-gb 1300 --max-num-workers 100 --runner dataflow
+
 ``--dry-run`` skips the ``ais.py`` invocations and the diff phase, and only
-dry-runs the copies (reporting their bytes against the ``--pin-max-gb`` cap),
-but still performs worktree setup/teardown — useful for validating the
-orchestration without burning Dataflow or BigQuery cost.
+dry-runs the copies or views (reporting their bytes against the
+``--pin-max-gb`` cap), but still performs worktree setup/teardown and, with
+``--baseline-production``, the job lookup and time-travel checks — useful for
+validating the orchestration without burning Dataflow or BigQuery cost.
 
 Note on cross-version semantics: ``ais.py``'s default ``--worker-image`` is a
 fixed published path (e.g. ``pipe-anchorages:v4.6.4``). Without
@@ -93,11 +119,18 @@ from typing import Optional, Sequence
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
+from dit import production as dit_production
 from dit.workflow import parse_choice_list, parse_modes
 
 # ais.py owns the canonical mode and step sets, date defaults, step rules and
 # comparison keys; import them so the two can't drift.
-from workflows.port_visits.ais import COMPARE_KEYS_BY_STEP, STEP_THIN, STEP_VISITS, validate_steps
+from workflows.port_visits.ais import (
+    COMPARE_KEYS_BY_STEP,
+    MODE_BF,
+    STEP_THIN,
+    STEP_VISITS,
+    validate_steps,
+)
 from workflows.port_visits.ais import DEFAULT_END as AIS_DEFAULT_END
 from workflows.port_visits.ais import DEFAULT_START as AIS_DEFAULT_START
 from workflows.port_visits.ais import SELECTABLE_MODES as AIS_SELECTABLE_MODES
@@ -117,6 +150,75 @@ DEFAULT_PIN_MAX_GB = dit_bq.DEFAULT_PIN_MAX_BYTES / 1e9
 
 AIS_WORKFLOW = Path(__file__).with_name("ais.py")
 
+#: Defaults of the flags that shape the run, applied after parsing.
+_RUN_SHAPE_DEFAULTS = {
+    "start": AIS_DEFAULT_START,
+    "end": AIS_DEFAULT_END,
+    "modes": DEFAULT_MODES,
+    "steps": ",".join(AIS_SELECTABLE_STEPS),
+}
+
+
+# --------------------------------------------------------------------------
+# Production baselines (PIPELINE-4703)
+# --------------------------------------------------------------------------
+#
+# With --baseline-production, no baseline binding runs: each binding's output
+# is compared with the table production wrote, and the binding reads the
+# inputs production read. Both are pinned with time-travel views at the
+# moments production's Dataflow job started (inputs) and finished (output).
+
+#: Expected candidate run time, so the inputs' time-travel window must stay
+#: open at least this much longer. Production's own job takes ~1.5 h at 100
+#: workers; the diff and DIT's own steps add time.
+DEFAULT_PRODUCTION_MARGIN_HOURS = 6.0
+
+
+@dataclasses.dataclass(frozen=True)
+class ProductionTarget:
+    """Where a production port-visits run reads and writes, and how to find
+    its Dataflow job for day D.
+
+    Hand-written from composer-dags-production; reading it from composer as
+    data is PIPELINE-4700's question.
+    """
+    name: str
+    dataflow_project: str
+    dataflow_region: str
+    job_name_prefix: str
+    output_table: str
+    thinned_table: str
+    segment_info_table: str
+    segs_activity_table: str
+    history_start: date
+    deployed_version: str
+
+    def job_name(self, production_date: date) -> str:
+        return f"{self.job_name_prefix}{production_date:%Y%m%d}"
+
+
+#: From composer-dags-production origin/main 0a644da (2026-10-22):
+#: dags/core/ais/v5.py (project, Versions.PORT_VISITS) and
+#: gfw/pipes/core/port_visits/v4.py (port_visits over 2012-01-01..D, full
+#: recompute, WRITE_TRUNCATE).
+PRODUCTION_TARGETS = {
+    target.name: target
+    for target in (
+        ProductionTarget(
+            name="ais-v5-datalake",
+            dataflow_project="world-fishing-827",
+            dataflow_region="us-central1",
+            job_name_prefix="core-ais-v5--port-visits-detect-port-visits--",
+            output_table="gfw-int-ais-datalake.port_visits_v1.port_visits",
+            thinned_table="gfw-int-ais-datalake.port_visits_v1.raw_port_events",
+            segment_info_table="global-fishing-watch.pipe_ais_v3_published.segment_info",
+            segs_activity_table="gfw-int-ais-datalake.summarized_positions_v1.segs_activity",
+            history_start=date(2012, 1, 1),
+            deployed_version="pipe-anchorages v4.6.4",
+        ),
+    )
+}
+
 
 # --------------------------------------------------------------------------
 # Argparse
@@ -135,15 +237,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     p.add_argument("--pin-source-at", help=argparse.SUPPRESS)
     p.add_argument("--binding", action="append", required=True, dest="bindings",
                    help="`name=ref` pair, repeatable. Both must be valid git refs in --pipeline-dir.")
-    p.add_argument("--start", default=AIS_DEFAULT_START,
+    # --start / --end / --modes / --steps default to None and are filled in
+    # after parsing (_RUN_SHAPE_DEFAULTS), so --baseline-production can tell
+    # a value the user typed from a default.
+    p.add_argument("--start", default=None,
                    help=f"Inclusive start date, forwarded to every binding and used to window the "
                         f"pinned messages. Default {AIS_DEFAULT_START}.")
-    p.add_argument("--end", default=AIS_DEFAULT_END,
+    p.add_argument("--end", default=None,
                    help=f"Inclusive end date, forwarded to every binding and used to window the "
                         f"pinned messages. Default {AIS_DEFAULT_END}.")
-    p.add_argument("--modes", default=DEFAULT_MODES,
+    p.add_argument("--modes", default=None,
                    help=f"Comma-separated mode names whose output tables get diffed pairwise. Default {DEFAULT_MODES}.")
-    p.add_argument("--steps", default=",".join(AIS_SELECTABLE_STEPS),
+    p.add_argument("--steps", default=None,
                    help=f"Comma-separated pipeline steps every binding runs (ais.py's --steps; "
                         f"default {','.join(AIS_SELECTABLE_STEPS)}). Decides what is pinned and "
                         f"which output is diffed (the last step's). {STEP_VISITS} alone needs "
@@ -199,12 +304,40 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                         "user-supplied --thinned-message-table in extras is ALWAYS dropped (even "
                         "when this wrapper flag is unset), so the user can't inject an unpinned "
                         "table and bypass the pin.")
+    p.add_argument("--baseline-production", choices=sorted(PRODUCTION_TARGETS), default=None,
+                   help="Compare every binding with this production target's own output instead "
+                        "of with another binding. The bindings read the inputs production read, "
+                        "pinned by time-travel views at the start of production's Dataflow job for "
+                        "--production-date, and are diffed against production's output pinned at "
+                        "the job's end. Runs what production runs: --steps port_visits, --modes "
+                        "1_bf, full history up to the production date.")
+    p.add_argument("--production-date", default=None, metavar="YYYY-MM-DD",
+                   help="Day D of the production run to compare with (its Dataflow job is named "
+                        "<prefix>YYYYMMDD and runs a few days after D).")
+    p.add_argument("--production-inputs-as-of", default=None, metavar="TIMESTAMP",
+                   help="Pin production's inputs as of this ISO timestamp instead of its job's "
+                        "creation time.")
+    p.add_argument("--production-output-as-of", default=None, metavar="TIMESTAMP",
+                   help="Pin production's output as of this ISO timestamp instead of the time its "
+                        "job finished.")
+    p.add_argument("--production-margin-hours", type=float, default=DEFAULT_PRODUCTION_MARGIN_HOURS,
+                   help=f"Refuse to start unless the pinned production data stays readable through "
+                        f"time travel for at least this many more hours. Default "
+                        f"{DEFAULT_PRODUCTION_MARGIN_HOURS:g}.")
     args, ais_extra_args = p.parse_known_args(argv)
     if args.pin_source_at is not None:
         raise SystemExit(
             "--pin-source-at was removed: sources are now pinned by copying them at run "
             "start. Drop the flag; to reuse an earlier run's copies, pass --reuse-pin <stamp>."
         )
+    if args.baseline_production is not None:
+        _apply_production_mode(args)
+    elif any(v is not None for v in (args.production_date, args.production_inputs_as_of,
+                                     args.production_output_as_of)):
+        raise SystemExit("--production-* flags need --baseline-production")
+    for attr, default in _RUN_SHAPE_DEFAULTS.items():
+        if getattr(args, attr) is None:
+            setattr(args, attr, default)
     args.bindings = [_parse_binding(b) for b in args.bindings]
     # Validate against ais.py's selectable modes -- previously any string
     # was accepted, so a typo silently produced zero diff pairs (which
@@ -239,6 +372,80 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                 f"declared bindings: {sorted(_binding_names)}"
             )
     return args, ais_extra_args
+
+
+def _apply_production_mode(args: argparse.Namespace) -> None:
+    """Set and check what --baseline-production implies, before the generic
+    parsing runs: the target defines the inputs, and the run must be the one
+    production does (step 2 alone, one full-history recompute up to day D),
+    or its output cannot match production's.
+
+    A flag left unset takes the production value; one set to anything else
+    is an error rather than silently replaced.
+    """
+    target = PRODUCTION_TARGETS[args.baseline_production]
+    if args.production_date is None:
+        raise SystemExit(
+            "--baseline-production needs --production-date (day D of the production run)"
+        )
+    production_date = _parse_date("--production-date", args.production_date)
+    conflicts = [
+        flag for flag, value in (
+            ("--thinned-message-table", args.thinned_message_table),
+            ("--source-messages-fqn", args.source_messages_fqn),
+            ("--source-segment-info-fqn", args.source_segment_info_fqn),
+            ("--source-segs-activity-fqn", args.source_segs_activity_fqn),
+            ("--reuse-pin", args.reuse_pin),
+        )
+        if value is not None
+    ]
+    if args.source_dataset_stem != DEFAULT_SOURCE_DATASET_STEM:
+        conflicts.append("--source-dataset-stem")
+    if conflicts:
+        raise SystemExit(
+            f"--baseline-production {target.name} defines its own inputs and pins; "
+            f"drop {', '.join(conflicts)}"
+        )
+    fixed = (
+        ("--steps", "steps", STEP_VISITS),
+        ("--modes", "modes", MODE_BF),
+        ("--start", "start", target.history_start.isoformat()),
+        ("--end", "end", production_date.isoformat()),
+    )
+    for flag, attr, required in fixed:
+        value = getattr(args, attr)
+        if value is None:
+            setattr(args, attr, required)
+        elif value != required:
+            raise SystemExit(
+                f"--baseline-production runs what production runs: {flag} must be "
+                f"{required}, got {value}"
+            )
+    args.production_date = production_date
+    args.production_inputs_as_of = _parse_timestamp(
+        "--production-inputs-as-of", args.production_inputs_as_of,
+    )
+    args.production_output_as_of = _parse_timestamp(
+        "--production-output-as-of", args.production_output_as_of,
+    )
+    args.thinned_message_table = target.thinned_table
+    args.source_segment_info_fqn = target.segment_info_table
+    args.source_segs_activity_fqn = target.segs_activity_table
+
+
+def _parse_timestamp(flag: str, s: Optional[str]) -> Optional[datetime]:
+    """An ISO timestamp with an explicit zone (``Z`` or an offset), or None."""
+    if s is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SystemExit(f"{flag}: invalid ISO timestamp {s!r}") from exc
+    if parsed.tzinfo is None:
+        raise SystemExit(f"{flag}: {s!r} needs a time zone, e.g. 2026-10-22T07:53:20Z")
+    if parsed.microsecond:
+        raise SystemExit(f"{flag}: {s!r} must be whole seconds (the pin's precision)")
+    return parsed
 
 
 def _parse_binding(spec: str) -> tuple[str, str]:
@@ -304,6 +511,10 @@ class _PinnedSources:
     without step 1, `segment_info` / `segs_activity` without step 2, and
     `thinned` unless step 2 runs alone. Frozen so nothing changes the pins
     between pinning and the `ais.py` invocations.
+
+    `production_output` is set only with --baseline-production: production's
+    output pinned as of the end of its run, which every binding is diffed
+    against. No binding reads it.
     """
     start: date
     end: date
@@ -311,6 +522,7 @@ class _PinnedSources:
     segment_info: Optional[str] = None
     segs_activity: Optional[str] = None
     thinned: Optional[str] = None
+    production_output: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -398,6 +610,116 @@ def _pin_sources(
     for field, fqn in pinned.items():
         logger.info("pinned %s: %s", field, fqn)
     return _PinnedSources(start=args.start, end=args.end, **pinned)
+
+
+# Roles of the production pins; distinct from the copies' roles above.
+_PRODUCTION_INPUT_ROLE = "production_input"
+_PRODUCTION_OUTPUT_ROLE = "production_output"
+
+
+def _production_times(
+    args: argparse.Namespace, target: ProductionTarget,
+) -> tuple[datetime, datetime]:
+    """(inputs as of, output as of): the creation and finish times of
+    production's Dataflow job for --production-date, unless both are given
+    explicitly. The job's creation precedes its BigQuery reads and its
+    finish follows its write; table metadata can't stand in, since the job
+    touches its output table's description when it starts."""
+    inputs_as_of = args.production_inputs_as_of
+    output_as_of = args.production_output_as_of
+    if inputs_as_of is None or output_as_of is None:
+        run = dit_production.find_dataflow_job(
+            project=target.dataflow_project,
+            region=target.dataflow_region,
+            name=target.job_name(args.production_date),
+            created_after=dit_production.default_created_after(args.production_date),
+        )
+        logger.info("production job: %s (%s)", run.job_id, run.name)
+        inputs_as_of = inputs_as_of or run.create_time
+        output_as_of = output_as_of or run.end_time
+    if output_as_of < inputs_as_of:
+        raise SystemExit(
+            f"production output pin {output_as_of.isoformat()} is before its inputs pin "
+            f"{inputs_as_of.isoformat()}"
+        )
+    return inputs_as_of, output_as_of
+
+
+def _check_inputs_unchanged_during_run(
+    specs: Sequence[_PinSpec], inputs_as_of: datetime, output_as_of: datetime,
+) -> None:
+    """Refuse when an input was modified while production ran: pinning it
+    at the job's start would then be ambiguous. A change after the run is
+    fine, since time travel returns the earlier state. Only the latest
+    modification is visible, so an earlier change inside the run that was
+    followed by a later one goes unnoticed."""
+    changed = [
+        (spec.source_table, modified)
+        for spec in specs
+        for modified in [dit_bq.table_last_modified(spec.source_table, project=PROJECT)]
+        if inputs_as_of < modified <= output_as_of
+    ]
+    if changed:
+        details = ", ".join(f"{table} at {modified.isoformat()}" for table, modified in changed)
+        raise SystemExit(
+            f"inputs changed while production ran ({inputs_as_of.isoformat()} .. "
+            f"{output_as_of.isoformat()}): {details}. Which state production read is "
+            f"unknown. If you know when it read them, pass that time as "
+            f"--production-inputs-as-of."
+        )
+
+
+def _pin_production(args: argparse.Namespace, target: ProductionTarget) -> _PinnedSources:
+    """Pin production's inputs as of its job's start and its output as of
+    the job's end, as time-travel views (no copies), after checking both stay
+    readable for the run and that no input changed during production's run."""
+    inputs_as_of, output_as_of = _production_times(args, target)
+    specs = [
+        dataclasses.replace(spec, role=_PRODUCTION_INPUT_ROLE) for spec in _pin_specs(args)
+    ]
+    deadline = min(
+        dit_bq.check_time_travel(
+            table, as_of=as_of, margin_hours=args.production_margin_hours, project=PROJECT,
+        )
+        for table, as_of in (
+            *((spec.source_table, inputs_as_of) for spec in specs),
+            (target.output_table, output_as_of),
+        )
+    )
+    _check_inputs_unchanged_during_run(specs, inputs_as_of, output_as_of)
+    logger.info(
+        "production baseline %s, day %s, %s: inputs as of %s, output as of %s; "
+        "readable through time travel until %s",
+        target.name, args.production_date, target.deployed_version,
+        inputs_as_of.isoformat(), output_as_of.isoformat(), deadline.isoformat(),
+    )
+
+    def view(
+        source_table: str, role: str, as_of: datetime,
+        window: Optional[dit_bq.SourceWindow],
+    ) -> str:
+        return dit_bq.pin_view_into_experiment(
+            source_table,
+            experiment_id=args.experiment_id,
+            role=role,
+            as_of=as_of,
+            window=window,
+            expiration_days=args.pin_expiration_days,
+            max_bytes=int(args.pin_max_gb * 1e9),
+            dry_run=args.dry_run,
+            project=PROJECT,
+        )
+
+    pinned = {
+        spec.field: view(spec.source_table, spec.role, inputs_as_of, spec.window)
+        for spec in specs
+    }
+    production_output = view(target.output_table, _PRODUCTION_OUTPUT_ROLE, output_as_of, None)
+    for field, fqn in {**pinned, "production_output": production_output}.items():
+        logger.info("pinned %s: %s", field, fqn)
+    return _PinnedSources(
+        start=args.start, end=args.end, production_output=production_output, **pinned,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -609,19 +931,61 @@ def _output_table(dest_dataset: str, suffix: str, mode: str, step: str) -> str:
     return f"{PROJECT}.{dest_dataset}.{_OUTPUT_PREFIX_BY_STEP[step]}_{suffix}_{mode}"
 
 
+def _compare_outputs(table_a: str, table_b: str, step: str) -> int:
+    """table-check two outputs of ``step`` on that step's key."""
+    return dit_compare.compare_tables(
+        table_a, table_b, keys=list(COMPARE_KEYS_BY_STEP[step]), view_suffix="",
+    )
+
+
 def _diff_pair(
     *, dest_dataset: str, a_suffix: str, b_suffix: str, mode: str, step: str,
 ) -> int:
     """Diff two bindings' outputs of ``step`` on that step's key."""
-    return dit_compare.compare_tables(
+    return _compare_outputs(
         _output_table(dest_dataset, a_suffix, mode, step),
         _output_table(dest_dataset, b_suffix, mode, step),
-        keys=list(COMPARE_KEYS_BY_STEP[step]),
-        view_suffix="",
+        step,
     )
 
 
 _SKIPPED = -1  # sentinel rc for diff pairs we couldn't run
+
+#: The production side's name in diff results (--baseline-production).
+_PRODUCTION_SIDE = "production"
+
+
+def _run_production_diffs(
+    *,
+    modes: list[str],
+    step: str,
+    suffix_by_binding: dict[str, str],
+    dest_dataset: str,
+    failed_bindings: set[str],
+    production_output: str,
+) -> dict[tuple[str, str, str], int]:
+    """Diff every binding's ``step`` output with production's pinned output,
+    per mode. The binding is table A and production table B, so table-check's
+    "only in A" rows are the candidate's and "only in B" rows production's."""
+    def diff(mode: str, name: str) -> int:
+        if name in failed_bindings:
+            logger.info("diff mode=%s %s vs %s -> SKIPPED (binding %s failed)",
+                        mode, name, _PRODUCTION_SIDE, name)
+            return _SKIPPED
+        rc = _compare_outputs(
+            _output_table(dest_dataset, suffix_by_binding[name], mode, step),
+            production_output,
+            step,
+        )
+        verdict = "IDENTICAL" if rc == 0 else f"DIFFERENT (table-check rc={rc})"
+        logger.info("diff mode=%s %s vs %s -> %s", mode, name, _PRODUCTION_SIDE, verdict)
+        return rc
+
+    return {
+        (mode, name, _PRODUCTION_SIDE): diff(mode, name)
+        for mode in modes
+        for name in suffix_by_binding
+    }
 
 
 def _run_diffs(
@@ -673,31 +1037,44 @@ def _summarize(results: dict[tuple[str, str, str], int]) -> str:
 # Main
 # --------------------------------------------------------------------------
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    args, ais_extra_args = parse_args(argv)
-
+def _pin(args: argparse.Namespace) -> _PinnedSources:
+    """Pin what the bindings read: with --baseline-production, production's
+    inputs and output as time-travel views; otherwise copies of the sources,
+    or an earlier run's copies with --reuse-pin."""
+    if args.baseline_production is not None:
+        return _pin_production(args, PRODUCTION_TARGETS[args.baseline_production])
     reuse = args.reuse_pin is not None
     pinned_at = (
         dit_bq.parse_pin_stamp(args.reuse_pin) if reuse
         else datetime.now(timezone.utc).replace(microsecond=0)
     )
-    logger.info("experiment_id: %s", args.experiment_id)
     logger.info("pin stamp: %s (%s)", dit_bq.format_pin_stamp(pinned_at),
                 "reusing an earlier run's copies" if reuse else "new copies")
+    logger.info("pinning: %s (copies in %s.tech_great_expectations)",
+                ", ".join(spec.source_table for spec in _pin_specs(args)), PROJECT)
+    pinned = _pin_sources(args, pinned_at, reuse=reuse)
+    if not reuse and not args.dry_run:
+        logger.info("to rerun on these copies, pass --reuse-pin %s",
+                    dit_bq.format_pin_stamp(pinned_at))
+    return pinned
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args, ais_extra_args = parse_args(argv)
+
+    logger.info("experiment_id: %s", args.experiment_id)
+    if args.baseline_production is not None:
+        logger.info("baseline: production %s for %s", args.baseline_production,
+                    args.production_date)
     logger.info("date range (inclusive): %s -> %s", args.start, args.end)
     logger.info("bindings: %s", args.bindings)
     logger.info("modes: %s", args.modes)
     logger.info("steps: %s", ",".join(args.steps))
     logger.info("pipeline_dir: %s", args.pipeline_dir)
-    logger.info("pinning: %s (copies in %s.tech_great_expectations)",
-                ", ".join(spec.source_table for spec in _pin_specs(args)), PROJECT)
 
     _verify_refs(args.pipeline_dir, args.bindings)
-    pinned = _pin_sources(args, pinned_at, reuse=reuse)
-    if not reuse and not args.dry_run:
-        logger.info("to rerun on these copies, pass --reuse-pin %s",
-                    dit_bq.format_pin_stamp(pinned_at))
+    pinned = _pin(args)
 
     # Each binding gets a deterministic suffix the diff step can address.
     suffix_by_binding = {
@@ -738,16 +1115,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logger.error("binding %s failed with rc=%d", name, rc)
 
     if args.dry_run:
-        logger.info("--dry-run set; skipping pairwise diffs.")
+        logger.info("--dry-run set; skipping diffs.")
         return 1 if failed_bindings else 0
 
-    results = _run_diffs(
-        modes=args.modes,
-        step=args.steps[-1],
-        suffix_by_binding=suffix_by_binding,
-        dest_dataset=args.dest_dataset,
-        failed_bindings=failed_bindings,
+    production_results = (
+        _run_production_diffs(
+            modes=args.modes,
+            step=args.steps[-1],
+            suffix_by_binding=suffix_by_binding,
+            dest_dataset=args.dest_dataset,
+            failed_bindings=failed_bindings,
+            production_output=pinned.production_output,
+        )
+        if pinned.production_output is not None else {}
     )
+    results = {
+        **production_results,
+        **_run_diffs(
+            modes=args.modes,
+            step=args.steps[-1],
+            suffix_by_binding=suffix_by_binding,
+            dest_dataset=args.dest_dataset,
+            failed_bindings=failed_bindings,
+        ),
+    }
     print(_summarize(results), file=sys.stderr)
     return 1 if failed_bindings else 0
 

@@ -9,7 +9,7 @@ visited.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,10 +18,12 @@ import pytest
 from dit.bq import (
     DEFAULT_PIN_MAX_BYTES,
     SourceWindow,
+    check_time_travel,
     derived_source_into_experiment,
     format_pin_stamp,
     parse_pin_stamp,
     pin_source_into_experiment,
+    pin_view_into_experiment,
     pinned_source_fqn,
     require_pinned_source,
     snapshot_dataset,
@@ -792,3 +794,130 @@ def test_require_pinned_source_rejects_missing_and_foreign_tables() -> None:
     with patch("google.cloud.bigquery.Client", return_value=client):
         with pytest.raises(ValueError, match="not a DIT source pin"):
             require_pinned_source("p.d.t")
+
+
+def test_require_pinned_source_accepts_a_labelled_view() -> None:
+    client = MagicMock()
+    client.get_table.return_value = SimpleNamespace(labels={"dit_artifact": "source_pin_view"})
+    with patch("google.cloud.bigquery.Client", return_value=client):
+        assert require_pinned_source("p.d.v") == "p.d.v"
+
+
+# -- time-travel views (pin_view_into_experiment, check_time_travel) --------
+
+_AS_OF = datetime(2026, 6, 7, 7, 46, 26, tzinfo=timezone.utc)
+_PROD_OUTPUT = "gfw-int-ais-datalake.port_visits_v1.port_visits"
+
+
+def _pin_view(client: MagicMock, **overrides) -> str:
+    kwargs = dict(experiment_id="pipeline-4690", role="production_output", as_of=_AS_OF)
+    kwargs.update(overrides)
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        return pin_view_into_experiment(_PROD_OUTPUT, **kwargs)
+
+
+def test_pin_view_emits_a_time_travel_view_named_after_as_of() -> None:
+    """IF NOT EXISTS is safe for views: source, as_of and window are all in
+    the name, so a view of that name always has the same definition."""
+    client = _make_pin_client_mock()
+    dest = _pin_view(client)
+
+    assert dest == (
+        "world-fishing-827.tech_great_expectations."
+        "dit_exp_pipeline_4690_production_output_port_visits_all_20260607t074626z"
+    )
+    assert client.query.call_count == 2
+    sql = client.query.call_args_list[1].args[0]
+    assert sql.startswith(f"CREATE VIEW IF NOT EXISTS `{dest}` OPTIONS(")
+    assert "expiration_timestamp=TIMESTAMP('2026-06-15T12:00:00+00:00')" in sql
+    assert "('dit_artifact', 'source_pin_view')" in sql
+    assert "('dit_pin', '20260607t074626z')" in sql
+    assert "('dit_source_table', 'port_visits')" in sql
+    assert "As of: 2026-06-07T07:46:26+00:00" in sql
+    assert sql.endswith(
+        f"AS SELECT * FROM `{_PROD_OUTPUT}` "
+        "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-06-07T07:46:26+00:00') WHERE TRUE"
+    )
+
+
+def test_pin_view_windows_rows_and_dry_runs_the_select_it_wraps() -> None:
+    client = _make_pin_client_mock()
+    _pin_view(client, window=_WINDOW)
+
+    dry_call, create_call = client.query.call_args_list
+    assert dry_call.kwargs["job_config"].dry_run is True
+    assert create_call.args[0].endswith(f"AS {dry_call.args[0]}")
+    assert dry_call.args[0].endswith(
+        "WHERE DATE(timestamp) >= '2026-09-01' AND DATE(timestamp) < '2026-10-01'"
+    )
+
+
+def test_pin_view_writes_as_of_in_utc() -> None:
+    client = _make_pin_client_mock()
+    _pin_view(client, as_of=_AS_OF.astimezone(timezone(timedelta(hours=2))))
+
+    assert "AS OF TIMESTAMP('2026-06-07T07:46:26+00:00')" in client.query.call_args.args[0]
+
+
+def test_pin_view_rejects_sub_second_as_of() -> None:
+    """The name's stamp has second precision; two as_of values within one
+    second would share a name but not a definition."""
+    with pytest.raises(ValueError, match="whole seconds"):
+        _pin_view(_make_pin_client_mock(), as_of=_AS_OF.replace(microsecond=500))
+
+
+def test_pin_view_above_the_cap_raises_and_dry_run_creates_nothing() -> None:
+    client = _make_pin_client_mock(estimate=1_150 * 10**9)
+    with pytest.raises(ValueError, match="1150.0 GB, above the 1000.0 GB cap"):
+        _pin_view(client)
+    assert client.query.call_count == 1
+
+    client = _make_pin_client_mock()
+    _pin_view(client, dry_run=True)
+    assert client.query.call_count == 1
+
+
+def _dataset_client(hours) -> MagicMock:
+    client = MagicMock()
+    client.get_dataset.return_value = SimpleNamespace(max_time_travel_hours=hours)
+    return client
+
+
+def _check(client: MagicMock, *, as_of: datetime, margin_hours: float = 6.0) -> datetime:
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        return check_time_travel(
+            "global-fishing-watch.pipe_ais_v3_published.segment_info",
+            as_of=as_of, margin_hours=margin_hours,
+        )
+
+
+def test_check_time_travel_returns_the_deadline_from_the_dataset_window() -> None:
+    client = _dataset_client("48")
+    deadline = _check(client, as_of=_AS_OF)
+
+    client.get_dataset.assert_called_once_with("global-fishing-watch.pipe_ais_v3_published")
+    assert deadline == datetime(2026, 6, 9, 7, 46, 26, tzinfo=timezone.utc)
+
+
+def test_check_time_travel_refuses_a_run_that_would_outlive_the_window() -> None:
+    """28.2 h of a 48 h window are used up; a 20 h margin does not fit."""
+    with pytest.raises(ValueError, match="leaves time travel at 2026-06-09T07:46:26"):
+        _check(_dataset_client(48), as_of=_AS_OF, margin_hours=20)
+
+
+def test_check_time_travel_defaults_to_seven_days() -> None:
+    deadline = _check(_dataset_client(None), as_of=_AS_OF)
+    assert deadline == datetime(2026, 6, 14, 7, 46, 26, tzinfo=timezone.utc)
+
+
+def test_check_time_travel_rejects_naive_and_future_times() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _check(_dataset_client(48), as_of=datetime(2026, 6, 7, 7, 46, 26))
+    with pytest.raises(ValueError, match="in the future"):
+        _check(_dataset_client(48), as_of=datetime(2026, 6, 9, tzinfo=timezone.utc))
