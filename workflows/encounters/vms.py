@@ -76,8 +76,10 @@ from typing import Optional, Sequence
 from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
+    add_max_num_workers_arg,
     add_modes_arg,
     parse_modes,
+    worker_cap,
 )
 
 from workflows.encounters import ais
@@ -167,11 +169,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Pre-existing BQ dataset for Beam EXPORT staging; env-var "
                         "fallback DIT_BQ_TEMP_DATASET. Must be US-located to match "
                         "the VMS sources (it is, by default).")
-    p.add_argument("--max-num-workers", type=int, default=ais.DEFAULT_MAX_NUM_WORKERS,
-                   help=f"Dataflow autoscaling ceiling, mirroring prod's cap for this "
-                        f"step. Load-bearing here: an all-vessel, year-wide VMS run "
-                        f"would otherwise scale unbounded. "
-                        f"Default: {ais.DEFAULT_MAX_NUM_WORKERS}")
+    add_max_num_workers_arg(
+        p, default=ais.DEFAULT_MAX_NUM_WORKERS,
+        help_detail="The default mirrors production's AIS cap for both encounters steps. "
+                    "Load-bearing here: an all-vessel, year-wide VMS run would otherwise "
+                    "scale unbounded.",
+    )
     p.add_argument("--build-from-source", action="store_true",
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one.")
@@ -198,6 +201,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Validate before any cloud call, same reasoning as ais.py: a typo'd mode
     # that silently ran nothing is indistinguishable from a passing run.
     args.modes = parse_modes(args.modes, choices=ais.SELECTABLE_MODES)
+    # Flag > ceiling env var > default, exactly as in ais.py.
+    args.worker_cap = worker_cap(args.max_num_workers, default=ais.DEFAULT_MAX_NUM_WORKERS)
+    args.max_num_workers = args.worker_cap.workers
     return args
 
 

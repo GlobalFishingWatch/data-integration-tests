@@ -120,7 +120,7 @@ from typing import Optional, Sequence
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit import production as dit_production
-from dit.workflow import parse_choice_list, parse_modes
+from dit.workflow import max_num_workers_ceiling, parse_choice_list, parse_modes
 
 # ais.py owns the canonical mode and step sets, date defaults, step rules and
 # comparison keys; import them so the two can't drift.
@@ -358,6 +358,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
             raise SystemExit(f"--reuse-pin: {exc}") from exc
     if args.pin_max_gb <= 0:
         raise SystemExit(f"--pin-max-gb must be > 0; got {args.pin_max_gb}")
+    # Every binding's ais.py inherits DIT_MAX_NUM_WORKERS_CEILING (and gets any
+    # --max-num-workers as an extra); check the env var before anything is pinned.
+    max_num_workers_ceiling()
     args.binding_worker_images = dict(_parse_binding(b) for b in args.binding_worker_images)
     args.binding_image_tags = dict(_parse_binding(b) for b in args.binding_image_tags)
     _binding_names = {n for n, _ in args.bindings}

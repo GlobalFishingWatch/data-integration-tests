@@ -32,10 +32,14 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
+    add_max_num_workers_arg,
     add_modes_arg,
     add_no_cache_arg,
+    log_worker_caps,
+    max_num_workers_options,
     parse_modes,
     resolve_run_context,
+    worker_cap,
 )
 
 # Pipeline repo name; used to namespace auto-snapshot refs
@@ -112,6 +116,18 @@ DEFAULT_WORKER_IMAGE = (
 )
 
 RUNNERS = ("docker", "dataflow")
+
+# Dataflow worker cap (--max-num-workers, PIPELINE-4701): production's daily
+# detect step (core.ais.v3 detect_gaps.raw_gaps, core.ais.v5
+# gaps.detect_raw_gaps). Before the flag existed dit emitted no cap, so
+# gfw-common's Pipeline.default_options() applied (max_num_workers=100 in every
+# gfw-common pipe-gaps' ~=0.10 pin resolves to, v0.10 through v0.23); the
+# emitted cap overrides that default. Shared with outage_recovery.py.
+DEFAULT_MAX_NUM_WORKERS = 50
+MAX_NUM_WORKERS_HELP_DETAIL = (
+    "The default matches production's daily detect step, and replaces "
+    "gfw-common's own default of 100."
+)
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
@@ -207,6 +223,7 @@ def _make_config(
     worker_image: Optional[str] = None,
     job_name: Optional[str] = None,
     labels: Optional[Sequence[str]] = None,
+    max_num_workers: Optional[int] = None,
 ) -> SimpleNamespace:
     # `labels` (a list of "key=value" strings) is seeded into unknown_parsed_args
     # so it flows into Beam's GoogleCloudOptions.labels via the PipelineFactory
@@ -236,6 +253,9 @@ def _make_config(
     cfg.dataflow_subnetwork = dataflow_subnetwork
     cfg.worker_image = worker_image
     cfg.job_name = job_name
+    # Runner-only: emitted by _run_pipeline (Dataflow only), stripped before
+    # DetectGapsConfig.from_namespace in _build_pipeline_for.
+    cfg.max_num_workers = max_num_workers
     return cfg
 
 
@@ -306,6 +326,7 @@ def _build_pipeline_for(cfg: SimpleNamespace):
             "dataflow_subnetwork",
             "worker_image",
             "job_name",
+            "max_num_workers",
         }
         cfg_attrs = {k: v for k, v in vars(cfg).items() if k not in runner_only_attrs}
         df_cfg = SimpleNamespace(**cfg_attrs)
@@ -348,7 +369,9 @@ def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
                 "is local-only and cannot be pulled by Dataflow workers."
             )
         rc = dit_dataflow.run(
-            args=[],
+            # The worker cap, if any. Reaches gfw-common's Pipeline through
+            # the options mapping, overriding its own default of 100.
+            args=max_num_workers_options(cfg.max_num_workers),
             image_tag=cfg.worker_image,
             service_account=cfg.service_account,
             region=cfg.dataflow_region,
@@ -536,7 +559,7 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
 
     Excludes plumbing (service accounts, regions, datasets), naming
     (experiment_id, suffix), and runner-only knobs (image_tag, parallel,
-    skip_pipelines) — none of which affect the output content.
+    skip_pipelines, max_num_workers) — none of which affect the output content.
     """
     params: dict[str, Any] = {
         "mode": mode,
@@ -643,6 +666,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                     f"keeps its own --enable-pipeline-4 gate.",
     )
     add_infra_args(p)
+    add_max_num_workers_arg(
+        p, default=DEFAULT_MAX_NUM_WORKERS, help_detail=MAX_NUM_WORKERS_HELP_DETAIL,
+    )
     # --bq-temp-dataset is workflow-local; not part of add_infra_args.
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
@@ -669,6 +695,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f'{MODE_BF}, so {MODE_BF} must be in --modes '
             f'(got {",".join(args.modes)}).'
         )
+    # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
+    args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
+    args.max_num_workers = args.worker_cap.workers
     return args
 
 
@@ -706,6 +735,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
+    log_worker_caps({"every job": args.worker_cap})
 
     source_messages = args.source_messages
     source_segments = args.source_segments
@@ -732,6 +762,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dataflow_subnetwork=args.dataflow_subnetwork or None,
         worker_image=args.worker_image or None,
         labels=dit_labels,
+        max_num_workers=args.max_num_workers,
     )
 
     base = f"{PROJECT}.{args.dest_dataset}.three_way_{suffix}"
