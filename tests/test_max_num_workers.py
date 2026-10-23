@@ -267,7 +267,7 @@ def _port_visits_options(*cli):
 
 @pytest.mark.parametrize("cli", ["v4", "v5"])
 def test_port_visits_default_options_are_unchanged(cli):
-    assert _port_visits_options("--pipeline-cli", cli)[:11] == [
+    assert _port_visits_options("--pipeline-cli", cli)[:13] == [
         "--runner=DataflowRunner",
         "--project=world-fishing-827",
         "--region=us-central1",
@@ -277,6 +277,8 @@ def test_port_visits_default_options_are_unchanged(cli):
         "--subnetwork=net",
         "--no_use_public_ips",  # added 2026-10-23, tests/test_worker_ips_and_sizing.py
         "--max_num_workers=4",
+        "--worker_machine_type=e2-highmem-4",  # production's sizing, ditto
+        "--disk_size_gb=50",
         f"--sdk_container_image={port_visits.DEFAULT_WORKER_IMAGE}",
         "--job_name=dit-anchorages-pipeline-thin-exp-1-bf-1-1",
     ]
@@ -298,7 +300,7 @@ def _encounters_options(module, *cli, runner="dataflow"):
 
 @pytest.mark.parametrize("module", [encounters_ais, encounters_vms])
 def test_encounters_default_options_are_unchanged(module):
-    assert _encounters_options(module)[:12] == [
+    assert _encounters_options(module)[:14] == [
         "--runner=DataflowRunner",
         "--project=world-fishing-827",
         "--region=us-central1",
@@ -309,6 +311,8 @@ def test_encounters_default_options_are_unchanged(module):
         "--subnetwork=net",
         "--no_use_public_ips",  # added 2026-10-23, tests/test_worker_ips_and_sizing.py
         "--max_num_workers=50",
+        "--worker_machine_type=e2-highmem-4",  # production's sizing, ditto
+        "--disk_size_gb=50",
         f"--sdk_container_image={encounters_ais.DEFAULT_WORKER_IMAGE}",
         "--job_name=dit-encounters-createraw-exp-1-bf-1-1",
     ]
@@ -506,7 +510,8 @@ def test_gaps_runner_gets_the_cap_as_beam_args(module, cap, expected_args, monke
     with patch.object(module.dit_dataflow, "run", side_effect=lambda **k: calls.append(k) or 0):
         module._run_pipeline("dataflow", _gaps_cfg(module, cap), "local-tag")
 
-    assert calls[0]["args"] == expected_args
+    # The sizing tokens that follow are tests/test_worker_ips_and_sizing.py's.
+    assert _cap_tokens(calls[0]["args"]) == expected_args
 
 
 @pytest.mark.parametrize("module", GAPS_MODULES)

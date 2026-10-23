@@ -161,10 +161,12 @@ from dit.workflow import (
     add_max_num_workers_arg,
     add_no_cache_arg,
     add_worker_sizing_args,
+    log_production_sizing_hint,
     log_worker_caps,
     log_worker_sizings,
     max_num_workers_options,
     resolve_run_context,
+    resolve_worker_sizing,
     worker_cap,
     worker_sizing_from_args,
     worker_sizing_options,
@@ -180,6 +182,7 @@ from workflows.pipe_gaps.mode_equivalence import (
     DEFAULT_N_HOURS_BEFORE,
     DEFAULT_WINDOW_PERIOD_D,
     DEFAULT_WORKER_IMAGE,
+    DEFAULT_WORKER_SIZING,
     GFW_COMMON_MACHINE_TYPE_OPTION,
     MAX_NUM_WORKERS_HELP_DETAIL,
     PIPELINE_NAME,
@@ -187,7 +190,7 @@ from workflows.pipe_gaps.mode_equivalence import (
     REPO_NAME,
     RUNNERS,
     STEP_NAME,
-    WORKER_SIZING_HELP_DETAIL,
+    STEP_WORKER_SIZING,
 )
 
 # Defaults point at the dit staging cohort (same project as the snapshot
@@ -557,7 +560,7 @@ def _make_config(
     cfg.job_name = job_name
     # Runner-only, as in mode_equivalence._make_config.
     cfg.max_num_workers = max_num_workers
-    cfg.worker_sizing = worker_sizing or WorkerSizing()
+    cfg.worker_sizing = DEFAULT_WORKER_SIZING if worker_sizing is None else worker_sizing
     return cfg
 
 
@@ -1149,7 +1152,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add_max_num_workers_arg(
         p, default=DEFAULT_MAX_NUM_WORKERS, help_detail=MAX_NUM_WORKERS_HELP_DETAIL,
     )
-    add_worker_sizing_args(p, help_detail=WORKER_SIZING_HELP_DETAIL)
+    add_worker_sizing_args(p, defaults=STEP_WORKER_SIZING)
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET)
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE)
@@ -1229,7 +1232,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
     args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
     args.max_num_workers = args.worker_cap.workers
-    args.worker_sizing = worker_sizing_from_args(args)
+    # Field by field: flag > production's sizing, as in mode_equivalence.py.
+    args.cli_worker_sizing = worker_sizing_from_args(args)
+    args.worker_sizing = resolve_worker_sizing(args.cli_worker_sizing, DEFAULT_WORKER_SIZING)
     return args
 
 
@@ -1273,6 +1278,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("Run suffix: %s", suffix)
     log_worker_caps({"every job": args.worker_cap})
     log_worker_sizings({"every job": args.worker_sizing})
+    if args.runner == "dataflow":
+        log_production_sizing_hint(
+            args.cli_worker_sizing, {"every job": args.worker_sizing},
+            [args.source_messages, args.source_segments],
+        )
     logger.info("Pin-at:        %s", args.pin_at)
     logger.info("Stage 1 (initial backfill):           [%s, %s]", start, backfill_end)
     logger.info("       outage (skipped):              [%s, %s]",

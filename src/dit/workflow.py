@@ -272,17 +272,25 @@ def max_num_workers_options(max_num_workers: int | None) -> list[str]:
 # through gfw-common, whose own default is already private (see
 # workflows/pipe_gaps/mode_equivalence.py).
 #
-# The worker machine type and boot disk size are optional knobs
-# (--worker-machine-type, --disk-size-gb). Unset, dit emits nothing and the
-# pipeline CLI's own default applies. They change how fast a job runs and
-# whether it runs out of memory, never what it writes: output must not depend
-# on them, so they stay out of every cache key, like the worker cap.
+# The worker machine type and boot disk size (--worker-machine-type,
+# --disk-size-gb) default to PRODUCTION's sizing for the production step each
+# workflow step mirrors (owner rule, 2026-10-23). Each workflow holds them as a
+# hand-written per-step constant citing composer-dags-production's rendered
+# snapshots, until PIPELINE-4700 reads them from composer as data. Production
+# machine types cost more per worker-hour than a small run needs, so a run
+# that keeps them on non-production data (the AIS staging cohort) logs a cost
+# hint (log_production_sizing_hint): overriding is encouraged there. Worker
+# caps are separate (section (a2)) and do not follow this rule.
+#
+# Sizing changes how fast a job runs and whether it runs out of memory, never
+# what it writes: output must not depend on it, so it stays out of every cache
+# key, like the worker cap.
 #
 # The more specific setting wins, field by field (resolve_worker_sizing):
 #   1. the flag on the command line;
-#   2. else the workflow's default (a pipe-segment step's, or with
-#      --baseline-production the production target's);
-#   3. else nothing is emitted.
+#   2. else the step's production-mirrored default (with --baseline-production,
+#      the production target's);
+#   3. else nothing is emitted (production passes no sizing for that step).
 
 NO_PUBLIC_IPS_OPTION = "--no_use_public_ips"
 WORKER_MACHINE_TYPE_FLAG = "--worker-machine-type"
@@ -325,28 +333,53 @@ def disk_size_gb_type(value: str) -> int:
     return _int_at_least(value, name=DISK_SIZE_GB_FLAG, minimum=MIN_DISK_SIZE_GB)
 
 
-def add_worker_sizing_args(parser: argparse.ArgumentParser, *, help_detail: str = "") -> None:
+def _describe_defaults(defaults: Mapping[str, WorkerSizing], field: str, unit: str = "") -> str:
+    """One field of per-step defaults for a help text: ``"e2-highmem-4"`` when
+    every step agrees, else ``"segment e2-standard-4, segment_info unset"``."""
+    def shown(value: object) -> str:
+        return "unset" if value is None else f"{value}{unit}"
+
+    values = {step: getattr(sizing, field) for step, sizing in defaults.items()}
+    if len(set(values.values())) == 1:
+        return shown(next(iter(values.values())))
+    return ", ".join(f"{step} {shown(value)}" for step, value in values.items())
+
+
+def add_worker_sizing_args(
+    parser: argparse.ArgumentParser,
+    *,
+    defaults: Mapping[str, WorkerSizing] | None,
+    help_detail: str = "",
+) -> None:
     """Add ``--worker-machine-type`` and ``--disk-size-gb``, both ``None``
     unless given. Read them with :func:`worker_sizing_from_args`, resolve them
-    against a default with :func:`resolve_worker_sizing`, and emit the result
-    with :func:`worker_sizing_options`. ``help_detail`` says what applies when
-    a flag is unset, if the workflow has a default of its own."""
+    against each step's default with :func:`resolve_worker_sizing`, and emit
+    the result with :func:`worker_sizing_options`.
+
+    ``defaults`` maps each step to its production-mirrored sizing, shown in
+    the help; ``None`` when the workflow has none of its own, in which case
+    ``help_detail`` must say what applies."""
     rule = (
-        "Dataflow runner only. It changes speed and out-of-memory behaviour, never "
-        "output, so it is not part of the cache key."
+        "An explicit value wins; on non-production data (e.g. the AIS staging cohort) "
+        "pass a smaller one to save cost. Dataflow runner only. It changes speed and "
+        "out-of-memory behaviour, never output, so it is not part of the cache key."
         + (f" {help_detail}" if help_detail else "")
     )
+
+    def default_clause(field: str, unit: str = "") -> str:
+        if defaults is None:
+            return ""
+        return f"Default, mirroring production: {_describe_defaults(defaults, field, unit)}. "
+
     parser.add_argument(
         WORKER_MACHINE_TYPE_FLAG, type=machine_type_type, default=None,
-        help=(f"Dataflow worker machine type (Beam's --worker_machine_type), e.g. "
-              f"e2-highmem-4. Default: unset, so the pipeline CLI's own default applies. "
-              f"{rule}"),
+        help=(f"Dataflow worker machine type (Beam's --worker_machine_type). "
+              f"{default_clause('machine_type')}{rule}"),
     )
     parser.add_argument(
         DISK_SIZE_GB_FLAG, type=disk_size_gb_type, default=None,
         help=(f"Dataflow worker boot disk size in GB (Beam's --disk_size_gb), at least "
-              f"{MIN_DISK_SIZE_GB}. Default: unset, so the pipeline CLI's own default "
-              f"applies. {rule}"),
+              f"{MIN_DISK_SIZE_GB}. {default_clause('disk_size_gb', ' GB')}{rule}"),
     )
 
 
@@ -400,6 +433,60 @@ def log_worker_sizings(sizings: Mapping[str, WorkerSizing]) -> None:
         "Dataflow worker sizing: %s",
         "; ".join(f"{scope} {describe_worker_sizing(s)}" for scope, s in sizings.items()),
     )
+
+
+#: Dataset prefix of the AIS staging cohort (pipe_ais_test_<snapshot date>,
+#: README § Source data targets): the non-production source the cost hint
+#: looks for.
+STAGING_DATASET_PREFIX = "pipe_ais_test_"
+
+
+def is_staging_source(table: str) -> bool:
+    """Whether ``table`` (``project.dataset.table``) is in the AIS staging cohort."""
+    parts = table.split(".")
+    return len(parts) == 3 and parts[1].startswith(STAGING_DATASET_PREFIX)
+
+
+def production_sizing_hint(
+    cli: WorkerSizing,
+    sizings: Mapping[str, WorkerSizing],
+    sources: Sequence[str | None],
+) -> str | None:
+    """The cost hint for a run that keeps a production-mirrored sizing on
+    non-production sources, or ``None``. Pure.
+
+    ``cli`` is the sizing given on the command line, ``sizings`` each step's
+    resolved sizing, ``sources`` the tables the run reads (``None`` entries are
+    ignored). A field counts as production-mirrored when the flag is absent and
+    a step's default sets it."""
+    staging = sorted({s for s in sources if s and is_staging_source(s)})
+    mirrored = {
+        step: sizing for step, sizing in sizings.items()
+        if any(getattr(cli, f.name) is None and getattr(sizing, f.name) is not None
+               for f in fields(sizing))
+    }
+    if not staging or not mirrored:
+        return None
+    steps = "; ".join(f"{step} {describe_worker_sizing(s)}" for step, s in mirrored.items())
+    more = f" and {len(staging) - 1} more" if len(staging) > 1 else ""
+    return (
+        f"cost hint: the Dataflow worker sizing mirrors production ({steps}), but this "
+        f"run reads non-production data ({staging[0]}{more}). Production machine types "
+        f"cost more per worker-hour than a small run needs: consider a smaller "
+        f"{WORKER_MACHINE_TYPE_FLAG} / {DISK_SIZE_GB_FLAG}. Output does not depend on them."
+    )
+
+
+def log_production_sizing_hint(
+    cli: WorkerSizing,
+    sizings: Mapping[str, WorkerSizing],
+    sources: Sequence[str | None],
+) -> None:
+    """Log :func:`production_sizing_hint` as a warning when there is one.
+    Never prompts or blocks."""
+    hint = production_sizing_hint(cli, sizings, sources)
+    if hint is not None:
+        logger.warning(hint)
 
 
 # --------------------------------------------------------------------------
