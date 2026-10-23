@@ -13,6 +13,8 @@ mode-equivalence test.
 | `pipe_events/fishing.py` | pipe-events (fishing events) | **BQ-SQL via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `event_id`) | no (deferred) |
 | `pipe_events/cross_version_fishing.py` | pipe-events (fishing events) | N per-binding subprocess invocations of `fishing.py` (each with its own **BQ-SQL via container** runtime, from a `git worktree` at that binding's ref) | truncate (`view_suffix=""`, `event_id`) across BOTH `_fishing_events` and `_product_events_fishing` views | no (deferred with `fishing.py`) |
 
+`port_visits/composer_drift.py` is not a test workflow. It is a read-only drift check that compares the port-visits `ProductionTarget` and v4 argv with production's rendered DAG in composer-dags-production, and runs nothing on GCP ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700), [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md)).
+
 ## Framework-extraction decision (2026-05-29) — `dit.phases` DEFERRED
 
 Phase 3 (the third consumer) was the designated point to decide whether to

@@ -20,7 +20,7 @@ User-confirmed decisions:
 | Phase 1 — pipe-gaps port | **Code complete.** Real-BQ verification + Track 5 (pipe-gaps repo shim) pending. |
 | Phase 2 — port-visits | **AIS-staging verified 2026-05-15** (3/3 pairwise green on `visit_id`). VMS not started; AIS-full not started. |
 | Phase 3 — pipe-events port | **Code complete (2026-05-29).** Workflow + automated comparison landed; framework extraction deliberately deferred. Live e2e run + pipe-events-repo shim pending. |
-| Phase 4 — composer-dags param sync | Not started. |
+| Phase 4 — composer-dags param sync | Spike 2026-10-23 (PIPELINE-4700): `dit.composer` reads composer's render snapshots as data; no params file yet. See `docs/composer-snapshots-2026-10.md`. |
 | Phase 5 — mutation library | Not started. |
 | Phase 6 — phase sharing / hash-based caching | Not started. |
 | Phase 7 — golden-table regression mode | Not started. |
@@ -377,7 +377,7 @@ pipe-events is **structurally different from the other two consumers**, which is
 
 ## Phase 4+ vision (one paragraph each)
 
-**Phase 4 — `composer-dags` sync.** `dit sync-params --from <composer-dags-checkout>` parses production DAGs and regenerates `params.yaml` rows so AIS/VMS shapes never drift between integration tests and prod. Trigger condition: a real prod-vs-test param drift bug.
+**Phase 4 — `composer-dags` sync.** `dit sync-params --from <composer-dags-checkout>` parses production DAGs and regenerates `params.yaml` rows so AIS/VMS shapes never drift between integration tests and prod. Trigger condition: a real prod-vs-test param drift bug. (Met by the pipe-anchorages v5 CLI drift. The 2026-10-23 spike found the data source: composer's CI-checked render snapshots, read without importing composer. The proposed order, a version-drift check before any params file, is in `docs/composer-snapshots-2026-10.md` § 7.)
 
 **Phase 5 — Mutation library.** Promote `restrict_ssvids` (currently `compute_restricted_ssvids` inside pipe-gaps' workflow) plus `drop_messages`, `shift_timestamps`, `set_segment_flag` into `dit.mutations` once a second consumer needs the same input-transform mechanism. Cap at ~5.
 
