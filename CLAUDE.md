@@ -72,6 +72,32 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-23 — Private worker IPs on every Dataflow job; optional worker sizing; production's sizing in production-baseline mode
+
+**Trigger.** The composer-snapshot drift check (draft PR #86, PIPELINE-4700 spike) compared DIT's port-visits argv with production's. `gcloud dataflow jobs describe` then showed how the jobs actually ran: production on e2-highmem-4, 50 GB, private IPs; DIT's v4 CLI on Dataflow's defaults (n1-standard-1, 30 GB, **public** IPs); DIT's v5 CLI on gfw-common's (e2-standard-2, 25 GB, private). The owner decided two items on #86:
+- **(4)** emit `--no_use_public_ips` for every DIT Dataflow run;
+- **(2b + 2c)** mirror production's sizing in production-baseline mode, and add optional `--worker-machine-type` / `--disk-size-gb` flags, unset by default, everywhere else.
+
+**What the audit found.**
+- **pipe-segment** already emitted `--no_use_public_ips` on all three steps, and `segment` hard-coded e2-standard-4 / 50 GB (production's `segment.segment` runs the same in core.ais.v3; so does `segment_identity_daily`, which DIT does not mirror).
+- **pipe-gaps** goes through gfw-common, whose `Pipeline.default_options()` sets `use_public_ips: False` (checked at v0.10.0, v0.15.0, v0.20.0, v0.23.0). Beam's `PipelineOptions.from_dictionary` renders a `False` `use_public_ips` as `--no_use_public_ips` (`_FLAG_THAT_SETS_FALSE_VALUE`, checked in Beam 2.72.0). So pipe-gaps' jobs were private all along.
+- **Port visits and encounters** emitted nothing, so their v4-CLI jobs got public IPs.
+
+**Decisions.**
+- **pipe-gaps: add nothing for IPs.** Its effective default is already private, and `dit.runners.dataflow`'s token parser could only add `no_use_public_ips=True`, the flag-name key Beam documents as discarded in an options mapping (and pipe-gaps' own README warns against). Instead a test pins that no option dit hands to gfw-common carries a public-IP key, and a second (skipped in the framework-only venv) checks gfw-common's default where it is installed.
+- **Placement:** `--no_use_public_ips` right after `--subnetwork` (networking together); sizing right after `--max_num_workers`. pipe-segment keeps its existing positions.
+- **Resolution, field by field, the more specific setting winning** (`resolve_worker_sizing(cli, default)`, pure): the flag, else the workflow's default (a pipe-segment step's, or the production target's), else nothing emitted. The same rule as #85's worker cap, minus the ceiling, which sizing has no use for.
+- **`cross_version_ais.py` owns the sizing flags** instead of passing them through as extras: with `--baseline-production` it must know whether the user gave a value, and owning them validates them before anything is pinned. It forwards the resolved values to every binding as ais.py flags and drops any that reach `_ais_args_for_binding` from extras.
+- **pipe-gaps sizing goes in as `--machine_type`** (Beam's alias of `--worker_machine_type`). gfw-common merges options by option name in a `ChainMap` over its defaults; the alias parses to the same `machine_type` key, so it replaces e2-standard-2 rather than sitting beside it, with argparse order deciding which wins.
+- **Hand-written target values.** `ProductionTarget.worker_machine_type` / `disk_size_gb` cite the rendered snapshot `tests/render_dags/snapshots/core_ais_v5.py`, task `port_visits.detect_port_visits`, at composer origin/main 0a644da (from `PortVisitsConfig.worker_machine_type` and `DataflowConfig.disk_size_gb`). Reading them from composer as data stays PIPELINE-4700's question.
+- **Output must not depend on machine type or disk.** They are runner-only and in no cache key; stated in `docs/conventions.md` § Runner-only Dataflow knobs.
+
+**Emitted options.** The capture harness #85 used, extended to 32 option lists: both port-visits CLIs and runners, encounters AIS and VMS on both runners, the three pipe-segment steps on both runners, every pipe-gaps runner call of both workflows, and `cross_version_ais.py`'s binding argv and the options those bindings emit, in default and production-baseline mode. Against `feat/shared-worker-cap`, 12 Dataflow lists gain exactly `--no_use_public_ips` after `--subnetwork`; the production-baseline binding also gains `--worker-machine-type e2-highmem-4 --disk-size-gb 50`, and so `--worker_machine_type=e2-highmem-4 --disk_size_gb=50`. Everything else is byte-identical. #85's two position-pinning tests gained the flag.
+
+**Stacked on #85** (`feat/shared-worker-cap`), whose `dit.workflow` § (a2) helpers this extends; rebase onto main after #85 merges.
+
+**Sections moved.** `src/dit/workflow.py` (module docstring; `_int_at_least`, which `_positive_int` now delegates to; new § (a3): `NO_PUBLIC_IPS_OPTION`, `WorkerSizing`, `UNSET_WORKER_SIZING`, the two argparse types, `add_worker_sizing_args`, `worker_sizing_from_args`, `resolve_worker_sizing`, `worker_sizing_options`, `worker_sizing_argv`, `describe_worker_sizing`, `log_worker_sizings`); `workflows/port_visits/ais.py` (docstring, `_worker_sizing`, `_dataflow_pipeline_options`, `parse_args`, `main`, cache-key docstring); `workflows/port_visits/cross_version_ais.py` (docstring, `ProductionTarget`, `PRODUCTION_TARGETS`, `parse_args`, `_ais_args_for_binding`, `_run_binding`, `main`); `workflows/encounters/{ais,vms}.py` (`ENCOUNTERS_SIZING_HELP`, `_pipeline_options`, `parse_args`, `run`); `workflows/pipe_gaps/{mode_equivalence,outage_recovery}.py` (worker-IP note, `GFW_COMMON_MACHINE_TYPE_OPTION`, `_make_config`, `_build_pipeline_for`, `_run_pipeline`, `parse_args`, `main`); `workflows/pipe_segment/identity_match_key.py` (`STEP_WORKER_SIZING`, `_step_worker_sizing`, the three argv builders, `parse_args`, `_run_binding`, `main`); new `tests/test_worker_ips_and_sizing.py` (80); `tests/test_max_num_workers.py` (two pinned lists); `docs/conventions.md` (§ Prod-infra boundary, new § Runner-only Dataflow knobs); `docs/production-baseline-2026-10.md` (step 3, target); README Features; CHANGELOG § 2026-10-23.
+
 ### 2026-10-23 — Shared Dataflow worker cap (`--max-num-workers`) on every Dataflow workflow, with a global ceiling (PIPELINE-4701)
 
 Follow-up to point 5(a) of the 2026-10-22 pipe-anchorages v5 entry: `world-fishing-827` also runs production Dataflow, so the cap had to become one knob, not two hand-written flags.
