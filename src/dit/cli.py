@@ -272,5 +272,55 @@ def cache_cancel(run_id: str, region: str | None) -> None:
         sys.exit(1)
 
 
+@main.command("composer-dag")
+@click.argument("snapshot")
+@click.option(
+    "--repo",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="composer-dags-production checkout. Defaults to DIT_COMPOSER_DAGS_DIR, "
+         "then $PROJECTS/composer-dags-production, then a sibling of this repo.",
+)
+@click.option("--ref", default=None, help="Ref to read (default origin/main). Fetch it first.")
+@click.option("--task-prefix", default="", help="Only tasks whose id starts with this.")
+@click.option(
+    "--templated",
+    is_flag=True,
+    help="Also print each argv with the run's dates as placeholders, "
+         "and the dates that fit several.",
+)
+def composer_dag(
+    snapshot: str, repo: Path | None, ref: str | None, task_prefix: str, templated: bool,
+) -> None:
+    """Print production's rendered DAG SNAPSHOT as JSON (read-only).
+
+    SNAPSHOT is a file stem under composer's tests/render_dags/snapshots/,
+    e.g. core_ais_v5. Read with `git show`, parsed as a literal, never
+    executed. See dit.composer.
+    """
+    import json
+
+    from dit import composer
+
+    try:
+        dag = composer.load_dag(
+            repo or composer.default_composer_dir(), snapshot, ref or composer.DEFAULT_REF,
+        )
+    except (RuntimeError, ValueError) as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+    click.echo(json.dumps({
+        "snapshot": dag.snapshot,
+        "dag_id": dag.dag_id,
+        "commit": dag.commit,
+        "execution_date": dag.execution_date.isoformat(),
+        "data_interval": [dag.data_interval.start.isoformat(), dag.data_interval.end.isoformat()],
+        "tasks": [
+            composer.task_summary(t, templated=templated)
+            for t in dag.tasks if t.task_id.startswith(task_prefix)
+        ],
+    }, indent=2))
+
+
 if __name__ == "__main__":
     main()

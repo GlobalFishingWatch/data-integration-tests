@@ -72,6 +72,37 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-23 — Composer render snapshots as data: `dit.composer` (PIPELINE-4700 spike)
+
+**Problem.** DIT hand-copies production's argv, tables and image pins into its workflows, and nothing tells it when they go stale (the pipe-anchorages v5 CLI drift, PIPELINE-4699). PIPELINE-4700 asks how DIT stays in sync. The working agreement rules out importing composer, and rendering DAGs ourselves would need airflow and composer's packages.
+
+**Data source.** composer-dags-production keeps one generated, CI-checked render snapshot per DAG (`tests/render_dags/snapshots/*.py`), each a single literal `rendered_dag = {...}` holding one run's tasks with image, cmds and full argv.
+- `dit.composer` reads it with `git show <commit>:<path>` (never checkout, so composer's working tree is untouched) and `ast.literal_eval` (never executes the file).
+- All 260 snapshots at composer 0a644da parse, in about 1.7 s.
+- Stdlib only, in the style of `dit.production`.
+
+**Design points.**
+- **Dates to placeholders.** `{start_date}` / `{end_date}` (last day) / `{end_date_exclusive}` / `{execution_date}` (only where it differs from the start), each with a `_nodash` form. A date that fits several is reported, not guessed. In a one-day interval (135 of 260 snapshots, including daily `core_ais_v5`) every run date is ambiguous, so only multi-day snapshots settle conventions. The backfill confirms port visits: step 1 runs start to end minus one day, step 2 runs 2012-01-01 to end minus one day, and job names end in the start date.
+- **argv order is not CI-verified.** composer's `assert_dicts` sorts lists, so `parse_argv`'s `--k v` pairing relies on the files being generated, not edited.
+- **Port-visits logic stays out of the library.** It lives in `workflows/port_visits/composer_drift.py`, as a read-only check with exit 1 on drift. DIT is configured as `--baseline-production` configures it, so a differing value is a real difference. `DIT_OWNED_FLAGS` (outputs, identity, placement, labels, job names, worker cap, `--temp_dataset`) are listed apart; that set is a proposal for the owner.
+- **The target maps to the daily snapshot `core_ais_v5`.** The brief named `core_ais_v5_backfill`, but `ProductionTarget`'s job-name prefix is the daily DAG's; the backfill is a separate DAG with its own job names.
+
+**Findings, reported and NOT acted on (owner decides).**
+- `ProductionTarget("ais-v5-datalake")`: all nine fields match the daily snapshot. Against the backfill, only the job-name prefix differs, as expected.
+- v4 argv: the commands are the same. `--runner` differs (`DataflowRunner` against `dataflow`; Beam matches partial runner names, not verified against the image). Five production-only flags: `--disk_size_gb`, `--worker_machine_type`, `--dataflow_service_options`, `--network`, `--no_use_public_ips`. Step 1 also differs in its two input tables, which `ProductionTarget` lacks.
+- Versions: production pins pipe-anchorages v4.6.4, as DIT does. DIT's pipe-events v4.2.17 and pipe-gaps v0.10.0 are behind `core.ais.v3` (v5.0.0, v0.10.3) and `core.ais.v5` (v8.0.1 with renamed commands, v0.17.0 with `raw-gaps`).
+- The survey's v6.2.0 / v0.12.0 for v5 were stale: v5's pins between 2026-08-21 and September.
+
+**Public-repo constraint.** No composer content is committed. Tests use synthetic fixtures, the doc summarises, and `composer_drift.py`'s output (which prints production infra values) is for local reading only. Any future checked-in params file needs an allow-list for the same reason.
+
+**Next step proposed:** a version-drift check for every workflow (image tags and command names against `pinned_versions`), before any `params/<pipeline>.yaml`. Full list in the doc's § 7.
+
+**Sections moved.**
+- New: `src/dit/composer.py`, `workflows/port_visits/composer_drift.py`, `docs/composer-snapshots-2026-10.md`, `tests/test_composer.py`, `tests/test_port_visits_composer_drift.py` (53 tests; suite 661 → 714).
+- `src/dit/cli.py`: `composer-dag` subcommand.
+- `docs/plan.md`: Phase 4 status row and vision paragraph.
+- README: Features and Roadmap 7b. `workflows/README.md`: a note on the drift check. CHANGELOG 2026-10-23.
+
 ### 2026-10-23 — Production baseline: candidate vs production's own output (PIPELINE-4703)
 
 A third comparison shape next to mode equivalence and cross-version. The bindings run on exactly what production read, and their output is diffed against what production wrote, without re-running production. The owner decided four points:
