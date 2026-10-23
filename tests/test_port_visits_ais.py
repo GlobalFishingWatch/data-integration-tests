@@ -42,6 +42,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         # Per-`main()` context normally set inside main():
         run_id="rid01",
         experiment_id="exp01",
+        no_cache=False,
         commit_sha="abc1234",
         unreviewed=False,
         worker_image="gcr.io/foo/pipe-anchorages:v4.6.4",
@@ -296,6 +297,24 @@ def test_run_with_cache_hit_skips_execute_fn():
     mock_write.assert_not_called()
     # Returns the CACHED FQN, not the fresh local one.
     assert result == "proj.ds.cached_visits"
+
+
+def test_run_with_cache_no_cache_recomputes_despite_a_hit():
+    """--no-cache reaches the shared wrapper: a cached row exists, yet the
+    mode runs and returns its own fresh table."""
+    args = _args(no_cache=True)
+    suffix = "exp01_abc1234_aabbcc"
+    execute_fn = MagicMock()
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=_cached_row()),
+        patch.object(dit_workflow, "verify_tables_exist", return_value=[True, True]),
+        patch.object(dit_workflow, "write_cache"),
+        patch.object(dit_workflow, "expires_at_for",
+                     return_value=datetime(2026, 11, 1, tzinfo=timezone.utc)),
+    ):
+        result = mod._run_with_cache(args, mod.MODE_BF, suffix, execute_fn)
+    execute_fn.assert_called_once()
+    assert result == mod._visits_table(args, suffix, mod.MODE_BF)
 
 
 def test_run_with_cache_miss_runs_and_writes():
