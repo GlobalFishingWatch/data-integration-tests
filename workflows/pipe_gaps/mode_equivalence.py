@@ -35,9 +35,11 @@ from dit.workflow import (
     add_max_num_workers_arg,
     add_modes_arg,
     add_no_cache_arg,
+    log_worker_caps,
     max_num_workers_options,
     parse_modes,
     resolve_run_context,
+    worker_cap,
 )
 
 # Pipeline repo name; used to namespace auto-snapshot refs
@@ -115,16 +117,16 @@ DEFAULT_WORKER_IMAGE = (
 
 RUNNERS = ("docker", "dataflow")
 
-# Dataflow worker cap (--max-num-workers, PIPELINE-4701). None: dit emits no
-# cap, so gfw-common's Pipeline.default_options() applies (max_num_workers=100
-# in every gfw-common pipe-gaps' ~=0.10 pin resolves to, v0.10 through v0.23),
-# exactly as before the flag existed. Production's daily detect step runs with
-# 50 (core.ais.v3 detect_gaps.raw_gaps, core.ais.v5 gaps.detect_raw_gaps).
-# Shared with outage_recovery.py.
-DEFAULT_MAX_NUM_WORKERS: int | None = None
+# Dataflow worker cap (--max-num-workers, PIPELINE-4701): production's daily
+# detect step (core.ais.v3 detect_gaps.raw_gaps, core.ais.v5
+# gaps.detect_raw_gaps). Before the flag existed dit emitted no cap, so
+# gfw-common's Pipeline.default_options() applied (max_num_workers=100 in every
+# gfw-common pipe-gaps' ~=0.10 pin resolves to, v0.10 through v0.23); the
+# emitted cap overrides that default. Shared with outage_recovery.py.
+DEFAULT_MAX_NUM_WORKERS = 50
 MAX_NUM_WORKERS_HELP_DETAIL = (
-    "Unset, dit emits no cap and gfw-common's Pipeline default applies "
-    "(100 workers). Production's daily detect step uses 50."
+    "The default matches production's daily detect step, and replaces "
+    "gfw-common's own default of 100."
 )
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
@@ -693,6 +695,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f'{MODE_BF}, so {MODE_BF} must be in --modes '
             f'(got {",".join(args.modes)}).'
         )
+    # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
+    args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
+    args.max_num_workers = args.worker_cap.workers
     return args
 
 
@@ -730,6 +735,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
+    log_worker_caps({"every job": args.worker_cap})
 
     source_messages = args.source_messages
     source_segments = args.source_segments

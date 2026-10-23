@@ -79,6 +79,7 @@ from dit.workflow import (
     add_max_num_workers_arg,
     add_modes_arg,
     parse_modes,
+    worker_cap,
 )
 
 from workflows.encounters import ais
@@ -200,6 +201,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Validate before any cloud call, same reasoning as ais.py: a typo'd mode
     # that silently ran nothing is indistinguishable from a passing run.
     args.modes = parse_modes(args.modes, choices=ais.SELECTABLE_MODES)
+    # Flag > ceiling env var > default, exactly as in ais.py.
+    args.worker_cap = worker_cap(args.max_num_workers, default=ais.DEFAULT_MAX_NUM_WORKERS)
+    args.max_num_workers = args.worker_cap.workers
     return args
 
 

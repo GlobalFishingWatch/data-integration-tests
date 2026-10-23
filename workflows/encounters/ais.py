@@ -122,9 +122,11 @@ from dit.workflow import (
     add_infra_args,
     add_max_num_workers_arg,
     add_modes_arg,
+    log_worker_caps,
     max_num_workers_options,
     parse_modes,
     resolve_run_context,
+    worker_cap,
 )
 
 logger = logging.getLogger(__name__)
@@ -191,7 +193,9 @@ DEFAULT_END = "2020-12-31"
 DEFAULT_TAIL_DAYS = 3
 
 # Dataflow autoscaling ceiling. Mirrors prod's
-# detect_encounters_config.max_num_workers (composer-dags dags/core/vms/config.py).
+# detect_encounters_config.max_num_workers (composer-dags dags/core/vms/config.py),
+# which is also what the AIS DAGs (core.ais.v3, core.ais.v5) run. core.vms.v5.daily
+# runs encounters at 400 instead; PIPELINE-4706 tracks that. dit stays at 50.
 # Without a cap, a wide run (all vessels over a year) scales unbounded.
 DEFAULT_MAX_NUM_WORKERS = 50
 
@@ -744,6 +748,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Validate before any cloud call: a typo'd mode that silently ran nothing
     # would look exactly like a passing run.
     args.modes = parse_modes(args.modes, choices=SELECTABLE_MODES)
+    # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
+    args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
+    args.max_num_workers = args.worker_cap.workers
     return args
 
 
@@ -811,6 +818,7 @@ def run(
                 args.start, args.end, args.tail_days)
     if args.ssvid_filter:
         logger.info("ssvid_filter: %s", args.ssvid_filter)
+    log_worker_caps({"every job": args.worker_cap})
 
     raw_fqns = {m: _raw_table(args, suffix, m) for m in SELECTABLE_MODES}
     merged_fqns = {m: _encounters_table(args, suffix, m) for m in SELECTABLE_MODES}

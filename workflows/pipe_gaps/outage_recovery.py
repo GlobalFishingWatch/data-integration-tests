@@ -159,8 +159,10 @@ from dit.workflow import (
     add_infra_args,
     add_max_num_workers_arg,
     add_no_cache_arg,
+    log_worker_caps,
     max_num_workers_options,
     resolve_run_context,
+    worker_cap,
 )
 
 # Reused workflow-wide constants. See mode_equivalence.py for full doc.
@@ -1206,6 +1208,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "from an earlier run with the same --experiment-id. Pick one."
         )
 
+    # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
+    args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
+    args.max_num_workers = args.worker_cap.workers
     return args
 
 
@@ -1247,6 +1252,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     suffix = _resolve_suffix(args)
     logger.info("experiment_id: %s", args.experiment_id)
     logger.info("Run suffix: %s", suffix)
+    log_worker_caps({"every job": args.worker_cap})
     logger.info("Pin-at:        %s", args.pin_at)
     logger.info("Stage 1 (initial backfill):           [%s, %s]", start, backfill_end)
     logger.info("       outage (skipped):              [%s, %s]",

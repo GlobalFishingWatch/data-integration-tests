@@ -104,8 +104,10 @@ from dit.workflow import (
     EXPERIMENT_ID_RE,
     add_experiment_id_arg,
     add_max_num_workers_arg,
+    log_worker_caps,
     max_num_workers_options,
     resolve_run_context,
+    worker_cap,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,8 +215,9 @@ DOWNSTREAM_OUTPUT_TABLES = (
 # Dataflow worker cap per step. segment and segment_identity match production
 # (segment.segment and segment.segment_identity_daily run with 50 in core.ais.v3
 # and core.vms.v5.daily). Production passes no Dataflow options to
-# segment_info, so its 20 is dit's own. --max-num-workers (unset by default)
-# replaces all three for one run (PIPELINE-4701).
+# segment_info, so its 20 is dit's own. These are the defaults of the shared
+# resolution (PIPELINE-4701): an explicit --max-num-workers replaces all three,
+# and DIT_MAX_NUM_WORKERS_CEILING lowers each to min(step default, ceiling).
 STEP_MAX_NUM_WORKERS = {
     "segment": 50,
     "segment_identity": 50,
@@ -222,9 +225,10 @@ STEP_MAX_NUM_WORKERS = {
 }
 
 
-def _step_max_num_workers(step: str, override: int | None) -> int:
-    """The cap for ``step``: ``--max-num-workers`` when set, else the step's own."""
-    return STEP_MAX_NUM_WORKERS[step] if override is None else override
+def _step_max_num_workers(step: str, resolved: int | None) -> int:
+    """The cap for ``step``: its resolved cap (``args.worker_caps``) when given,
+    else the step's default."""
+    return STEP_MAX_NUM_WORKERS[step] if resolved is None else resolved
 
 
 # Compare-key map per output table. Verified against pipe_segment/schemas/
@@ -332,14 +336,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     step_caps = ", ".join(f"{step} {cap}" for step, cap in STEP_MAX_NUM_WORKERS.items())
     add_max_num_workers_arg(
         p, default=None,
-        help_detail=f"Set, it replaces the cap of all three steps. Unset, each step keeps "
-                    f"its own: {step_caps}.",
+        help_detail=f"Unset here means per step: {step_caps}, each lowered by the "
+                    f"ceiling env var; an explicit value replaces all three.",
     )
     args = p.parse_args(argv)
 
     args.bindings = [_parse_binding(b) for b in args.bindings]
     args.pin_source_at = _parse_iso8601(args.pin_source_at)
     args.date_range = _parse_daterange(args.date_range)
+    # Per step: flag > ceiling env var > step default (resolve_max_num_workers).
+    # args.max_num_workers stays the raw flag value.
+    args.worker_caps = {
+        step: worker_cap(args.max_num_workers, default=default)
+        for step, default in STEP_MAX_NUM_WORKERS.items()
+    }
     return args
 
 
@@ -961,7 +971,7 @@ def _run_binding(
             ssvid_filter_query=args.ssvid_filter_query,
             service_account=args.service_account,
             include_satellite_offsets=args.include_satellite_offsets,
-            max_num_workers=args.max_num_workers,
+            max_num_workers=args.worker_caps["segment"].workers,
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -982,7 +992,7 @@ def _run_binding(
             runner=args.runner,
             worker_image=image_tag,
             service_account=args.service_account,
-            max_num_workers=args.max_num_workers,
+            max_num_workers=args.worker_caps["segment_identity"].workers,
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -999,7 +1009,7 @@ def _run_binding(
             runner=args.runner,
             worker_image=image_tag,
             service_account=args.service_account,
-            max_num_workers=args.max_num_workers,
+            max_num_workers=args.worker_caps["segment_info"].workers,
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -1117,6 +1127,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("runner:        %s", args.runner)
     logger.info("pipeline_dir:  %s", args.pipeline_dir)
     logger.info("dest_dataset:  %s", args.dest_dataset)
+    log_worker_caps(args.worker_caps)
     if args.skip_downstream:
         logger.info("downstream:    SKIPPED (segment_identity, segment_info)")
 

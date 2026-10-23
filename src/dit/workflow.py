@@ -5,8 +5,8 @@ Both ``workflows/pipe_gaps/mode_equivalence.py`` and
 pipeline-specific logic:
 
 * per-user infra knobs (DIT_* env-backed defaults + the argparse flags that
-  override them), plus the Dataflow worker cap (``--max-num-workers``, a
-  per-workflow default with no env var);
+  override them), plus the Dataflow worker cap (``--max-num-workers`` over a
+  per-workflow default, lowered by the ``DIT_MAX_NUM_WORKERS_CEILING`` env var);
 * the ``--experiment-id`` slug (validation, auto-default, argparse flag);
 * the ``main()`` preamble that resolves the committed pipeline ref, classifies
   it as reviewed/unreviewed, ensures a worker image exists, and stamps the
@@ -28,7 +28,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -118,12 +118,42 @@ def add_infra_args(parser: argparse.ArgumentParser) -> None:
 # world-fishing-827 is also the execution project of production Dataflow jobs
 # (e.g. core.ais.v5.backfill), so an uncapped dit run competes with production
 # for regional CPU and IP quota. Every Dataflow workflow takes --max-num-workers
-# through these helpers, each with its own default (None = dit emits no cap).
-# The cap is runner-only: it never changes output, so it stays out of every
-# cache key. Deliberately no DIT_* env-var fallback: a silent environment
-# variable could raise a cap without anyone noticing.
+# through these helpers, each with its own default. The cap is runner-only: it
+# never changes output, so it stays out of every cache key.
+#
+# The effective cap follows the usual override order, the more specific setting
+# winning (resolve_max_num_workers):
+#   1. --max-num-workers N on the command line, even above the ceiling;
+#   2. else min(default, DIT_MAX_NUM_WORKERS_CEILING) when that env var is set
+#      (a global ceiling: it can only lower a default, never raise one);
+#   3. else the workflow's (or the step's) default.
 
 MAX_NUM_WORKERS_FLAG = "--max-num-workers"
+MAX_NUM_WORKERS_CEILING_ENV = "DIT_MAX_NUM_WORKERS_CEILING"
+
+#: Where an effective cap came from; logged once per run.
+CAP_FROM_CLI = "cli"
+CAP_FROM_CEILING = "ceiling"
+CAP_FROM_DEFAULT = "default"
+
+
+@dataclass(frozen=True)
+class WorkerCap:
+    """An effective Dataflow worker cap (``None``: dit emits none) and its source."""
+
+    workers: int | None
+    source: str
+
+
+def _positive_int(value: str, *, name: str) -> int:
+    """``value`` as an integer of at least 1; ``SystemExit`` naming ``name`` otherwise."""
+    try:
+        workers = int(value)
+    except ValueError:
+        raise SystemExit(f"error: {name} must be an integer; got {value!r}.") from None
+    if workers < 1:
+        raise SystemExit(f"error: {name} must be >= 1; got {workers}.")
+    return workers
 
 
 def max_num_workers_type(value: str) -> int:
@@ -132,15 +162,59 @@ def max_num_workers_type(value: str) -> int:
     Raises ``SystemExit`` with the reason, like :func:`validate_experiment_id`,
     so a bad value fails before any cloud call.
     """
-    try:
-        workers = int(value)
-    except ValueError:
-        raise SystemExit(
-            f"error: {MAX_NUM_WORKERS_FLAG} must be an integer; got {value!r}."
-        ) from None
-    if workers < 1:
-        raise SystemExit(f"error: {MAX_NUM_WORKERS_FLAG} must be >= 1; got {workers}.")
-    return workers
+    return _positive_int(value, name=MAX_NUM_WORKERS_FLAG)
+
+
+def max_num_workers_ceiling(environ: Mapping[str, str] = os.environ) -> int | None:
+    """The validated ``DIT_MAX_NUM_WORKERS_CEILING``, or ``None`` when unset or empty.
+
+    Read when a run starts (not at import), and validated like the flag, so a
+    bad value fails before any cloud call.
+    """
+    raw = environ.get(MAX_NUM_WORKERS_CEILING_ENV, "").strip()
+    return _positive_int(raw, name=MAX_NUM_WORKERS_CEILING_ENV) if raw else None
+
+
+def resolve_max_num_workers(
+    cli: int | None, ceiling: int | None, default: int | None,
+) -> WorkerCap:
+    """The effective cap from the flag, the ceiling and the default. Pure.
+
+    The explicit flag wins outright, even above the ceiling. Otherwise the
+    ceiling lowers the default and never raises it; with no default of its
+    own (``None``), the ceiling is the cap. Otherwise the default applies.
+    Every workflow and pipe-segment step resolves through here, so none can
+    order the three differently.
+    """
+    if cli is not None:
+        return WorkerCap(cli, CAP_FROM_CLI)
+    if ceiling is not None and (default is None or ceiling < default):
+        return WorkerCap(ceiling, CAP_FROM_CEILING)
+    return WorkerCap(default, CAP_FROM_DEFAULT)
+
+
+def worker_cap(
+    cli: int | None, *, default: int | None, environ: Mapping[str, str] = os.environ,
+) -> WorkerCap:
+    """:func:`resolve_max_num_workers` with the ceiling read from ``environ``.
+
+    Workflows call it in ``parse_args`` on the parsed ``--max-num-workers``.
+    """
+    return resolve_max_num_workers(cli, max_num_workers_ceiling(environ), default)
+
+
+def describe_worker_cap(cap: WorkerCap) -> str:
+    """E.g. ``"4 (default)"``, ``"10 (ceiling)"``, ``"30 (cli)"``."""
+    shown = "unset" if cap.workers is None else str(cap.workers)
+    return f"{shown} ({cap.source})"
+
+
+def log_worker_caps(caps: Mapping[str, WorkerCap]) -> None:
+    """Log each scope's effective cap and its source. Call once per run."""
+    logger.info(
+        "Dataflow worker cap: %s",
+        ", ".join(f"{scope} {describe_worker_cap(cap)}" for scope, cap in caps.items()),
+    )
 
 
 def add_max_num_workers_arg(
@@ -151,17 +225,21 @@ def add_max_num_workers_arg(
 ) -> None:
     """Add ``--max-num-workers`` (the Dataflow autoscaling ceiling per job).
 
-    ``default`` is the workflow's own cap, or ``None`` when the workflow
-    emits none of its own. Emit the parsed value with
-    :func:`max_num_workers_options`. ``help_detail`` says what the default is
-    sized for, or what applies when it is ``None``.
+    The parsed value is ``None`` unless the flag is given, so that
+    :func:`worker_cap` can tell an explicit value from the default; resolve it
+    with ``worker_cap(args.max_num_workers, default=...)`` and emit the result
+    with :func:`max_num_workers_options`. ``default`` is the workflow's cap,
+    shown in the help, or ``None`` when it has none of its own. ``help_detail``
+    says what the default is sized for, or what applies when it is ``None``.
     """
     shown = "unset" if default is None else str(default)
     parser.add_argument(
-        MAX_NUM_WORKERS_FLAG, type=max_num_workers_type, default=default,
+        MAX_NUM_WORKERS_FLAG, type=max_num_workers_type, default=None,
         help=(
             f"Dataflow autoscaling ceiling per job (Beam's --max_num_workers). "
-            f"Default: {shown}. Dataflow runner only. It does not affect output, "
+            f"Default: {shown}, lowered (never raised) to "
+            f"${MAX_NUM_WORKERS_CEILING_ENV} when that is set. An explicit value "
+            f"wins over both. Dataflow runner only. It does not affect output, "
             f"so it is not part of the cache key."
             + (f" {help_detail}" if help_detail else "")
         ),
