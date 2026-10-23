@@ -78,8 +78,10 @@ from dit.workflow import (
     add_infra_args,
     add_max_num_workers_arg,
     add_modes_arg,
+    add_worker_sizing_args,
     parse_modes,
     worker_cap,
+    worker_sizing_from_args,
 )
 
 from workflows.encounters import ais
@@ -175,6 +177,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                     "Load-bearing here: an all-vessel, year-wide VMS run would otherwise "
                     "scale unbounded.",
     )
+    add_worker_sizing_args(p, help_detail=ais.ENCOUNTERS_SIZING_HELP)
     p.add_argument("--build-from-source", action="store_true",
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one.")
@@ -204,6 +207,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Flag > ceiling env var > default, exactly as in ais.py.
     args.worker_cap = worker_cap(args.max_num_workers, default=ais.DEFAULT_MAX_NUM_WORKERS)
     args.max_num_workers = args.worker_cap.workers
+    args.worker_sizing = worker_sizing_from_args(args)
     return args
 
 

@@ -6,7 +6,9 @@ pipeline-specific logic:
 
 * per-user infra knobs (DIT_* env-backed defaults + the argparse flags that
   override them), plus the Dataflow worker cap (``--max-num-workers`` over a
-  per-workflow default, lowered by the ``DIT_MAX_NUM_WORKERS_CEILING`` env var);
+  per-workflow default, lowered by the ``DIT_MAX_NUM_WORKERS_CEILING`` env var),
+  private worker IPs, and the optional worker sizing (``--worker-machine-type``,
+  ``--disk-size-gb``);
 * the ``--experiment-id`` slug (validation, auto-default, argparse flag);
 * the ``main()`` preamble that resolves the committed pipeline ref, classifies
   it as reviewed/unreviewed, ensures a worker image exists, and stamps the
@@ -29,7 +31,7 @@ import re
 import subprocess
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -145,15 +147,21 @@ class WorkerCap:
     source: str
 
 
-def _positive_int(value: str, *, name: str) -> int:
-    """``value`` as an integer of at least 1; ``SystemExit`` naming ``name`` otherwise."""
+def _int_at_least(value: str, *, name: str, minimum: int) -> int:
+    """``value`` as an integer of at least ``minimum``; ``SystemExit`` naming
+    ``name`` otherwise."""
     try:
-        workers = int(value)
+        number = int(value)
     except ValueError:
         raise SystemExit(f"error: {name} must be an integer; got {value!r}.") from None
-    if workers < 1:
-        raise SystemExit(f"error: {name} must be >= 1; got {workers}.")
-    return workers
+    if number < minimum:
+        raise SystemExit(f"error: {name} must be >= {minimum}; got {number}.")
+    return number
+
+
+def _positive_int(value: str, *, name: str) -> int:
+    """``value`` as an integer of at least 1; ``SystemExit`` naming ``name`` otherwise."""
+    return _int_at_least(value, name=name, minimum=1)
 
 
 def max_num_workers_type(value: str) -> int:
@@ -252,6 +260,146 @@ def max_num_workers_options(max_num_workers: int | None) -> list[str]:
     if max_num_workers is None:
         return []
     return [f"--max_num_workers={max_num_workers}"]
+
+
+# --------------------------------------------------------------------------
+# (a3) Dataflow worker IPs and sizing
+# --------------------------------------------------------------------------
+# Every DIT Dataflow job runs with private worker IPs, as production does.
+# DIT's subnetwork reaches Google's APIs without external IPs, so a public IP
+# buys nothing and uses up external-IP quota that production shares. Each
+# workflow emits NO_PUBLIC_IPS_OPTION in its Dataflow options; pipe-gaps goes
+# through gfw-common, whose own default is already private (see
+# workflows/pipe_gaps/mode_equivalence.py).
+#
+# The worker machine type and boot disk size are optional knobs
+# (--worker-machine-type, --disk-size-gb). Unset, dit emits nothing and the
+# pipeline CLI's own default applies. They change how fast a job runs and
+# whether it runs out of memory, never what it writes: output must not depend
+# on them, so they stay out of every cache key, like the worker cap.
+#
+# The more specific setting wins, field by field (resolve_worker_sizing):
+#   1. the flag on the command line;
+#   2. else the workflow's default (a pipe-segment step's, or with
+#      --baseline-production the production target's);
+#   3. else nothing is emitted.
+
+NO_PUBLIC_IPS_OPTION = "--no_use_public_ips"
+WORKER_MACHINE_TYPE_FLAG = "--worker-machine-type"
+DISK_SIZE_GB_FLAG = "--disk-size-gb"
+#: Dataflow's smallest accepted boot disk is 10 GB.
+MIN_DISK_SIZE_GB = 10
+
+#: Beam's flag for the machine type. gfw-common merges options by option
+#: name, so the in-process pipe-gaps path passes the alias ``--machine_type``.
+MACHINE_TYPE_OPTION = "--worker_machine_type"
+
+
+@dataclass(frozen=True)
+class WorkerSizing:
+    """A Dataflow worker machine type and boot disk size in GB. A ``None``
+    field is not emitted, so the pipeline CLI's own default applies."""
+
+    machine_type: str | None = None
+    disk_size_gb: int | None = None
+
+
+#: Neither field set: dit emits no sizing option.
+UNSET_WORKER_SIZING = WorkerSizing()
+
+
+def machine_type_type(value: str) -> str:
+    """argparse ``type`` for ``--worker-machine-type``: a non-empty string,
+    stripped. Raises ``SystemExit`` before any cloud call otherwise."""
+    machine_type = value.strip()
+    if not machine_type:
+        raise SystemExit(
+            f"error: {WORKER_MACHINE_TYPE_FLAG} must be a non-empty machine type; got {value!r}."
+        )
+    return machine_type
+
+
+def disk_size_gb_type(value: str) -> int:
+    """argparse ``type`` for ``--disk-size-gb``: an integer of at least
+    :data:`MIN_DISK_SIZE_GB`. Raises ``SystemExit`` otherwise."""
+    return _int_at_least(value, name=DISK_SIZE_GB_FLAG, minimum=MIN_DISK_SIZE_GB)
+
+
+def add_worker_sizing_args(parser: argparse.ArgumentParser, *, help_detail: str = "") -> None:
+    """Add ``--worker-machine-type`` and ``--disk-size-gb``, both ``None``
+    unless given. Read them with :func:`worker_sizing_from_args`, resolve them
+    against a default with :func:`resolve_worker_sizing`, and emit the result
+    with :func:`worker_sizing_options`. ``help_detail`` says what applies when
+    a flag is unset, if the workflow has a default of its own."""
+    rule = (
+        "Dataflow runner only. It changes speed and out-of-memory behaviour, never "
+        "output, so it is not part of the cache key."
+        + (f" {help_detail}" if help_detail else "")
+    )
+    parser.add_argument(
+        WORKER_MACHINE_TYPE_FLAG, type=machine_type_type, default=None,
+        help=(f"Dataflow worker machine type (Beam's --worker_machine_type), e.g. "
+              f"e2-highmem-4. Default: unset, so the pipeline CLI's own default applies. "
+              f"{rule}"),
+    )
+    parser.add_argument(
+        DISK_SIZE_GB_FLAG, type=disk_size_gb_type, default=None,
+        help=(f"Dataflow worker boot disk size in GB (Beam's --disk_size_gb), at least "
+              f"{MIN_DISK_SIZE_GB}. Default: unset, so the pipeline CLI's own default "
+              f"applies. {rule}"),
+    )
+
+
+def worker_sizing_from_args(args: argparse.Namespace) -> WorkerSizing:
+    """The sizing given on the command line (``None`` where a flag is absent)."""
+    return WorkerSizing(machine_type=args.worker_machine_type, disk_size_gb=args.disk_size_gb)
+
+
+def resolve_worker_sizing(
+    cli: WorkerSizing, default: WorkerSizing = UNSET_WORKER_SIZING,
+) -> WorkerSizing:
+    """Field by field, an explicit value wins over the default. Pure."""
+    return replace(default, **{
+        field.name: getattr(cli, field.name)
+        for field in fields(cli)
+        if getattr(cli, field.name) is not None
+    })
+
+
+def worker_sizing_options(
+    sizing: WorkerSizing, *, machine_type_option: str = MACHINE_TYPE_OPTION,
+) -> list[str]:
+    """Beam option tokens for the set fields, e.g.
+    ``["--worker_machine_type=e2-highmem-4", "--disk_size_gb=50"]``; ``[]``
+    when neither is set."""
+    return [
+        *([f"{machine_type_option}={sizing.machine_type}"] if sizing.machine_type else []),
+        *([f"--disk_size_gb={sizing.disk_size_gb}"] if sizing.disk_size_gb is not None else []),
+    ]
+
+
+def worker_sizing_argv(sizing: WorkerSizing) -> list[str]:
+    """dit flags for the set fields, to forward the sizing to another dit
+    workflow (``cross_version_ais.py`` to every binding's ``ais.py``)."""
+    return [
+        *([WORKER_MACHINE_TYPE_FLAG, sizing.machine_type] if sizing.machine_type else []),
+        *([DISK_SIZE_GB_FLAG, str(sizing.disk_size_gb)] if sizing.disk_size_gb is not None else []),
+    ]
+
+
+def describe_worker_sizing(sizing: WorkerSizing) -> str:
+    """E.g. ``"machine type e2-highmem-4, disk 50 GB"``; ``unset`` for a
+    ``None`` field."""
+    disk = "unset" if sizing.disk_size_gb is None else f"{sizing.disk_size_gb} GB"
+    return f"machine type {sizing.machine_type or 'unset'}, disk {disk}"
+
+
+def log_worker_sizings(sizings: Mapping[str, WorkerSizing]) -> None:
+    """Log each scope's sizing. Call once per run."""
+    logger.info(
+        "Dataflow worker sizing: %s",
+        "; ".join(f"{scope} {describe_worker_sizing(s)}" for scope, s in sizings.items()),
+    )
 
 
 # --------------------------------------------------------------------------
