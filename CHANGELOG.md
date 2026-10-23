@@ -24,13 +24,23 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   Dry-run verified against production's 2026-10-20 run (job `2026-10-23_00_46_26-2424624824928045608`). Estimated full reads through the views: 1150.5 GB of thinned input, 69.6 GB `segment_info`, 103.4 GB `segs_activity`, and 443.0 GB of production output, so a live run needs `--pin-max-gb 1300`. 37 new tests; suite 624 → 661 (on top of `--no-cache`, #82). Runbook and caveats: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
 
 #### Changed
-- **`--max-num-workers` is one shared flag on every Dataflow workflow ([PIPELINE-4701](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4701)).** `world-fishing-827` is also the execution project of production Dataflow jobs, so an unbounded dit run could take regional quota from them. The flag, its validation and its emission now live in `dit.workflow` (`add_max_num_workers_arg`, `max_num_workers_options`); each workflow passes its own default. No default changed, and default runs emit byte-identical Beam options (checked with a capture harness over all 18 option lists, and pinned by tests):
-  - `port_visits/ais.py`: 4 (unchanged). `cross_version_ais.py` still forwards the flag to every binding.
-  - `encounters/ais.py` and `vms.py`: 50 (unchanged). Values below 1 are now rejected here too.
-  - `pipe_gaps/mode_equivalence.py` and `outage_recovery.py`: **new flag**, unset by default. Unset, dit emits no cap and gfw-common's `Pipeline` default applies: 100 workers, as before. Set, it overrides that default through the in-process runner. DirectRunner (`--runner docker`) runs get no cap.
-  - `pipe_segment/identity_match_key.py`: **new flag**, unset by default. Unset, each step keeps its hard-coded cap (`segment` 50, `segment_identity` 50, `segment_info` 20); set, it replaces all three.
+- **`--max-num-workers` is one shared flag on every Dataflow workflow, with a global ceiling ([PIPELINE-4701](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4701)).** `world-fishing-827` is also the execution project of production Dataflow jobs, so an unbounded dit run could take regional quota from them. The flag, its validation, the resolution and the emission now live in `dit.workflow` (`add_max_num_workers_arg`, `worker_cap`, `max_num_workers_options`); each workflow passes its own default.
+  - **Precedence, the more specific setting winning:**
+    1. an explicit `--max-num-workers N` applies to every job and step, even above the ceiling;
+    2. otherwise the new **`DIT_MAX_NUM_WORKERS_CEILING`** env var, when set, lowers each default to `min(default, ceiling)`. It never raises one;
+    3. otherwise the workflow's or step's default.
 
-  Dataflow runner only, and never part of a cache key (tested for every cached workflow and mode). No `DIT_MAX_NUM_WORKERS` env var, on purpose: a silent environment variable could raise a cap unnoticed. Non-integers and values below 1 fail at argument parsing, before any cloud call. 47 new tests in `tests/test_max_num_workers.py`; suite 661 → 708.
+    The env var is validated like the flag (an integer of at least 1) and fails at argument parsing. `cross_version_ais.py` checks it before pinning anything. Each run logs its cap and its source (`cli`, `ceiling` or `default`) once.
+  - **Defaults:**
+    - **pipe-gaps** (`mode_equivalence.py`, `outage_recovery.py`): new flag, **default 50**, production's daily detect cap. This **lowers the effective cap from 100**: before, dit emitted nothing, so gfw-common's `Pipeline` default of 100 applied. Default Dataflow runs now pass `--max_num_workers=50`. DirectRunner (`--runner docker`) runs get no cap.
+    - `port_visits/ais.py`: 4, unchanged. `cross_version_ais.py` forwards the flag to every binding, and each binding's `ais.py` inherits the ceiling.
+    - `encounters/ais.py` and `vms.py`: 50, unchanged. Values below 1 are now rejected here too.
+    - `pipe_segment/identity_match_key.py`: new flag. Defaults per step are unchanged (`segment` 50, `segment_identity` 50, `segment_info` 20); the ceiling lowers each, an explicit value replaces all three.
+
+    Apart from pipe-gaps' new cap, default runs emit byte-identical Beam options, checked with a capture harness over all 18 option lists and pinned by tests.
+  - **Not in Cloud Build yet:** `cloudbuild-dit.yaml` passes no such variable into its build step, so a ceiling exported on the laptop does not reach a `make dit-cloud` run. Pass `--max-num-workers N` in `ARGS` there; wiring the ceiling through is a follow-up.
+
+  Dataflow runner only, and never part of a cache key, with or without a ceiling (tested for every cached workflow and mode). Gaps' in-process path hands the value to gfw-common as a string; gfw-common builds Beam options with `PipelineOptions.from_dictionary` in every tag from v0.10.0 to v0.23.0, which parses it with Beam's int type. 106 new tests in `tests/test_max_num_workers.py`, plus `tests/conftest.py`, which clears the ceiling so a developer's environment cannot change test results; suite 661 → 767.
 
 ### 2026-10-22
 
