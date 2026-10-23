@@ -98,21 +98,45 @@ That confirms `ProductionTarget.job_name(D)` (prefix plus D) and the inclusive `
 
 ### 5b. argv flags, DIT's v4 builders against production
 
-Both steps run the same command (`pipe-anchorages thin_port_messages`, `pipe-anchorages port_visits`).
+Both steps run the same command (`pipe-anchorages thin_port_messages`, `pipe-anchorages port_visits`). What the check reports, with the owner's decisions of 2026-10-23 applied:
 
 | | `thin_port_messages` | `port_visits` |
 |---|---|---|
-| Same | `--start_date`, `--end_date`, `--project`, `--region`, `--sdk_container_image`, `--wait_for_job` | the same, plus `--thinned_message_table`, `--vessel_id_table`, `--bad_segs` (SQL byte-identical) |
-| DIT-owned, expected to differ | `--output_table`, `--job_name`, `--labels`, `--service_account_email`, `--temp_location`, `--staging_location`, `--subnetwork`, `--max_num_workers`, `--temp_dataset` (DIT only) | same |
-| Only in production | `--disk_size_gb`, `--worker_machine_type`, `--dataflow_service_options` (lineage), `--network`, `--no_use_public_ips` | same |
-| Values differ | `--runner`; `--anchorage_table`; `--input_table` | `--runner` |
-| Only in DIT, outside the DIT-owned set | none | none |
+| Same | `--start_date`, `--end_date`, `--runner` (spellings treated as equal), `--project`, `--region`, `--sdk_container_image`, `--wait_for_job` | the same, plus `--thinned_message_table`, `--vessel_id_table`, `--bad_segs` (SQL byte-identical) |
+| Expected to differ: DIT-owned | `--output_table`, `--job_name`, `--labels`, `--service_account_email`, `--temp_location`, `--staging_location`, `--subnetwork`, `--max_num_workers`, `--temp_dataset` (DIT only) | same |
+| Expected to differ: accepted | `--dataflow_service_options` (lineage), `--network` | same |
+| Only in production (still reported) | `--disk_size_gb`, `--worker_machine_type`, `--no_use_public_ips` | same |
+| Values differ | `--anchorage_table`, `--input_table` | none |
+| Only in DIT, outside the expected set | none | none |
 
-Notes for the owner, who decides. Nothing was changed.
-- **`--runner`.** DIT passes `DataflowRunner`, production passes `dataflow`. Beam's `create_runner` matches partial runner names, per Beam's runner guide, so these should select the same runner. Not verified against the v4.6.4 image.
-- **Production-only flags.** These are sizing and networking flags: worker disk and machine type, private IPs and network, a lineage service option. None should change output. Machine type matters for out-of-memory behaviour at production scale, which DIT's 4-worker default never reaches.
-- **Step 1 tables.** `ProductionTarget` has no messages or named-anchorages table, because the production baseline runs step 2 only. So DIT's step 1 shows its staging defaults. Production v5 also reads a newer named-anchorages version (2026) from another project. Production v3 reads DIT's default version (v20240117), but from another project too. A step-1 production baseline would need both tables in the target.
-- **`DIT_OWNED_FLAGS` is a proposal.** The list (in `composer_drift.py`) is my reading of which differences are deliberate.
+How DIT's jobs actually ran, from `gcloud dataflow jobs describe` on 2026-10-23: the v4-CLI jobs used Dataflow's default machine type and disk with public worker IPs, and the v5-CLI production-baseline run used gfw-common's default machine type with private IPs. Production runs both steps on a larger high-memory machine type with private IPs and lineage on.
+
+**Owner decisions (2026-10-23, on PR #86):**
+1. **`--runner`.** DIT keeps `DataflowRunner`; production passes `dataflow`. Beam's `create_runner` matches partial runner names (Beam's runner guide), so both select the Dataflow runner. The check treats the two spellings as equal (`EQUIVALENT_VALUES`).
+2. **Machine type and disk.** Production-like sizing in production-baseline mode, plus optional `--worker-machine-type` / `--disk-size-gb` flags, unset by default. That work is on a separate PR, so this check keeps reporting both flags until it lands.
+3. **Lineage stays off in DIT, on purpose,** so DIT's test tables never enter production's lineage graph. `--dataflow_service_options` is an accepted difference.
+4. **Networking.** `--network` is an accepted difference: DIT's `--subnetwork` determines it. `--no_use_public_ips` will be emitted for every DIT Dataflow run. That is part of the same separate PR, so the check keeps reporting it until then.
+5. **`DIT_OWNED_FLAGS`** is approved as proposed.
+6. **Step 1 inputs: sync the named-anchorages default and automate source drift.**
+   - The case: DIT's default (v20240117) was the newest version when the workflow was written. Production v5 now reads v20260302, from another project, and nothing flagged it. Production v3 still reads v20240117, also from another project.
+   - Decision: bump DIT's default to v20260302 now. That bump is not part of this PR.
+   - Going forward, DIT should warn or flag when its sources or versions differ from production's, and have a mechanism to sync them (section 7, items 1 and 7).
+   - `--input_table` differs only because the drift check runs step 1 on DIT's staging messages. `ProductionTarget` has no step-1 tables, since the production baseline runs step 2 only.
+
+**The lineage principle (owner, 2026-10-23).** Every comparison must rest on the same lineage.
+- When DIT runs both sides of a comparison, the two sides share lineage by construction.
+- A comparison against production must instead match production's lineage. Ideally DIT does not take source table names from its own config. It finds out what production actually read and pins exactly that, by copy, view or time travel (`dit.bq.pin_view_into_experiment`, PIPELINE-4703).
+
+**Feasibility** (the evidence is in Jira PIPELINE-4700, comment of 2026-10-23).
+- GFW's BigQuery job-metadata view holds the query jobs of production's port-visits run. They carry composer's labels (`task_name=detect_port_visits`, `stage_version=v4-6-4`, plus `stage`, `environment`, `mode`).
+- For the 2026-10-19 run, their `referenced_tables` are exactly the three inputs `ProductionTarget` hard-codes. Their `creation_time` gives the actual read times, which are more precise than the Dataflow job's creation time DIT pins to today.
+- The same view shows that production rewrote the thinned table twice that day, which is why reading at the right moment matters.
+
+Caveats recorded there:
+- The view lags about 6 hours, while one input dataset keeps only 48 hours of time travel. `INFORMATION_SCHEMA.JOBS_BY_PROJECT` is real time but needs `jobs.listAll`.
+- The step labels are composer's convention, so each pipeline needs a label mapping.
+- The output write does not appear in the view, so the job's `Done` time stays the output pin.
+- The Data Lineage API is an alternative source, since production runs with lineage on. DIT's access to it is unverified.
 
 ## 6. Version drift visible in the snapshots
 
@@ -136,14 +160,25 @@ DIT's pipe-events pin is stale even against v3: `core.ais.v3` left v4.2.17 on 20
 
 In order of value per effort:
 
-1. **Version-drift check for every workflow (small, do first).** Map each workflow's default image to the snapshot(s) and task(s) it mirrors. Compare its tag and command names with `pinned_versions` and the parsed positionals. This alone would have flagged the pipe-events and pipe-gaps drift above, and production's eventual move to pipe-anchorages v5. It only needs image tags and command names, so it exposes no infrastructure.
-2. **Generalise `composer_drift.py` into a `composer-diff` check.** Each workflow declares three things: its snapshot task, the DIT configuration that mirrors it, and its DIT-owned flags. The check diffs DIT-emitted argv against production's. Where it runs is open:
+1. **Version- and source-drift check for every workflow (small, do first).** Map each workflow's default image to the snapshot(s) and task(s) it mirrors. Compare its tag and command names with `pinned_versions` and the parsed positionals. This alone would have flagged the pipe-events and pipe-gaps drift above, and production's eventual move to pipe-anchorages v5. It only needs image tags and command names, so it exposes no infrastructure.
+
+   The owner's item 6 (2026-10-23) extends it to sources: warn when a workflow's default input tables differ from what production's task reads (the named-anchorages case). Table names stay in the check's local output, never in this repository.
+2. **Generalise `composer_drift.py` into a `composer-diff` check.** Each workflow declares three things: its snapshot task, the DIT configuration that mirrors it, and its expected differences (DIT-owned and accepted flags, plus equivalent spellings). The check diffs DIT-emitted argv against production's. Where it runs is open:
    - composer is private, and whether `automated-testing@` can clone it is unverified;
    - a laptop or scheduled run against a fetched checkout works today;
    - a hook in composer's CI would catch drift at the source.
-3. **Owner decisions on section 5b.** Decide on `--runner`, the production-only sizing and networking flags, and the `DIT_OWNED_FLAGS` set. Then the port-visits check passes (exit 0) and stays a regression guard.
+3. **Owner decisions on section 5b: taken 2026-10-23.** The check already applies them. It will pass (exit 0) and stay a regression guard once three things are done:
+   - the separate sizing and private-IP PR lands;
+   - the named-anchorages default is bumped;
+   - step 1's messages input is settled. It differs only because `ProductionTarget` has no step-1 tables. Item 7 would supply it, or the target gains the table.
 4. **Generate `ProductionTarget` from the snapshot.** The fields map one to one (section 5a proves the mapping). The run-date convention needs a multi-day snapshot or the DAG source, because daily snapshots are ambiguous. Keep the hand-written target until the drift check has run green for a while, then generate it, or keep both, with the check as the test.
 5. **Checked-in `params/<pipeline>.yaml` at a pinned composer commit.** This is Phase 4 of `docs/plan.md`. Templated argv (placeholders instead of dates) renders back with DIT's own dates (`render_template`). The repo is public, so an allow-list is mandatory: versions, commands, flag names, and the tables DIT targets. Never infrastructure values. Reviewed diffs on regeneration are the sync mechanism. Worth it once two or more workflows consume more than versions and commands; until then, step 1 and step 2 read the snapshot live.
 6. **CLI-generation adapters (v4 / v5).** The snapshot shows which generation production runs (image version plus command names: `thin_port_messages` is v4, `port-state-transitions` is v5). It does not show the other generation's argv: a PR on v5 has no snapshot while production is on v4. So the builders stay hand-written per generation. The production generation gets a golden test (snapshot argv rendered with DIT's dates against the builder's output), and a cross-version run picks each binding's adapter by its version. When production moves to v5, the v5 builder gets its golden test from the snapshot instead of from pipe-anchorages main.
+7. **Pin what production actually read (the owner's lineage principle; long-term).** For comparisons against production, stop configuring source tables at all.
+   - Find the production run's BigQuery query jobs in GFW's job metadata by composer's labels (`task_name`, `stage_version`).
+   - Take their `referenced_tables` as the inputs and their `creation_time` as the read times.
+   - Pin exactly those with `dit.bq.pin_view_into_experiment`.
 
-**Recommended next step:** item 1 (version-drift check across all five workflows), together with the owner's decisions in item 3.
+   The snapshots then serve a different purpose: telling DIT which task and labels to look for, and checking DIT's own defaults. Open points (section 5b): the view's lag against short time-travel windows, a per-pipeline label mapping, the output pin staying the job's `Done` time, and the Data Lineage API as an alternative.
+
+**Recommended next step:** item 1, including the source check, together with the named-anchorages bump. Item 7 is the direction for production-baseline runs. The owner has not yet ruled on the order of items 2, 4 and 5.

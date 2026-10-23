@@ -11,13 +11,15 @@ reports two things, changing nothing:
 
 DIT is configured the way ``--baseline-production`` configures it: the target's
 tables, its history start, and the snapshot run's dates. A value that differs is
-therefore a real difference, not a different run. Flags DIT sets to its own
-values on purpose (outputs, identity, placement, labels, job names, worker cap)
-are listed apart as expected differences (:data:`DIT_OWNED_FLAGS`).
+therefore a real difference, not a different run. Flags expected to differ are
+listed apart (:data:`EXPECTED_DIFFERENCES`): those DIT sets to its own values on
+purpose (:data:`DIT_OWNED_FLAGS`: outputs, identity, placement, labels, job
+names, worker cap) and those the owner accepted (:data:`ACCEPTED_DIFFERENCES`).
+Spellings that mean the same value are compared as one (:data:`EQUIVALENT_VALUES`).
 
-Exit code: 0 when nothing differs beyond DIT-owned flags, 1 otherwise, 2 when
-the snapshot or a task cannot be read. Mismatches are for the workflow owner to
-judge; this check never edits ``ProductionTarget`` or the argv builders.
+Exit code: 0 when nothing differs beyond the expected differences, 1 otherwise,
+2 when the snapshot or a task cannot be read. Mismatches are for the workflow
+owner to judge; this check never edits ``ProductionTarget`` or the argv builders.
 
     dit run workflows/port_visits/composer_drift.py \\
         --composer-dir ../composer-dags-production --ref origin/main
@@ -65,8 +67,7 @@ TARGET_SOURCES = {
 #: Flags DIT sets to its own values on purpose: its output tables, Dataflow job
 #: names and labels, its service account, GCS paths and subnetwork, its worker
 #: cap, and ``--temp_dataset`` (DIT's staging dataset, a flag production does
-#: not pass). A difference here is expected; anything else is reported as drift.
-#: This set is a proposal for the owner to confirm (PIPELINE-4700).
+#: not pass). Approved by the owner on 2026-10-23 (PR #86).
 DIT_OWNED_FLAGS = frozenset({
     "--output_table",
     "--job_name",
@@ -78,6 +79,23 @@ DIT_OWNED_FLAGS = frozenset({
     "--max_num_workers",
     "--temp_dataset",
 })
+
+#: Production flags DIT leaves out on purpose, with the reason (owner, 2026-10-23).
+ACCEPTED_DIFFERENCES = {
+    "--dataflow_service_options": "lineage stays off in DIT, so DIT's tables never "
+                                  "enter production's lineage graph",
+    "--network": "determined by DIT's --subnetwork",
+}
+
+#: Every flag expected to differ; a difference anywhere else is drift.
+EXPECTED_DIFFERENCES = DIT_OWNED_FLAGS | frozenset(ACCEPTED_DIFFERENCES)
+
+#: Spellings of a value that mean the same thing, mapped to one form before
+#: comparing. Beam resolves both runner names to the Dataflow runner (owner,
+#: 2026-10-23: DIT keeps ``DataflowRunner``, production passes ``dataflow``).
+EQUIVALENT_VALUES: Mapping[str, Mapping[str, str]] = {
+    "--runner": {"DataflowRunner": "dataflow"},
+}
 
 _BACKTICKED = re.compile(r"`([^`]+)`")
 _TRAILING_COMPACT_DATE = re.compile(r"(\d{8})$")
@@ -182,7 +200,7 @@ class ArgvComparison:
     dit: composer.ParsedArgv
     production: composer.ParsedArgv
     diff: composer.FlagDiff
-    dit_owned: tuple[str, ...]
+    expected: tuple[str, ...]
 
     @property
     def command_matches(self) -> bool:
@@ -190,28 +208,41 @@ class ArgvComparison:
 
     @property
     def drift(self) -> bool:
-        """Anything beyond the DIT-owned flags differs, or the command does."""
+        """Anything beyond the expected differences differs, or the command does."""
         return not (self.command_matches and self.diff.identical)
+
+
+def canonical_values(
+    parsed: composer.ParsedArgv,
+    equivalents: Mapping[str, Mapping[str, str]] = EQUIVALENT_VALUES,
+) -> composer.ParsedArgv:
+    """``parsed`` with each value that has an equivalent spelling written in one form."""
+    return dataclasses.replace(parsed, flags=tuple(
+        composer.Flag(f.name, equivalents.get(f.name, {}).get(f.value, f.value))
+        for f in parsed.flags
+    ))
 
 
 def compare_argv(
     step: str, dit_tokens: Sequence[str], production_task: composer.RenderedTask,
-    *, dit_owned: Collection[str] = DIT_OWNED_FLAGS,
+    *, expected: Collection[str] = EXPECTED_DIFFERENCES,
+    equivalents: Mapping[str, Mapping[str, str]] = EQUIVALENT_VALUES,
 ) -> ArgvComparison:
     """Compare DIT's argv (entrypoint first) with production's for ``step``.
 
-    DIT-owned flags are taken out of the diff and listed in ``dit_owned`` when
+    Both sides' values go through :func:`canonical_values` first. Flags in
+    ``expected`` are taken out of the diff and listed in ``expected`` when
     either side passes them.
     """
-    dit = composer.parse_argv(dit_tokens)
-    production = composer.parse_argv(production_task.argv)
+    dit = canonical_values(composer.parse_argv(dit_tokens), equivalents)
+    production = canonical_values(composer.parse_argv(production_task.argv), equivalents)
     passed = set(dit.names()) | set(production.names())
     return ArgvComparison(
         step=step,
         dit=dit,
         production=production,
-        diff=composer.diff_flags(dit, production, ignore=dit_owned),
-        dit_owned=tuple(sorted(passed & set(dit_owned))),
+        diff=composer.diff_flags(dit, production, ignore=expected),
+        expected=tuple(sorted(passed & set(expected))),
     )
 
 
@@ -300,6 +331,12 @@ def _show(parsed: composer.ParsedArgv, name: str) -> str:
     return " ".join(name if v is None else f"{name}={v}" for v in parsed.values(name))
 
 
+def _expected(name: str) -> str:
+    """An expected difference, with its reason when the owner accepted it."""
+    reason = ACCEPTED_DIFFERENCES.get(name)
+    return f"{name} ({reason})" if reason else name
+
+
 def format_report(report: DriftReport) -> str:
     dag = report.dag
     interval = dag.data_interval
@@ -325,7 +362,7 @@ def format_report(report: DriftReport) -> str:
                      f"production={' '.join(cmp.production.positionals)}"
             ),
             "  same: " + (", ".join(cmp.diff.same) or "-"),
-            "  DIT-owned (expected to differ): " + (", ".join(cmp.dit_owned) or "-"),
+            "  expected to differ: " + (", ".join(map(_expected, cmp.expected)) or "-"),
             "  only in production: " + (
                 "; ".join(_show(cmp.production, n) for n in cmp.diff.only_right) or "-"),
             "  only in DIT: " + ("; ".join(_show(cmp.dit, n) for n in cmp.diff.only_left) or "-"),

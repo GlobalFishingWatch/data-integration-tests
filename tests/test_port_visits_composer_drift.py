@@ -25,9 +25,13 @@ SOURCE = drift.TARGET_SOURCES["ais-v5-datalake"]
 _PRODUCTION_ONLY = (
     "--disk_size_gb=11",
     "--worker_machine_type=example-machine",
+    "--no_use_public_ips",
+)
+
+#: Invented production-only flags the owner accepted as differences.
+_PRODUCTION_ACCEPTED = (
     "--dataflow_service_options=example_option=true",
     "--network=example-network",
-    "--no_use_public_ips",
 )
 
 #: Invented values for the flags DIT owns.
@@ -58,8 +62,9 @@ def _raw_dag(
     production_only: tuple[str, ...] = _PRODUCTION_ONLY, visits_cmds: list[str] | None = None,
     image: str = ais.DEFAULT_WORKER_IMAGE,
 ) -> dict:
-    """A production DAG that runs what DIT runs, except for DIT-owned and
-    production-only flags (and the given overrides)."""
+    """A production DAG that runs what DIT runs, except for DIT-owned flags,
+    the accepted production-only flags, ``production_only`` and the overrides."""
+    production_only = (*production_only, *_PRODUCTION_ACCEPTED)
     interval = composer.DataInterval(
         datetime.fromisoformat(f"{start}T00:00:00+00:00"),
         datetime.fromisoformat(f"{end}T00:00:00+00:00"),
@@ -179,19 +184,32 @@ def _comparisons(**kwargs) -> dict[str, drift.ArgvComparison]:
     return {c.step: c for c in report.argv}
 
 
-def test_argv_differences_are_split_into_dit_owned_and_drift() -> None:
+def test_argv_differences_are_split_into_expected_and_drift() -> None:
     visits = _comparisons()[ais.STEP_VISITS]
 
     assert visits.command_matches
     assert set(visits.diff.only_right) == {t.split("=", 1)[0] for t in _PRODUCTION_ONLY}
     assert visits.diff.only_left == ()
     assert visits.diff.differing == ()
-    assert set(visits.dit_owned) == {*_PRODUCTION_OWNED, "--output_table", "--job_name",
-                                     "--labels", "--temp_dataset"}
+    assert set(visits.expected) == {
+        *_PRODUCTION_OWNED, "--output_table", "--job_name", "--labels", "--temp_dataset",
+        "--dataflow_service_options", "--network",
+    }
     assert {"--start_date", "--end_date", "--thinned_message_table", "--vessel_id_table",
             "--bad_segs", "--project", "--region", "--sdk_container_image",
             "--wait_for_job", "--runner"} <= set(visits.diff.same)
     assert visits.drift
+
+
+def test_expected_differences_are_dit_owned_plus_accepted_with_reasons() -> None:
+    assert drift.EXPECTED_DIFFERENCES == drift.DIT_OWNED_FLAGS | {
+        "--dataflow_service_options", "--network",
+    }
+    assert all(drift.ACCEPTED_DIFFERENCES.values())
+    # Still reported until the sizing / private-IP change lands (separate PR).
+    assert not {"--worker_machine_type", "--disk_size_gb", "--no_use_public_ips"} & (
+        drift.EXPECTED_DIFFERENCES
+    )
 
 
 def test_no_drift_when_production_runs_what_dit_runs() -> None:
@@ -200,10 +218,29 @@ def test_no_drift_when_production_runs_what_dit_runs() -> None:
     assert not any(c.drift for c in comparisons.values())
 
 
+def test_runner_spellings_compare_equal() -> None:
+    visits = _comparisons(production_only=(), visits_overrides={"--runner": "dataflow"})[
+        ais.STEP_VISITS
+    ]
+
+    assert "--runner" in visits.diff.same
+    assert not visits.drift
+
+
+def test_canonical_values_rewrites_only_listed_spellings() -> None:
+    parsed = composer.parse_argv(["--runner=DataflowRunner", "--runner=DirectRunner", "--x"])
+
+    assert drift.canonical_values(parsed).flags == (
+        composer.Flag("--runner", "dataflow"),
+        composer.Flag("--runner", "DirectRunner"),
+        composer.Flag("--x", None),
+    )
+
+
 def test_a_changed_value_or_command_is_drift() -> None:
-    changed = _comparisons(production_only=(), visits_overrides={"--runner": "dataflow"})
+    changed = _comparisons(production_only=(), visits_overrides={"--project": "example-project"})
     visits = changed[ais.STEP_VISITS]
-    assert visits.diff.differing == ("--runner",)
+    assert visits.diff.differing == ("--project",)
     assert visits.drift
 
     renamed = _comparisons(production_only=(), visits_cmds=["pipe-anchorages", "port-visits"])
@@ -238,6 +275,7 @@ def test_format_report_lists_mismatches_and_the_verdict() -> None:
     assert report.drift
     assert "DIFF  job_name_prefix" in text
     assert "only in production: --disk_size_gb=11" in text
+    assert "--network (determined by DIT's --subnetwork)" in text
     assert text.endswith("drift: yes")
 
 

@@ -84,21 +84,34 @@ Most-recent-first: prepend new entries above the existing ones. Each entry is on
 **Design points.**
 - **Dates to placeholders.** `{start_date}` / `{end_date}` (last day) / `{end_date_exclusive}` / `{execution_date}` (only where it differs from the start), each with a `_nodash` form. A date that fits several is reported, not guessed. In a one-day interval (135 of 260 snapshots, including daily `core_ais_v5`) every run date is ambiguous, so only multi-day snapshots settle conventions. The backfill confirms port visits: step 1 runs start to end minus one day, step 2 runs 2012-01-01 to end minus one day, and job names end in the start date.
 - **argv order is not CI-verified.** composer's `assert_dicts` sorts lists, so `parse_argv`'s `--k v` pairing relies on the files being generated, not edited.
-- **Port-visits logic stays out of the library.** It lives in `workflows/port_visits/composer_drift.py`, as a read-only check with exit 1 on drift. DIT is configured as `--baseline-production` configures it, so a differing value is a real difference. `DIT_OWNED_FLAGS` (outputs, identity, placement, labels, job names, worker cap, `--temp_dataset`) are listed apart; that set is a proposal for the owner.
+- **Port-visits logic stays out of the library.** It lives in `workflows/port_visits/composer_drift.py`, as a read-only check with exit 1 on drift. DIT is configured as `--baseline-production` configures it, so a differing value is a real difference. Expected differences are listed apart:
+  - `DIT_OWNED_FLAGS`: outputs, identity, placement, labels, job names, worker cap, `--temp_dataset`;
+  - `ACCEPTED_DIFFERENCES`, each with its reason;
+  - `EQUIVALENT_VALUES` for spellings that mean the same.
 - **The target maps to the daily snapshot `core_ais_v5`.** The brief named `core_ais_v5_backfill`, but `ProductionTarget`'s job-name prefix is the daily DAG's; the backfill is a separate DAG with its own job names.
 
-**Findings, reported and NOT acted on (owner decides).**
+**Findings.**
 - `ProductionTarget("ais-v5-datalake")`: all nine fields match the daily snapshot. Against the backfill, only the job-name prefix differs, as expected.
-- v4 argv: the commands are the same. `--runner` differs (`DataflowRunner` against `dataflow`; Beam matches partial runner names, not verified against the image). Five production-only flags: `--disk_size_gb`, `--worker_machine_type`, `--dataflow_service_options`, `--network`, `--no_use_public_ips`. Step 1 also differs in its two input tables, which `ProductionTarget` lacks.
+- v4 argv: the commands are the same. `--runner` is spelled differently (`DataflowRunner` against `dataflow`). Five flags are production-only: `--disk_size_gb`, `--worker_machine_type`, `--dataflow_service_options`, `--network`, `--no_use_public_ips`. Step 1 also differs in its two input tables, which `ProductionTarget` lacks.
 - Versions: production pins pipe-anchorages v4.6.4, as DIT does. DIT's pipe-events v4.2.17 and pipe-gaps v0.10.0 are behind `core.ais.v3` (v5.0.0, v0.10.3) and `core.ais.v5` (v8.0.1 with renamed commands, v0.17.0 with `raw-gaps`).
 - The survey's v6.2.0 / v0.12.0 for v5 were stale: v5's pins between 2026-08-21 and September.
 
+**Owner decisions (2026-10-23, on PR #86), applied by the check.**
+- The two runner spellings are equal; DIT keeps `DataflowRunner`.
+- Lineage stays off in DIT, on purpose, so DIT's tables never enter production's lineage graph. `--dataflow_service_options` is an accepted difference.
+- `--network` is an accepted difference: DIT's `--subnetwork` determines it.
+- `DIT_OWNED_FLAGS` is approved.
+- Still reported, because they are being implemented on a separate PR and not here: machine type and disk (production-like sizing in production-baseline mode, plus optional flags) and `--no_use_public_ips` (on every DIT Dataflow run).
+- Named anchorages: bump DIT's default to production's v20260302 (not in this PR) and automate source and version drift detection.
+- **The lineage principle:** a comparison against production must match production's lineage. In the long term, DIT discovers the inputs production actually read and pins exactly those, instead of configuring source tables. Production's port-visits query jobs in GFW's BigQuery job metadata carry composer's labels, and their `referenced_tables` and `creation_time` give the inputs and read times. Evidence is in the Jira PIPELINE-4700 comment of 2026-10-23; the doc's § 5b and § 7 item 7 hold the summary and caveats.
+- `dit composer-dag` now also catches `KeyError` (a snapshot missing a required key), as `composer_drift.main` does (Copilot review).
+
 **Public-repo constraint.** No composer content is committed. Tests use synthetic fixtures, the doc summarises, and `composer_drift.py`'s output (which prints production infra values) is for local reading only. Any future checked-in params file needs an allow-list for the same reason.
 
-**Next step proposed:** a version-drift check for every workflow (image tags and command names against `pinned_versions`), before any `params/<pipeline>.yaml`. Full list in the doc's § 7.
+**Next step proposed:** a version- and source-drift check for every workflow (image tags, command names and default input tables against the snapshots), together with the named-anchorages bump, before any `params/<pipeline>.yaml`. Lineage-based input discovery is the direction for production-baseline runs. Full list in the doc's § 7.
 
 **Sections moved.**
-- New: `src/dit/composer.py`, `workflows/port_visits/composer_drift.py`, `docs/composer-snapshots-2026-10.md`, `tests/test_composer.py`, `tests/test_port_visits_composer_drift.py` (53 tests; suite 661 → 714).
+- New: `src/dit/composer.py`, `workflows/port_visits/composer_drift.py`, `docs/composer-snapshots-2026-10.md`, `tests/test_composer.py`, `tests/test_port_visits_composer_drift.py` (57 tests; suite 661 → 718).
 - `src/dit/cli.py`: `composer-dag` subcommand.
 - `docs/plan.md`: Phase 4 status row and vision paragraph.
 - README: Features and Roadmap 7b. `workflows/README.md`: a note on the drift check. CHANGELOG 2026-10-23.

@@ -433,6 +433,25 @@ def test_cli_reports_an_unreadable_snapshot(composer_repo: Path) -> None:
     assert "git show" in result.output
 
 
+def test_cli_reports_a_snapshot_missing_a_required_key(composer_repo: Path) -> None:
+    """A literal dict without e.g. ``dag_id`` exits 1 with a message, not a
+    traceback (Copilot review on #86)."""
+    (composer_repo / composer.SNAPSHOT_DIR / "no_dag_id.py").write_text(
+        "rendered_dag = {'tasks': {}}\n"
+    )
+    _git(composer_repo, "add", ".")
+    _git(composer_repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "commit", "-q", "-m", "snapshot without dag_id")
+
+    result = CliRunner().invoke(cli.main, [
+        "composer-dag", "no_dag_id", "--repo", str(composer_repo), "--ref", "main",
+    ])
+
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "snapshot no_dag_id is missing required key" in result.output
+
+
 # --------------------------------------------------------------------------
 # optional: a real composer-dags-production checkout
 # --------------------------------------------------------------------------

@@ -306,6 +306,12 @@ def composer_dag(
         dag = composer.load_dag(
             repo or composer.default_composer_dir(), snapshot, ref or composer.DEFAULT_REF,
         )
+    except KeyError as e:
+        # A snapshot that parses as a dict but lacks a required key (dag_id,
+        # execution_date, the data interval, tasks). Same set of errors as
+        # workflows/port_visits/composer_drift.py's main().
+        click.echo(f"snapshot {snapshot} is missing required key {e}", err=True)
+        sys.exit(1)
     except (RuntimeError, ValueError) as e:
         click.echo(str(e), err=True)
         sys.exit(1)
