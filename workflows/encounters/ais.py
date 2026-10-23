@@ -118,15 +118,23 @@ from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
 from dit.workflow import (
+    NO_PUBLIC_IPS_OPTION,
+    WorkerSizing,
     add_experiment_id_arg,
     add_infra_args,
     add_max_num_workers_arg,
     add_modes_arg,
+    add_worker_sizing_args,
+    log_production_sizing_hint,
     log_worker_caps,
+    log_worker_sizings,
     max_num_workers_options,
     parse_modes,
     resolve_run_context,
+    resolve_worker_sizing,
     worker_cap,
+    worker_sizing_from_args,
+    worker_sizing_options,
 )
 
 logger = logging.getLogger(__name__)
@@ -198,6 +206,21 @@ DEFAULT_TAIL_DAYS = 3
 # runs encounters at 400 instead; PIPELINE-4706 tracks that. dit stays at 50.
 # Without a cap, a wide run (all vessels over a year) scales unbounded.
 DEFAULT_MAX_NUM_WORKERS = 50
+
+# Worker sizing per step, mirroring production (owner rule 2026-10-23; the cap
+# above does not follow it); shared with vms.py. composer-dags-production
+# origin/main 0a644da, rendered snapshots: core_ais_v5.py tasks
+# encounters.detect_daily_encounters (create_raw_encounters) and
+# encounters.merge_encounters, both --worker_machine_type=e2-highmem-4
+# --disk_size_gb=50; core_ais_v3.py (detect_encounters.*) and the VMS DAGs
+# (core_vms_v5_daily.py, core_vms_v3_last_4days_daily.py) agree. From
+# EncountersConfig.worker_machine_type (gfw/pipes/core/encounters/v4.py) and
+# DataflowConfig.disk_size_gb (gfw/common/config/dataflow.py). Hand-written
+# until PIPELINE-4700 reads them from composer.
+STEP_WORKER_SIZING = {
+    "create_raw_encounters": WorkerSizing(machine_type="e2-highmem-4", disk_size_gb=50),
+    "merge_encounters": WorkerSizing(machine_type="e2-highmem-4", disk_size_gb=50),
+}
 
 # Detection tuning -- prod values from composer-dags-production
 # gfw/pipes/v3/detect_encounters.py.
@@ -489,10 +512,15 @@ def _pipeline_options(
         f"--temp_dataset={args.bq_temp_dataset}",
         f"--staging_location={dataflow_staging_location(args.dataflow_temp_bucket)}",
         f"--subnetwork={args.dataflow_subnetwork}",
+        # Private worker IPs, as production; see dit.workflow (a3).
+        NO_PUBLIC_IPS_OPTION,
         # Bound autoscaling. Without this a wide run (all vessels over a year)
         # scales freely; prod caps this same step at 50
         # (detect_encounters_config.max_num_workers in composer-dags).
         *max_num_workers_options(args.max_num_workers),
+        # Machine type and disk, only when set.
+        # Machine type and disk: production's unless overridden; see STEP_WORKER_SIZING.
+        *worker_sizing_options(getattr(args, "worker_sizings", STEP_WORKER_SIZING)[step]),
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
         "--wait_for_job",
@@ -721,6 +749,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         p, default=DEFAULT_MAX_NUM_WORKERS,
         help_detail="The default mirrors production's cap for both encounters steps.",
     )
+    add_worker_sizing_args(p, defaults=STEP_WORKER_SIZING)
     p.add_argument("--build-from-source", action="store_true",
                    help="Build the image from the local checkout via docker compose "
                         "instead of pulling the published one. Recommended on laptop: "
@@ -751,7 +780,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
     args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
     args.max_num_workers = args.worker_cap.workers
+    resolve_step_sizings(args)
     return args
+
+
+def resolve_step_sizings(args: argparse.Namespace) -> None:
+    """Stamp ``args.cli_worker_sizing`` and, per step and field, flag >
+    production's sizing as ``args.worker_sizings``. Shared with vms.py."""
+    args.cli_worker_sizing = worker_sizing_from_args(args)
+    args.worker_sizings = {
+        step: resolve_worker_sizing(args.cli_worker_sizing, default)
+        for step, default in STEP_WORKER_SIZING.items()
+    }
 
 
 def run(
@@ -819,6 +859,12 @@ def run(
     if args.ssvid_filter:
         logger.info("ssvid_filter: %s", args.ssvid_filter)
     log_worker_caps({"every job": args.worker_cap})
+    log_worker_sizings(args.worker_sizings)
+    if args.runner == "dataflow":
+        log_production_sizing_hint(args.cli_worker_sizing, args.worker_sizings, [
+            args.source_messages_fqn, args.source_segment_info_fqn,
+            args.source_segs_activity_fqn, args.spatial_measures_fqn,
+        ])
 
     raw_fqns = {m: _raw_table(args, suffix, m) for m in SELECTABLE_MODES}
     merged_fqns = {m: _encounters_table(args, suffix, m) for m in SELECTABLE_MODES}

@@ -27,6 +27,8 @@ Production reprocesses daily, so its inputs and its output both move. The compar
 
    Views copy nothing and work across organisations. The name carries source, window and `as_of`, so a view of a given name always has the same definition, and reruns are idempotent. They are labelled `dit_artifact=source_pin_view` and expire after `--pin-expiration-days` (default 7). Snapshots are not an option: BigQuery refuses them across organisations, and no DIT identity has `bigquery.tables.deleteSnapshot` on `tech_great_expectations`. Copies are not an option either, because they pin only "now".
 3. **Run the candidate** as production runs: `--steps port_visits` on the pinned thinned table, `--modes 1_bf`, `--start` at the target's history start and `--end D`. These flags are fixed: left unset they take those values, and any other value is an error, because a different run cannot match production's output. Open visits get their `end_timestamp` and confidence from the end date, so D must match too.
+
+   Every binding also runs on production's worker sizing: the target's `worker_machine_type` and `disk_size_gb` (e2-highmem-4 and 50 GB for `ais-v5-datalake`), forwarded to `ais.py` as `--worker-machine-type` / `--disk-size-gb`. They equal `ais.py`'s own production-mirrored defaults today; the target pins them for this production run. An explicit value of either on the command line wins, field by field. Sizing changes speed and out-of-memory behaviour, never output, so it is not fixed like the flags above. Workers get private IPs, as in every DIT Dataflow job. Since 2026-10-23.
 4. **Diff** each binding's `port_visits_<exp>-<binding>_1_bf` against the production-output view on `visit_id` (table-check `summary`). The binding is table A and production table B. With several bindings, the usual pairwise diffs run as well.
 
 ## Guards (before anything is created)
@@ -40,7 +42,7 @@ Production reprocesses daily, so its inputs and its output both move. The compar
 
 One target today, hand-written from `composer-dags-production` origin/main 0a644da (`dags/core/ais/v5.py`, `gfw/pipes/core/port_visits/v4.py`). Reading targets from composer as data belongs to [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700).
 
-**`ais-v5-datalake`**: pipe-anchorages v4.6.4, v4 CLI. Dataflow in `world-fishing-827`, `us-central1`, 100 × e2-highmem-4. Job name `core-ais-v5--port-visits-detect-port-visits--YYYYMMDD`.
+**`ais-v5-datalake`**: pipe-anchorages v4.6.4, v4 CLI. Dataflow in `world-fishing-827`, `us-central1`, 100 × e2-highmem-4 with 50 GB disks and private IPs (the sizing from the rendered snapshot `tests/render_dags/snapshots/core_ais_v5.py`, task `port_visits.detect_port_visits`). Job name `core-ais-v5--port-visits-detect-port-visits--YYYYMMDD`.
 
 | role | table | time travel | full read (2026-10-23) |
 |---|---|---|---|
