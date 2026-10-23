@@ -89,14 +89,15 @@ Most-recent-first: prepend new entries above the existing ones. Each entry is on
   - The `--temp_dataset` item follows the overlay decision.
   - The laptop runtime gave way to Cloud Build.
   - Pipe-gaps uses `make_job_name` (#10) and `_dit_run_labels` (#30). Port-visits' per-job labels (`dit_repo`, `dit_step`, `dit_experiment_id`, `dit_mode`, iteration, slice) are still port-visits-only; cleanup does not need them.
-- README Roadmap 7a records the PIPELINE-4690 Dataflow runs: staging smoke, staging cross-version, September, Q3. Three more are listed as in progress without results.
-- README Roadmap item 6 lists the deferrals. Item 7c is left to the session that owns it.
+- README Roadmap 7a records the PIPELINE-4690 Dataflow runs: staging smoke, staging cross-version, September, Q3, the September three-way with v4.6.4, and determinism.
+- README Roadmap item 6 lists the deferrals.
+- 7c and `docs/production-baseline-2026-10.md` record the first live production-baseline run (Cloud Build `7781dd48`, added by the main session), and CHANGELOG gains a `Verified` entry for it. The 7c follow-ups gain "derive inputs from what production actually read". That is the owner's same-lineage principle, recorded on PIPELINE-4700.
 - `workflows/README.md`: the table had four of the nine workflows; it now has all nine. The 2026-05-29 `dit.phases` deferral gains a note that its revisit conditions are met: encounters' bf/bfd/bftruncate slicing is identical to port-visits' (compared function by function), and `identity_match_key.py` is a third cross-version wrapper. Planned order: `dit.cross_version`, run scaffolding, `dit.phases` (date slicing only), `dit.cohorts`. Nothing is extracted.
 - `docs/pr-triggers-2026-06.md`: T1 and T2 marked landed (#70, #71). Their Plan-changelog entries are dated 2026-06-11, but the squash-merge commits are dated 2026-07-30.
 - `docs/pr-triggers-2026-06.md`, tag timing: the conflict is noted, not resolved. That doc says "tag first"; README's last roadmap item says tag after PR triggers. The order is the owner's decision.
 - Comment-only: `src/dit/workflow.py` (module docstring, `add_infra_args`, § (b2), `resolve_run_context`'s `resolve_digest` note, the `TODO(M5)` on `dataflow_job_ids`) and the `src/dit/cache.py` module docstring.
 
-**Sections moved.** `docs/plan.md` (Context decisions, § Status, Phase 1/2 status lines, Phase 3 extraction decision, cross-version "does NOT include", Runtime & CI heading, § Next steps, § Open items); README § Features (run cache, cleanup control plane), § Roadmap (intro, table header, row 2, items 6 and 7a, closing note); `workflows/README.md`; `docs/pr-triggers-2026-06.md` header, T1, T2; `src/dit/workflow.py`, `src/dit/cache.py` (comments only). No CHANGELOG entry: docs-only.
+**Sections moved.** `docs/plan.md` (Context decisions, § Status, Phase 1/2 status lines, Phase 3 extraction decision, cross-version "does NOT include", Runtime & CI heading, § Next steps, § Open items); README § Features (run cache, cleanup control plane), § Roadmap (intro, table header, row 2, items 6 and 7a, closing note); `workflows/README.md`; `docs/pr-triggers-2026-06.md` header, T1, T2; `src/dit/workflow.py`, `src/dit/cache.py` (comments only); README items 7c; `docs/production-baseline-2026-10.md` (Status, § First live run). CHANGELOG gets a `Verified` entry only, for the live run and the determinism check; no code changes.
 
 ### 2026-10-23 — Production baseline: candidate vs production's own output (PIPELINE-4703)
 

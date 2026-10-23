@@ -342,13 +342,28 @@ Each phase below is a short summary of what's planned and where we are. This sec
    - **Staging cross-version**, b36aed6 vs 14b4be8 (Cloud Build `1f7447b4`): step 1 identical; visits differ in 2 of 10,292 rows, both explained by same-second ties, which #176 intends.
    - **September 2026**, main b36aed6 vs PR 14b4be8 (Cloud Build `2a984881`): DIFFERENT, consistent with #176. Duplicate `visit_id`s are gone and burst splits are merged.
    - **Q3 2026**, production v4.6.4 vs PR (Cloud Builds `0c6a46a6` and `77c967ef`): DIFFERENT, consistent with #176.
-   - **In progress 2026-10-23, no results yet:** the September determinism re-run (Cloud Build `8a1348d1`); September v4.6.4 on the same pins (Cloud Build `ec8b6dae`); the production-baseline live run (Cloud Build `7781dd48`).
+   - **September 2026 three-way**, v4.6.4 on the same pins (Cloud Build `ec8b6dae`, 2026-10-23): this separates #176 from main's other changes.
+     - Rows with a duplicate `visit_id`: 2,302 for v4.6.4, 2,658 for main, 0 for the PR.
+     - v4.6.4 vs main changes about 1,100 visits (mostly zero-duration ones); v4.6.4 vs the PR about 4,000.
+   - **Determinism**, September (Cloud Build `8a1348d1`, `--no-cache`, 2026-10-23): the PR twice, plus the 2026-10-22 run. All three are IDENTICAL (3,869,516 rows).
+   - **Production baseline** (7c), PR vs production's own 2026-10-20 output: see 7c.
 
    Open: TIC has no multiset comparison, so baseline duplicate `visit_id`s show up as duplicate-key warnings rather than counted diffs.
 
 7b. **Keeping dit in sync with pipeline interface changes ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700)).** The v5 drift went unnoticed for months because production still pins v4.6.4. Define how drift is detected, who updates dit, and how cross-version runs handle bindings on different interfaces.
 
-7c. **Candidate against production's own output ([PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703)).** `--baseline-production ais-v5-datalake` landed 2026-10-23, with code, unit tests and a dry run against production's 2026-10-20 run. Next: one live run of PIPELINE-4690's PR (#176) against it (≤100 workers, `--pin-max-gb 1300`, owner go-ahead). Follow-ups: the core AIS v3 target, a trigger after the production DAG, and a copy fallback when the time-travel window is too short.
+7c. **Candidate against production's own output ([PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703)).** `--baseline-production ais-v5-datalake` landed 2026-10-23 (#83).
+   - **Verified live the same day** (Cloud Build `7781dd48`): PIPELINE-4690's PR (#176) against production's 2026-10-20 output, full history. Dataflow took 99 minutes at 100 × e2-standard-2.
+   - **Result:** DIFFERENT, consistent with #176.
+     - production has 412,190,532 rows (2,801 with a duplicate `visit_id`); the PR has 412,181,996, all unique;
+     - 9,789 rows exist only in production (6,849 of them zero-duration), 1,361 only in the PR;
+     - 2,715 shared visits changed, 2,342 of them longer.
+     - Breakdown: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
+   - **Follow-ups:**
+     - the core AIS v3 target;
+     - a trigger after the production DAG;
+     - a copy fallback when the time-travel window is too short;
+     - deriving inputs from what production actually read (job metadata; PIPELINE-4700 comment of 2026-10-23).
 
 8. **Docs reorganisation.** This README has outgrown its shape — it now carries source-target inventories, per-workflow interpretation notes, and operational findings that belong in `docs/` or alongside the workflow they describe (`workflows/<pipeline>/README.md`, as `workflows/encounters/README.md` now does). Near-term: move content out and leave the README as an index. Longer-term this needs a **concept for storing dit outputs and analyses in a structured way** — run results, comparison summaries and their interpretation currently have no home at all, which is why they keep landing in prose. Recorded 2026-07-31.
 9. The first dit release tag (`v0.1.0`) once per-pipeline PR triggers + caching land — that's the natural "framework is usable by outsiders" milestone.
