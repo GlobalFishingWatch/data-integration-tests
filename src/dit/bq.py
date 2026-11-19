@@ -894,7 +894,7 @@ def pin_source_into_experiment(
         or 0
     )
     logger.info(
-        "pinning %s%s -> %s (%s): dry run estimates %.1f GB (cap %.1f GB)",
+        "pinning %s%s -> %s (%s): dry run estimates %.3f GB (cap %.1f GB)",
         source_table, " (a view)" if is_view else "", dest_table, predicate,
         estimate / 1e9, max_bytes / 1e9,
     )
