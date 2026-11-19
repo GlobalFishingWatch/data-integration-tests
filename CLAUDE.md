@@ -72,6 +72,38 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-10-23 — Shared Dataflow worker cap (`--max-num-workers`) on every Dataflow workflow, with a global ceiling (PIPELINE-4701)
+
+Follow-up to point 5(a) of the 2026-10-22 pipe-anchorages v5 entry: `world-fishing-827` also runs production Dataflow, so the cap had to become one knob, not two hand-written flags.
+
+**What the audit found.** Not every "uncapped" workflow really was uncapped:
+- **pipe-gaps** (both workflows) submits in-process, and gfw-common's `Pipeline.default_options()` sets `max_num_workers: 100`. Checked at v0.10.0, v0.17.0 and v0.23.0, which covers what pipe-gaps' `~=0.10` pin can resolve to. So those runs were capped at 100 all along, by a library default nobody in dit chose.
+- **pipe-segment** hard-coded `--max_num_workers` 50 / 50 / 20 for `segment` / `segment_identity` / `segment_info`, with no flag.
+- **pipe-events** runs BigQuery SQL, not Dataflow; it is out of scope.
+
+**Owner decisions (PR #85).** Production caps were read from composer-dags-production `origin/main` 0a644da rendered snapshots:
+- **pipe-gaps default 50**, production's daily detect cap (core.ais.v3, core.ais.v5, core.ais.testing.detect_gaps.daily; 100 in core.vms.v5.daily, 200 in core.ais.v5.backfill). This deliberately lowers the implicit 100.
+- **A global ceiling is wanted**, but it must not block an explicit override. The owner's rule is the common override logic: the more specific setting always wins.
+- **pipe-segment** follows from that rule: an explicit flag replaces all three step caps, and the ceiling lowers each step's default. Production's `segment` and `segment_identity_daily` run with 50, matching dit; production passes no Dataflow options to `segment_info`, so its 20 is dit's own.
+- **Encounters stays at 50**, matching the AIS DAGs; core.vms.v5.daily runs 400, tracked in PIPELINE-4706. Port visits keeps 4 (production: 100, 250 in the v5 backfill, 400 on VMS v5).
+
+**Design.**
+- **Precedence, in one pure function** (`resolve_max_num_workers(cli, ceiling, default) -> WorkerCap(workers, source)`):
+  1. the explicit flag, even above the ceiling;
+  2. else `min(default, DIT_MAX_NUM_WORKERS_CEILING)` when the env var is set; with no default of its own, the ceiling is the cap;
+  3. else the default.
+
+  `worker_cap(cli, *, default)` adds the env read (`max_num_workers_ceiling`, validated like the flag), and workflows call it in `parse_args`. pipe-segment calls it once per step into `args.worker_caps`; the others set `args.worker_cap` and the effective `args.max_num_workers`. The flag therefore parses to `None` when absent, so an explicit value is distinguishable from the default. `log_worker_caps` logs the result and its source once per run.
+- **Validation:** `max_num_workers_type` raises `SystemExit` like `validate_experiment_id`, so a bad value fails at parse time. That kept port visits' existing `>= 1` test unchanged, and the check moved out of its `main()`. `cross_version_ais.py` validates the ceiling before pinning: its bindings inherit the environment (`env={**os.environ}`), so a bad value would otherwise surface only after the copies.
+- **Emission** is `*max_num_workers_options(...)` in the place each literal used to be, so the option order is unchanged.
+- **pipe-gaps' in-process path** passes the token as the runner's `args`. The runner signature stays the plan's contract. `_parse_args` turns the token into an option, `_build_pipeline_for` merges it into `unknown_parsed_args`, and that overrides gfw-common's 100. The value reaches gfw-common as a string, which is safe: gfw-common builds options with `PipelineOptions.from_dictionary` in every tag from v0.10.0 to v0.23.0, and the raw options have no other reader. `from_dictionary` emits `--max_num_workers=<value>`, which Beam parses with `type=int` (checked in Beam 2.77.0). The cap must also join `runner_only_attrs`, because gfw-common's `from_namespace` is `cls(**vars(ns))` and a stray attribute crashes `DetectGapsConfig`. A test checks both through the real runner with stubbed Beam, gfw-common and pipe_gaps.
+- **Emitted options:** a capture harness over all 18 option lists diffed against `origin/main`. They cover both port-visits CLIs and runners, encounters AIS and VMS, the three pipe-segment steps, and both pipe-gaps runner calls. The only change is pipe-gaps' two runner calls gaining `--max_num_workers=50`. Tests pin the cap's value and position.
+- **Cache keys:** the cap is runner-only. No `canonical_params_dict` reads it, with or without a ceiling; tested for every mode of port visits and both pipe-gaps workflows.
+- **Tests:** `tests/conftest.py` clears the ceiling for every test, so a developer's environment cannot change results. The full suite also passes with `DIT_MAX_NUM_WORKERS_CEILING=2` exported.
+- **Cloud Build does not carry the ceiling.** `cloudbuild-dit.yaml`'s build step sets only `DIT_PIPELINE_COMMIT`, `DIT_UNREVIEWED` and `DIT_CLOUD_MODE`, and a build never sees the submitter's shell. Cloud runs pass `--max-num-workers` in `ARGS`. Wiring the ceiling through needs a `_MAX_NUM_WORKERS_CEILING` substitution, an `env:` entry and the Makefile pass-through. That is a follow-up, deliberately not done here, because the yaml is shared runtime.
+
+**Sections moved.** `src/dit/workflow.py` (module docstring, new § (a2)); `workflows/port_visits/{ais,cross_version_ais}.py`; `workflows/encounters/{ais,vms}.py`; `workflows/pipe_gaps/{mode_equivalence,outage_recovery}.py` (`DEFAULT_MAX_NUM_WORKERS`, `MAX_NUM_WORKERS_HELP_DETAIL`, `_make_config`, `_build_pipeline_for`, `_run_pipeline`, `base_cfg`, `parse_args`, `main`); `workflows/pipe_segment/identity_match_key.py` (`STEP_MAX_NUM_WORKERS`, `_step_max_num_workers`, the three argv builders, `parse_args`, `_run_binding`, `main`); new `tests/test_max_num_workers.py` (106) and `tests/conftest.py`; `.envrc.example`; `docs/conventions.md` § Prod-infra boundary; README Features; CHANGELOG § 2026-10-23 `#### Changed`.
+
 ### 2026-10-23 — Production baseline: candidate vs production's own output (PIPELINE-4703)
 
 A third comparison shape next to mode equivalence and cross-version. The bindings run on exactly what production read, and their output is diffed against what production wrote, without re-running production. The owner decided four points:
