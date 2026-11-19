@@ -227,8 +227,8 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
                         "fishing.py run.")
     p.add_argument("--reuse-pin", default=None, metavar="STAMP",
                    help="Reuse the pinned copies of an earlier run with the same "
-                        "--experiment-id, --start, --end, --tail-days and sources instead of "
-                        "copying again. STAMP is the pin stamp that run logged (e.g. "
+                        "--experiment-id, --start, --end and sources instead of copying "
+                        "again. STAMP is the pin stamp that run logged (e.g. "
                         "20261119t171500z). Fails if any copy is missing.")
     p.add_argument("--pin-expiration-days", type=int, default=DEFAULT_PIN_EXPIRATION_DAYS,
                    help=f"Days until the pinned copies expire. Default "
