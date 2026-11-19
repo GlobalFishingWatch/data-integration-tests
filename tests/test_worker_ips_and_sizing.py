@@ -409,8 +409,14 @@ def test_encounters_hint_on_staging_data(module, cli, hinted, caplog):
 # pipe-segment: per step
 # --------------------------------------------------------------------------
 
+#: pipe-segment's steps in pipeline order: two Beam jobs, then four BigQuery
+#: SQL commands, which have no workers.
+SEGMENT_BEAM_STEPS = ["segment", "segment_identity"]
+SEGMENT_SQL_STEPS = ["segment_vessel_daily", "segment_info", "vessel_info", "segment_vessel"]
+
+
 def _segment_argvs(*cli, runner="dataflow"):
-    """The three steps' argv through _run_binding, in pipeline order."""
+    """The six steps' argv through _run_binding, in pipeline order."""
     args = pipe_segment.parse_args([*SEGMENT_ARGV, "--runner", runner, *cli])
     calls = []
     ctx = SimpleNamespace(worker_image="img", pipeline_commit="c", unreviewed=False)
@@ -425,14 +431,28 @@ def _segment_argvs(*cli, runner="dataflow"):
             name="before", ref="v5.0.3", args=args, suffix="exp_before",
             snapshot_fqns=pipe_segment._PipeSegmentSnapshotFQNs(normalized_messages="p.d.n"),
         ) == 0
-    assert [argv[0] for argv in calls] == ["segment", "segment_identity", "segment_info"]
+    assert [argv[0] for argv in calls] == [*SEGMENT_BEAM_STEPS, *SEGMENT_SQL_STEPS]
     return calls
 
 
-def test_pipe_segment_steps_keep_private_ips():
-    for argv in _segment_argvs():
+def _segment_beam_argvs(*cli, runner="dataflow"):
+    return _segment_argvs(*cli, runner=runner)[:len(SEGMENT_BEAM_STEPS)]
+
+
+def _segment_sql_argvs(*cli, runner="dataflow"):
+    return _segment_argvs(*cli, runner=runner)[len(SEGMENT_BEAM_STEPS):]
+
+
+def test_pipe_segment_beam_steps_keep_private_ips():
+    for argv in _segment_beam_argvs():
         assert _ip_tokens(argv) == [NO_PUBLIC_IPS_OPTION], argv[0]
-    for argv in _segment_argvs(*SIZING_ARGV, runner="DirectRunner"):
+    for argv in _segment_beam_argvs(*SIZING_ARGV, runner="DirectRunner"):
+        assert _ip_tokens(argv) == [] and _sizing_tokens(argv) == [], argv[0]
+
+
+@pytest.mark.parametrize("runner", ["dataflow", "DirectRunner"])
+def test_pipe_segment_sql_steps_take_no_worker_option(runner):
+    for argv in _segment_sql_argvs(*SIZING_ARGV, runner=runner):
         assert _ip_tokens(argv) == [] and _sizing_tokens(argv) == [], argv[0]
 
 
@@ -440,18 +460,16 @@ STANDARD_4_TOKENS = ["--worker_machine_type=e2-standard-4", "--disk_size_gb=50"]
 
 
 @pytest.mark.parametrize("cli, expected", [
-    # Production: segment and segment_identity e2-standard-4 / 50 GB; segment_info none.
-    ([], [STANDARD_4_TOKENS, STANDARD_4_TOKENS, []]),
+    # Production: segment and segment_identity e2-standard-4 / 50 GB.
+    ([], [STANDARD_4_TOKENS] * 2),
     (["--disk-size-gb", "100"],
-     [["--worker_machine_type=e2-standard-4", "--disk_size_gb=100"]] * 2
-     + [["--disk_size_gb=100"]]),
+     [["--worker_machine_type=e2-standard-4", "--disk_size_gb=100"]] * 2),
     (["--worker-machine-type", "n2-standard-8"],
-     [["--worker_machine_type=n2-standard-8", "--disk_size_gb=50"]] * 2
-     + [["--worker_machine_type=n2-standard-8"]]),
-    (SIZING_ARGV, [SIZING_TOKENS] * 3),
+     [["--worker_machine_type=n2-standard-8", "--disk_size_gb=50"]] * 2),
+    (SIZING_ARGV, [SIZING_TOKENS] * 2),
 ])
-def test_pipe_segment_resolves_the_sizing_per_step(cli, expected):
-    argvs = _segment_argvs(*cli)
+def test_pipe_segment_resolves_the_sizing_per_beam_step(cli, expected):
+    argvs = _segment_beam_argvs(*cli)
 
     assert [_sizing_tokens(argv) for argv in argvs] == expected
     for argv in argvs:
@@ -463,7 +481,6 @@ def test_pipe_segment_steps_mirror_production():
     assert pipe_segment.STEP_WORKER_SIZING == {
         "segment": E2_STANDARD_4,
         "segment_identity": E2_STANDARD_4,
-        "segment_info": WorkerSizing(),
     }
 
 

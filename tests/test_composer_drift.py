@@ -18,6 +18,7 @@ from __future__ import annotations
 import subprocess
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -32,6 +33,7 @@ from workflows.pipe_events import composer_drift as events_drift
 from workflows.pipe_events import fishing
 from workflows.pipe_gaps import composer_drift as gaps_drift
 from workflows.pipe_gaps import mode_equivalence as gaps_modes
+from workflows.pipe_segment import composer_drift as segment_drift
 from workflows.pipe_segment import identity_match_key as segment
 
 from .test_port_visits_composer_drift import _raw_dag as _port_visits_raw_dag
@@ -67,8 +69,15 @@ COMMANDS = {
     ("pipe_segment/identity_match_key", "segment"): ("pipe-segment", "segment"),
     ("pipe_segment/identity_match_key", "segment_identity"):
         ("pipe-segment", "segment_identity"),
+    ("pipe_segment/identity_match_key", "segment_vessel_daily"):
+        ("pipe-segment", "segment_vessel_daily"),
     ("pipe_segment/identity_match_key", "segment_info"): ("pipe-segment", "segment_info"),
+    ("pipe_segment/identity_match_key", "vessel_info"): ("pipe-segment", "vessel_info"),
+    ("pipe_segment/identity_match_key", "segment_vessel"): ("pipe-segment", "segment_vessel"),
 }
+
+#: The workflows marked in sync with production: drift in one of them exits 1.
+IN_SYNC = ["port_visits/ais", "pipe_segment/identity_match_key"]
 
 
 def _steps() -> list[tuple[str, str]]:
@@ -101,12 +110,12 @@ def offline(monkeypatch):
 # the registry
 # --------------------------------------------------------------------------
 
-def test_every_workflow_has_a_spec_and_only_port_visits_is_marked_in_sync() -> None:
+def test_every_workflow_has_a_spec_and_two_are_marked_in_sync() -> None:
     assert [spec.name for spec in runner.SPECS] == [
         "port_visits/ais", "encounters/ais", "encounters/vms", "pipe_events/fishing",
         "pipe_gaps/mode_equivalence", "pipe_segment/identity_match_key",
     ]
-    assert [spec.name for spec in runner.SPECS if spec.in_sync] == ["port_visits/ais"]
+    assert [spec.name for spec in runner.SPECS if spec.in_sync] == IN_SYNC
     assert all((Path(__file__).parents[1] / spec.workflow).is_file() for spec in runner.SPECS)
     # A workflow not yet in sync says why.
     assert all(spec.note for spec in runner.SPECS if not spec.in_sync)
@@ -281,21 +290,87 @@ def test_pipe_gaps_sizing_is_checked_as_fields() -> None:
     ]
 
 
+def test_pipe_segment_spec_covers_productions_six_tasks_in_order() -> None:
+    assert [(step.step, step.task_id) for step in segment_drift.SPEC.steps] == [
+        ("segment", "segment.segment"),
+        ("segment_identity", "segment.segment_identity_daily"),
+        ("segment_vessel_daily", "segment.segment_vessel_daily"),
+        ("segment_info", "segment.segment_info"),
+        ("vessel_info", "segment.vessel_info"),
+        ("segment_vessel", "segment.segment_vessel"),
+    ]
+    assert [step.step for step in segment_drift.SPEC.steps] == list(segment.STEPS)
+
+
 def test_pipe_segment_tokens_are_one_default_bindings_argv() -> None:
-    seg = _parsed("pipe_segment/identity_match_key", "segment")
-    identity = _parsed("pipe_segment/identity_match_key", "segment_identity")
-    info = _parsed("pipe_segment/identity_match_key", "segment_info")
+    seg, identity, daily, info, vessel_info, seg_vessel = (
+        _parsed("pipe_segment/identity_match_key", step) for step in segment.STEPS
+    )
 
     # --date-range is inclusive on both ends and forwarded as given.
-    assert seg.value("--date_range") == identity.value("--date_range") == "2026-03-01,2026-03-10"
+    assert (seg.value("--date_range") == identity.value("--date_range")
+            == daily.value("--date_range") == "2026-03-01,2026-03-10")
     assert seg.value("--in_normalized_messages_table") == segment.DEFAULT_SRC_NORMALIZED_TABLE
-    assert seg.value("--runner") == "dataflow"
+    assert seg.value("--runner") == identity.value("--runner") == "dataflow"
     assert seg.value("--sdk_container_image") == segment.DEFAULT_IMAGE_TAG
     assert seg.value("--max_num_workers") == str(segment.STEP_MAX_NUM_WORKERS["segment"])
     # Satellite offsets are opt-in, so a default run passes none of their flags.
     assert "--in_sat_positions_table" not in seg.names()
+    # A default run is a published-image run: no setup file, as in production.
+    assert "--setup_file" not in seg.names() + identity.names()
+    assert "--experiments" not in seg.names() + identity.names()
+    # Each step reads what the step before it wrote, as production's chain does.
     assert identity.value("--source_segments") == seg.value("--out_segments_table")
-    assert info.value("--source_segment_identity") == identity.value("--dest_segment_identity")
+    assert identity.value("--source_fragments") == seg.value("--fragments_table")
+    assert daily.value("--source_segment_identity") == identity.value("--dest_segment_identity")
+    for step in (info, vessel_info):
+        assert step.value("--source_segment_identity") == identity.value(
+            "--dest_segment_identity")
+        assert step.value("--source_segment_vessel") == daily.value("--destination")
+    assert seg_vessel.value("--source_segment_vessel_daily") == daily.value("--destination")
+
+
+def test_pipe_segment_tokens_are_what_the_workflow_hands_the_runner() -> None:
+    args = segment_drift._dit_args(PLACEHOLDERS)
+    ctx = SimpleNamespace(worker_image=args.image_tag, pipeline_commit="c", unreviewed=False)
+    calls = []
+    with (
+        patch.object(segment.subprocess, "run"),
+        patch.object(segment, "_verify_gpsdio_segment", return_value="pin"),
+        patch.object(segment, "resolve_run_context", return_value=ctx),
+        patch.object(segment.dit_docker, "run",
+                     side_effect=lambda image, argv, **kw: calls.append((argv, kw)) or 0),
+    ):
+        assert segment._run_binding(
+            name=segment_drift._BINDING, ref="HEAD", args=args,
+            suffix=f"{args.experiment_id}_{segment_drift._BINDING}",
+            snapshot_fqns=segment._PipeSegmentSnapshotFQNs(
+                normalized_messages=args.source_normalized_table),
+        ) == 0
+
+    # The chain's six calls, in the order of the spec's steps.
+    assert [[kw["entrypoint"], *argv] for argv, kw in calls] == [
+        step.tokens(PLACEHOLDERS) for step in segment_drift.SPEC.steps
+    ]
+
+
+def test_pipe_segment_accepts_the_satellite_inputs_and_owns_the_handed_over_tables() -> None:
+    spec = segment_drift.SPEC
+    by_step = {step.step: step for step in spec.steps}
+
+    # Production's satellite-offset inputs are accepted for `segment` only.
+    satellite = {"--in_normalized_sat_offset_messages_table", "--in_norad_to_receiver_table",
+                 "--in_sat_positions_table"}
+    assert satellite <= set(by_step["segment"].accepted)
+    assert all("date-sharded" in by_step["segment"].accepted[flag] for flag in satellite)
+    assert not any(satellite & set(by_step[step].accepted) for step in segment.STEPS[1:])
+    # The tables one step hands to the next carry DIT's own names.
+    assert {"--source_segment_identity", "--source_segment_vessel",
+            "--source_segment_vessel_daily", "--destination"} <= spec.dit_owned
+    # No Dataflow flag is waved through for the SQL steps: each accepts
+    # --project only, so a Dataflow option passed to one would be drift.
+    for step in segment.SQL_STEPS:
+        assert set(by_step[step].accepted) == {"--project"}
 
 
 # --------------------------------------------------------------------------
@@ -325,12 +400,15 @@ def _mirror_task(step: drift.StepSpec, *, version: str | None = None) -> dict:
     }
 
 
-def _snapshot(name: str, *, version: str | None = None, port_visits: dict | None = None) -> dict:
+def _snapshot(name: str, *, version: str | None = None, in_sync_version: str | None = None,
+              port_visits: dict | None = None) -> dict:
     """Snapshot ``name``: a mirror task for every step of every spec that reads
-    it, plus the port-visits tasks where given."""
+    it, plus the port-visits tasks where given. ``version`` is production's
+    version for the workflows not yet in sync, ``in_sync_version`` for the
+    mirrored ones marked in sync."""
     base = _port_visits_raw_dag(production_only=())
     tasks = {
-        step.task_id: _mirror_task(step, version=version)
+        step.task_id: _mirror_task(step, version=in_sync_version if spec.in_sync else version)
         for spec in runner.SPECS if spec.snapshot == name and spec.name != "port_visits/ais"
         for step in spec.steps
     }
@@ -353,18 +431,18 @@ def _commit(repo: Path, snapshots: dict[str, dict]) -> Path:
     return repo
 
 
-def _repo(tmp_path: Path, *, version: str | None = None, without: tuple[str, ...] = (),
-          port_visits_kwargs: dict | None = None) -> Path:
+def _repo(tmp_path: Path, *, version: str | None = None, in_sync_version: str | None = None,
+          without: tuple[str, ...] = (), port_visits_kwargs: dict | None = None) -> Path:
     """A composer checkout in which production runs what DIT runs.
     ``port_visits_kwargs`` are passed to the port-visits fixture's DAG."""
     port_visits = _port_visits_raw_dag(
         **({"production_only": ()} if port_visits_kwargs is None else port_visits_kwargs),
     )
+    versions = {"version": version, "in_sync_version": in_sync_version}
     snapshots = {
-        "core_ais_v5": _snapshot("core_ais_v5", version=version,
-                                 port_visits=port_visits["tasks"]),
-        "core_vms_v5_daily": _snapshot("core_vms_v5_daily", version=version),
-        "core_ais_v3": _snapshot("core_ais_v3", version=version),
+        "core_ais_v5": _snapshot("core_ais_v5", port_visits=port_visits["tasks"], **versions),
+        "core_vms_v5_daily": _snapshot("core_vms_v5_daily", **versions),
+        "core_ais_v3": _snapshot("core_ais_v3", **versions),
     }
     return _commit(tmp_path / "composer",
                    {k: v for k, v in snapshots.items() if k not in without})
@@ -379,8 +457,9 @@ def test_no_drift_anywhere_when_production_runs_what_dit_runs(tmp_path, capsys) 
 
     out = capsys.readouterr().out
     assert "port_visits/ais: in sync; 12 field checks, 0 differ" in out
+    assert "pipe_segment/identity_match_key: in sync" in out
     for name in SPECS:
-        if name != "port_visits/ais":
+        if name not in IN_SYNC:
             assert f"{name}: no drift (can be marked in sync)" in out
     assert "DIFF" not in out and "indicative" not in out
     assert sum(line.startswith("  ") for line in out.splitlines()) == 1 + len(COMMANDS)
@@ -394,8 +473,40 @@ def test_drift_in_a_workflow_not_yet_in_sync_is_reported_but_exits_0(tmp_path, c
     assert "encounters/ais: drift (known: not expected in sync yet)" in out
     assert "DIFF v4.4.0 -> v99.0.0" in out
     assert "port_visits/ais: in sync" in out
+    assert "pipe_segment/identity_match_key: in sync" in out
 
     assert _main(repo, "--strict") == 1
+
+
+def test_drift_in_pipe_segment_exits_1(tmp_path, capsys) -> None:
+    repo = _repo(tmp_path, in_sync_version="v99.0.0")
+
+    assert _main(repo) == 1
+    out = capsys.readouterr().out
+    assert "pipe_segment/identity_match_key: DRIFT (expected in sync)" in out
+    assert "DIFF v5.0.3 -> v99.0.0" in out
+    assert _main(repo, "--workflow", "encounters/ais") == 0
+
+
+def test_a_dataflow_option_on_a_pipe_segment_sql_step_is_drift() -> None:
+    """Production passes its SQL tasks no Dataflow option. If DIT passed one
+    again, the check must report it and not wave it through as DIT-owned."""
+    step = _step("pipe_segment/identity_match_key", "segment_info")
+    mirror = _mirror_task(step)
+    dag = composer.dag_from_snapshot(
+        {**_port_visits_raw_dag(production_only=()), "tasks": {step.task_id: mirror}},
+        snapshot="synthetic",
+    )
+    with_runner = drift.StepSpec(
+        step=step.step, task_id=step.task_id, image=step.image, accepted=step.accepted,
+        tokens=lambda placeholders: [*step.tokens(placeholders), "--runner=dataflow",
+                                     "--region=us-central1"],
+    )
+
+    assert not drift.check_step(segment_drift.SPEC, step, dag).drift
+    report = drift.check_step(segment_drift.SPEC, with_runner, dag)
+    assert report.drift
+    assert report.argv.diff.only_left == ("--runner", "--region")
 
 
 def test_drift_in_port_visits_exits_1(tmp_path, capsys) -> None:

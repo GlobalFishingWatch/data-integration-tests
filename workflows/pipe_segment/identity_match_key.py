@@ -5,12 +5,12 @@ Tests the impact of reducing ``MsgProcessor.match_key`` from
 gpsdio-segment (the AIS identity-to-position match heuristic). The change
 lives in the gpsdio-segment library, not pipe-segment itself; we expose it
 via two short-lived pipe-segment branches that pin different gpsdio-segment
-SHAs in ``requirements/prod.in`` and ``setup.py``.
+SHAs (in ``pyproject.toml`` from v5.0.3 on; ``requirements/prod.in`` before).
 
 Pattern follows ``workflows/port_visits/cross_version_ais.py`` (git-worktree
 each binding's ref) but the per-binding execution mirrors
-``workflows/pipe_events/fishing.py`` (single-step docker-runner consumer that
-goes through ``dit.runners.docker.run`` + ``dit.workflow.resolve_run_context``).
+``workflows/pipe_events/fishing.py`` (a docker-runner consumer that goes
+through ``dit.runners.docker.run`` + ``dit.workflow.resolve_run_context``).
 
 Steps:
 
@@ -39,20 +39,57 @@ Steps:
       kaniko cache-hit silently reusing the wrong image -- a false
       "IDENTICAL" verdict is worse than a noisy diff).
    d. Run ``segment`` via ``dit_docker.run(image_tag=ctx.worker_image,
-      args=[...], entrypoint="pipe", volumes=["gcp:/root/.config"],
+      args=[...], entrypoint="pipe-segment", volumes=["gcp:/root/.config"],
       service="dev", build_from_source=args.build_from_source)`` from the
-      worktree CWD. Cloud-mode handling (``--network=cloudbuild``,
-      ``GOOGLE_CLOUD_QUOTA_PROJECT``) is automatic via ``_apply_cloud_mode``.
-      Pass ``--sdk_container_image=ctx.worker_image`` to the segment CLI so
+      worktree CWD. Cloud-mode handling (``--network=cloudbuild``) is
+      automatic via ``_apply_cloud_mode``. Pass
+      ``--sdk_container_image=ctx.worker_image`` to the segment CLI so
       Dataflow workers run the same per-binding code.
-   e. If ``--skip-downstream`` is not set, chain ``segment_identity`` +
-      ``segment_info`` against the per-binding outputs.
+   e. If ``--skip-downstream`` is not set, run the other five steps against
+      the per-binding outputs (see "The six steps" below).
 
 4. Diff: for each (output table, binding-pair) run ``dit.compare.compare_tables``.
    Output tables are date-partitioned single tables (since pipe-segment v5.0.0
    PIPELINE-2074), so no per-shard iteration. Diffs are informational (exit
    0 even when non-empty); the overall exit code is non-zero only if a
    binding execution itself failed.
+
+The six steps
+-------------
+Each binding runs what production's segment group runs (the ``segment.*``
+tasks of the AIS v3 DAG, pipe-segment v5.0.3), in this order:
+
+1. ``segment`` (Beam): normalized messages -> ``messages_segmented``,
+   ``segments``, ``fragments``.
+2. ``segment_identity`` (Beam): ``segments``, ``fragments`` ->
+   ``segment_identity_daily``.
+3. ``segment_vessel_daily`` (BigQuery SQL): ``segment_identity_daily`` ->
+   ``segment_vessel_daily``.
+4. ``segment_info`` (BigQuery SQL): ``segment_identity_daily``,
+   ``segment_vessel_daily`` -> ``segment_info``.
+5. ``vessel_info`` (BigQuery SQL): the same two inputs -> ``vessel_info``.
+6. ``segment_vessel`` (BigQuery SQL): ``segment_vessel_daily`` ->
+   ``segment_vessel``.
+
+Production runs the last three in parallel; here they run one after the other.
+
+* The two Beam steps take the runner and, on Dataflow, the Dataflow options.
+  ``--setup_file`` is passed only with ``--build-from-source``: the published
+  image holds the installed package and no source tree, and production passes
+  no setup file.
+* The four SQL steps are BigQuery queries run by the container. They take
+  their tables, ``--labels`` and ``--project`` and nothing else: no runner and
+  no Dataflow option. They behave the same whatever ``--runner`` is.
+* Every step gets ``--labels``. pipe-segment builds its BigQuery helper from
+  them without a ``None`` guard, so a step without labels raises ``TypeError``
+  before it does any work.
+
+**What a run here does not reproduce.** A binding starts from empty output
+tables, so ``segment`` has no fragment history to stitch onto and
+``segment_vessel_daily`` sees only the run's own days in its 30-day window.
+Both hold for every binding alike, so an A/B is fair; the outputs are not
+comparable with production's own tables. The satellite-offset branch is off
+unless ``--include-satellite-offsets`` is given (see the constants below).
 
 Example (DirectRunner smoke, 1 day, single binding to validate plumbing)::
 
@@ -62,7 +99,6 @@ Example (DirectRunner smoke, 1 day, single binding to validate plumbing)::
         --binding before=v5.0.3 \\
         --date-range 2020-01-01,2020-01-01 \\
         --runner DirectRunner \\
-        --include-satellite-offsets \\
         --skip-downstream \\
         --build-from-source
 
@@ -74,14 +110,14 @@ Example (Dataflow A/B, 1 day, after the experiment branches are pushed)::
         --binding before=v5.0.3 \\
         --binding after=experiment/identity-match-key-transponder-only \\
         --date-range 2020-01-01,2020-01-01 \\
-        --runner dataflow \\
-        --include-satellite-offsets
+        --runner dataflow
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import dataclasses
+import functools
 import itertools
 import logging
 import os
@@ -183,6 +219,20 @@ DEFAULT_SRC_NORMALIZED_TABLE = (
 # identity-match-key change under test, satellite offsets are not relevant,
 # so the default is OFF.
 #
+# Production's `segment` task always passes the three satellite-offset inputs.
+# Leaving them out is an accepted difference in this workflow's drift spec
+# (composer_drift.py), for these reasons (read from pipe-segment v5.0.3, not
+# run):
+#   * the satellite positions are date-sharded, and dit does not support
+#     date-sharded inputs;
+#   * the offsets query reads its message source as `<table>*` filtered on
+#     `_TABLE_SUFFIX` (assets/satellite_offsets.sql.j2), which matches a
+#     date-sharded source only. dit's source is one partitioned table, so the
+#     query would read no rows.
+# With the branch off, `messages_segmented` keeps messages that production
+# drops when a satellite's clock is off. Whether to remove this option is the
+# owner's decision; its behaviour is unchanged.
+#
 # Cross-org caveat for the opt-in: the satellite-positions source lives in
 # `gfw-int-pipe-v3` (org `115316357079`), which is a DIFFERENT GCP org from
 # `world-fishing-827` (org `433637338589`). BQ refuses cross-org snapshots,
@@ -214,22 +264,36 @@ SAT_OFFSET_OUTPUT_TABLES = (
     "satellite_timing_offsets",
 )
 
-# Optional downstream tables produced by segment_identity / segment_info.
+# The six pipe-segment commands one binding runs, in the order production's
+# segment group runs them (the segment.* tasks of the AIS v3 DAG: segment,
+# segment_identity_daily, segment_vessel_daily, then segment_info, vessel_info
+# and segment_vessel). --skip-downstream runs the first only.
+BEAM_STEPS = ("segment", "segment_identity")
+# BigQuery SQL commands at v5.0.3, not Beam jobs: each builds a BigQuery
+# client, creates or clears its destination and runs one query per day
+# (segment_vessel_daily) or one query (the other three). They parse only their
+# own flags and ignore the rest, so Dataflow options mean nothing to them.
+SQL_STEPS = ("segment_vessel_daily", "segment_info", "vessel_info", "segment_vessel")
+STEPS = (*BEAM_STEPS, *SQL_STEPS)
+
+# Tables the five downstream steps write, one per step, in step order.
 DOWNSTREAM_OUTPUT_TABLES = (
     "segment_identity_daily",
+    "segment_vessel_daily",
     "segment_info",
+    "vessel_info",
+    "segment_vessel",
 )
 
-# Dataflow worker cap per step. segment and segment_identity match production
-# (segment.segment and segment.segment_identity_daily run with 50 in core.ais.v3
-# and core.vms.v5.daily). Production passes no Dataflow options to
-# segment_info, so its 20 is dit's own. These are the defaults of the shared
-# resolution (PIPELINE-4701): an explicit --max-num-workers replaces all three,
-# and DIT_MAX_NUM_WORKERS_CEILING lowers each to min(step default, ceiling).
+# Dataflow worker cap per Beam step, matching production (segment.segment and
+# segment.segment_identity_daily run with 50 in core.ais.v3 and
+# core.vms.v5.daily). The SQL steps are not Dataflow jobs and have no cap.
+# These are the defaults of the shared resolution (PIPELINE-4701): an explicit
+# --max-num-workers replaces both, and DIT_MAX_NUM_WORKERS_CEILING lowers each
+# to min(step default, ceiling).
 STEP_MAX_NUM_WORKERS = {
     "segment": 50,
     "segment_identity": 50,
-    "segment_info": 20,
 }
 
 
@@ -245,14 +309,12 @@ def _step_max_num_workers(step: str, resolved: int | None) -> int:
 # core_ais_v3.py, core_vms_v3_last_4days_daily.py and core_vms_v5_daily.py:
 # segment.segment and segment.segment_identity_daily both run with
 # --worker_machine_type=e2-standard-4 --disk_size_gb=50 (segment's predate the
-# flags in dit). segment.segment_info gets no Dataflow options in production,
-# so dit emits none there either and pipe-segment's own default applies.
+# flags in dit). The SQL steps have no workers to size.
 # Hand-written until PIPELINE-4700 reads them from composer. A flag replaces
-# that field in all three steps.
+# that field in both Beam steps.
 STEP_WORKER_SIZING = {
     "segment": WorkerSizing(machine_type="e2-standard-4", disk_size_gb=50),
     "segment_identity": WorkerSizing(machine_type="e2-standard-4", disk_size_gb=50),
-    "segment_info": WorkerSizing(),
 }
 
 
@@ -270,13 +332,34 @@ def _step_worker_sizing(step: str, resolved: WorkerSizing | None) -> WorkerSizin
 # wall-clock time even when the data is identical. `first_timestamp` is
 # the first POSITION message timestamp in the segment for the day and is
 # stable if the segment composition is.
+#
+# The keys of the three tables added on 2026-11-19 (segment_vessel_daily,
+# vessel_info, segment_vessel) come from the final GROUP BY of each step's
+# query at v5.0.3 (src/pipe_segment/assets/queries/*.sql.j2), so uniqueness
+# follows from the SQL; no run has confirmed it:
+#   * segment_vessel_daily: per processed day, one row per (ssvid, seg_id)
+#     (segment_most_common GROUP BY ssvid, seg_id; the join that adds the
+#     vessel id is one row per ssvid). `day` is the processed day, and a run
+#     deletes its date range before it writes.
+#   * vessel_info: vessel_most_common GROUP BY ssvid, vessel_id; the table is
+#     truncated and rebuilt.
+#   * segment_vessel: seg_vessel_ssvid GROUP BY seg_id, ssvid, vessel_id; the
+#     table is truncated and rebuilt.
+# `vessel_id` is a hash of the ssvid and the most common identity values
+# (vesselID in util.sql.j2). So when a binding changes a vessel's identity,
+# vessel_info and segment_vessel show the old id as only-in-A and the new id as
+# only-in-B, not as a field difference on one row. In segment_vessel_daily and
+# segment_info the same change is a field difference in `vessel_id`.
 COMPARE_KEYS = {
     "messages_segmented":       ["msgid"],
     "segments":                 ["seg_id", "frag_id"],   # one row per (seg, frag, day)
     "fragments":                ["frag_id"],             # frag_id is globally unique
     "satellite_timing_offsets": ["timestamp", "receiver"],
     "segment_identity_daily":   ["seg_id", "first_timestamp"],
+    "segment_vessel_daily":     ["seg_id", "ssvid", "day"],
     "segment_info":             ["seg_id"],              # clustered_by seg_id
+    "vessel_info":              ["vessel_id", "ssvid"],
+    "segment_vessel":           ["seg_id", "ssvid", "vessel_id"],
 }
 
 
@@ -336,11 +419,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "source tree, so worker code reflects each binding's ref. Bypasses both "
                         "the canonical-image pull and the kaniko auto-build -- the natural "
                         "laptop inner-loop pattern. Note: --runner=dataflow + --build-from-source "
-                        "is rarely what you want (workers still pull --sdk_container_image which "
-                        "wouldn't reflect the worktree).")
+                        "is rarely what you want: workers still pull --sdk_container_image, the "
+                        "published image. Only this combination passes --setup_file=./setup.py, "
+                        "which ships the worktree's package to the workers on top of that image.")
     p.add_argument("--skip-downstream", action="store_true",
-                   help="Skip segment_identity and segment_info; only run + diff the segment step. "
-                        "Useful for fast smoke tests.")
+                   help="Run and diff the segment step only; skip the other five "
+                        f"({', '.join(STEPS[1:])}). Useful for fast smoke tests.")
     p.add_argument("--dry-run", action="store_true",
                    help="Skip pipe-segment invocations and the diff phase; still snapshots source "
                         "and sets up worktrees. Lets you validate orchestration without burning runs.")
@@ -367,18 +451,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     step_caps = ", ".join(f"{step} {cap}" for step, cap in STEP_MAX_NUM_WORKERS.items())
     add_max_num_workers_arg(
         p, default=None,
-        help_detail=f"Unset here means per step: {step_caps}, each lowered by the "
-                    f"ceiling env var; an explicit value replaces all three.",
+        help_detail=f"Unset here means per Beam step: {step_caps}, each lowered by the "
+                    f"ceiling env var; an explicit value replaces both. The four SQL "
+                    f"steps are not Dataflow jobs and take no cap.",
     )
     add_worker_sizing_args(
         p, defaults=STEP_WORKER_SIZING,
-        help_detail="An explicit value replaces that field in all three steps.",
+        help_detail="An explicit value replaces that field in both Beam steps. The four "
+                    "SQL steps have no workers.",
     )
     args = p.parse_args(argv)
 
     args.bindings = [_parse_binding(b) for b in args.bindings]
     args.pin_source_at = _parse_iso8601(args.pin_source_at)
     args.date_range = _parse_daterange(args.date_range)
+    if args.runner == "dataflow":
+        _verify_job_names(args.experiment_id, args.bindings)
     # Per step: flag > ceiling env var > step default (resolve_max_num_workers).
     # args.max_num_workers stays the raw flag value.
     args.worker_caps = {
@@ -411,6 +499,38 @@ def _parse_binding(spec: str) -> tuple[str, str]:
             f"Got: {spec!r}."
         )
     return name, value
+
+
+def _job_name(step: str, *, experiment_id: str, binding_name: str) -> str:
+    """Dataflow job name of one Beam step of one binding:
+    ``dit-pipe-segment-<step>-<experiment>-<binding>``.
+
+    ``dit.job_names.make_job_name`` enforces Dataflow's ``[a-z0-9-]`` alphabet
+    and the 63-character cap. It shortens the experiment id when the name is
+    too long and keeps step and binding whole, since those tell concurrent
+    jobs apart.
+    """
+    return make_job_name(
+        repo=PIPELINE_NAME, step=step, experiment_id=experiment_id, binding=binding_name,
+    )
+
+
+def _verify_job_names(experiment_id: str, bindings: list[tuple[str, str]]) -> None:
+    """Fail at parse time when a binding name leaves no room for a job name.
+
+    A binding name may be 32 characters, but the longest step name
+    (``segment_identity``) leaves 27 for it. Without this check the error
+    would come from the second step's argv, after the first job has run.
+    """
+    for name, _ in bindings:
+        for step in BEAM_STEPS:
+            try:
+                _job_name(step, experiment_id=experiment_id, binding_name=name)
+            except ValueError as exc:
+                raise SystemExit(
+                    f"--binding name {name!r} is too long for the Dataflow job name of "
+                    f"step {step!r}: {exc}"
+                ) from exc
 
 
 def _parse_iso8601(s: str) -> datetime:
@@ -681,6 +801,68 @@ def _output_prefix(table: str, *, dest_dataset: str, suffix: str) -> str:
     return f"{PROJECT}.{dest_dataset}.{table}_{_sanitize_for_dataset(suffix)}"
 
 
+def _step_labels(step: str, *, experiment_id: str, binding_name: str) -> list[str]:
+    """``--labels`` of one step. Every step needs them, on every runner.
+
+    Each pipe-segment command builds ``BigQueryHelper(labels=...)``, which
+    splits every entry on ``=`` with no ``None`` guard
+    (``utils/bq_tools.py`` at v5.0.3). Without ``--labels`` the command raises
+    ``TypeError`` before it does any work. The labels land on the step's
+    tables and query jobs, and for the Beam steps on the Dataflow job.
+
+    ``experiment_id`` and ``binding`` are separate labels, each sanitised by
+    ``_safe_label_value``: BigQuery caps label values at 63 characters and the
+    raw suffix can be 65 (``<exp32>_<binding32>``). (Copilot PR #44 round 2.)
+    """
+    return [
+        "--labels=environment=develop",
+        "--labels=resource_creator=dit",
+        f"--labels=step={step}",
+        f"--labels=experiment_id={_safe_label_value(experiment_id)}",
+        f"--labels=binding={_safe_label_value(binding_name)}",
+    ]
+
+
+def _dataflow_options(
+    step: str,
+    *,
+    experiment_id: str,
+    binding_name: str,
+    worker_image: str | None,
+    service_account: str,
+    max_num_workers: int | None,
+    worker_sizing: WorkerSizing | None,
+    build_from_source: bool,
+) -> list[str]:
+    """The Dataflow options of one Beam step, as production's task passes them.
+
+    ``--setup_file=./setup.py`` is passed only with ``build_from_source``.
+    Production passes none: the published image has the package installed and
+    no source tree (the Dockerfile's ``prod`` stage at v5.0.3), so
+    ``./setup.py`` does not exist in it. With ``--build-from-source`` the
+    compose ``dev`` service mounts the worktree at the working directory, so
+    the file exists. Beam then stages the worktree's package for the workers,
+    which otherwise run only what ``--sdk_container_image`` holds. Read from
+    the Dockerfile and compose file; not confirmed by a run.
+
+    No ``--experiments``: production passes none.
+    """
+    return [
+        *(["--setup_file=./setup.py"] if build_from_source else []),
+        "--wait_for_job",
+        "--region=us-central1",
+        *max_num_workers_options(_step_max_num_workers(step, max_num_workers)),
+        *worker_sizing_options(_step_worker_sizing(step, worker_sizing)),
+        NO_PUBLIC_IPS_OPTION,
+        "--network=gfw-internal-network",
+        "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
+        f"--service_account_email={service_account}",
+        "--job_name="
+        + _job_name(step, experiment_id=experiment_id, binding_name=binding_name),
+        *([f"--sdk_container_image={worker_image}"] if worker_image is not None else []),
+    ]
+
+
 def _segment_args(
     *,
     snapshot_fqns: _PipeSegmentSnapshotFQNs,
@@ -696,6 +878,7 @@ def _segment_args(
     include_satellite_offsets: bool,
     max_num_workers: Optional[int] = None,
     worker_sizing: WorkerSizing | None = None,
+    build_from_source: bool = False,
 ) -> list[str]:
     """CLI args for `pipe-segment segment`.
 
@@ -713,11 +896,8 @@ def _segment_args(
     match-key change under test, and its inputs are date-sharded in prod
     (not mirrored to the staging cohort).
 
-    Dataflow ``--job_name`` is built via ``dit.job_names.make_job_name``
-    (Copilot PR #44 comment): the shared helper enforces Dataflow's
-    ``[a-z0-9-]`` alphabet (underscores are rejected) and the 63-char cap,
-    truncating ``experiment_id`` from the right when overlong while
-    preserving ``binding`` / ``step`` (load-bearing for triage).
+    The Dataflow options, the job name among them, come from
+    :func:`_dataflow_options`.
     """
     start, end = date_range
     args = [
@@ -727,15 +907,7 @@ def _segment_args(
         f"--out_segmented_messages_table={_output_prefix('messages_segmented', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--out_segments_table={_output_prefix('segments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--fragments_table={_output_prefix('fragments', dest_dataset=dest_dataset, suffix=suffix)}",
-        # Standard labels — make A/B-runs visibly distinct in Dataflow UI.
-        # experiment_id + binding are split + sanitised via _safe_label_value
-        # because BQ caps label values at 63 chars and the raw suffix can be
-        # up to 65 chars (`<exp32>_<binding32>`). (Copilot PR #44 round 2.)
-        "--labels=environment=develop",
-        "--labels=resource_creator=dit",
-        "--labels=step=segment",
-        f"--labels=experiment_id={_safe_label_value(experiment_id)}",
-        f"--labels=binding={_safe_label_value(binding_name)}",
+        *_step_labels("segment", experiment_id=experiment_id, binding_name=binding_name),
         # Project + runner.
         f"--project={PROJECT}",
         f"--runner={runner}",
@@ -769,21 +941,16 @@ def _segment_args(
     if ssvid_filter_query is not None:
         args.append(f"--ssvid_filter_query={ssvid_filter_query}")
     if runner == "dataflow":
-        args.extend([
-            "--setup_file=./setup.py",
-            "--wait_for_job",
-            "--region=us-central1",
-            *max_num_workers_options(_step_max_num_workers("segment", max_num_workers)),
-            *worker_sizing_options(_step_worker_sizing("segment", worker_sizing)),
-            "--experiments=use_runner_v2",
-            NO_PUBLIC_IPS_OPTION,
-            "--network=gfw-internal-network",
-            "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
-            f"--service_account_email={service_account}",
-            f"--job_name={make_job_name(repo=PIPELINE_NAME, step='segment', experiment_id=experiment_id, binding=binding_name)}",
-        ])
-        if worker_image is not None:
-            args.append(f"--sdk_container_image={worker_image}")
+        args.extend(_dataflow_options(
+            "segment",
+            experiment_id=experiment_id,
+            binding_name=binding_name,
+            worker_image=worker_image,
+            service_account=service_account,
+            max_num_workers=max_num_workers,
+            worker_sizing=worker_sizing,
+            build_from_source=build_from_source,
+        ))
     return args
 
 
@@ -791,14 +958,17 @@ def _segment_identity_args(
     *,
     dest_dataset: str,
     suffix: str,
+    experiment_id: str,
+    binding_name: str,
     date_range: tuple[date, date],
     runner: str,
     worker_image: Optional[str],
     service_account: str,
     max_num_workers: Optional[int] = None,
     worker_sizing: WorkerSizing | None = None,
+    build_from_source: bool = False,
 ) -> list[str]:
-    """CLI args for `pipe-segment segment_identity`."""
+    """CLI args for `pipe-segment segment_identity` (a Beam job, like `segment`)."""
     start, end = date_range
     args = [
         "segment_identity",
@@ -806,6 +976,7 @@ def _segment_identity_args(
         f"--source_segments={_output_prefix('segments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--source_fragments={_output_prefix('fragments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--dest_segment_identity={_output_prefix('segment_identity_daily', dest_dataset=dest_dataset, suffix=suffix)}",
+        *_step_labels("segment_identity", experiment_id=experiment_id, binding_name=binding_name),
         f"--project={PROJECT}",
         f"--runner={runner}",
         # See _segment_args for the temp_location/staging_location rationale.
@@ -813,66 +984,183 @@ def _segment_identity_args(
         f"--staging_location={dataflow_staging_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
     ]
     if runner == "dataflow":
-        args.extend([
-            "--setup_file=./setup.py",
-            "--wait_for_job",
-            "--region=us-central1",
-            *max_num_workers_options(_step_max_num_workers("segment_identity", max_num_workers)),
-            *worker_sizing_options(_step_worker_sizing("segment_identity", worker_sizing)),
-            NO_PUBLIC_IPS_OPTION,
-            "--network=gfw-internal-network",
-            "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
-            f"--service_account_email={service_account}",
-        ])
-        if worker_image is not None:
-            args.append(f"--sdk_container_image={worker_image}")
+        args.extend(_dataflow_options(
+            "segment_identity",
+            experiment_id=experiment_id,
+            binding_name=binding_name,
+            worker_image=worker_image,
+            service_account=service_account,
+            max_num_workers=max_num_workers,
+            worker_sizing=worker_sizing,
+            build_from_source=build_from_source,
+        ))
     return args
+
+
+def _sql_step_args(
+    step: str,
+    table_flags: Sequence[str],
+    *,
+    experiment_id: str,
+    binding_name: str,
+) -> list[str]:
+    """CLI args for one of pipe-segment's four BigQuery SQL commands.
+
+    The command's own table (and date) flags, the labels, and the project the
+    queries are billed to. Nothing else: these commands are not Beam jobs, so
+    they get no runner and no Dataflow option, as in production. Production
+    leaves ``--project`` to the CLI's default; dit names its project on every
+    step so the billing project never depends on a pipeline's default.
+    """
+    return [
+        step,
+        *table_flags,
+        *_step_labels(step, experiment_id=experiment_id, binding_name=binding_name),
+        f"--project={PROJECT}",
+    ]
+
+
+def _segment_vessel_daily_args(
+    *,
+    dest_dataset: str,
+    suffix: str,
+    experiment_id: str,
+    binding_name: str,
+    date_range: tuple[date, date],
+) -> list[str]:
+    """CLI args for `pipe-segment segment_vessel_daily`.
+
+    Assigns a ``vessel_id`` to each segment of each day in ``date_range``
+    (inclusive on both ends, like the Beam steps), from the identity counts of
+    the 30 days up to that day. A binding's identity table holds only the
+    run's own days, so the window is shorter here than in production.
+    """
+    start, end = date_range
+    table = functools.partial(_output_prefix, dest_dataset=dest_dataset, suffix=suffix)
+    return _sql_step_args(
+        "segment_vessel_daily",
+        [
+            f"--date_range={start.isoformat()},{end.isoformat()}",
+            f"--source_segment_identity={table('segment_identity_daily')}",
+            f"--destination={table('segment_vessel_daily')}",
+        ],
+        experiment_id=experiment_id, binding_name=binding_name,
+    )
 
 
 def _segment_info_args(
     *,
     dest_dataset: str,
     suffix: str,
-    runner: str,
-    worker_image: Optional[str],
-    service_account: str,
-    max_num_workers: Optional[int] = None,
-    worker_sizing: WorkerSizing | None = None,
+    experiment_id: str,
+    binding_name: str,
 ) -> list[str]:
-    """CLI args for `pipe-segment segment_info`.
+    """CLI args for `pipe-segment segment_info`: one row per segment.
 
-    Note: segment_info reads `segment_vessel`, but our A/B only runs `segment`
-    + `segment_identity`. For the smoke version we pass the identity table as
-    a stand-in for segment_vessel — segment_info will still produce a per-seg
-    aggregation that reflects the identity differences. If it errors, you may
-    need to also run the `segment_vessel` step (out of scope for v1).
+    ``--source_segment_vessel`` is the ``segment_vessel_daily`` table, as in
+    production. The query selects ``vessel_id``, ``seg_id`` and ``day`` from
+    it; the identity table has no ``vessel_id`` or ``day`` and cannot stand in.
     """
-    args = [
+    table = functools.partial(_output_prefix, dest_dataset=dest_dataset, suffix=suffix)
+    return _sql_step_args(
         "segment_info",
-        f"--source_segment_identity={_output_prefix('segment_identity_daily', dest_dataset=dest_dataset, suffix=suffix)}",
-        f"--source_segment_vessel={_output_prefix('segment_identity_daily', dest_dataset=dest_dataset, suffix=suffix)}",
-        f"--destination={_output_prefix('segment_info', dest_dataset=dest_dataset, suffix=suffix)}",
-        f"--project={PROJECT}",
-        f"--runner={runner}",
-        # See _segment_args for the temp_location/staging_location rationale.
-        f"--temp_location={dataflow_temp_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
-        f"--staging_location={dataflow_staging_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
-    ]
-    if runner == "dataflow":
-        args.extend([
-            "--setup_file=./setup.py",
-            "--wait_for_job",
-            "--region=us-central1",
-            *max_num_workers_options(_step_max_num_workers("segment_info", max_num_workers)),
-            *worker_sizing_options(_step_worker_sizing("segment_info", worker_sizing)),
-            NO_PUBLIC_IPS_OPTION,
-            "--network=gfw-internal-network",
-            "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
-            f"--service_account_email={service_account}",
-        ])
-        if worker_image is not None:
-            args.append(f"--sdk_container_image={worker_image}")
-    return args
+        [
+            f"--source_segment_identity={table('segment_identity_daily')}",
+            f"--source_segment_vessel={table('segment_vessel_daily')}",
+            f"--destination={table('segment_info')}",
+        ],
+        experiment_id=experiment_id, binding_name=binding_name,
+    )
+
+
+def _vessel_info_args(
+    *,
+    dest_dataset: str,
+    suffix: str,
+    experiment_id: str,
+    binding_name: str,
+) -> list[str]:
+    """CLI args for `pipe-segment vessel_info`: one row per vessel id and
+    ssvid, from the same two inputs as `segment_info`."""
+    table = functools.partial(_output_prefix, dest_dataset=dest_dataset, suffix=suffix)
+    return _sql_step_args(
+        "vessel_info",
+        [
+            f"--source_segment_identity={table('segment_identity_daily')}",
+            f"--source_segment_vessel={table('segment_vessel_daily')}",
+            f"--destination={table('vessel_info')}",
+        ],
+        experiment_id=experiment_id, binding_name=binding_name,
+    )
+
+
+def _segment_vessel_args(
+    *,
+    dest_dataset: str,
+    suffix: str,
+    experiment_id: str,
+    binding_name: str,
+) -> list[str]:
+    """CLI args for `pipe-segment segment_vessel`: the mapping between
+    segments, ssvids and vessel ids over the whole `segment_vessel_daily`
+    table. Production's later stages read this table."""
+    table = functools.partial(_output_prefix, dest_dataset=dest_dataset, suffix=suffix)
+    return _sql_step_args(
+        "segment_vessel",
+        [
+            f"--source_segment_vessel_daily={table('segment_vessel_daily')}",
+            f"--destination={table('segment_vessel')}",
+        ],
+        experiment_id=experiment_id, binding_name=binding_name,
+    )
+
+
+def _step_argvs(
+    args: argparse.Namespace,
+    *,
+    binding_name: str,
+    suffix: str,
+    snapshot_fqns: _PipeSegmentSnapshotFQNs,
+    worker_image: str | None,
+) -> dict[str, list[str]]:
+    """The argv of every step one binding runs, by step, in run order.
+
+    Pure: no docker and no cloud call, so the drift spec builds the same
+    tokens offline. ``--skip-downstream`` keeps ``segment`` only.
+    """
+    tables = dict(dest_dataset=args.dest_dataset, suffix=suffix)
+    identity = dict(experiment_id=args.experiment_id, binding_name=binding_name)
+
+    def beam(step: str) -> dict:
+        return dict(
+            runner=args.runner,
+            worker_image=worker_image,
+            service_account=args.service_account,
+            max_num_workers=args.worker_caps[step].workers,
+            worker_sizing=args.worker_sizings[step],
+            build_from_source=args.build_from_source,
+        )
+
+    builders = {
+        "segment": lambda: _segment_args(
+            snapshot_fqns=snapshot_fqns,
+            date_range=args.date_range,
+            ssvid_filter_query=args.ssvid_filter_query,
+            include_satellite_offsets=args.include_satellite_offsets,
+            **tables, **identity, **beam("segment"),
+        ),
+        "segment_identity": lambda: _segment_identity_args(
+            date_range=args.date_range, **tables, **identity, **beam("segment_identity"),
+        ),
+        "segment_vessel_daily": lambda: _segment_vessel_daily_args(
+            date_range=args.date_range, **tables, **identity,
+        ),
+        "segment_info": lambda: _segment_info_args(**tables, **identity),
+        "vessel_info": lambda: _vessel_info_args(**tables, **identity),
+        "segment_vessel": lambda: _segment_vessel_args(**tables, **identity),
+    }
+    steps = STEPS[:1] if args.skip_downstream else STEPS
+    return {step: builders[step]() for step in steps}
 
 
 @contextlib.contextmanager
@@ -900,10 +1188,10 @@ def _run_pipe_subcommand(
     cli_args: list[str],
     build_from_source: bool,
 ) -> int:
-    """One ``pipe-segment`` subcommand (segment / segment_identity / segment_info) via dit_docker.run.
+    """One ``pipe-segment`` subcommand (any of ``STEPS``) via dit_docker.run.
 
     Runs from ``worktree_dir`` (chdir context) so ``docker compose`` finds the
-    worktree's ``compose.yaml``. ``dit_docker.run`` handles cloud-mode
+    worktree's compose file. ``dit_docker.run`` handles cloud-mode
     (``--network=cloudbuild``), per-call compose project name
     uniquification, and ``--entrypoint`` injection.
 
@@ -1004,69 +1292,21 @@ def _run_binding(
             logger.info("[%s] --dry-run set; skipping pipe-segment invocations.", name)
             return 0
 
-        seg_args = _segment_args(
-            snapshot_fqns=snapshot_fqns,
-            dest_dataset=args.dest_dataset,
-            suffix=suffix,
-            experiment_id=args.experiment_id,
-            binding_name=name,
-            date_range=args.date_range,
-            runner=args.runner,
-            worker_image=image_tag,
-            ssvid_filter_query=args.ssvid_filter_query,
-            service_account=args.service_account,
-            include_satellite_offsets=args.include_satellite_offsets,
-            max_num_workers=args.worker_caps["segment"].workers,
-            worker_sizing=args.worker_sizings["segment"],
+        # Each step reads what the one before wrote, so the first failure
+        # ends the binding.
+        argvs = _step_argvs(
+            args, binding_name=name, suffix=suffix,
+            snapshot_fqns=snapshot_fqns, worker_image=image_tag,
         )
-        rc = _run_pipe_subcommand(
-            worktree_dir=worktree_dir, binding_name=name,
-            image_tag=image_tag, cli_args=seg_args,
-            build_from_source=args.build_from_source,
-        )
-        if rc != 0:
-            logger.error("[%s] segment step failed with rc=%d", name, rc)
-            return rc
-
-        if args.skip_downstream:
-            return 0
-
-        ident_args = _segment_identity_args(
-            dest_dataset=args.dest_dataset,
-            suffix=suffix,
-            date_range=args.date_range,
-            runner=args.runner,
-            worker_image=image_tag,
-            service_account=args.service_account,
-            max_num_workers=args.worker_caps["segment_identity"].workers,
-            worker_sizing=args.worker_sizings["segment_identity"],
-        )
-        rc = _run_pipe_subcommand(
-            worktree_dir=worktree_dir, binding_name=name,
-            image_tag=image_tag, cli_args=ident_args,
-            build_from_source=args.build_from_source,
-        )
-        if rc != 0:
-            logger.error("[%s] segment_identity step failed with rc=%d", name, rc)
-            return rc
-
-        info_args = _segment_info_args(
-            dest_dataset=args.dest_dataset,
-            suffix=suffix,
-            runner=args.runner,
-            worker_image=image_tag,
-            service_account=args.service_account,
-            max_num_workers=args.worker_caps["segment_info"].workers,
-            worker_sizing=args.worker_sizings["segment_info"],
-        )
-        rc = _run_pipe_subcommand(
-            worktree_dir=worktree_dir, binding_name=name,
-            image_tag=image_tag, cli_args=info_args,
-            build_from_source=args.build_from_source,
-        )
-        if rc != 0:
-            logger.error("[%s] segment_info step failed with rc=%d", name, rc)
-            return rc
+        for step, cli_args in argvs.items():
+            rc = _run_pipe_subcommand(
+                worktree_dir=worktree_dir, binding_name=name,
+                image_tag=image_tag, cli_args=cli_args,
+                build_from_source=args.build_from_source,
+            )
+            if rc != 0:
+                logger.error("[%s] %s step failed with rc=%d", name, step, rc)
+                return rc
 
         return 0
     finally:
@@ -1182,7 +1422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.cli_worker_sizing, args.worker_sizings, [args.source_normalized_table],
         )
     if args.skip_downstream:
-        logger.info("downstream:    SKIPPED (segment_identity, segment_info)")
+        logger.info("downstream:    SKIPPED (%s)", ", ".join(STEPS[1:]))
 
     _verify_refs(args.pipeline_dir, args.bindings)
     # Cheap preflight: fail before snapshotting if the A/B is misconfigured

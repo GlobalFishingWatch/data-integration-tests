@@ -68,8 +68,10 @@ def test_encounters_jobs_use_the_prefix(runner):
 
 @pytest.mark.parametrize("runner", ["DataflowRunner", "DirectRunner"])
 def test_pipe_segment_jobs_use_the_prefix_in_the_configured_bucket(runner):
-    argv = pipe_segment._segment_info_args(
-        dest_dataset="d", suffix="s", runner=runner, worker_image=None, service_account="sa",
+    argv = pipe_segment._segment_identity_args(
+        dest_dataset="d", suffix="s", experiment_id="e", binding_name="b",
+        date_range=(date(2020, 1, 1), date(2020, 1, 1)),
+        runner=runner, worker_image=None, service_account="sa",
     )
     bucket = pipe_segment.DEFAULT_DATAFLOW_TEMP_BUCKET
 
