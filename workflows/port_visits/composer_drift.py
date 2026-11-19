@@ -1,15 +1,19 @@
-"""Port-visits drift check against production's rendered DAG (PIPELINE-4700 spike).
+"""Port-visits drift check against production's rendered DAG (PIPELINE-4700).
 
-Read-only. Loads the rendered DAG behind a ``ProductionTarget`` from
+Read-only. The spec of ``workflows/port_visits/ais.py`` for the general drift
+check (:mod:`dit.drift`, run for every workflow by
+``workflows/composer_drift.py``), plus this workflow's own command line. It
+loads the rendered DAG behind a ``ProductionTarget`` from
 composer-dags-production (through :mod:`dit.composer`: data, not code) and
-reports three things, changing nothing:
+reports, changing nothing:
 
 1. each ``ProductionTarget`` field (``cross_version_ais.PRODUCTION_TARGETS``)
    against what the DAG's port-visits tasks pass;
-2. the pipe-anchorages version DIT's default image holds
-   (``ais.DEFAULT_PIPELINE_VERSION``) against the image tag of those tasks;
-3. the flags DIT's argv builders (``ais._thin_argv`` / ``ais._visits_argv``)
-   emit against production's argv for the same run.
+2. per step, the pipe-anchorages version DIT's default image holds
+   (``ais.DEFAULT_PIPELINE_VERSION``) against the image tag of the task;
+3. per step, the command and the flags DIT's argv builders
+   (``ais._thin_argv`` / ``ais._visits_argv``) emit against production's argv
+   for the same run.
 
 The flag names are those of the pipe-anchorages CLI production runs (v5.0.1:
 ``port-state-transitions`` / ``port-visits``, ``--bq-in-*`` / ``--bq-out-*``).
@@ -21,9 +25,9 @@ tables, its history start, and the snapshot run's dates. A value that differs is
 therefore a real difference, not a different run. Flags expected to differ are
 listed apart (:data:`EXPECTED_DIFFERENCES`): those DIT sets to its own values on
 purpose (:data:`DIT_OWNED_FLAGS`: outputs, identity, placement, labels, job
-names, worker cap, image) and those the owner accepted
-(:data:`ACCEPTED_DIFFERENCES`). Spellings that mean the same value are compared
-as one (:data:`EQUIVALENT_VALUES`).
+names, worker cap, image) and the accepted ones (:data:`ACCEPTED_DIFFERENCES`,
+and :data:`THIN_ACCEPTED_DIFFERENCES` for step 1 only). Spellings that mean the
+same value are compared as one (:data:`EQUIVALENT_VALUES`).
 
 Exit code: 0 when nothing differs beyond the expected differences, 1 otherwise,
 2 when the snapshot or a task cannot be read. Mismatches are for the workflow
@@ -40,13 +44,15 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import re
 import sys
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 
-from dit import composer
+from dit import composer, drift
+from dit.drift import FieldCheck
 from workflows.port_visits import ais
 from workflows.port_visits.cross_version_ais import PRODUCTION_TARGETS, ProductionTarget
 
@@ -80,43 +86,52 @@ TARGET_SOURCES = {
 #:
 #: ``--sdk_container_image`` joined on 2026-11-19, when the owner made a
 #: DIT-built overlay image the default: the registry path differs from
-#: production's by design. The version inside it is still checked, by
-#: :func:`default_version_checks`.
-DIT_OWNED_FLAGS = frozenset({
+#: production's by design. The version inside it is still checked, as each
+#: step's version level.
+DIT_OWNED_FLAGS = drift.DATAFLOW_OWNED_FLAGS | frozenset({
     "--bq-out-port-state-transitions",
     "--bq-out-port-visits",
-    "--job_name",
-    "--labels",
-    "--service_account_email",
-    "--temp_location",
-    "--staging_location",
-    "--subnetwork",
-    "--max_num_workers",
-    "--sdk_container_image",
 })
 
-#: Production flags DIT leaves out on purpose, with the reason (owner, 2026-10-23).
+#: Production flags DIT leaves out on purpose, with the reason.
+#:
+#: The first two are the owner's decisions of 2026-10-23.
+#:
+#: PENDING OWNER DECISION: ``--no-rich-logging`` and ``--wait_for_job`` are
+#: accepted here on a recommendation the owner has not confirmed (2026-11-19).
+#: Neither changes output. To have the check report them again, delete the two
+#: entries; to emit them instead, add them to ``ais._pipeline_options`` and
+#: delete the entries.
 ACCEPTED_DIFFERENCES = {
-    "--dataflow_service_options": "lineage stays off in DIT, so DIT's tables never "
-                                  "enter production's lineage graph",
-    "--network": "determined by DIT's --subnetwork",
+    **drift.DATAFLOW_ACCEPTED_DIFFERENCES,
+    "--no-rich-logging": "log format only: plain instead of coloured output "
+                         "(pending owner decision)",
+    "--wait_for_job": "a v4 flag the v5 CLI does not define; gfw-common waits for "
+                      "batch jobs regardless (pending owner decision)",
 }
 
-#: Every flag expected to differ; a difference anywhere else is drift.
+#: Accepted for step 1 only. The check runs step 1 on DIT's default messages
+#: table, the AIS staging cohort, which is DIT's default by design
+#: (``ProductionTarget`` has no step-1 tables: the production baseline runs
+#: step 2 only). The named-anchorages table is still compared.
+THIN_ACCEPTED_DIFFERENCES = {
+    "--bq-in-messages": "step 1 reads DIT's AIS staging cohort by design; "
+                        "the production target has no step-1 tables",
+}
+
+#: Every flag expected to differ in both steps; a difference anywhere else is drift.
 EXPECTED_DIFFERENCES = DIT_OWNED_FLAGS | frozenset(ACCEPTED_DIFFERENCES)
 
 #: Spellings of a value that mean the same thing, mapped to one form before
 #: comparing. Beam resolves both runner names to the Dataflow runner (owner,
 #: 2026-10-23: DIT keeps ``DataflowRunner``, production passes ``dataflow``).
-EQUIVALENT_VALUES: Mapping[str, Mapping[str, str]] = {
-    "--runner": {"DataflowRunner": "dataflow"},
-}
+EQUIVALENT_VALUES: Mapping[str, Mapping[str, str]] = drift.RUNNER_EQUIVALENTS
 
 #: Flags that take several values after one mention. The pipe-anchorages CLI's
 #: ``--labels`` does (gfw-common's labels option): production passes
 #: ``--labels k=v k=v ...``, DIT ``--labels=k=v`` repeated, and both parse to
 #: the same pairs. Without the hint production's pairs read as positionals.
-MULTI_VALUE_FLAGS = frozenset({"--labels"})
+MULTI_VALUE_FLAGS = drift.LABELS_MULTI_VALUE
 
 _BACKTICKED = re.compile(r"`([^`]+)`")
 _TRAILING_COMPACT_DATE = re.compile(r"(\d{8})$")
@@ -126,29 +141,17 @@ _TRAILING_COMPACT_DATE = re.compile(r"(\d{8})$")
 # ProductionTarget vs the rendered DAG
 # --------------------------------------------------------------------------
 
-@dataclasses.dataclass(frozen=True)
-class FieldCheck:
-    """One ``ProductionTarget`` field: DIT's value and what composer passes."""
-
-    field: str
-    dit: str
-    composer: str | None
-    note: str = ""
-
-    @property
-    def matches(self) -> bool:
-        return self.dit == self.composer
-
-
 def parse_argv(tokens: Sequence[str]) -> composer.ParsedArgv:
     """A pipe-anchorages argv, DIT's or production's, split into flags."""
     return composer.parse_argv(tokens, multi=MULTI_VALUE_FLAGS)
 
 
-def _single(parsed: composer.ParsedArgv, name: str) -> str | None:
-    """The value of a flag given exactly once, else ``None``."""
-    values = parsed.values(name)
-    return values[0] if len(values) == 1 else None
+def canonical_values(
+    parsed: composer.ParsedArgv,
+    equivalents: Mapping[str, Mapping[str, str]] = EQUIVALENT_VALUES,
+) -> composer.ParsedArgv:
+    """``parsed`` with each value that has an equivalent spelling written in one form."""
+    return drift.canonical_values(parsed, equivalents)
 
 
 def split_run_date(job_name: str, placeholders: Mapping[str, date]) -> tuple[str, str]:
@@ -184,25 +187,26 @@ def production_target_checks(
     thin = dag.task(source.thin_task)
     v = parse_argv(visits.argv)
     t = parse_argv(thin.argv)
+    single = drift.single_value
     placeholders = composer.task_placeholders(visits)
 
-    job_name = _single(v, "--job_name")
+    job_name = single(v, "--job_name")
     prefix, job_note = (
         split_run_date(job_name, placeholders) if job_name else (None, "no single --job_name")
     )
-    segs = tuple(dict.fromkeys(_BACKTICKED.findall(_single(v, "--bad-segs") or "")))
-    start = composer.templatize(_single(v, "--start-date") or "", placeholders)
+    segs = tuple(dict.fromkeys(_BACKTICKED.findall(single(v, "--bad-segs") or "")))
+    start = composer.templatize(single(v, "--start-date") or "", placeholders)
     return (
-        FieldCheck("dataflow_project", target.dataflow_project, _single(v, "--project")),
-        FieldCheck("dataflow_region", target.dataflow_region, _single(v, "--region")),
+        FieldCheck("dataflow_project", target.dataflow_project, single(v, "--project")),
+        FieldCheck("dataflow_region", target.dataflow_region, single(v, "--region")),
         FieldCheck("job_name_prefix", target.job_name_prefix, prefix, job_note),
-        FieldCheck("output_table", target.output_table, _single(v, "--bq-out-port-visits")),
+        FieldCheck("output_table", target.output_table, single(v, "--bq-out-port-visits")),
         FieldCheck("thinned_table", target.thinned_table,
-                   _single(v, "--bq-in-port-state-transitions"), "step 2 input"),
+                   single(v, "--bq-in-port-state-transitions"), "step 2 input"),
         FieldCheck("thinned_table", target.thinned_table,
-                   _single(t, "--bq-out-port-state-transitions"), "step 1 output"),
+                   single(t, "--bq-out-port-state-transitions"), "step 1 output"),
         FieldCheck("segment_info_table", target.segment_info_table,
-                   _single(v, "--bq-in-segment-info")),
+                   single(v, "--bq-in-segment-info")),
         FieldCheck("segs_activity_table", target.segs_activity_table,
                    segs[0] if len(segs) == 1 else None,
                    "from --bad-segs" if len(segs) == 1 else f"{len(segs)} tables in --bad-segs"),
@@ -212,85 +216,14 @@ def production_target_checks(
                    f"{visits.image_name} {visits.version}" if visits.image else None,
                    "image of the port-visits task"),
         FieldCheck("worker_machine_type", target.worker_machine_type,
-                   _single(v, "--worker_machine_type")),
-        FieldCheck("disk_size_gb", str(target.disk_size_gb), _single(v, "--disk_size_gb")),
-    )
-
-
-def default_version_checks(
-    dag: composer.RenderedDag, source: TargetSource,
-) -> tuple[FieldCheck, ...]:
-    """The pipe-anchorages version in DIT's default image against the image
-    tag of each production task.
-
-    DIT's default image is its own overlay build, so the image flag itself is
-    DIT-owned and not compared. This is what tells DIT that production moved
-    to a new version and the overlay image must be rebuilt.
-    """
-    return tuple(
-        FieldCheck("default_pipeline_version", ais.DEFAULT_PIPELINE_VERSION,
-                   dag.task(task_id).version, f"image tag of {task_id}")
-        for task_id in (source.thin_task, source.visits_task)
+                   single(v, "--worker_machine_type")),
+        FieldCheck("disk_size_gb", str(target.disk_size_gb), single(v, "--disk_size_gb")),
     )
 
 
 # --------------------------------------------------------------------------
-# DIT's argv vs production's
+# DIT's argv, built offline
 # --------------------------------------------------------------------------
-
-@dataclasses.dataclass(frozen=True)
-class ArgvComparison:
-    """DIT's argv for one step against production's, by flag."""
-
-    step: str
-    dit: composer.ParsedArgv
-    production: composer.ParsedArgv
-    diff: composer.FlagDiff
-    expected: tuple[str, ...]
-
-    @property
-    def command_matches(self) -> bool:
-        return self.dit.positionals == self.production.positionals
-
-    @property
-    def drift(self) -> bool:
-        """Anything beyond the expected differences differs, or the command does."""
-        return not (self.command_matches and self.diff.identical)
-
-
-def canonical_values(
-    parsed: composer.ParsedArgv,
-    equivalents: Mapping[str, Mapping[str, str]] = EQUIVALENT_VALUES,
-) -> composer.ParsedArgv:
-    """``parsed`` with each value that has an equivalent spelling written in one form."""
-    return dataclasses.replace(parsed, flags=tuple(
-        composer.Flag(f.name, equivalents.get(f.name, {}).get(f.value, f.value))
-        for f in parsed.flags
-    ))
-
-
-def compare_argv(
-    step: str, dit_tokens: Sequence[str], production_task: composer.RenderedTask,
-    *, expected: Collection[str] = EXPECTED_DIFFERENCES,
-    equivalents: Mapping[str, Mapping[str, str]] = EQUIVALENT_VALUES,
-) -> ArgvComparison:
-    """Compare DIT's argv (entrypoint first) with production's for ``step``.
-
-    Both sides' values go through :func:`canonical_values` first. Flags in
-    ``expected`` are taken out of the diff and listed in ``expected`` when
-    either side passes them.
-    """
-    dit = canonical_values(parse_argv(dit_tokens), equivalents)
-    production = canonical_values(parse_argv(production_task.argv), equivalents)
-    passed = set(dit.names()) | set(production.names())
-    return ArgvComparison(
-        step=step,
-        dit=dit,
-        production=production,
-        diff=composer.diff_flags(dit, production, ignore=expected),
-        expected=tuple(sorted(passed & set(expected))),
-    )
-
 
 def _dit_args(*cli: str) -> argparse.Namespace:
     """``ais.py``'s namespace for ``cli``, with the run context ``main()`` would stamp."""
@@ -343,94 +276,56 @@ def dit_visits_tokens(target: ProductionTarget, placeholders: Mapping[str, date]
 
 
 # --------------------------------------------------------------------------
-# Report
+# Spec and report
 # --------------------------------------------------------------------------
 
-@dataclasses.dataclass(frozen=True)
-class DriftReport:
-    target: str
-    dag: composer.RenderedDag
-    fields: tuple[FieldCheck, ...]
-    defaults: tuple[FieldCheck, ...]
-    argv: tuple[ArgvComparison, ...]
+def spec(
+    target_name: str = "ais-v5-datalake", source: TargetSource | None = None,
+) -> drift.WorkflowSpec:
+    """The drift spec of ``ais.py`` against ``target_name``'s DAG.
 
-    @property
-    def drift(self) -> bool:
-        return (
-            any(not f.matches for f in (*self.fields, *self.defaults))
-            or any(a.drift for a in self.argv)
-        )
-
-
-def build_report(target_name: str, dag: composer.RenderedDag, source: TargetSource) -> DriftReport:
+    The image flag is DIT-owned (an overlay build under DIT's namespace), so
+    each step names the pipeline version inside the image; that is what tells
+    DIT that production moved to a new version and the overlay must be rebuilt.
+    """
     target = PRODUCTION_TARGETS[target_name]
-    thin = dag.task(source.thin_task)
-    visits = dag.task(source.visits_task)
-    return DriftReport(
-        target=target_name,
-        dag=dag,
-        fields=production_target_checks(target, dag, source),
-        defaults=default_version_checks(dag, source),
-        argv=(
-            compare_argv(ais.STEP_THIN, dit_thin_tokens(composer.task_placeholders(thin)), thin),
-            compare_argv(ais.STEP_VISITS,
-                         dit_visits_tokens(target, composer.task_placeholders(visits)), visits),
-        ),
-    )
-
-
-def _show(parsed: composer.ParsedArgv, name: str) -> str:
-    return " ".join(name if v is None else f"{name}={v}" for v in parsed.values(name))
-
-
-def _expected(name: str) -> str:
-    """An expected difference, with its reason when the owner accepted it."""
-    reason = ACCEPTED_DIFFERENCES.get(name)
-    return f"{name} ({reason})" if reason else name
-
-
-def _format_check(check: FieldCheck) -> str:
-    return (
-        f"  {'ok  ' if check.matches else 'DIFF'}  {check.field:<24} dit={check.dit}"
-        + ("" if check.matches else f"  composer={check.composer}")
-        + (f"  ({check.note})" if check.note else "")
-    )
-
-
-def format_report(report: DriftReport) -> str:
-    dag = report.dag
-    interval = dag.data_interval
-    lines = [
-        f"composer-dags-production @ {(dag.commit or 'unknown')[:12]}, snapshot {dag.snapshot} "
-        f"({dag.dag_id}), run [{interval.start.isoformat()}, {interval.end.isoformat()})",
-        "",
-        f"ProductionTarget {report.target}:",
-        *map(_format_check, report.fields),
-        "",
-        "DIT defaults (workflows/port_visits/ais.py):",
-        *map(_format_check, report.defaults),
-    ]
-    for cmp in report.argv:
-        lines += [
-            "",
-            f"{cmp.step} argv, DIT vs production:",
-            "  command: " + (
-                "same (" + " ".join(cmp.dit.positionals) + ")" if cmp.command_matches
-                else f"dit={' '.join(cmp.dit.positionals)}  "
-                     f"production={' '.join(cmp.production.positionals)}"
+    source = source or TARGET_SOURCES[target_name]
+    image = {"image": ais.DEFAULT_WORKER_IMAGE, "version": ais.DEFAULT_PIPELINE_VERSION}
+    return drift.WorkflowSpec(
+        name="port_visits/ais",
+        workflow="workflows/port_visits/ais.py",
+        snapshot=source.snapshot,
+        steps=(
+            drift.StepSpec(
+                step=ais.STEP_THIN, task_id=source.thin_task, tokens=dit_thin_tokens,
+                accepted=THIN_ACCEPTED_DIFFERENCES, **image,
             ),
-            "  same: " + (", ".join(cmp.diff.same) or "-"),
-            "  expected to differ: " + (", ".join(map(_expected, cmp.expected)) or "-"),
-            "  only in production: " + (
-                "; ".join(_show(cmp.production, n) for n in cmp.diff.only_right) or "-"),
-            "  only in DIT: " + ("; ".join(_show(cmp.dit, n) for n in cmp.diff.only_left) or "-"),
-            "  values differ: " + ("; ".join(
-                f"{n}: dit={_show(cmp.dit, n)} production={_show(cmp.production, n)}"
-                for n in cmp.diff.differing
-            ) or "-"),
-        ]
-    lines += ["", "drift: " + ("yes" if report.drift else "no")]
-    return "\n".join(lines)
+            drift.StepSpec(
+                step=ais.STEP_VISITS, task_id=source.visits_task,
+                tokens=functools.partial(dit_visits_tokens, target), **image,
+            ),
+        ),
+        dit_owned=DIT_OWNED_FLAGS,
+        accepted=ACCEPTED_DIFFERENCES,
+        equivalents=EQUIVALENT_VALUES,
+        multi_value=MULTI_VALUE_FLAGS,
+        field_checks=lambda dag: production_target_checks(target, dag, source),
+        fields_title=f"ProductionTarget {target_name}",
+        in_sync=True,
+    )
+
+
+#: The specs ``workflows/composer_drift.py`` runs for this package.
+SPECS = (spec(),)
+
+
+def build_report(
+    target_name: str, dag: composer.RenderedDag, source: TargetSource,
+) -> drift.WorkflowReport:
+    return drift.check_workflow(spec(target_name, source), dag)
+
+
+format_report = drift.format_report
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -456,7 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         dag = composer.load_dag(args.composer_dir, source.snapshot, args.ref)
         report = build_report(args.target, dag, source)
-    except (RuntimeError, KeyError, ValueError) as exc:
+    except drift.READ_ERRORS as exc:
         print(f"composer drift check could not run: {exc}", file=sys.stderr)
         return 2
     print(format_report(report))

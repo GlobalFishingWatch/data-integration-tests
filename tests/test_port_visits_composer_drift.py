@@ -1,4 +1,7 @@
-"""Tests for ``workflows/port_visits/composer_drift.py`` (PIPELINE-4700 spike).
+"""Tests for ``workflows/port_visits/composer_drift.py`` (PIPELINE-4700).
+
+The module is the port-visits spec of the general drift check (``dit.drift``,
+tested in ``tests/test_drift.py``) plus the workflow's own command line.
 
 The production DAGs here are synthetic: built in code from DIT's own
 ``ProductionTarget`` and defaults, plus invented infrastructure values
@@ -19,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from dit import composer
+from dit import drift as dit_drift
 from workflows.port_visits import ais
 from workflows.port_visits import composer_drift as drift
 from workflows.port_visits.cross_version_ais import PRODUCTION_TARGETS
@@ -33,10 +37,13 @@ _PRODUCTION_ONLY = (
     "--example_production_switch",
 )
 
-#: Invented production-only flags the owner accepted as differences.
+#: Production-only flags that are accepted differences, with invented values.
+#: The last two are the bare flags accepted pending the owner's decision.
 _PRODUCTION_ACCEPTED = (
     "--dataflow_service_options=example_option=true",
     "--network=example-network",
+    "--no-rich-logging",
+    "--wait_for_job",
 )
 
 #: Production's own image: another registry than DIT's overlay, same version.
@@ -184,21 +191,26 @@ def test_deployed_version_follows_the_port_visits_image_tag() -> None:
     assert not check.matches
 
 
+def _versions(**kwargs) -> list:
+    report = drift.build_report("ais-v5-datalake", _dag(**kwargs), SOURCE)
+    return [step.version for step in report.steps]
+
+
 def test_the_default_image_version_is_checked_against_both_tasks() -> None:
     # The image flag is DIT-owned (an overlay build under DIT's namespace), so
-    # the argv diff cannot see a production version bump; this check does.
-    same = drift.default_version_checks(_dag(), SOURCE)
-    bumped = drift.default_version_checks(
-        _dag(image="registry.example.invalid/core/pipe-anchorages:v9.9.9"), SOURCE,
-    )
+    # the argv diff cannot see a production version bump; the version level does.
+    same = _versions()
+    bumped = _versions(image="registry.example.invalid/core/pipe-anchorages:v9.9.9")
 
-    assert [(c.dit, c.composer) for c in same] == [(ais.DEFAULT_PIPELINE_VERSION,) * 2] * 2
-    assert {c.note for c in same} == {
-        f"image tag of {SOURCE.thin_task}", f"image tag of {SOURCE.visits_task}",
-    }
-    assert all(c.matches for c in same)
-    assert [c.composer for c in bumped] == ["v9.9.9", "v9.9.9"]
-    assert not any(c.matches for c in bumped)
+    # DIT's version is the constant, not the overlay image's tag.
+    assert ais._worker_image_tag(ais.DEFAULT_WORKER_IMAGE) != ais.DEFAULT_PIPELINE_VERSION
+    assert [(v.dit_image, v.dit_version) for v in same] == [
+        ("pipe-anchorages", ais.DEFAULT_PIPELINE_VERSION),
+    ] * 2
+    assert [v.production_version for v in same] == [ais.DEFAULT_PIPELINE_VERSION] * 2
+    assert all(v.matches for v in same)
+    assert [v.production_version for v in bumped] == ["v9.9.9", "v9.9.9"]
+    assert not any(v.matches for v in bumped)
 
 
 def test_a_production_version_bump_is_drift_even_with_identical_flags() -> None:
@@ -207,9 +219,12 @@ def test_a_production_version_bump_is_drift_even_with_identical_flags() -> None:
         "ais-v5-datalake", _dag(production_only=(), image=image), SOURCE,
     )
 
-    assert not any(c.drift for c in report.argv)
-    assert report.drift
-    assert "DIFF  default_pipeline_version" in drift.format_report(report)
+    assert not any(step.argv.drift for step in report.steps)
+    assert report.drift and report.unexpected_drift
+    assert (
+        f"version: DIFF  dit=pipe-anchorages {ais.DEFAULT_PIPELINE_VERSION}  "
+        "production=pipe-anchorages v9.9.9"
+    ) in drift.format_report(report)
 
 
 def test_a_different_production_sizing_is_reported() -> None:
@@ -239,9 +254,9 @@ def test_segs_activity_needs_exactly_one_table_in_bad_segs() -> None:
 # argv
 # --------------------------------------------------------------------------
 
-def _comparisons(**kwargs) -> dict[str, drift.ArgvComparison]:
+def _comparisons(**kwargs) -> dict[str, dit_drift.ArgvComparison]:
     report = drift.build_report("ais-v5-datalake", _dag(**kwargs), SOURCE)
-    return {c.step: c for c in report.argv}
+    return {step.argv.step: step.argv for step in report.steps}
 
 
 def test_argv_differences_are_split_into_expected_and_drift() -> None:
@@ -253,7 +268,7 @@ def test_argv_differences_are_split_into_expected_and_drift() -> None:
     assert visits.diff.differing == ()
     assert set(visits.expected) == {
         *_PRODUCTION_OWNED, "--bq-out-port-visits", "--job_name", "--labels",
-        "--dataflow_service_options", "--network",
+        "--dataflow_service_options", "--network", "--no-rich-logging", "--wait_for_job",
     }
     assert {"--start-date", "--end-date", "--bq-in-port-state-transitions",
             "--bq-in-segment-info", "--bad-segs", "--project", "--region", "--runner",
@@ -267,11 +282,35 @@ def test_step_1_flags_compare_under_their_v5_names() -> None:
 
     assert thin.command_matches
     assert thin.dit.positionals == ("pipe-anchorages", "port-state-transitions")
-    assert {"--start-date", "--end-date", "--bq-in-named-anchorages", "--bq-in-messages",
+    assert {"--start-date", "--end-date", "--bq-in-named-anchorages",
             "--project", "--region", "--runner", "--worker_machine_type", "--disk_size_gb",
             "--no_use_public_ips"} == set(thin.diff.same)
     assert "--bq-out-port-state-transitions" in thin.expected
     assert not thin.drift
+
+
+def test_step_1_messages_table_is_an_accepted_difference_for_step_1_only() -> None:
+    # Step 1 runs on DIT's staging messages by design; the named-anchorages
+    # table is still compared.
+    report = drift.build_report("ais-v5-datalake", _dag(production_only=()), SOURCE)
+    thin, visits = report.steps
+
+    assert "--bq-in-messages" in thin.argv.expected
+    assert "staging cohort" in thin.reasons["--bq-in-messages"]
+    assert "--bq-in-messages" not in visits.reasons
+    assert "--bq-in-named-anchorages" in thin.argv.diff.same
+    assert "--bq-in-named-anchorages" not in drift.spec().expected(drift.spec().steps[0])
+
+
+def test_the_two_production_only_flags_are_accepted_pending_the_owner() -> None:
+    # Accepted on a recommendation the owner has not confirmed: easy to flip.
+    pending = {name: reason for name, reason in drift.ACCEPTED_DIFFERENCES.items()
+               if "pending owner decision" in reason}
+
+    assert set(pending) == {"--no-rich-logging", "--wait_for_job"}
+    for comparison in _comparisons(production_only=()).values():
+        assert set(pending) <= set(comparison.expected)
+        assert not comparison.drift
 
 
 def test_productions_space_separated_labels_stay_out_of_the_command() -> None:
@@ -293,8 +332,9 @@ def test_productions_space_separated_labels_stay_out_of_the_command() -> None:
 
 def test_expected_differences_are_dit_owned_plus_accepted_with_reasons() -> None:
     assert drift.EXPECTED_DIFFERENCES == drift.DIT_OWNED_FLAGS | {
-        "--dataflow_service_options", "--network",
+        "--dataflow_service_options", "--network", "--no-rich-logging", "--wait_for_job",
     }
+    assert all(drift.THIN_ACCEPTED_DIFFERENCES.values())
     assert all(drift.ACCEPTED_DIFFERENCES.values())
     # The names are the v5 CLI's; nothing of the removed v4 CLI is left.
     assert drift.DIT_OWNED_FLAGS == {
@@ -375,12 +415,26 @@ def test_format_report_lists_mismatches_and_the_verdict() -> None:
     text = drift.format_report(report)
 
     assert report.drift
+    assert "ProductionTarget ais-v5-datalake:" in text
     assert "DIFF  job_name_prefix" in text
-    assert "ok    default_pipeline_version" in text
+    assert f"version: same (pipe-anchorages {ais.DEFAULT_PIPELINE_VERSION})" in text
     assert "command: same (pipe-anchorages port-visits)" in text
     assert "only in production: --example_production_value=11" in text
-    assert "--network (determined by DIT's --subnetwork)" in text
-    assert text.endswith("drift: yes")
+    assert "--network [production only] (determined by DIT's --subnetwork)" in text
+    assert "indicative only" not in text
+    assert text.endswith("expected in sync: yes\ndrift: yes")
+
+
+def test_the_spec_is_marked_in_sync_and_mirrors_both_tasks() -> None:
+    spec = drift.spec()
+
+    assert [s.name for s in drift.SPECS] == [spec.name]
+    assert spec.in_sync
+    assert (spec.name, spec.snapshot) == ("port_visits/ais", SOURCE.snapshot)
+    assert [(s.step, s.task_id) for s in spec.steps] == [
+        (ais.STEP_THIN, SOURCE.thin_task), (ais.STEP_VISITS, SOURCE.visits_task),
+    ]
+    assert {s.pipeline_version for s in spec.steps} == {ais.DEFAULT_PIPELINE_VERSION}
 
 
 def _git(repo: Path, *args: str) -> None:
