@@ -518,7 +518,6 @@ def _pipeline_options(
         # scales freely; prod caps this same step at 50
         # (detect_encounters_config.max_num_workers in composer-dags).
         *max_num_workers_options(args.max_num_workers),
-        # Machine type and disk, only when set.
         # Machine type and disk: production's unless overridden; see STEP_WORKER_SIZING.
         *worker_sizing_options(getattr(args, "worker_sizings", STEP_WORKER_SIZING)[step]),
         f"--sdk_container_image={args.worker_image}",
