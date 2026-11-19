@@ -328,4 +328,5 @@ Read at composer `origin/main` df5c973c7. The check exits 0: port visits, the on
 - **Inputs.** DIT's tokens use the workflow's default tables. A staging table differs from production's by design. Port visits accepts that for step 1. For the other workflows the port decides, per input, whether the difference is by design or drift. The owner's lineage principle (section 5b) still stands for comparisons against production.
 - **DIT-owned flags** are not compared, not even for presence. The report marks the one-sided ones; nobody is forced to read them.
 - **Anything outside the argv:** environment variables, the steps production runs and DIT does not, and whether a pipeline accepts the flags it is given.
+- **The environment it runs in.** DIT's tokens are what the workflows would run here. A `DIT_*` override in the shell (for example `DIT_DATAFLOW_REGION`) changes them, and a compared flag then differs. Run the check without such overrides.
 - **Where it runs.** Nothing runs the check on a schedule. A laptop with a fetched composer checkout works today.

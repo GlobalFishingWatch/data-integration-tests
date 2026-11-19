@@ -113,7 +113,7 @@ When the command differs the flag differences are still listed, marked indicativ
 - `workflows/port_visits/composer_drift.py` (rebuilt on the library; `spec()`, `SPECS`, `THIN_ACCEPTED_DIFFERENCES`, two more accepted differences); `tests/test_port_visits_composer_drift.py` (ported, +3).
 - `workflows/encounters/ais.py`, `workflows/pipe_events/fishing.py` (builders extracted).
 - Docs: `docs/composer-snapshots-2026-10.md` (header, § 5, § 7 status, new § 8); `docs/plan.md` § Phase 4 vision (one sentence); README Features and Roadmap 7b; `workflows/README.md`; `docs/pipeline-contract.md` § Process (step 5); CHANGELOG § 2026-11-19.
-- Suite: 1,000 → 1,098.
+- Suite: 1,000 → 1,099 with a composer checkout; without one, the three tests that read it skip.
 
 **Sections NOT moved.**
 - No workflow is ported.

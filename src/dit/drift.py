@@ -376,6 +376,16 @@ def check_workflow(spec: WorkflowSpec, dag: composer.RenderedDag) -> WorkflowRep
 READ_ERRORS = (RuntimeError, KeyError, ValueError)
 
 
+def _describe(exc: Exception) -> str:
+    """A read error as one line. A bare ``KeyError`` is a missing key: a field
+    the snapshot lacks, or a run date its interval does not have (an empty
+    interval has no end date)."""
+    if isinstance(exc, KeyError) and exc.args:
+        detail = str(exc.args[0])
+        return detail if " " in detail else f"missing key {detail!r}"
+    return str(exc)
+
+
 def run_specs(
     specs: Iterable[WorkflowSpec], composer_dir: Path, ref: str = composer.DEFAULT_REF,
 ) -> tuple[tuple[WorkflowReport, ...], tuple[WorkflowError, ...]]:
@@ -395,7 +405,7 @@ def run_specs(
         try:
             return composer.load_dag(composer_dir, snapshot, commit)
         except READ_ERRORS as exc:
-            return str(exc)
+            return _describe(exc)
 
     dags = {name: load(name) for name in dict.fromkeys(spec.snapshot for spec in specs)}
 
@@ -406,7 +416,7 @@ def run_specs(
         try:
             return check_workflow(spec, dag)
         except READ_ERRORS as exc:
-            return WorkflowError(spec, str(exc))
+            return WorkflowError(spec, _describe(exc))
 
     results = tuple(map(check, specs))
     return (

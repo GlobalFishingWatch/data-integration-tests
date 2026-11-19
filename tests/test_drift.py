@@ -386,8 +386,26 @@ def test_an_unreadable_snapshot_or_task_is_an_error_and_the_rest_still_runs(
 
     assert [r.spec.name for r in reports] == ["ok"]
     assert [e.spec.name for e in errors] == ["no-snapshot", "no-task"]
-    assert "group.absent" in errors[1].message
+    assert errors[1].message == "example_daily (example.daily) has no task 'group.absent'"
     assert drift.exit_code(reports, errors) == 2
+
+
+def test_a_run_date_the_snapshot_lacks_is_an_error_naming_it(tmp_path: Path) -> None:
+    # An empty interval (a backfill whose dates come from params) has no end date.
+    repo = tmp_path / "composer"
+    snapshots = repo / composer.SNAPSHOT_DIR
+    snapshots.mkdir(parents=True)
+    empty = _raw_dag({TASK: _raw_task(PRODUCTION)}, end="2026-03-05")
+    (snapshots / "example_daily.py").write_text(f"rendered_dag = {empty!r}\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", ".")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "commit", "-q", "-m", "fixture")
+
+    reports, errors = drift.run_specs([_spec()], repo, "main")
+
+    assert reports == ()
+    assert [e.message for e in errors] == ["missing key 'end_date_exclusive'"]
 
 
 def test_an_unknown_ref_is_an_error_for_every_spec(composer_repo: Path) -> None:
