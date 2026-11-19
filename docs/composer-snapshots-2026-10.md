@@ -116,7 +116,7 @@ Both steps run the same command (`pipe-anchorages port-state-transitions`, `pipe
 | Same | `--start-date`, `--end-date`, `--bq-in-named-anchorages`, `--runner` (spellings treated as equal), `--project`, `--region`, `--no_use_public_ips`, `--worker_machine_type`, `--disk_size_gb` | `--start-date`, `--end-date`, `--bq-in-port-state-transitions`, `--bq-in-segment-info`, `--bad-segs` (SQL byte-identical), and the same six Dataflow flags |
 | Expected to differ: DIT-owned | `--bq-out-port-state-transitions`, `--job_name`, `--labels`, `--service_account_email`, `--temp_location`, `--staging_location`, `--subnetwork`, `--max_num_workers`, `--sdk_container_image` | the same, with `--bq-out-port-visits` |
 | Expected to differ: accepted | `--dataflow_service_options` (lineage), `--network` | same |
-| Expected to differ: accepted, pending the owner's decision | `--no-rich-logging`, `--wait_for_job` | same |
+| Expected to differ: accepted by the owner on 2026-11-19 | `--no-rich-logging`, `--wait_for_job` | same |
 | Expected to differ: accepted for step 1 only | `--bq-in-messages` | not passed |
 | Only in production, only in DIT, or values differ, outside the expected set | none | none |
 
@@ -125,7 +125,7 @@ Until the general check landed, the check exited 1 on three understood differenc
 - **`--no-rich-logging`.** A real option of the CLI: plain instead of coloured log output. It changes the log format only. DIT does not pass it.
 - **`--wait_for_job`.** Production still passes this v4 flag. The v5 CLI does not define it; gfw-common's `Pipeline` waits for batch jobs regardless (read at gfw-common v0.25.0). DIT does not pass it.
 
-**Pending owner decision.** The last two are accepted on a recommendation the owner has not confirmed. Neither changes output. They are marked "pending owner decision" in `ACCEPTED_DIFFERENCES` and in the report. To have the check report them again, delete the two entries. To emit them instead, add them to `ais._pipeline_options` and delete the entries.
+**Owner decision (2026-11-19, on PR #91).** The last two are accepted. Neither changes output. To have the check report them again, delete the two entries. To emit them instead, add them to `ais._pipeline_options` and delete the entries.
 
 Two changes to the expected set since PR #86:
 - The v4 names went with the v4 CLI: `--output_table` became the two `--bq-out-*` flags, and `--temp_dataset` (DIT-only) is gone. DIT now hands the staging dataset to its overlay image through a container environment variable, which is not part of the argv.

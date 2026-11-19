@@ -38,7 +38,7 @@ _PRODUCTION_ONLY = (
 )
 
 #: Production-only flags that are accepted differences, with invented values.
-#: The last two are the bare flags accepted pending the owner's decision.
+#: The last two are the bare flags the owner accepted on 2026-11-19.
 _PRODUCTION_ACCEPTED = (
     "--dataflow_service_options=example_option=true",
     "--network=example-network",
@@ -302,14 +302,14 @@ def test_step_1_messages_table_is_an_accepted_difference_for_step_1_only() -> No
     assert "--bq-in-named-anchorages" not in drift.spec().expected(drift.spec().steps[0])
 
 
-def test_the_two_production_only_flags_are_accepted_pending_the_owner() -> None:
-    # Accepted on a recommendation the owner has not confirmed: easy to flip.
-    pending = {name: reason for name, reason in drift.ACCEPTED_DIFFERENCES.items()
-               if "pending owner decision" in reason}
+def test_the_two_production_only_flags_are_accepted_by_the_owner() -> None:
+    # Accepted by the owner on 2026-11-19 (PR #91).
+    accepted = {name: reason for name, reason in drift.ACCEPTED_DIFFERENCES.items()
+                if "owner, 2026-11-19" in reason}
 
-    assert set(pending) == {"--no-rich-logging", "--wait_for_job"}
+    assert set(accepted) == {"--no-rich-logging", "--wait_for_job"}
     for comparison in _comparisons(production_only=()).values():
-        assert set(pending) <= set(comparison.expected)
+        assert set(accepted) <= set(comparison.expected)
         assert not comparison.drift
 
 

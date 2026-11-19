@@ -102,7 +102,7 @@ When the command differs the flag differences are still listed, marked indicativ
 **Port visits.**
 - Same behaviour, on the library. Its own command line stays (`--target`, `--snapshot`). The version check is now each step's version level; the "DIT defaults" block is gone.
 - The three remaining differences are accepted, so the check reports "in sync" and exits 0: step 1's messages table (`THIN_ACCEPTED_DIFFERENCES`, step 1 only, DIT's staging cohort by design), `--no-rich-logging` and `--wait_for_job`.
-- **Pending owner decision:** the last two are accepted on a recommendation the owner has not confirmed. They are marked in the code comment, the reason text, the doc and the PR. Deleting the two entries of `ACCEPTED_DIFFERENCES` flips them back.
+- **Owner decision (2026-11-19, on PR #91):** the last two are accepted. Deleting the two entries of `ACCEPTED_DIFFERENCES` flips them back.
 
 **Result against composer `origin/main` df5c973c7 (2026-11-19).** Port visits in sync. Encounters (AIS, VMS), pipe-events and pipe-gaps differ in version, command and flags. pipe-segment matches in version and command and differs in flags. In words, per workflow: `docs/composer-snapshots-2026-10.md` § 8d.
 

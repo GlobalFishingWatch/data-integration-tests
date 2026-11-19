@@ -97,17 +97,17 @@ DIT_OWNED_FLAGS = drift.DATAFLOW_OWNED_FLAGS | frozenset({
 #:
 #: The first two are the owner's decisions of 2026-10-23.
 #:
-#: PENDING OWNER DECISION: ``--no-rich-logging`` and ``--wait_for_job`` are
-#: accepted here on a recommendation the owner has not confirmed (2026-11-19).
+#: ``--no-rich-logging`` and ``--wait_for_job`` are accepted by the owner
+#: (2026-11-19, on PR #91).
 #: Neither changes output. To have the check report them again, delete the two
 #: entries; to emit them instead, add them to ``ais._pipeline_options`` and
 #: delete the entries.
 ACCEPTED_DIFFERENCES = {
     **drift.DATAFLOW_ACCEPTED_DIFFERENCES,
     "--no-rich-logging": "log format only: plain instead of coloured output "
-                         "(pending owner decision)",
+                         "(owner, 2026-11-19)",
     "--wait_for_job": "a v4 flag the v5 CLI does not define; gfw-common waits for "
-                      "batch jobs regardless (pending owner decision)",
+                      "batch jobs regardless (owner, 2026-11-19)",
 }
 
 #: Accepted for step 1 only. The check runs step 1 on DIT's default messages
