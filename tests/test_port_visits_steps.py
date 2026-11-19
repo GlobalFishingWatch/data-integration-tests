@@ -83,15 +83,14 @@ def test_a_thinned_input_needs_port_visits_alone():
 # which steps a slice runs
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize(("cli", "thin_cmd", "visits_cmd"), [
-    ((), "thin_port_messages", "port_visits"),
-    (("--pipeline-cli", "v5"), "port-state-transitions", "port-visits"),
-])
-def test_each_selection_runs_exactly_its_steps(cli, thin_cmd, visits_cmd):
-    assert _subcommands(_args(*cli)) == [thin_cmd, visits_cmd]
-    assert _subcommands(_args(*cli, "--steps", "thin_port_messages")) == [thin_cmd]
+def test_each_selection_runs_exactly_its_steps():
+    # DIT's step names select the pipeline's commands.
+    thin_cmd, visits_cmd = "port-state-transitions", "port-visits"
+
+    assert _subcommands(_args()) == [thin_cmd, visits_cmd]
+    assert _subcommands(_args("--steps", "thin_port_messages")) == [thin_cmd]
     assert _subcommands(_args(
-        *cli, "--steps", "port_visits", "--thinned-message-table", "p.d.t",
+        "--steps", "port_visits", "--thinned-message-table", "p.d.t",
     )) == [visits_cmd]
 
 

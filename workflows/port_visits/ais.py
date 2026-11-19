@@ -1,10 +1,11 @@
 """Mode equivalence integration test for pipe-anchorages port-visits (AIS staging).
 
-Drives the two-step port-visits pipeline (``thin_port_messages`` -> ``port_visits``)
-three different ways ("modes") and asserts all three produce identical output on
-the per-mode ``port_visits_..._<mode>`` BQ tables. Any divergence between modes
-signals non-determinism in the pipeline or a bug in the partitioned-write /
-re-run logic.
+Drives the two-step port-visits pipeline (``thin_port_messages`` -> ``port_visits``,
+pipe-anchorages' ``port-state-transitions`` -> ``port-visits``) three different
+ways ("modes") and asserts all three produce identical output on the per-mode
+``port_visits_..._<mode>`` BQ tables. Any divergence between modes signals
+non-determinism in the pipeline or a bug in the partitioned-write / re-run
+logic.
 
 Modes (each gets its own UUID-suffixed output table; compared pairwise at the
 end):
@@ -34,42 +35,50 @@ or thinned messages on ``(identifier, timestamp)``. That key was unique in
 every mode of the 2026-10-22 staging smoke; it is not guaranteed (a segment
 could hold two messages in one second), but it serves for QA.
 
-Date semantics: ``--start`` and ``--end`` are **inclusive on both ends**,
-matching the pipe-anchorages v4 CLI. (Pipe-gaps' workflow uses half-open dates,
-matching detect-gaps' CLI; the wart is unavoidable given the downstream
-tools' contracts.)
+Date semantics: ``--start`` and ``--end`` are **inclusive on both ends**.
+pipe-anchorages' ``--end-date`` is exclusive, so the workflow passes
+``end + 1 day`` (``_exclusive_end``). (Pipe-gaps' workflow uses half-open
+dates, matching detect-gaps' CLI.)
 
-Two pipe-anchorages CLI generations (``--pipeline-cli``, PIPELINE-4699):
+The pipeline CLI is the one production runs: pipe-anchorages v5.0.1
+(``core.ais.v5``, since 2026-11-04). Its commands are
+``port-state-transitions`` / ``port-visits``, with ``--bq-in-*`` /
+``--bq-out-*`` flags, the exclusive ``--end-date`` and a required
+``--labels`` on every runner. The CLI of v4.6.4 and before
+(``thin_port_messages`` / ``port_visits``, underscore flags) and the
+``--pipeline-cli`` switch were removed on 2026-11-19. DIT's own step names
+stay ``thin_port_messages`` and ``port_visits``.
 
-* ``v4`` (default): the v4.6.4 CLI production still pins --
-  ``thin_port_messages`` / ``port_visits``, underscore flags, inclusive
-  ``--end_date``, ``--wait_for_job``, ``--temp_dataset`` (honoured only by
-  DIT's patched branch, never upstream).
-* ``v5``: the gfw-common CLI on pipe-anchorages main --
-  ``port-state-transitions`` / ``port-visits``, ``--bq-in-*`` / ``--bq-out-*``
-  flags, **exclusive** ``--end-date`` (the workflow keeps its inclusive
-  ``--start/--end`` and passes ``end + 1 day``), required ``--labels`` on every
-  runner, no ``--wait_for_job`` (gfw-common's Pipeline waits). Upstream has no
-  way to name the BigQuery staging dataset, so v5 runs need a DIT overlay
-  image (``docker/overlays/pipe-anchorages-temp-dataset/``) as both submitter
-  (``--image-tag``) and worker (``--worker-image``); the workflow hands the
-  dataset to it through the ``DIT_BQ_TEMP_DATASET`` container env var.
+Images. pipe-anchorages has no option to name Beam's BigQuery staging
+dataset, and DIT's service account may not create one. So the default
+``--image-tag`` (submitter) and ``--worker-image`` (Dataflow workers) are a
+DIT-built overlay of v5.0.1 (``docker/overlays/pipe-anchorages-temp-dataset/``).
+The workflow hands it the dataset through the ``DIT_BQ_TEMP_DATASET``
+container env var. The overlay must be both submitter and worker.
+
+The default image holds v5.0.1 and nothing else. For a checkout that is
+unreviewed (dirty, a snapshot, or not merged into ``origin/main``), a run
+that would execute the default image refuses to start (``check_images``):
+build an overlay image of that commit with the overlay's ``build.sh`` and
+pass it as ``--image-tag`` and ``--worker-image``. DIT never auto-builds an
+image for this workflow, because a plain build has no overlay.
+``--runner docker --build-from-source`` runs the working tree locally and
+needs no image; that build has no overlay either, so Beam creates its own
+staging dataset with the operator's credentials.
 
 The default ``--runner=dataflow`` submits to Dataflow from inside the
 container (the same pattern composer uses). ``--runner=docker`` runs
 DirectRunner inside the container for fast local sanity checks. Both go
 through ``dit.runners.docker`` -- the Dataflow submission is opaque to the
-runner, which only owns the docker process and waits for it via
-``--wait_for_job`` inside the pipeline.
+runner, which only owns the docker process; gfw-common's ``Pipeline`` waits
+for the batch job.
 
 Dataflow jobs always run with private worker IPs (``--no_use_public_ips``,
-as production; without it the v4 CLI falls back to Dataflow's public IPs).
-The worker sizing mirrors production's by default (``STEP_WORKER_SIZING``,
-e2-highmem-4 and 50 GB on both steps), in place of each CLI's own default
-(v4: Dataflow's n1-standard-1 and 30 GB; v5: gfw-common's e2-standard-2 and
-25 GB). ``--worker-machine-type`` / ``--disk-size-gb`` override it; a run on the
-staging cohort logs a hint to do so, since production machine types cost more
-per worker-hour than it needs.
+as production). The worker sizing mirrors production's by default
+(``STEP_WORKER_SIZING``, e2-highmem-4 and 50 GB on both steps), in place of
+gfw-common's default (e2-standard-2 and 25 GB). ``--worker-machine-type`` /
+``--disk-size-gb`` override it; a run on the staging cohort logs a hint to do
+so, since production machine types cost more per worker-hour than it needs.
 
 This is the **abstraction-validation step** for Phase 2: first real exercise
 of ``dit.compare.compare_tables(view_suffix="", keys=["visit_id"])``
@@ -80,6 +89,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
 import itertools
 import logging
 import os
@@ -145,8 +155,10 @@ _MODES_USING_TAIL = frozenset({MODE_BFD, MODE_BFTRUNCATE})
 #: Modes selectable via --modes, in canonical order.
 SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
 
-# Step names (DIT's standard, from the v4 CLI; also used in Dataflow job
-# names and the dit_step label). Selectable via --steps, in pipeline order.
+# Step names (DIT's standard, kept from the pipe-anchorages v4 CLI; the
+# pipeline's own commands are port-state-transitions and port-visits). Also
+# used in Dataflow job names and the dit_step label. Selectable via --steps,
+# in pipeline order.
 STEP_THIN = "thin_port_messages"
 STEP_VISITS = "port_visits"
 SELECTABLE_STEPS = (STEP_THIN, STEP_VISITS)
@@ -201,10 +213,11 @@ DEFAULT_SOURCE_SEGS_ACTIVITY_FQN = (
 )
 
 # Global anchorages reference (not staging-specific), read by step 1. The
-# version production v5 reads: composer-dags-production origin/main 0a644da,
-# dags/core/ais/v5.py (NAMED_ANCHORAGES) and, in that same repo, the rendered
-# snapshot tests/render_dags/snapshots/core_ais_v5.py, task port_visits.detect_port_events
-# (--anchorage_table). Until 2026-10-23 dit defaulted to
+# version production v5 reads: composer-dags-production origin/main 9f214877b
+# (2026-11-19), dags/core/ais/v5.py (NAMED_ANCHORAGES) and, in that same repo,
+# the rendered snapshot tests/render_dags/snapshots/core_ais_v5.py, task
+# port_visits.detect_port_events (--bq-in-named-anchorages). Until 2026-10-23
+# dit defaulted to
 # world-fishing-827.anchorages.named_anchorages_v20240117, the latest version
 # when the workflow was written; keeping it in sync by hand is the source drift
 # PIPELINE-4700 wants automated.
@@ -226,27 +239,57 @@ DEFAULT_TAIL_DAYS = 3
 DEFAULT_MAX_NUM_WORKERS = 4
 
 # Worker sizing per step, mirroring production (owner rule 2026-10-23; the cap
-# above does not follow it). composer-dags-production origin/main 0a644da,
-# rendered snapshots: core_ais_v5.py tasks port_visits.detect_port_events
-# (step 1) and port_visits.detect_port_visits (step 2), both
-# --worker_machine_type=e2-highmem-4 --disk_size_gb=50; core_ais_v3.py
-# (detect_port_visits.*) and core_vms_v5_daily.py agree. From
-# PortVisitsConfig.worker_machine_type (gfw/pipes/core/port_visits/v4.py) and
-# DataflowConfig.disk_size_gb (gfw/common/config/dataflow.py). Hand-written
-# until PIPELINE-4700 reads them from composer.
+# above does not follow it). composer-dags-production origin/main 9f214877b
+# (2026-11-19), rendered snapshots: core_ais_v5.py tasks
+# port_visits.detect_port_events (step 1) and port_visits.detect_port_visits
+# (step 2), both --worker_machine_type=e2-highmem-4 --disk_size_gb=50;
+# core_vms_v5_daily.py agrees. From PortVisitsConfig.worker_machine_type
+# (gfw/pipes/core/anchorages/v5.py) and DataflowConfig.disk_size_gb
+# (gfw/common/config/dataflow.py). Hand-written until PIPELINE-4700 reads them
+# from composer.
 STEP_WORKER_SIZING = {
     STEP_THIN: WorkerSizing(machine_type="e2-highmem-4", disk_size_gb=50),
     STEP_VISITS: WorkerSizing(machine_type="e2-highmem-4", disk_size_gb=50),
 }
 
-DEFAULT_IMAGE_TAG = "gfw/pipe-anchorages:v4.6.4"
+#: The pipe-anchorages version production runs (core.ais.v5: Versions.ANCHORAGES
+#: in composer-dags-production's dags/core/ais/v5.py, v5.0.1 since 2026-11-04)
+#: and the default image holds. composer_drift.py compares it with the image
+#: tag of production's tasks.
+DEFAULT_PIPELINE_VERSION = "v5.0.1"
 
-# Dataflow worker container image -- needs pipe_anchorages installed (workers
-# unpickle DoFns from pipe_anchorages.*). Published path in GFW's Artifact
-# Registry. Distinct from DEFAULT_IMAGE_TAG (which names the local image
-# docker run uses for the submission process).
-DEFAULT_WORKER_IMAGE = (
-    "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4"
+#: The default image: pipe-anchorages DEFAULT_PIPELINE_VERSION (commit 767770f)
+#: with DIT's temp-dataset overlay (patch 905dc761), built by
+#: docker/overlays/pipe-anchorages-temp-dataset/build.sh and listed in that
+#: directory's README. Production's own image cannot be the default: upstream
+#: has no way to name Beam's BigQuery staging dataset, and DIT's service
+#: account may not create one. When production bumps its version: build the
+#: overlay image of the new tag, then bump both constants here (and
+#: ANCHORAGES_PIPELINE_BEAM_VERSION in the Makefile, if the Beam pin moved).
+DEFAULT_OVERLAY_IMAGE = (
+    f"gcr.io/world-fishing-827/dit/pipe-anchorages:"
+    f"{DEFAULT_PIPELINE_VERSION}-767770f-temp-dataset-905dc761"
+)
+
+#: Submitter image: ``docker run`` builds and submits the Beam graph in it. The
+#: overlay sets the staging dataset at pipeline construction, so the submitter
+#: must be an overlay image too.
+DEFAULT_IMAGE_TAG = DEFAULT_OVERLAY_IMAGE
+
+#: Dataflow worker container image (``--sdk_container_image``): workers
+#: unpickle DoFns from pipe_anchorages.*, so it must hold the same code as the
+#: submitter.
+DEFAULT_WORKER_IMAGE = DEFAULT_OVERLAY_IMAGE
+
+#: Where the overlay images are built; named in the refusal of check_images.
+OVERLAY_DIR = "docker/overlays/pipe-anchorages-temp-dataset"
+
+#: Shown when a caller still passes the removed ``--pipeline-cli`` flag; shared
+#: with cross_version_ais.py, which rejects it before anything is pinned.
+PIPELINE_CLI_REMOVED = (
+    "--pipeline-cli was removed (2026-11-19): the port-visits workflows drive only the "
+    "current pipe-anchorages CLI (port-state-transitions / port-visits), on a DIT overlay "
+    "image by default. Drop the flag."
 )
 
 # Comparison contract for port-visits (truncate shape, no SCD-2).
@@ -261,14 +304,8 @@ THIN_COMPARE_KEYS = ("identifier", "timestamp")
 #: Comparison key per step output; a run compares its last step's output.
 COMPARE_KEYS_BY_STEP = {STEP_THIN: THIN_COMPARE_KEYS, STEP_VISITS: COMPARE_KEYS}
 
-# pipe-anchorages CLI generations this workflow can drive (see module docstring).
-PIPELINE_CLI_V4 = "v4"
-PIPELINE_CLI_V5 = "v5"
-PIPELINE_CLIS = (PIPELINE_CLI_V4, PIPELINE_CLI_V5)
-DEFAULT_PIPELINE_CLI = PIPELINE_CLI_V4
-
 #: Container env var the DIT overlay patch reads to pass ``temp_dataset`` to
-#: Beam's ReadFromBigQuery (v5 only; see docker/overlays/pipe-anchorages-temp-dataset/).
+#: Beam's ReadFromBigQuery (see docker/overlays/pipe-anchorages-temp-dataset/).
 TEMP_DATASET_ENV = "DIT_BQ_TEMP_DATASET"
 
 #: Laptop-mode GCP credentials: the ``gcp`` docker named volume holding the
@@ -279,10 +316,10 @@ TEMP_DATASET_ENV = "DIT_BQ_TEMP_DATASET"
 #: Cloud mode (``DIT_CLOUD_MODE``) drops it in ``dit.runners.docker``.
 GCP_VOLUME = "gcp:/root/.config"
 
-# Labels on every pipe-anchorages job. pipe-anchorages requires --labels to be
-# non-None (v4: cloud_to_labels in transforms/sink.py iterates without a None
-# guard; v5: --labels is a required option). Mirrors composer's
-# LabelsConfig.as_dataflow_cli_arguments shape.
+# Labels on every pipe-anchorages job, on every runner: --labels is a required
+# option of the pipe-anchorages CLI. Production passes one --labels flag with
+# space-separated pairs; the repeated --labels=k=v form used here parses to the
+# same mapping (gfw-common's labels option accumulates).
 _STATIC_LABELS = (
     "--labels=environment=integration_test",
     "--labels=resource_creator=dit",
@@ -290,11 +327,6 @@ _STATIC_LABELS = (
     "--labels=workflow=port_visits_ais",
     "--labels=stage=testing",
 )
-
-
-def _pipeline_cli(args: argparse.Namespace) -> str:
-    """The CLI generation to emit; defaults to v4 for Namespaces built without it."""
-    return getattr(args, "pipeline_cli", DEFAULT_PIPELINE_CLI)
 
 
 def _max_num_workers(args: argparse.Namespace) -> int:
@@ -309,7 +341,7 @@ def _worker_sizing(args: argparse.Namespace, step: str) -> WorkerSizing:
 
 
 def _exclusive_end(inclusive_end: date) -> str:
-    """The v5 CLI's exclusive ``--end-date`` for an inclusive last day."""
+    """pipe-anchorages' exclusive ``--end-date`` for an inclusive last day."""
     return (inclusive_end + timedelta(days=1)).isoformat()
 
 
@@ -437,7 +469,7 @@ def _dataflow_pipeline_options(
     slice_start: date,
     slice_end: date,
 ) -> list[str]:
-    options = [
+    return [
         "--runner=DataflowRunner",
         f"--project={PROJECT}",
         f"--region={args.dataflow_region}",
@@ -453,12 +485,6 @@ def _dataflow_pipeline_options(
         *worker_sizing_options(_worker_sizing(args, step)),
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
-    ]
-    # v5 removed --wait_for_job (gfw-common's Pipeline waits for batch jobs).
-    if _pipeline_cli(args) == PIPELINE_CLI_V4:
-        options.append("--wait_for_job")
-    return [
-        *options,
         *_STATIC_LABELS,
         *_dynamic_labels(
             args, step=step, mode=mode,
@@ -468,14 +494,9 @@ def _dataflow_pipeline_options(
     ]
 
 
-def _directrunner_pipeline_options(
-    args: Optional[argparse.Namespace] = None, **label_kwargs
-) -> list[str]:
-    """DirectRunner options. v4 keeps its historical two-flag shape; v5 needs
-    labels (required option) plus a project and temp_location, which Beam's
-    BigQuery read needs on any runner."""
-    if args is None or _pipeline_cli(args) == PIPELINE_CLI_V4:
-        return ["--runner=DirectRunner", "--wait_for_job"]
+def _directrunner_pipeline_options(args: argparse.Namespace, **label_kwargs) -> list[str]:
+    """DirectRunner options: labels (a required option) plus a project and
+    temp_location, which Beam's BigQuery read needs on any runner."""
     return [
         "--runner=DirectRunner",
         f"--project={PROJECT}",
@@ -614,7 +635,7 @@ def _run_slice(
 ) -> None:
     """One slice = one thin_port_messages call + one port_visits call.
 
-    port_visits' --start_date is the workflow's --start (pipeline-level
+    port_visits' --start-date is the workflow's --start (pipeline-level
     data_available_from); it does a full recompute over [start, slice_end]
     on every call, matching production semantics.
 
@@ -669,16 +690,14 @@ def _run_slice(
 
 def _docker_run_kwargs(args: argparse.Namespace) -> dict:
     """Keyword arguments for ``dit_docker.run``. Every call mounts the GCP
-    credentials volume; v5 calls also hand the BigQuery staging dataset to the
-    DIT overlay patch inside the container (upstream has no option for it)."""
-    kwargs: dict = {
+    credentials volume and hands the BigQuery staging dataset to the DIT
+    overlay patch inside the container (upstream has no option for it)."""
+    return {
         "entrypoint": "pipe-anchorages",
         "build_from_source": args.build_from_source,
         "volumes": [GCP_VOLUME],
+        "container_env": {TEMP_DATASET_ENV: args.bq_temp_dataset},
     }
-    if _pipeline_cli(args) == PIPELINE_CLI_V5:
-        kwargs["container_env"] = {TEMP_DATASET_ENV: args.bq_temp_dataset}
-    return kwargs
 
 
 def _thin_argv(
@@ -691,32 +710,21 @@ def _thin_argv(
     iteration: int,
     total_iterations: int,
 ) -> list[str]:
-    """argv for step 1 (``thin_port_messages`` / ``port-state-transitions``)
-    over the inclusive slice ``[slice_start, slice_end]``."""
-    options = _pipeline_options(
-        args, step=STEP_THIN, mode=mode,
-        iteration=iteration, total_iterations=total_iterations,
-        slice_start=slice_start, slice_end=slice_end,
-    )
-    if _pipeline_cli(args) == PIPELINE_CLI_V5:
-        return [
-            "port-state-transitions",
-            f"--start-date={slice_start.isoformat()}",
-            f"--end-date={_exclusive_end(slice_end)}",
-            f"--bq-in-named-anchorages={args.named_anchorages}",
-            f"--bq-in-messages={_messages_table(args)}",
-            f"--bq-out-port-state-transitions={_thinned_table(args, suffix, mode)}",
-            *options,
-        ]
+    """argv for step 1 (``thin_port_messages``, the pipeline's
+    ``port-state-transitions``) over the inclusive slice
+    ``[slice_start, slice_end]``."""
     return [
-        "thin_port_messages",
-        f"--start_date={slice_start.isoformat()}",
-        f"--end_date={slice_end.isoformat()}",
-        f"--anchorage_table={args.named_anchorages}",
-        f"--input_table={_messages_table(args)}",
-        f"--output_table={_thinned_table(args, suffix, mode)}",
-        f"--temp_dataset={args.bq_temp_dataset}",
-        *options,
+        "port-state-transitions",
+        f"--start-date={slice_start.isoformat()}",
+        f"--end-date={_exclusive_end(slice_end)}",
+        f"--bq-in-named-anchorages={args.named_anchorages}",
+        f"--bq-in-messages={_messages_table(args)}",
+        f"--bq-out-port-state-transitions={_thinned_table(args, suffix, mode)}",
+        *_pipeline_options(
+            args, step=STEP_THIN, mode=mode,
+            iteration=iteration, total_iterations=total_iterations,
+            slice_start=slice_start, slice_end=slice_end,
+        ),
     ]
 
 
@@ -730,34 +738,21 @@ def _visits_argv(
     iteration: int,
     total_iterations: int,
 ) -> list[str]:
-    """argv for step 2 (``port_visits`` / ``port-visits``), a full recompute
-    over ``[args.start, slice_end]`` inclusive, as in production."""
-    options = _pipeline_options(
-        args, step=STEP_VISITS, mode=mode,
-        iteration=iteration, total_iterations=total_iterations,
-        slice_start=_parse_date(args.start), slice_end=slice_end,
-    )
-    if _pipeline_cli(args) == PIPELINE_CLI_V5:
-        return [
-            "port-visits",
-            f"--start-date={args.start}",
-            f"--end-date={_exclusive_end(slice_end)}",
-            f"--bq-in-port-state-transitions={thinned_input}",
-            f"--bq-in-segment-info={_segment_info_table(args)}",
-            f"--bq-out-port-visits={_visits_table(args, suffix, mode)}",
-            f"--bad-segs={_bad_segs_sql(args)}",
-            *options,
-        ]
+    """argv for step 2 (``port_visits``, the pipeline's ``port-visits``), a
+    full recompute over ``[args.start, slice_end]`` inclusive, as in production."""
     return [
-        "port_visits",
-        f"--start_date={args.start}",
-        f"--end_date={slice_end.isoformat()}",
-        f"--thinned_message_table={thinned_input}",
-        f"--vessel_id_table={_segment_info_table(args)}",
-        f"--output_table={_visits_table(args, suffix, mode)}",
-        f"--bad_segs={_bad_segs_sql(args)}",
-        f"--temp_dataset={args.bq_temp_dataset}",
-        *options,
+        "port-visits",
+        f"--start-date={args.start}",
+        f"--end-date={_exclusive_end(slice_end)}",
+        f"--bq-in-port-state-transitions={thinned_input}",
+        f"--bq-in-segment-info={_segment_info_table(args)}",
+        f"--bq-out-port-visits={_visits_table(args, suffix, mode)}",
+        f"--bad-segs={_bad_segs_sql(args)}",
+        *_pipeline_options(
+            args, step=STEP_VISITS, mode=mode,
+            iteration=iteration, total_iterations=total_iterations,
+            slice_start=_parse_date(args.start), slice_end=slice_end,
+        ),
     ]
 
 
@@ -920,11 +915,10 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
         params["steps"] = list(args.steps)
     if mode in _MODES_USING_TAIL:
         params["tail_days"] = args.tail_days
-    # v5 drives a different pipeline CLI (and an overlay image), so its rows
-    # must not satisfy v4 lookups. Added only for v5 so every existing v4 key
-    # stays byte-identical.
-    if _pipeline_cli(args) == PIPELINE_CLI_V5:
-        params["pipeline_cli"] = PIPELINE_CLI_V5
+    # No pipeline-CLI field: there is one CLI. Until 2026-11-19 v5 rows carried
+    # ``pipeline_cli: v5`` to keep them apart from v4 rows. Dropping it cannot
+    # make a new run hit an old v4 row: the key also holds this file's sha1,
+    # which that change moved, so every earlier row misses.
     return params
 
 
@@ -1041,15 +1035,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET,
                    help="Pre-existing BQ dataset for Beam EXPORT staging; "
                         "env-var fallback DIT_BQ_TEMP_DATASET (defaults to "
-                        "${PROJECT}.${DIT_DEST_DATASET}). v4 passes it as --temp_dataset; "
-                        "v5 passes it to the overlay image as the DIT_BQ_TEMP_DATASET "
-                        "container env var.")
-    p.add_argument("--pipeline-cli", choices=PIPELINE_CLIS, default=DEFAULT_PIPELINE_CLI,
-                   help="pipe-anchorages CLI generation to drive. v4 (default): the v4.6.4 "
-                        "CLI production pins (thin_port_messages / port_visits). v5: the CLI on "
-                        "pipe-anchorages main (port-state-transitions / port-visits, exclusive "
-                        "--end-date, required labels); needs a DIT overlay image as --image-tag "
-                        "and --worker-image, see docker/overlays/pipe-anchorages-temp-dataset/.")
+                        "${PROJECT}.${DIT_DEST_DATASET}). Passed to the overlay image as "
+                        "the DIT_BQ_TEMP_DATASET container env var; pipe-anchorages has no "
+                        "option for it.")
+    # Removed 2026-11-19 with the v4 CLI. Rejected explicitly, with the reason,
+    # so an old invocation does not fail on a bare "unrecognized arguments".
+    p.add_argument("--pipeline-cli", default=None, help=argparse.SUPPRESS)
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
                    help=f"Staging dataset stem (default {DEFAULT_SOURCE_DATASET_STEM}); "
                         "_internal and _published are appended to derive the three source "
@@ -1089,12 +1080,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                     "month of production AIS, 100 for production's full-history step.",
     )
     add_worker_sizing_args(p, defaults=STEP_WORKER_SIZING)
-    p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
+    p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
+                   help=f"Submitter image: builds and submits the Beam graph. Default: DIT's "
+                        f"overlay of pipe-anchorages {DEFAULT_PIPELINE_VERSION}, the version "
+                        f"production runs ({DEFAULT_IMAGE_TAG}). For other code, pass an overlay "
+                        f"image of that commit, built with {OVERLAY_DIR}/build.sh, here and as "
+                        f"--worker-image.")
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
-                   help="Dataflow worker container image with pipe_anchorages installed; "
-                        "passed to Beam as --sdk_container_image.")
+                   help="Dataflow worker container image, passed to Beam as "
+                        "--sdk_container_image. Default: the same overlay image as --image-tag. "
+                        "Must hold the same code as the submitter.")
     p.add_argument("--build-from-source", action="store_true",
-                   help="Fall back to `docker compose run dev` when no published image is available.")
+                   help="Run `docker compose run dev` on the working tree instead of --image-tag. "
+                        "That build has no temp-dataset overlay: fine with --runner docker, but on "
+                        "Dataflow Beam will try to create its own staging dataset, which DIT's "
+                        "service account may not.")
     p.add_argument("--suffix", default=None,
                    help="Output-table suffix; auto-generated from git HEAD when omitted.")
     add_experiment_id_arg(p)
@@ -1132,6 +1132,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add_infra_args(p)
     add_modes_arg(p, choices=SELECTABLE_MODES)
     args = p.parse_args(argv)
+    if args.pipeline_cli is not None:
+        raise SystemExit(PIPELINE_CLI_REMOVED)
+    del args.pipeline_cli
     # Validate before any cloud call: a typo'd mode that silently ran
     # nothing would look exactly like a passing run.
     args.modes = parse_modes(args.modes, choices=SELECTABLE_MODES)
@@ -1149,6 +1152,64 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         for step, default in STEP_WORKER_SIZING.items()
     }
     return args
+
+
+def _default_images_executed(args: argparse.Namespace) -> tuple[str, ...]:
+    """The image flags still at the default whose image this run executes.
+
+    The submitter image runs unless ``--build-from-source`` replaces it. The
+    worker image runs only on Dataflow. A compare-only run executes neither.
+    """
+    if args.skip_pipelines:
+        return ()
+    candidates = (
+        ("--image-tag", args.image_tag == DEFAULT_IMAGE_TAG and not args.build_from_source),
+        ("--worker-image",
+         args.worker_image == DEFAULT_WORKER_IMAGE and args.runner == "dataflow"),
+    )
+    return tuple(flag for flag, executed in candidates if executed)
+
+
+def check_images(args: argparse.Namespace, pipeline_commit: str, unreviewed: bool) -> None:
+    """Refuse a run that would execute the default image on code it does not hold.
+
+    The default image is pipe-anchorages ``DEFAULT_PIPELINE_VERSION`` with
+    DIT's temp-dataset overlay. For unreviewed code (a dirty tree, a DIT
+    snapshot, a commit not merged into ``origin/main``) it is the wrong code.
+    The shared harness would replace a default worker image with a kaniko
+    build of the commit, but that build is plain source: no overlay, so Beam
+    would try to create its own BigQuery staging dataset and the Dataflow job
+    would fail (``bigquery.datasets.create`` denied). The submitter would also
+    stay on the default image, a different commit than the workers.
+
+    So nothing is auto-built for this workflow (``resolve_run_context`` calls
+    this in place of the auto-build), and the run stops here, before any
+    registry, Cloud Build, BigQuery or Dataflow call. Reviewed code runs the
+    default image; explicit images are always respected.
+    """
+    flags = _default_images_executed(args)
+    if not (unreviewed and flags):
+        return
+    raise SystemExit(
+        f"error: this pipe-anchorages checkout is unreviewed (commit {pipeline_commit}: a "
+        f"dirty tree, a DIT snapshot, or not merged into origin/main), and the run would "
+        f"execute DIT's default image for {' and '.join(flags)}:\n"
+        f"  {DEFAULT_OVERLAY_IMAGE}\n"
+        f"That image holds pipe-anchorages {DEFAULT_PIPELINE_VERSION} with DIT's temp-dataset "
+        f"overlay, not this code. DIT does not auto-build an image for port visits: a plain "
+        f"build has no overlay, and its Dataflow job would fail creating a BigQuery staging "
+        f"dataset. Choose one:\n"
+        f"  - build an overlay image of the commit and pass it as BOTH --image-tag and "
+        f"--worker-image:\n"
+        f"      {OVERLAY_DIR}/build.sh <pipe-anchorages dir> {pipeline_commit} <label> --push\n"
+        f"    (build.sh builds a commit; uncommitted changes are in it only if "
+        f"{pipeline_commit} is a DIT snapshot)\n"
+        f"  - check the working tree locally, without Dataflow: --runner docker "
+        f"--build-from-source (no overlay there either: Beam creates its own staging "
+        f"dataset, with your credentials)\n"
+        f"  - run pipe-anchorages {DEFAULT_PIPELINE_VERSION} itself: use a clean checkout of a "
+        f"commit merged into origin/main"
+    )
 
 
 def _source_tables_read(args: argparse.Namespace) -> list[str | None]:
@@ -1192,7 +1253,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # addressable digest so :tag retags invalidate the cache cleanly.
         # Falls back to the tag form on failure (cache misses, run still works).
         resolve_digest=True,
+        # No auto-build for this workflow: a plain build cannot replace the
+        # overlay default. Unreviewed code on a default image is refused.
+        check_images=functools.partial(check_images, args),
     )
+    if args.build_from_source and args.runner == "dataflow" and not args.skip_pipelines:
+        logger.warning(
+            "--build-from-source submits from a plain build of the working tree, without "
+            "the temp-dataset overlay. Beam will try to create its own BigQuery staging "
+            "dataset as %s; DIT's default service account may not. Prefer an overlay "
+            "image of the commit as --image-tag (%s/build.sh).",
+            args.service_account, OVERLAY_DIR,
+        )
     args.run_context = ctx
     args.commit_sha = ctx.pipeline_commit
     args.unreviewed = ctx.unreviewed
@@ -1245,7 +1317,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("source segment_info: %s", _segment_info_table(args))
         logger.info("source segs_activity: %s", _segs_activity_table(args))
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
-    logger.info("runner: %s  pipeline_cli: %s", args.runner, args.pipeline_cli)
+    logger.info("runner: %s", args.runner)
+    if not args.build_from_source:
+        logger.info("submitter image: %s", args.image_tag)
+    if args.runner == "dataflow":
+        logger.info("worker image:    %s", args.worker_image)
     log_worker_caps({"every job": args.worker_cap})
     selected_sizings = {step: args.worker_sizings[step] for step in args.steps}
     log_worker_sizings(selected_sizings)
