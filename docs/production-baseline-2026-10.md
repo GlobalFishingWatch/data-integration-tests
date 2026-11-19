@@ -4,13 +4,20 @@
 **Status:** verified live on 2026-10-23 (Cloud Build `7781dd48`, PR #176 against production's 2026-10-20 run; see "First live run" below). That followed dry runs on the laptop and in Cloud Build as `automated-testing@` (build `947240a8`).
 **Entry point:** `workflows/port_visits/cross_version_ais.py --baseline-production <target> --production-date D`.
 
+**Update 2026-11-19.** Production's `core.ais.v5` DAG moved to pipe-anchorages v5.0.0 on 2026-10-26 and v5.0.1 on 2026-11-04, with the v5 CLI. What changed here:
+- The target records v5.0.1 (`ProductionTarget.deployed_version`). Its other fields were re-checked against composer `origin/main` 9f214877b and still match.
+- DIT drives only the v5 CLI now. `--pipeline-cli` is gone, so the commands below no longer pass it.
+- The default image is DIT's overlay of v5.0.1. A candidate that is not merged into pipe-anchorages `origin/main` still needs its own overlay image as `--binding-image-tag` and `--binding-worker-image`.
+- PR #176, the candidate of the first live run, is part of v5.0.0. The run below is history: it compared the PR with what production ran then, v4.6.4.
+- v5.0.1 makes the port-visits table require a partition filter, which the whole-table output pin did not pass. That is fixed in #89 (`dit.bq`), which also documents it here. No live production-baseline run has been made since the move.
+
 ## What it does
 
 An ordinary cross-version run executes two bindings, for example main and a PR, on pinned inputs, then diffs their outputs. A production-baseline run executes **only the candidate**. It compares the candidate's output with the table production actually wrote, and the candidate reads exactly the inputs production read. Production is not re-run.
 
 This makes the test:
 - cheaper, because it runs one binding instead of two;
-- more direct, because it compares with what production published, including differences between the deployed version and `main`. Production pins pipe-anchorages v4.6.4, 17 merged PRs behind `main` as of 2026-10-22.
+- more direct, because it compares with what production published, including differences between the deployed version and `main`. At the first live run production ran pipe-anchorages v4.6.4, 17 merged PRs behind `main`. Since 2026-11-04 it runs v5.0.1, which was `main`'s head on 2026-11-19.
 
 ## How the pins are chosen
 
@@ -40,9 +47,9 @@ Production reprocesses daily, so its inputs and its output both move. The compar
 
 ## Targets
 
-One target today, hand-written from `composer-dags-production` origin/main 0a644da (`dags/core/ais/v5.py`, `gfw/pipes/core/port_visits/v4.py`). Reading targets from composer as data belongs to [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700).
+One target today, hand-written from `composer-dags-production` (`dags/core/ais/v5.py`, `gfw/pipes/core/anchorages/v5.py`), last re-checked at origin/main 9f214877b (2026-11-19). `workflows/port_visits/composer_drift.py` checks every field against the rendered DAG. Reading targets from composer as data belongs to [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700).
 
-**`ais-v5-datalake`**: pipe-anchorages v4.6.4, v4 CLI. Dataflow in `world-fishing-827`, `us-central1`, 100 × e2-highmem-4 with 50 GB disks and private IPs (the sizing from the rendered snapshot `tests/render_dags/snapshots/core_ais_v5.py`, task `port_visits.detect_port_visits`). Job name `core-ais-v5--port-visits-detect-port-visits--YYYYMMDD`.
+**`ais-v5-datalake`**: pipe-anchorages v5.0.1, v5 CLI (`port-visits`; v4.6.4 and the v4 CLI until 2026-10-26). Dataflow in `world-fishing-827`, `us-central1`, 100 × e2-highmem-4 with 50 GB disks and private IPs (the sizing from the rendered snapshot `tests/render_dags/snapshots/core_ais_v5.py`, task `port_visits.detect_port_visits`). Job name `core-ais-v5--port-visits-detect-port-visits--YYYYMMDD`.
 
 | role | table | time travel | full read (2026-10-23) |
 |---|---|---|---|
@@ -70,6 +77,8 @@ A live run needs the owner's go-ahead on the cap (`--pin-max-gb 1300`) and the w
 
 ## Running it
 
+The commands are those of the first live run, for PR #176, minus the removed `--pipeline-cli v5`. For a new candidate, replace the binding and its overlay image.
+
 Dry run on the laptop: free, read-only, creates nothing. It resolves the job, prints T0, T1, the deadline, view names, estimates and the binding's `ais.py` argv:
 
 ```bash
@@ -80,20 +89,20 @@ CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT= dit run workflows/port_visits/cross_v
     --binding-worker-image pr=gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761 \
     --binding-image-tag pr=gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761 \
     --pin-max-gb 1300 --dry-run \
-    --pipeline-cli v5 --max-num-workers 100 --runner dataflow
+    --max-num-workers 100 --runner dataflow
 ```
 
-Live, in Cloud Build. `DIT_REF` is needed until this lands on `main`:
+Live, in Cloud Build. `BEAM_VERSION=2.76.0` is the Makefile's default for `PIPELINE=anchorages_pipeline` since 2026-11-19 and can be left out:
 
 ```bash
 IMG=gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761
 CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT= make dit-cloud PIPELINE=anchorages_pipeline \
-    PROJECTS=<fresh clone parent> DIT_REF=feat/production-baseline BEAM_VERSION=2.76.0 \
+    PROJECTS=<fresh clone parent> BEAM_VERSION=2.76.0 \
     WORKFLOW=workflows/port_visits/cross_version_ais.py \
     ARGS="--experiment-id pipeline-4690-prod --baseline-production ais-v5-datalake \
           --production-date 2026-10-20 --binding pr=14b4be8 \
           --binding-image-tag pr=$IMG --binding-worker-image pr=$IMG \
-          --pipeline-dir /workspace --pipeline-cli v5 --max-num-workers 100 \
+          --pipeline-dir /workspace --max-num-workers 100 \
           --pin-max-gb 1300 --runner dataflow"
 ```
 
@@ -101,7 +110,7 @@ Check `gcloud builds list` after submitting; a hung upload can retry and create 
 
 ## Reading the result
 
-table-check's post-tolerance counts are inflated when keys repeat: its `_l2` step re-joins on the key only, so a key with n rows on each side yields n² pairs. Production's v4.6.4 output has duplicate `visit_id`s, which is the behaviour PIPELINE-4690 removes, so expect DIFFERENT. Break the result down with SQL rather than reading table-check's row counts. A fix is drafted for the table-check maintainer; per the working agreement, comparison features go upstream, not into `dit.compare`.
+table-check's post-tolerance counts are inflated when keys repeat: its `_l2` step re-joins on the key only, so a key with n rows on each side yields n² pairs. Production's v4.6.4 output had duplicate `visit_id`s, which is the behaviour PIPELINE-4690 removed (in production since v5.0.0), so that run was expected to be DIFFERENT. Break the result down with SQL rather than reading table-check's row counts. A fix is drafted for the table-check maintainer; per the working agreement, comparison features go upstream, not into `dit.compare`.
 
 The breakdown used for the 2026-09 and 2026-07..09 runs, with `PR` the candidate's output and `PROD` the production-output view:
 
@@ -127,14 +136,14 @@ The `end_timestamp` filter satisfies tables that require a partition filter. Rea
 
 **The run:** PIPELINE-4690's PR (pipe-anchorages #176, `14b4be8`, v5 CLI, overlay `…-905dc761`) against production's run for D = 2026-10-20. Production's job started 07:46:26Z and finished 09:04:17Z.
 - **Cloud Build:** `7781dd48`, DIT `main` at `c73836a`.
-- **Dataflow:** 10:11–11:50Z, 99 minutes. It ran on 100 × **e2-standard-2** (8 GB), the v5 CLI's default; production uses e2-highmem-4 (32 GB). Machine type affects speed, not output. Mirroring production's sizing in this mode is a separate PR.
+- **Dataflow:** 10:11–11:50Z, 99 minutes. It ran on 100 × **e2-standard-2** (8 GB), the v5 CLI's default; production uses e2-highmem-4 (32 GB). Machine type affects speed, not output. DIT has mirrored production's sizing since #87.
 - **Analysis cost:** 73 GB for the breakdown above, 97 GB for the changed-field count.
 
 **Result, full history:**
 
 | | rows | distinct `visit_id` | duplicate rows | zero-duration |
 |---|---|---|---|---|
-| production (v4.6.4) | 412,190,532 | 412,187,731 | 2,801 | 6,944,787 |
+| production (v4.6.4 at the time) | 412,190,532 | 412,187,731 | 2,801 | 6,944,787 |
 | PR #176 | 412,181,996 | 412,181,996 | 0 | 6,938,005 |
 | only in production | 9,789 | 7,096 (3,955 vessels) | | 6,849 |
 | only in PR | 1,361 | 1,361 (1,348 vessels) | | 630 |
@@ -147,7 +156,7 @@ The `end_timestamp` filter satisfies tables that require a partition filter. Rea
 
 table-check's "matched 412,180,635" is those ids plus 12 that are duplicated in production. Its "value diffs 4,407 (filtered −2,340)" is inflated by the duplicate-key behaviour above.
 
-**Attribution.** This compares production's code (v4.6.4) with the PR, which sits on pipe-anchorages main, 17 PRs past v4.6.4. So it includes main's changes as well as #176's. A September three-way run on the same pins separates them (README Roadmap 7a):
+**Attribution.** This compares production's code at the time (v4.6.4) with the PR, which sits on pipe-anchorages main, 17 PRs past v4.6.4. So it includes main's changes as well as #176's. A September three-way run on the same pins separates them (README Roadmap 7a):
 - main alone changes about 1,100 visits against v4.6.4;
 - the PR changes about 4,000.
 

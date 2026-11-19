@@ -257,8 +257,10 @@ Five tracks. 1–3 are independent and parallelisable; 4 depends on 2+3; 5 depen
 
 **Scope.** Build port-visits workflows for AIS and VMS, exercising the helpers extracted in Phase 1. This is the abstraction-validation step: if `dit.compare`'s `view_suffix=""` path doesn't work, or if `dit.runners.docker` can't accept a different image tag without surprise, Phase 1's design needs adjustment.
 
-`dit run workflows/port_visits/ais.py --image-tag <tag> --start <date> --end <date> --suffix <hex> --parallel`:
-1. Pulls the published `gfw/pipe-anchorages:<tag>` image.
+**Pipeline version and image (2026-11-19).** The workflows drive one pipe-anchorages CLI, that of v5.0.1, which production's `core.ais.v5` runs (`port-state-transitions` / `port-visits`). The v4 CLI and the `--pipeline-cli` switch are removed. The default image, for submitter and workers alike, is DIT's temp-dataset overlay build of v5.0.1, not an upstream image: upstream cannot name Beam's BigQuery staging dataset. The workflow never auto-builds an image, because a plain build has no overlay; for unreviewed code it refuses to run a default image and asks for an overlay image of that commit (`--image-tag` and `--worker-image`). DIT's step names stay `thin_port_messages` and `port_visits`.
+
+`dit run workflows/port_visits/ais.py --start <date> --end <date> --suffix <hex> --parallel`:
+1. Runs DIT's overlay image of pipe-anchorages v5.0.1 (`--image-tag` / `--worker-image` name another overlay image).
 2. Runs three pipeline invocations in parallel: `_1_bf`, `_2_bfd`, `_3_bftruncate`.
 3. Compares all three pairs with `dit.compare.compare_tables(..., keys=["visit_id"], view_suffix="")`.
 4. Returns 0 if all three match.
@@ -303,7 +305,7 @@ A capability not in the original Phase 1-7 numbering, emerged from the PIPELINE-
 - **Reference catalog (deferred V2).** Today's cross-version runs both bindings every time. The optimisation that caches main's output as a no-TTL reference and lets PRs run only the candidate side is sketched in the 2026-05-15 Plan changelog and explicitly deferred until the 12-hour-run cost becomes operationally painful.
 - **`--fail-on-diff` mode for PR gating.** Today's wrapper treats diff as information; PR-gating semantics flip this. One-flag addition when needed.
 - **Pipe-gaps cross-version workflow.** None exists. Job names and the cleanup label are at parity (see Open items); a cross-version workflow for pipe-gaps would mirror `cross_version_ais.py` for the detect-gaps shape.
-- **`--temp_dataset` for pipe-anchorages: no upstream PR (decision 2026-10-22, PIPELINE-4699).** The v4.6.4 CLI's `--temp_dataset` only ever existed on the local `anchorages_pipeline@dit-temp-dataset-support` branch, which the PIPELINE-1465 synthetic branches cherry-picked. For the v5 CLI, dit builds a test-only overlay image instead ([`docker/overlays/pipe-anchorages-temp-dataset/`](../docker/overlays/pipe-anchorages-temp-dataset/README.md)); it is never proposed upstream.
+- **`--temp_dataset` for pipe-anchorages: no upstream PR (decision 2026-10-22, PIPELINE-4699).** The v4.6.4 CLI's `--temp_dataset` only ever existed on the local `anchorages_pipeline@dit-temp-dataset-support` branch, which the PIPELINE-1465 synthetic branches cherry-picked. For the v5 CLI, dit builds a test-only overlay image instead ([`docker/overlays/pipe-anchorages-temp-dataset/`](../docker/overlays/pipe-anchorages-temp-dataset/README.md)); it is never proposed upstream. Confirmed on 2026-11-19, when the v4 CLI was dropped and the overlay of v5.0.1 became the workflows' default image.
 
 ## Runtime & CI
 

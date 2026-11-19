@@ -9,6 +9,8 @@ Code:
 
 This is a point-in-time analysis. Production values change; rerun the check rather than trusting the numbers here.
 
+**Update 2026-11-19.** Re-read at composer `origin/main` **9f214877b** for pipe-anchorages only. Production's v5 DAGs (AIS and VMS) run pipe-anchorages **v5.0.1** with the v5 CLI since 2026-11-04 (v5.0.0 from 2026-10-26). DIT dropped the v4 CLI the same day and ported the drift check. Section 5 and the pipe-anchorages row of section 6 are rewritten for that state. Everything else, including the counts in sections 2 to 4 and the other pipelines' rows, is still as read at 0a644da.
+
 ## 1. Why
 
 DIT hand-copies what production runs:
@@ -50,8 +52,8 @@ The snapshots cover only what a DAG passes to a task. DIT's staging cohorts, DIT
    | Placeholder | Meaning |
    |---|---|
    | `{start_date}` | the interval start's date |
-   | `{end_date}` | the last day inside the interval (end minus one day for a midnight end): inclusive ends such as pipe-anchorages v4 `--end_date` |
-   | `{end_date_exclusive}` | the interval end's date: exclusive ends such as pipe-events v8 `--end-date` |
+   | `{end_date}` | the last day inside the interval (end minus one day for a midnight end): inclusive ends such as the old pipe-anchorages v4 `--end_date` |
+   | `{end_date_exclusive}` | the interval end's date: exclusive ends such as pipe-anchorages v5 and pipe-events v8 `--end-date` |
    | `{execution_date}` | the logical date, only where it differs from the interval start |
 
    Each has a `_nodash` form (`YYYYMMDD`), used in job names. An 8-digit date right after a letter (`_v20240117`) is a table version and is never replaced. A date matching one placeholder is replaced; one matching several is left as written and reported as ambiguous; one matching none is reported as a constant. How the intervals limit this:
@@ -69,6 +71,8 @@ The snapshots cover only what a DAG passes to a task. DIT's staging cohorts, DIT
 
 Run with `dit run workflows/port_visits/composer_drift.py` (exit 1 means drift was found). DIT is configured as `--baseline-production` configures it: the target's tables, its history start, and the snapshot run's dates.
 
+This section is as of 2026-11-19 (composer 9f214877b, pipe-anchorages v5.0.1, DIT's v5-only builders). The check written on 2026-10-23 read the v4 flag names, because production's v5 DAG then still ran v4.6.4. Once production moved, it reported false field mismatches and could not compare the argv, so it was ported.
+
 ### 5a. `ProductionTarget("ais-v5-datalake")`
 
 The target finds the job of the daily DAG `core.ais.v5`. Results against `core_ais_v5` (daily) and `core_ais_v5_backfill`:
@@ -80,36 +84,50 @@ The target finds the job of the daily DAG `core.ais.v5`. Results against `core_a
 | `output_table` | match | match |
 | `thinned_table` (step 1 output and step 2 input) | match | match |
 | `segment_info_table` | match | match |
-| `segs_activity_table` (the one table in `--bad_segs`) | match | match |
+| `segs_activity_table` (the one table in `--bad-segs`) | match | match |
 | `history_start` (2012-01-01, a constant, not tied to the interval) | match | match |
-| `deployed_version` (pipe-anchorages v4.6.4) | match | match |
+| `deployed_version` (pipe-anchorages v5.0.1) | match | match |
+| `worker_machine_type`, `disk_size_gb` | match | match |
+
+A second block, "DIT defaults", compares `ais.DEFAULT_PIPELINE_VERSION` (the pipe-anchorages version inside DIT's default overlay image) with the image tag of both production tasks. It matches (v5.0.1) in both snapshots. This is the line that turns to DIFF when production bumps the version.
 
 The brief asked for a comparison with `core_ais_v5_backfill`. The target was written from `dags/core/ais/v5.py`, which defines both DAGs, and its job-name prefix is the daily DAG's. So the backfill's prefix difference is expected, not drift.
 
-The backfill (a 226-day interval) settles the date conventions that the daily snapshot leaves ambiguous:
-- step 1 runs `{start_date}` to `{end_date}`;
-- step 2 runs from the constant 2012-01-01 to `{end_date}`;
+The backfill (a 226-day interval) settles the date conventions that the daily snapshot leaves ambiguous. With the v5 CLI the end date is exclusive:
+- step 1 runs `--start-date {start_date}` to `--end-date {end_date_exclusive}`;
+- step 2 runs from the constant 2012-01-01 to `--end-date {end_date_exclusive}`;
 - job names end in `{start_date_nodash}`;
 - the `run_date` label is `{start_date}`.
 
-That confirms `ProductionTarget.job_name(D)` (prefix plus D) and the inclusive `--end D` of the production baseline.
+DIT keeps inclusive `--start` / `--end` and passes the pipeline `end + 1 day`. Configured with the snapshot's `[start_date, end_date]`, it emits the same two dates as production in both snapshots. That confirms `ProductionTarget.job_name(D)` (prefix plus D) and the inclusive `--end D` of the production baseline: production's job named `...--D` passes `--end-date D+1`.
 
 `core_ais_v3` differs: its job names end in the interval END (the execution date). Both `{end_date_exclusive}` and `{execution_date}` fit, so the reader reports it as ambiguous. A core AIS v3 target (README roadmap 7c follow-up) needs that settled, from the DAG source or a multi-day snapshot, before `job_name(D)` is written.
 
-### 5b. argv flags, DIT's v4 builders against production
+### 5b. argv flags, DIT's builders against production
 
-Both steps run the same command (`pipe-anchorages thin_port_messages`, `pipe-anchorages port_visits`). What the check reports, with the owner's decisions of 2026-10-23 applied:
+Both steps run the same command (`pipe-anchorages port-state-transitions`, `pipe-anchorages port-visits`). Production passes `--labels` once, followed by space-separated pairs; the check parses that as one multi-value flag (`MULTI_VALUE_FLAGS`), so the pairs no longer read as part of the command. What the check reports on 2026-11-19, for the daily and the backfill snapshot alike:
 
-| | `thin_port_messages` | `port_visits` |
+| | `thin_port_messages` (`port-state-transitions`) | `port_visits` (`port-visits`) |
 |---|---|---|
-| Same | `--start_date`, `--end_date`, `--runner` (spellings treated as equal), `--project`, `--region`, `--sdk_container_image`, `--wait_for_job`, and since the sizing change (#87) `--disk_size_gb`, `--worker_machine_type`, `--no_use_public_ips` | the same, plus `--thinned_message_table`, `--vessel_id_table`, `--bad_segs` (SQL byte-identical) |
-| Expected to differ: DIT-owned | `--output_table`, `--job_name`, `--labels`, `--service_account_email`, `--temp_location`, `--staging_location`, `--subnetwork`, `--max_num_workers`, `--temp_dataset` (DIT only) | same |
+| Same | `--start-date`, `--end-date`, `--bq-in-named-anchorages`, `--runner` (spellings treated as equal), `--project`, `--region`, `--no_use_public_ips`, `--worker_machine_type`, `--disk_size_gb` | `--start-date`, `--end-date`, `--bq-in-port-state-transitions`, `--bq-in-segment-info`, `--bad-segs` (SQL byte-identical), and the same six Dataflow flags |
+| Expected to differ: DIT-owned | `--bq-out-port-state-transitions`, `--job_name`, `--labels`, `--service_account_email`, `--temp_location`, `--staging_location`, `--subnetwork`, `--max_num_workers`, `--sdk_container_image` | the same, with `--bq-out-port-visits` |
 | Expected to differ: accepted | `--dataflow_service_options` (lineage), `--network` | same |
-| Only in production (still reported) | none since #87 (before it: `--disk_size_gb`, `--worker_machine_type`, `--no_use_public_ips`) | same |
-| Values differ | `--anchorage_table`, `--input_table` | none |
+| Only in production (still reported) | `--no-rich-logging`, `--wait_for_job` | same |
+| Values differ | `--bq-in-messages` | none |
 | Only in DIT, outside the expected set | none | none |
 
-How DIT's jobs actually ran, from `gcloud dataflow jobs describe` on 2026-10-23: the v4-CLI jobs used Dataflow's default machine type and disk with public worker IPs, and the v5-CLI production-baseline run used gfw-common's default machine type with private IPs. Production runs both steps on a larger high-memory machine type with private IPs and lineage on.
+So the check still exits 1, on three understood differences:
+- **`--bq-in-messages`** (step 1 only). The check runs step 1 on DIT's staging messages, because `ProductionTarget` has no step-1 tables. Unchanged from 2026-10-23, under the flag's new name.
+- **`--no-rich-logging`.** A real option of the CLI: plain instead of coloured log output. It changes the log format only. DIT does not pass it.
+- **`--wait_for_job`.** Production still passes this v4 flag. The v5 CLI does not define it; gfw-common's `Pipeline` waits for batch jobs regardless (read at gfw-common v0.25.0). DIT does not pass it.
+
+Neither new difference changes output. Whether DIT should emit the two flags, or list them as accepted differences, is the owner's call; until then they stay reported.
+
+Two changes to the expected set since PR #86:
+- The v4 names went with the v4 CLI: `--output_table` became the two `--bq-out-*` flags, and `--temp_dataset` (DIT-only) is gone. DIT now hands the staging dataset to its overlay image through a container environment variable, which is not part of the argv.
+- `--sdk_container_image` is DIT-owned since 2026-11-19. The default image is DIT's overlay build, by the owner's decision, so the path differs from production's by design. The version inside it is checked separately (5a, "DIT defaults").
+
+How DIT's jobs ran in October, from `gcloud dataflow jobs describe` on 2026-10-23: the v4-CLI jobs used Dataflow's default machine type and disk with public worker IPs, and the v5-CLI production-baseline run used gfw-common's default machine type with private IPs. Production runs both steps on a larger high-memory machine type with private IPs and lineage on. DIT has mirrored the machine type, disk and private IPs since #87.
 
 **Owner decisions (2026-10-23, on PR #86):**
 1. **`--runner`.** DIT keeps `DataflowRunner`; production passes `dataflow`. Beam's `create_runner` matches partial runner names (Beam's runner guide), so both select the Dataflow runner. The check treats the two spellings as equal (`EQUIVALENT_VALUES`).
@@ -121,14 +139,14 @@ How DIT's jobs actually ran, from `gcloud dataflow jobs describe` on 2026-10-23:
    - The case: DIT's default (v20240117) was the newest version when the workflow was written. Production v5 now reads v20260302, from another project, and nothing flagged it. Production v3 still reads v20240117, also from another project.
    - Decision: bump DIT's default to v20260302 now. That bump is not part of this PR.
    - Going forward, DIT should warn or flag when its sources or versions differ from production's, and have a mechanism to sync them (section 7, items 1 and 7).
-   - `--input_table` differs only because the drift check runs step 1 on DIT's staging messages. `ProductionTarget` has no step-1 tables, since the production baseline runs step 2 only.
+   - `--input_table` (now `--bq-in-messages`) differs only because the drift check runs step 1 on DIT's staging messages. `ProductionTarget` has no step-1 tables, since the production baseline runs step 2 only.
 
 **The lineage principle (owner, 2026-10-23).** Every comparison must rest on the same lineage.
 - When DIT runs both sides of a comparison, the two sides share lineage by construction.
 - A comparison against production must instead match production's lineage. Ideally DIT does not take source table names from its own config. It finds out what production actually read and pins exactly that, by copy, view or time travel (`dit.bq.pin_view_into_experiment`, PIPELINE-4703).
 
 **Feasibility** (the evidence is in Jira PIPELINE-4700, comment of 2026-10-23).
-- GFW's BigQuery job-metadata view holds the query jobs of production's port-visits run. They carry composer's labels (`task_name=detect_port_visits`, `stage_version=v4-6-4`, plus `stage`, `environment`, `mode`).
+- GFW's BigQuery job-metadata view holds the query jobs of production's port-visits run. They carry composer's labels (on 2026-10-23: `task_name=detect_port_visits`, `stage_version=v4-6-4`, plus `stage`, `environment`, `mode`; the label keys and the version value have changed with the v5 DAG's move to v5.0.1, so re-read them before relying on them).
 - For the 2026-10-19 run, their `referenced_tables` are exactly the three inputs `ProductionTarget` hard-codes. Their `creation_time` gives the actual read times, which are more precise than the Dataflow job's creation time DIT pins to today.
 - The same view shows that production rewrote the thinned table twice that day, which is why reading at the right moment matters.
 
@@ -144,13 +162,13 @@ Image tags are each task's pinned version, and `cmds` + `arguments` give the com
 
 | Pipeline | DIT drives | Production `core.ais.v3` | Production `core.ais.v5` (+ backfill) |
 |---|---|---|---|
-| pipe-anchorages | v4.6.4, v4 CLI (`thin_port_messages`, `port_visits`) | v4.6.4, same commands | v4.6.4, same commands. The VMS DAGs also pin v4.6.4. |
+| pipe-anchorages (re-read 2026-11-19, composer 9f214877b) | **v5.0.1**, v5 CLI (`port-state-transitions`, `port-visits`), on DIT's overlay image | v4.6.4, v4 CLI (`thin_port_messages`, `port_visits`), which DIT no longer drives | **v5.0.1**, v5 CLI, same commands as DIT. The VMS v5 daily and backfill DAGs also run v5.0.1 (a one-off VMS v5 backfill pins v5.0.0 for another command); the VMS v3 DAGs still pin v4.6.4. |
 | pipe-events | v4.2.17, entrypoint `pipe`: `incremental_events`, `incremental_filter_events`, `auth_and_regions_fishing_events`, `fishing_restrictive` | **v5.0.0**, same entrypoint and command names | **v8.0.1**, entrypoint `pipe-events`, renamed commands (`fishing_events_incremental`, `fishing_events_incremental_filter`, `fishing_events_auth_and_regions`, `fishing_events_restrictive`), hyphenated `--key=value` flags, exclusive `--end-date` |
 | pipe-gaps | v0.10.0 worker image, `detect` | **v0.10.3**, `detect` / `publish` | **v0.17.0**, `raw-gaps` / `gap-events` |
 | pipe-encounters | v4.4.0 (`create_raw_encounters`, `merge_encounters`) | v4.4.0, same commands | **v4.6.0**, same commands (`create_raw_encounters`, `merge_encounters`) |
 | pipe-segment | v5.0.3 | v5.0.3 | no AIS task; VMS v5 pins v5.0.3 |
 
-So yes: the snapshots show that production pins pipe-anchorages v4.6.4, and that DIT's pipe-events and pipe-gaps pins differ from production's in version and, for v5, in command names.
+So yes: the snapshots show which pipe-anchorages version each DAG pins, and that DIT's pipe-events and pipe-gaps pins differ from production's in version and, for v5, in command names. On 2026-10-23 every DAG pinned pipe-anchorages v4.6.4. The v5 DAGs' move to v5.0.0 and v5.0.1 was visible in the snapshots from the day it merged, but nothing ran the check, which is the gap item 1 below describes.
 
 **Correction to the brief.** It gave production v5 as EVENTS v6.2.0 and gaps v0.12.0. Those were `core.ais.v5`'s pins from 2026-08-21 (composer `de9b8564c`) until September: gaps went to v0.12.2 on 2026-09-12 (`cc275168d`) and events moved on 2026-09-21 (`81cba5ccb`). At 0a644da the DAG source pins EVENTS v8.0.1 and GAPS v0.17.0, and the snapshots agree.
 
@@ -174,6 +192,8 @@ In order of value per effort:
 4. **Generate `ProductionTarget` from the snapshot.** The fields map one to one (section 5a proves the mapping). The run-date convention needs a multi-day snapshot or the DAG source, because daily snapshots are ambiguous. Keep the hand-written target until the drift check has run green for a while, then generate it, or keep both, with the check as the test.
 5. **Checked-in `params/<pipeline>.yaml` at a pinned composer commit.** This is Phase 4 of `docs/plan.md`. Templated argv (placeholders instead of dates) renders back with DIT's own dates (`render_template`). The repo is public, so an allow-list is mandatory: versions, commands, flag names, and the tables DIT targets. Never infrastructure values. Reviewed diffs on regeneration are the sync mechanism. Worth it once two or more workflows consume more than versions and commands; until then, step 1 and step 2 read the snapshot live.
 6. **CLI-generation adapters (v4 / v5).** The snapshot shows which generation production runs (image version plus command names: `thin_port_messages` is v4, `port-state-transitions` is v5). It does not show the other generation's argv: a PR on v5 has no snapshot while production is on v4. So the builders stay hand-written per generation. The production generation gets a golden test (snapshot argv rendered with DIT's dates against the builder's output), and a cross-version run picks each binding's adapter by its version. When production moves to v5, the v5 builder gets its golden test from the snapshot instead of from pipe-anchorages main.
+
+   *Status 2026-11-19:* production moved to v5 and the owner dropped the v4 path, so port visits has one builder set and no adapters. The drift check compares it with the snapshot live. A checked-in golden test would need production's argv in this public repository, so it waits for the allow-list of item 5. The adapter question returns with the next CLI change.
 7. **Pin what production actually read (the owner's lineage principle; long-term).** For comparisons against production, stop configuring source tables at all.
    - Find the production run's BigQuery query jobs in GFW's job metadata by composer's labels (`task_name`, `stage_version`).
    - Take their `referenced_tables` as the inputs and their `creation_time` as the read times.

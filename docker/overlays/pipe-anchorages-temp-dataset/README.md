@@ -1,6 +1,8 @@
 # pipe-anchorages temp-dataset overlay
 
-Test-only patch that lets DIT run current pipe-anchorages (the `--pipeline-cli v5` CLI) on Dataflow as `automated-testing@`. It is **never** proposed upstream (decision 2026-10-22, PIPELINE-4699).
+Test-only patch that lets DIT run pipe-anchorages on Dataflow as `automated-testing@`. It is **never** proposed upstream (decision 2026-10-22, PIPELINE-4699; confirmed 2026-11-19).
+
+Since 2026-11-19 an overlay image is the **default image** of the port-visits workflows: `workflows/port_visits/ais.py` runs the overlay of pipe-anchorages v5.0.1, the version production runs, as both submitter and worker. See "Default image" below.
 
 ## Why it exists
 
@@ -8,23 +10,25 @@ Port visits reads BigQuery with queries (joins and filters), not plain table rea
 
 Nothing outside the code can redirect this, which was verified on 2026-10-22:
 
-- Beam v2.76.0 (the version pipe-anchorages main pins) has no pipeline option or environment variable for it; the only input is the transform argument.
+- Beam v2.76.0 (the version pipe-anchorages pins, still at v5.0.1) has no pipeline option or environment variable for it; the only input is the transform argument.
 - The Python Dataflow runner adds nothing; its job-environment `dataset` field is hard-coded and unused by the read path.
 - Prod confirms it: every Beam query job in the last three days wrote to its own fresh `beam_temp_dataset_<hex>`.
 - No GFW pipeline exposes the option; pipe-gaps gets it from DIT's in-process DAG-factory injection, encounters from an overlay.
 
-The v4.6.4 CLI's `--temp_dataset` only ever existed on DIT's local patch branch.
+Re-checked on 2026-11-19 at pipe-anchorages v5.0.1 and gfw-common v0.25.0: neither has a staging-dataset option.
+
+The old v4.6.4 CLI's `--temp_dataset` only ever existed on DIT's local patch branch. DIT dropped that CLI on 2026-11-19.
 
 ## What the patch does
 
-`temp_dataset.patch`, against pipe-anchorages main (b36aed6):
+`temp_dataset.patch`, written against pipe-anchorages main at b36aed6. It applies unchanged to v5.0.1 (767770f): the three patched files did not move.
 
 - adds `src/pipe_anchorages/_dit_overlay.py`: `temp_dataset_kwargs()` returns `{"temp_dataset": DatasetReference(...)}` when `DIT_BQ_TEMP_DATASET=<project>.<dataset>` is set, `{}` otherwise;
 - adds `**temp_dataset_kwargs()` to `read_from_bigquery_kwargs` of every BigQuery read: `ReadMessages` and `ReadNamedAnchorages` in `pipelines/port_state_transitions/main.py`, and `ReadPortStateTransitions` in `pipelines/port_visits/main.py`.
 
 The first version of the patch (`21aed7a5`) missed `ReadNamedAnchorages`, a side input. The first v5 staging smoke (2026-10-22, run `89744c79850f`) failed on it in every mode: Beam tried to create `beam_temp_dataset_<hex>` and got `bigquery.datasets.create` denied. Images tagged `-temp-dataset-21aed7a5` are broken for Dataflow; do not use them.
 
-Unset, the image behaves exactly like the commit it was built from. The argument is set at pipeline construction and pickled into the source, which the workers split, so the overlay image must be **both** the submitter (`--image-tag`) and the worker (`--worker-image`). `workflows/port_visits/ais.py --pipeline-cli v5` sets the variable through the docker runner's `container_env` from `--bq-temp-dataset`.
+Unset, the image behaves exactly like the commit it was built from. The argument is set at pipeline construction and pickled into the source, which the workers split, so the overlay image must be **both** the submitter (`--image-tag`) and the worker (`--worker-image`). `workflows/port_visits/ais.py` sets the variable on every run, through the docker runner's `container_env`, from `--bq-temp-dataset`.
 
 ## How it differs from the encounters overlay
 
@@ -35,7 +39,7 @@ The encounters overlay copies patched files over a published image (`docs/conven
 ```bash
 ./build.sh <pipe-anchorages repo dir> <commit-ish> <label> [--push]
 # e.g.
-./build.sh "$PROJECTS/anchorages_pipeline" b36aed6 main --push
+./build.sh "$PROJECTS/anchorages_pipeline" v5.0.1 v5.0.1 --push          # the default image
 ./build.sh "$PROJECTS/anchorages_pipeline" PIPELINE-4690-one-record-per-vessel-instant pipeline-4690 --push
 ```
 
@@ -43,17 +47,42 @@ Image: `gcr.io/world-fishing-827/dit/pipe-anchorages:<label>-<commit7>-temp-data
 
 `--push` uses docker's gcloud credential helper. If gcloud is set to impersonate a service account without upload rights (e.g. `dq-monitoring@`), the push fails with `uploadArtifacts` denied. Run it as your own account instead: `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT= ./build.sh ... --push`.
 
-Built so far (2026-10-22, PIPELINE-4690):
+Built so far:
 
-| side | commit | image | digest |
-|---|---|---|---|
-| baseline | pipe-anchorages main b36aed6 | `dit/pipe-anchorages:main-b36aed6-temp-dataset-905dc761` | `sha256:31e39bead44142e683f8cf9d54f5a06d8e288ee2ce87e96e1cde3253de2185c8` |
-| candidate | PR #176 head 14b4be8 | `dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` | `sha256:9dd605712c24bbdcb720493dc426c0ac6888929beba0ffc501feb96f3db4c9cb` |
+| side | commit | image | digest | built |
+|---|---|---|---|---|
+| **default** (production's version) | pipe-anchorages v5.0.1, 767770f | `dit/pipe-anchorages:v5.0.1-767770f-temp-dataset-905dc761` | `sha256:a21755a13377e86359677da826c0647a7569ebd5eb75ee468dbc280d8793b106` | 2026-11-19 |
+| baseline | pipe-anchorages main b36aed6 | `dit/pipe-anchorages:main-b36aed6-temp-dataset-905dc761` | `sha256:31e39bead44142e683f8cf9d54f5a06d8e288ee2ce87e96e1cde3253de2185c8` | 2026-10-22, PIPELINE-4690 |
+| candidate | PR #176 head 14b4be8 | `dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` | `sha256:9dd605712c24bbdcb720493dc426c0ac6888929beba0ffc501feb96f3db4c9cb` | 2026-10-22, PIPELINE-4690 |
+
+The v5.0.1 image was checked inside the image when it was built: apache-beam 2.76.0, pipe-anchorages 5.0.1, `verify_overlay.py` passes with the read counts 2 and 1, and `pipe-anchorages port-visits --help` runs. No Dataflow job has run on it yet.
+
+The two October images predate v5.0.1. They lack its later changes, among them the partition filter the port-visits table now requires. Use them only to reproduce the PIPELINE-4690 runs.
 
 Superseded, broken for Dataflow (patch `21aed7a5` missed `ReadNamedAnchorages`): `main-b36aed6-temp-dataset-21aed7a5` (`sha256:ebdd9fd4…a28c07`) and `pipeline-4690-14b4be8-temp-dataset-21aed7a5` (`sha256:e06d29ee…b76ff9`).
 
 The build fails if the patch does not apply (`git apply --check`), and after building runs `verify_overlay.py` inside the image. That self-check asserts the variable is honoured, Beam forwards `temp_dataset` to the export source, the source then skips dataset creation, and both pipelines import the helper. It also asserts that every `ReadFromBigQuery.from_query` in both pipelines passes the patched kwargs, with the expected read count per pipeline (2 and 1), so a read added upstream fails the build instead of the Dataflow job. It also checks the `pipe-anchorages` console script.
 
+## Default image
+
+`workflows/port_visits/ais.py` defaults `--image-tag` and `--worker-image` to the row marked **default** above (`DEFAULT_OVERLAY_IMAGE`). Production's own image cannot be the default, because it has no staging-dataset option.
+
+What follows from that:
+
+- **A reviewed checkout runs v5.0.1.** With a clean checkout of a commit merged into pipe-anchorages `origin/main` and no image flags, the run executes the default image, whatever that commit is.
+- **Unreviewed code needs its own overlay image.** For a dirty tree, a DIT snapshot or a commit not merged into `origin/main`, a run that would execute the default image refuses to start, before any cloud call. Build an overlay image of the commit with `build.sh` and pass it as both `--image-tag` and `--worker-image` (in a cross-version run: `--binding-image-tag` and `--binding-worker-image`).
+- **DIT never auto-builds an image for port visits.** The shared auto-build (`dit.worker_image`) builds plain source. Such an image has no overlay, so its Dataflow job would fail when Beam tries to create a staging dataset.
+- **`--build-from-source` has no overlay either.** It runs `docker compose` on the working tree. That is fine for a local `--runner docker` check. On Dataflow the workflow logs a warning.
+
+When production bumps pipe-anchorages:
+
+1. Build and push the overlay image of the new tag: `./build.sh <repo> <tag> <tag> --push`. The build fails if the patch no longer applies or a BigQuery read was added.
+2. Add its row to the table above, with the digest.
+3. Bump `DEFAULT_PIPELINE_VERSION` and `DEFAULT_OVERLAY_IMAGE` in `workflows/port_visits/ais.py`, and `ProductionTarget.deployed_version` in `cross_version_ais.py`.
+4. If the Beam pin moved, bump `ANCHORAGES_PIPELINE_BEAM_VERSION` in the `Makefile` in the same commit.
+
+`workflows/port_visits/composer_drift.py` reports the bump: it compares `DEFAULT_PIPELINE_VERSION` with the image tag of production's port-visits tasks.
+
 ## Retire it
 
-Delete this directory if pipe-anchorages ever gains a native staging-dataset option, and switch `ais.py --pipeline-cli v5` to pass that option instead of the container variable.
+Delete this directory if pipe-anchorages ever gains a native staging-dataset option. Then `ais.py` passes that option instead of the container variable, and its default image can be production's own.
