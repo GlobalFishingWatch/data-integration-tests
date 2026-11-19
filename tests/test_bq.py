@@ -14,10 +14,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from google.cloud import bigquery
 
 from dit.bq import (
     DEFAULT_PIN_MAX_BYTES,
     SourceWindow,
+    all_rows_predicate,
     check_time_travel,
     derived_source_into_experiment,
     format_pin_stamp,
@@ -609,12 +611,34 @@ _PINNED_AT = datetime(2026, 10, 22, 17, 15, 0, tzinfo=timezone.utc)
 _WINDOW = SourceWindow(column="timestamp", start=date(2026, 9, 1), end=date(2026, 10, 1))
 
 
-def _make_pin_client_mock(estimate: int = 5 * 10**9) -> MagicMock:
+def _source_table(**api_fields) -> bigquery.Table:
+    """Source-table metadata as ``client.get_table`` returns it, built from
+    the REST fields that describe partitioning (no BigQuery call)."""
+    return bigquery.Table.from_api_repr({
+        "tableReference": {"projectId": "p", "datasetId": "d", "tableId": "t"},
+        **api_fields,
+    })
+
+
+_UNPARTITIONED = _source_table()
+#: Production port visits since pipe-anchorages v5.0.1.
+_REQUIRES_FILTER = _source_table(
+    timePartitioning={"type": "MONTH", "field": "end_timestamp"},
+    requirePartitionFilter=True,
+)
+_ALL_END_TIMESTAMPS = "(`end_timestamp` IS NULL OR `end_timestamp` IS NOT NULL)"
+
+
+def _make_pin_client_mock(
+    estimate: int = 5 * 10**9, source: bigquery.Table = _UNPARTITIONED,
+) -> MagicMock:
     """First ``query`` call is the dry run (returns ``estimate`` bytes), the
-    second the copy itself."""
+    second the copy itself. ``source`` is the source table's metadata, read
+    only when a pin has no window."""
     client = MagicMock()
     client.query.return_value.total_bytes_processed = estimate
     client.query.return_value.result.return_value = None
+    client.get_table.return_value = source
     return client
 
 
@@ -727,6 +751,115 @@ def test_pin_without_window_copies_the_whole_table() -> None:
     assert dest.endswith("_messages_positions_all_20261022t171500z")
     assert sql.endswith("WHERE TRUE")
     assert "Rows: all (no filter)" in sql
+    client.get_table.assert_called_once_with(
+        "gfw-int-pipe-v3.pipe_ais_v3_internal.messages_positions"
+    )
+
+
+# -- whole-table pins of partitioned sources ---------------------------------
+#
+# A pin without a window must select every row. ``WHERE TRUE`` does, but
+# BigQuery rejects it on a table that requires a partition filter, so
+# column-partitioned sources get a predicate that names the partition column
+# and still excludes nothing. Copies and views share the rule.
+
+_PIN_HELPERS = pytest.mark.parametrize("pin", ["copy", "view"])
+
+
+def _run_pin(pin: str, client: MagicMock, **overrides) -> str:
+    """Pin through the copy helper or the view helper."""
+    return _pin(client, **overrides) if pin == "copy" else _pin_view(client, **overrides)
+
+
+def _pin_sql(pin: str, source: bigquery.Table, **overrides) -> tuple[MagicMock, str]:
+    """Dry-run a pin (without a window unless overridden) of a source with
+    the metadata ``source``; return the client and the dry-run statement."""
+    client = _make_pin_client_mock(source=source)
+    _run_pin(pin, client, **{"window": None, "dry_run": True, **overrides})
+    return client, client.query.call_args_list[0].args[0]
+
+
+def test_all_rows_predicate_names_the_column_and_keeps_null_rows() -> None:
+    """IS NULL OR IS NOT NULL is true for every row, including the rows whose
+    partition column is NULL, which `col >= <anything>` would drop. The
+    column is quoted, so a reserved word as a column name still parses."""
+    assert all_rows_predicate("end_timestamp") == _ALL_END_TIMESTAMPS
+    assert all_rows_predicate("date") == "(`date` IS NULL OR `date` IS NOT NULL)"
+
+
+@_PIN_HELPERS
+def test_whole_table_pin_of_a_source_that_requires_a_partition_filter(pin: str) -> None:
+    client, sql = _pin_sql(pin, _REQUIRES_FILTER)
+
+    assert sql.endswith(f"WHERE {_ALL_END_TIMESTAMPS}")
+    assert "WHERE TRUE" not in sql
+    client.get_table.assert_called_once()
+
+
+@_PIN_HELPERS
+def test_whole_table_pin_does_not_depend_on_the_requirement_being_set(pin: str) -> None:
+    """A pipeline can switch require_partition_filter on for an existing
+    table. The predicate follows the partition column, which cannot change,
+    so a view's definition stays fixed by its name and a view pinned before
+    the switch stays readable after it."""
+    not_required = _source_table(timePartitioning={"type": "MONTH", "field": "end_timestamp"})
+    _, sql = _pin_sql(pin, not_required)
+
+    assert sql.endswith(f"WHERE {_ALL_END_TIMESTAMPS}")
+
+
+@_PIN_HELPERS
+def test_whole_table_pin_of_an_integer_range_partitioned_source(pin: str) -> None:
+    by_range = _source_table(
+        rangePartitioning={
+            "field": "bucket", "range": {"start": "0", "end": "10", "interval": "1"},
+        },
+        requirePartitionFilter=True,
+    )
+    _, sql = _pin_sql(pin, by_range)
+
+    assert sql.endswith("WHERE (`bucket` IS NULL OR `bucket` IS NOT NULL)")
+
+
+@_PIN_HELPERS
+def test_whole_table_pin_of_an_unpartitioned_source_or_a_view_stays_where_true(pin: str) -> None:
+    _, sql = _pin_sql(pin, _UNPARTITIONED)
+
+    assert sql.endswith("WHERE TRUE")
+
+
+@_PIN_HELPERS
+def test_whole_table_pin_of_an_ingestion_time_source(pin: str) -> None:
+    """No partition column exists, only the _PARTITIONTIME pseudo-column,
+    which SELECT * does not carry. Without the requirement WHERE TRUE works
+    as before; with it the pin is refused before any query, and the message
+    names the way out."""
+    _, sql = _pin_sql(pin, _source_table(timePartitioning={"type": "DAY"}))
+    assert sql.endswith("WHERE TRUE")
+
+    required = _source_table(timePartitioning={"type": "DAY"}, requirePartitionFilter=True)
+    client = _make_pin_client_mock(source=required)
+    with pytest.raises(ValueError, match="partitioned by ingestion time.*_PARTITIONTIME"):
+        _run_pin(pin, client, window=None)
+    client.query.assert_not_called()
+
+
+@_PIN_HELPERS
+def test_a_window_is_used_as_given_without_reading_the_source_metadata(pin: str) -> None:
+    client, sql = _pin_sql(pin, _REQUIRES_FILTER, window=_WINDOW)
+
+    assert sql.endswith("WHERE DATE(timestamp) >= '2026-09-01' AND DATE(timestamp) < '2026-10-01'")
+    client.get_table.assert_not_called()
+
+
+@_PIN_HELPERS
+def test_whole_table_pin_description_says_the_predicate_excludes_nothing(pin: str) -> None:
+    client = _make_pin_client_mock(source=_REQUIRES_FILTER)
+    _run_pin(pin, client, window=None)
+
+    ddl = client.query.call_args_list[1].args[0]
+    assert f"Rows: all (WHERE {_ALL_END_TIMESTAMPS} excludes no row" in ddl
+    assert "Rows: all (no filter)" not in ddl
 
 
 def test_pin_dry_runs_first_and_caps_the_copy_job() -> None:
@@ -821,8 +954,13 @@ def _pin_view(client: MagicMock, **overrides) -> str:
 
 def test_pin_view_emits_a_time_travel_view_named_after_as_of() -> None:
     """IF NOT EXISTS is safe for views: source, as_of and window are all in
-    the name, so a view of that name always has the same definition."""
-    client = _make_pin_client_mock()
+    the name, so a view of that name always has the same definition.
+
+    The source here is production's port-visits table, which requires a
+    partition filter since pipe-anchorages v5.0.1: the whole-table view
+    filters on the partition column inside its definition, so the dry run
+    passes and a plain SELECT over the view needs no filter of its own."""
+    client = _make_pin_client_mock(source=_REQUIRES_FILTER)
     dest = _pin_view(client)
 
     assert dest == (
@@ -837,10 +975,16 @@ def test_pin_view_emits_a_time_travel_view_named_after_as_of() -> None:
     assert "('dit_pin', '20260607t074626z')" in sql
     assert "('dit_source_table', 'port_visits')" in sql
     assert "As of: 2026-06-07T07:46:26+00:00" in sql
-    assert sql.endswith(
-        f"AS SELECT * FROM `{_PROD_OUTPUT}` "
-        "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-06-07T07:46:26+00:00') WHERE TRUE"
+    select = (
+        f"SELECT * FROM `{_PROD_OUTPUT}` "
+        "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-06-07T07:46:26+00:00') "
+        f"WHERE {_ALL_END_TIMESTAMPS}"
     )
+    assert sql.endswith(f"AS {select}")
+    # The dry run is the view's own SELECT, so it fails exactly when a read
+    # through the view would.
+    assert client.query.call_args_list[0].args[0] == select
+    client.get_table.assert_called_once_with(_PROD_OUTPUT)
 
 
 def test_pin_view_windows_rows_and_dry_runs_the_select_it_wraps() -> None:
