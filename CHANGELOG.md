@@ -6,6 +6,17 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-19
+
+#### Fixed
+- **Whole-table pins failed on tables that require a partition filter, which broke `--baseline-production`.** Since pipe-anchorages v5.0.1 the production port-visits table requires a filter on `end_timestamp`. A pin without a date window selected its rows with `WHERE TRUE`, which BigQuery rejects on such a table, so `workflows/port_visits/cross_version_ais.py --baseline-production` stopped at the dry run of the output pin, before creating anything.
+  - **Fix, in `dit.bq`, for copies and views** (`pin_source_into_experiment`, `pin_view_into_experiment`). Without a window, a source partitioned on a column is now filtered with ``(`col` IS NULL OR `col` IS NOT NULL)``. The predicate names the partition column, so BigQuery accepts it, and it is true for every row, including rows whose partition column is NULL. It prunes nothing, so the `--pin-max-gb` cap is what limits a whole-table pin. New helper `dit.bq.all_rows_predicate(column)`, also for hand-written SQL.
+  - **Unchanged:** a pin with a window uses the window as before. Unpartitioned sources and views keep `WHERE TRUE`.
+  - **Refused:** a whole-table pin of a table that is partitioned by ingestion time and requires a filter. It has no partition column; pin it with a window on `_PARTITIONTIME`.
+  - **Reading a pinned view** needs no filter, since the filter is in the view. A reader's own filter on the partition column still prunes.
+  - **Your own SQL on a port-visits table** from pipe-anchorages v5.0.1 or later needs a filter on `end_timestamp`, on DIT's output tables too. The breakdown query in `docs/production-baseline-2026-10.md` now uses the predicate above. Its old filter, `end_timestamp >= TIMESTAMP('1970-01-01')`, would drop rows with a NULL `end_timestamp`; the production table has none. `table-check` adds its own filter and needs no change.
+  - Checked with BigQuery dry runs only. A live production-baseline run has not been repeated.
+
 ### 2026-10-23
 
 #### Verified

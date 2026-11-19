@@ -72,6 +72,53 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-19 — Whole-table pins pass a required partition filter (`--baseline-production` was broken)
+
+**Problem.** pipe-anchorages v5.0.1 sets `require_partition_filter` on the port-visits table it writes (`PortVisitsTableConfig`, MONTH on `end_timestamp`). Production runs v5.0.1, and on 2026-11-19 the production output had the requirement. A pin without a window used `WHERE TRUE`, which BigQuery rejects on such a table (recorded in the 2026-10-22 entry on copies). So `--baseline-production` failed at the dry run of the output pin, before anything was created.
+
+**Reproduced with dry runs.** `SELECT * FROM <production output> [FOR SYSTEM_TIME AS OF …] WHERE TRUE` returns `Cannot query over table '…port_visits' without a filter over column(s) 'end_timestamp' that can be used for partition elimination`. The same error came from `_pin_production` on `main`, run with `--dry-run` and explicit as-of times.
+
+**Decision: fix it in `dit.bq`, for views and copies.** Without a window, the helpers read the source's partitioning (`client.get_table`) and choose the predicate in `_whole_table_predicate`:
+- **Partitioned on a column** (time-unit or integer-range): ``(`col` IS NULL OR `col` IS NOT NULL)``, from the new `all_rows_predicate`.
+- **Not partitioned, or a view:** `TRUE`, as before.
+- **Ingestion-time partitioned and requiring a filter:** `ValueError`. The only column to filter on is `_PARTITIONTIME`, which `SELECT *` does not carry, so a pin could not keep the rows' partitions. The caller passes a window on the pseudo-column.
+- **With a window:** the window, with no metadata read.
+
+**Why this predicate.**
+- BigQuery only checks that the `WHERE` filters on the partition column. The predicate does, and it is a tautology, so no row is excluded.
+- It keeps rows whose partition column is NULL. A comparison such as `col >= '1970-01-01'` drops them.
+- table-check's NULL-safe dummy filter (`col IS NULL OR DATE(col) != '1979-01-01'`) is the same idea, but it drops rows on its sentinel date and assumes a date-like column. A pin must hold every row and may sit on an integer column.
+
+**Why it follows the partition column, not the requirement.** A pipeline can switch the requirement on for an existing table. pipe-anchorages v5.0.1 did that to production's output, which was created in 2026-07 and was still read with `WHERE TRUE` on 2026-10-23. A view pinned before the switch must stay readable after it. The partition column cannot change during a table's life, so the view's definition is still fixed by its name, which is what makes `IF NOT EXISTS` safe for views.
+
+**What this changes for copies (owner to confirm).** The 2026-10-22 entry treated the rejection as useful: a required filter forced a window where a full copy would be expensive. A whole-table copy of such a source now goes through, and only the `--pin-max-gb` cap (1 TB by default, dry-run first) limits it. No current workflow pins a filter-requiring source whole by copy.
+
+**Dry-run evidence (2026-11-19, production output, 447.0 GB).**
+- The predicate is accepted directly, through `FOR SYSTEM_TIME AS OF`, and in the `CREATE TABLE … LIKE … AS SELECT` of a copy.
+- Its estimate is 447,030,966,425 bytes each time, equal to the table's `numBytes`. It prunes nothing.
+- The view's `SELECT`, used as a subquery, is readable by a plain `SELECT *` and by `COUNT(*)`.
+- A month filter on top of it is estimated at 5.3 GB, so readers still prune.
+- `WHERE end_timestamp IS NULL` is estimated at 0 bytes: the table has no rows in the NULL partition today.
+- `_pin_production` with `--dry-run` passes all four pins.
+
+**Other readers of port-visits tables.**
+- `table-check` detects the requirement with a dry run and adds its own filter. `dit.compare` is unchanged.
+- No DIT code reads a port-visits table with SQL of its own.
+- The breakdown query in `docs/production-baseline-2026-10.md` filtered with `end_timestamp >= TIMESTAMP('1970-01-01')`, which is not NULL-safe. It now uses the predicate above. The 2026-10-23 results stand, since the table has no NULL `end_timestamp`.
+
+**Workflow-side workarounds: none.** `cross_version_ais.py` gains one comment in `_pin_production`.
+
+**Sections moved (this commit).**
+- `src/dit/bq.py`: `all_rows_predicate`, `_whole_table_predicate`, `_rows_line`; both pin helpers and their docstrings.
+- `workflows/port_visits/cross_version_ais.py`: a comment in `_pin_production`.
+- Tests: `tests/test_bq.py` (+15) and `tests/test_port_visits_cross_version_ais.py` (+1); 944 → 960.
+- `docs/production-baseline-2026-10.md` (pin step, new section "Tables that require a partition filter", breakdown SQL), `docs/plan.md` § `dit.bq` contract, README § Source data targets, CHANGELOG 2026-11-19.
+
+**Sections NOT moved.**
+- No live run, and no view or copy was created. A read through a real pinned view is untested; the subquery dry run stands in for it.
+- BigQuery accepting the predicate on an integer-range partitioned table that requires a filter is not verified. No such table was at hand.
+- `ProductionTarget` still names v4.6.4. Moving the port-visits workflows to the v5 CLI and v5.0.1 is a separate PR.
+
 ### 2026-10-23 — Worker sizing defaults always mirror production; cost hint for staging runs
 
 **Owner rule (on PR #87, answering its open question).** Sizing defaults ALWAYS mirror production, in every Dataflow workflow, not only in production-baseline mode. Per step, from production's composer snapshot for the production step each workflow step mirrors. Overrides are nudged, especially for non-production data, without prompting or blocking; an explicit CLI value still wins. Worker caps are not part of this and stay as decided in #85. This supersedes "unset by default" from the entry below.
