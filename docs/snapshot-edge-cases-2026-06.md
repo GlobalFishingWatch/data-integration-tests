@@ -8,6 +8,13 @@ Empirical audit of `dit.bq.snapshot_table` / `snapshot_dataset` against two edge
 
 **Update 2026-10-22.** A second blocker this audit missed: since the canonical-dataset migration, snapshots go into `tech_great_expectations` with an expiration, which needs `bigquery.tables.deleteSnapshot`. Neither `automated-testing@` (Data Editor) nor the operator account has it there, so no snapshot into that dataset has ever succeeded (Cloud Build `5153fd50`). `workflows/port_visits/cross_version_ais.py` now pins by copying (`dit.bq.pin_source_into_experiment`, `CREATE TABLE … LIKE … AS SELECT`), which reads across organisations and needs only `bigquery.tables.create`. The other snapshot consumers (`pipe_events/cross_version_fishing.py`, `pipe_segment/identity_match_key.py`, `pipe_gaps/outage_recovery.py` without `--no-snapshot`) still snapshot and are still blocked. The `--snapshot-dest-project` workaround below writes into the production organisation and conflicts with dit's prod-infra boundary.
 
+**Update 2026-11-19 (PIPELINE-4705).** `pipe_gaps/outage_recovery.py` and `pipe_segment/identity_match_key.py` now pin by copying too. What this changes in the sections below:
+- **§ 4, `outage_recovery.py`.** `--snapshot-dest-project` is removed. A production VMS source is read across organisations by the copy, and the copy lands in `world-fishing-827`. `--pin-at` is removed as well: the copy is taken at run start.
+- **§ 4, `identity_match_key.py`.** The latent bug is closed by refusing `--include-satellite-offsets` at argument parsing. The option could not work for two reasons this audit did not cover: its inputs are date-sharded tables, which dit does not support, and pipe-segment's offsets query reads its message source through a table wildcard that a partitioned table does not match. `--snapshot-dest-project` is removed here too.
+- **§ 5, "Tactical: add `--snapshot-dest-project` to pipe-segment"** (done in June) is undone by the above.
+- **View sources.** A copy with `CREATE TABLE … LIKE` rejects a view source, as a snapshot does. Both workflows therefore still need table sources. View sources for `pin_source_into_experiment` are a separate change under PIPELINE-4705.
+- Still on snapshots, and still blocked: `pipe_events/cross_version_fishing.py`.
+
 ## TL;DR
 
 | Edge case | Result | Risk class |

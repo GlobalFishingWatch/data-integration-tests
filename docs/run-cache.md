@@ -78,6 +78,15 @@ cache_key = sha256(json.dumps({
 
 **Per-workflow filter.** Each workflow's `parse_args` exposes a `canonical_params_dict(args) -> dict` function listing the output-affecting keys. Reviewer ensures new args land in the right side (output vs plumbing). When in doubt, default to including — false invalidation costs one recompute; false cache hit costs a wrong verdict.
 
+**Pinned inputs (2026-11-19, PIPELINE-4705).** A workflow that pins its sources by copy reads the copies, not the sources, so the copies identify its inputs.
+- **`pipe_gaps/outage_recovery.py`** puts the copies' names in its params (`pinned_messages`, `pinned_segments`), next to the source FQNs. A name holds the experiment id, the source's table name, the window and the pin stamp.
+  - A `--reuse-pin` rerun recomputes the same names and hits.
+  - A new pin has a new stamp and misses. Its copies were taken at another time.
+  - With `--no-pin` both are null. Live reads of the same sources then share rows, which is right only while the sources do not change. Use `--no-cache` otherwise.
+- **Consequence:** the experiment id reaches this key through the copies' names. It is still not a param of its own. Two experiments never share a pinned row, because they never share a copy.
+- **`port_visits/cross_version_ais.py`** gets the same effect through each binding's `ais.py` run, whose source FQN params are the copies.
+- The key had `pin_at` (the snapshot time) and a `no_snapshot` marker before. Rows written then miss anyway: the workflow file's sha1 changed.
+
 ## Lookup + write flow
 
 ```

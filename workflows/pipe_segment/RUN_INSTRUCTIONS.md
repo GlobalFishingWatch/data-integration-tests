@@ -8,19 +8,21 @@ End-to-end steps to A/B-test the gpsdio-segment identity-match-key change
 runs (pipe-segment v5.0.3, the six tasks of the AIS v3 DAG's segment group;
 see [`composer_drift.py`](composer_drift.py)). That was established by reading
 code. The only recorded run is one laptop smoke of the `segment` step on
-2026-06-03. Three things still stand between this file and a full run:
+2026-06-03. Two things still stand between this file and a full run:
 
-- **Source pinning.** Step 2 of the workflow snapshots its source table, and
-  no DIT identity can create a snapshot with an expiration in
-  `tech_great_expectations`. Until the workflow pins by copy
-  ([PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705))
-  it is expected to stop there.
 - **Dataflow as the test service account.** pipe-segment has no way to name
   the dataset Beam stages query results in, and `automated-testing@` may not
   create one. Sections 6 and 7 need an overlay image first, as port visits and
   encounters have. Inferred from the code; not tried.
 - **Nothing here has run end to end.** Treat the expected results below as
   expectations.
+
+Source pinning no longer stands in the way. The workflow pinned its source
+with a BigQuery snapshot, which no DIT identity can create in
+`tech_great_expectations`. Since 2026-11-19 it pins by copy
+([PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705));
+see section 5. The copy statement was accepted by BigQuery dry runs. No copy
+has been created yet.
 
 ## 1. Install dit
 
@@ -168,17 +170,42 @@ before it wrote; the first failure ends the binding.
   `--dest-dataset` (default `tech_great_expectations`).
 - `--date-range` is inclusive on both ends.
 
+**The pinned source.** Before any binding runs, the workflow copies the
+normalized messages of the run's `--date-range` into
+`world-fishing-827.tech_great_expectations`. Every binding's `segment` reads
+that copy, so a difference between bindings comes from their code.
+
+- The copy holds exactly the run's days. `segment` reads its source by date
+  between the two ends of `--date-range`, with no lookback, and no other step
+  reads it (pipe-segment v5.0.3).
+- Size on the staging table: 10.7 MB for one day, 363 MB for January 2020,
+  3.78 GB for all of 2020 (dry runs, 2026-11-19).
+- The run logs a pin stamp, e.g. `20261119t101500z`. It ends the copy's name:
+  `dit_exp_<experiment id>_pipe_segment_normalized_messages_<start>_<end>_<stamp>`.
+- `--reuse-pin <stamp>` reads an earlier run's copy again, e.g. to retry after
+  a failed binding. It needs the same `--experiment-id`, `--date-range` and
+  source table, and fails if the copy is gone.
+- `--pin-max-gb` (default 1000) refuses a copy that would process more.
+  `--pin-expiration-days` (default 7) sets when the copy expires.
+- `--dry-run` only dry-runs the copy, reports its bytes against the cap and
+  skips the pipe-segment steps and the diff. It still creates the worktrees.
+- `--source-normalized-table` must be one table, partitioned on `timestamp`:
+  not a view and not date-sharded tables.
+- Removed with the snapshots: `--pin-source-at`, `--snapshot-dest-project`,
+  `--snapshot-expiration-days`. Each is rejected with what replaces it.
+
 **Not production's state.** A binding starts from empty tables. `segment` has
 no fragment history to stitch onto, and `segment_vessel_daily` sees only the
 run's own days in its 30-day window. Both are the same for every binding, so
 the A/B is fair; the tables are not comparable with production's.
 
 **Satellite offsets.** Production's `segment` also reads satellite positions
-and writes clock offsets. `--include-satellite-offsets` asks for that here. It
-is off by default and should stay off: the satellite positions are
-date-sharded, which DIT does not support, their snapshot is blocked across
-organisations, and the offsets query reads its message source as date shards,
-which DIT's partitioned source is not. Whether the option stays is an open
+and writes clock offsets. No run here does. `--include-satellite-offsets`
+asked for it and is refused at argument parsing, before any cloud call
+(PIPELINE-4705). It could not work: the satellite positions are date-sharded
+tables in another organisation, which DIT does not support, and the offsets
+query reads its message source through a table wildcard, which DIT's
+partitioned source does not match. Whether the option is deleted is an open
 decision.
 
 ## 6. DirectRunner smoke (laptop, fast)
@@ -190,7 +217,6 @@ vessels, source = staging cohort. Start with the `segment` step:
 cd ~/git/data_integration_tests
 dit run workflows/pipe_segment/identity_match_key.py \
     --experiment-id pipe-segment-smoke \
-    --pin-source-at 2026-06-03T10:00:00Z \
     --binding before=v5.0.3 \
     --date-range 2020-01-01,2020-01-01 \
     --runner DirectRunner \
@@ -216,13 +242,12 @@ Expected:
 
 ## 7. Cloud-build smoke (one-binding, Dataflow)
 
-Needs the two prerequisites in the status note at the top.
+Needs the overlay image named in the status note at the top.
 
 ```bash
 make dit-cloud PIPELINE=pipe-segment \
     WORKFLOW=workflows/pipe_segment/identity_match_key.py \
     ARGS="--experiment-id pipe-segment-cloud-smoke \
-          --pin-source-at 2026-06-03T10:00:00Z \
           --binding before=v5.0.3 \
           --date-range 2020-01-01,2020-01-01 \
           --runner dataflow \
@@ -238,7 +263,6 @@ Reviewed v5.0.3 → no kaniko build, pulls canonical image.
 make dit-cloud PIPELINE=pipe-segment \
     WORKFLOW=workflows/pipe_segment/identity_match_key.py \
     ARGS="--experiment-id idmatchkey \
-          --pin-source-at 2026-06-03T10:00:00Z \
           --binding before=v5.0.3 \
           --binding after=experiment/identity-match-key-transponder-only \
           --date-range 2020-01-01,2020-01-03 \
@@ -287,8 +311,9 @@ label, so `make dit-cancel` finds nothing for it.
 - Dataflow jobs: named `dit-pipe-segment-<step>-<experiment id>-<binding name>`.
   Cancel a running one in the Dataflow console or with
   `gcloud dataflow jobs cancel`.
-- Source snapshots expire after 7 days (configurable via
-  `--snapshot-expiration-days`).
+- The pinned copy of the source expires after 7 days (configurable via
+  `--pin-expiration-days`). It carries the labels `dit_artifact=source_pin`
+  and `dit_experiment_id=<experiment id>`.
 
 ## Troubleshooting
 
@@ -296,10 +321,13 @@ label, so `make dit-cancel` finds nothing for it.
 |---|---|
 | `gpsdio-segment pin -> …` identical across bindings | The "after" branch wasn't pushed, or the worktree didn't pick it up. Re-fetch the pipe-segment refs (`git -C ~/git/pipe-segment fetch origin`). |
 | All output-table diffs IDENTICAL | Either the "after" image wasn't actually built (check the kaniko build log for the relevant commit) or `--image-tag` was set to a single image overriding the per-binding auto-build. |
-| `rows_only_in_a` / `rows_only_in_b` non-zero on `messages_segmented` | Source data wasn't pinned (different snapshot for each binding). Re-run with the same `--pin-source-at`. |
+| `rows_only_in_a` / `rows_only_in_b` non-zero on `messages_segmented` | The bindings did not read the same copy, e.g. they ran in two invocations without `--reuse-pin`. Re-run them in one invocation, or the second with the first's `--reuse-pin <stamp>`. |
 | `rows_only_in_a` / `rows_only_in_b` non-zero on `vessel_info` or `segment_vessel` | Expected when identities change: `vessel_id` is in the key (section 8). |
 | A step fails with `TypeError: 'NoneType' object is not iterable` in `BigQueryHelper` | The step got no `--labels`. The workflow passes them on every step; check for a hand-built command line. |
 | `--binding name … is too long for the Dataflow job name` | On Dataflow a binding name may be at most 27 characters. Shorten it. |
-| The source snapshot is denied (`deleteSnapshot`) | Source pinning by snapshot does not work in `tech_great_expectations` (status note at the top). |
+| `pinning … would process … GB, above the … GB cap` | The copy of the run's dates is larger than `--pin-max-gb`. Narrow `--date-range`, or raise the cap on purpose. |
+| `pinned copy … does not exist` with `--reuse-pin` | The copy expired, or the stamp, `--experiment-id`, `--date-range` or source table differ from the run that made it. |
+| The copy is denied `bigquery.tables.create` | The identity may not create tables in `tech_great_expectations`. With gcloud impersonating `dq-monitoring@`, that is the case. |
 | A Dataflow job fails creating `beam_temp_dataset_…` | The test service account may not create datasets, and pipe-segment cannot be told which dataset to use (status note at the top). |
-| `Cannot snapshot tables across projects that are in different orgs` | `--include-satellite-offsets` reads satellite positions from another organisation. Leave the option off (section 5). |
+| `--include-satellite-offsets cannot run and is refused` | The option is refused at argument parsing (section 5). Drop the flag. |
+| `… was removed with snapshot pinning` | `--pin-source-at`, `--snapshot-dest-project` or `--snapshot-expiration-days` was passed. The message names what to use instead. |

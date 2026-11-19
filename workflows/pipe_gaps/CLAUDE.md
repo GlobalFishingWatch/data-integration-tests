@@ -34,7 +34,8 @@ by which a reprocess takes ownership of the tail.
    Today this is satisfied: the recovery range is `[outage_start -
    recovery_buffer_days, end]` (the recovery stage runs `pipe-gaps
    detect --start_date <recovery_start> --end_date <end>` against the
-   snapshot/live source), which always terminates at `end`. Keep it
+   pinned copy or, with `--no-pin`, the live source), which always
+   terminates at `end`. Keep it
    that way in any redesign. The same applies to any future "recovery"
    / "fix" stage in any sibling workflow.
 
@@ -122,3 +123,68 @@ contract-violation reason, not a pipe-gaps bug. Don't do this.
   a degenerate config that would violate the contract. That's a future
   guard worth adding if a foot-gun ever materialises; for now, code
   review on PRs in this directory is the enforcement.
+
+## Source pinning in `outage_recovery.py` (2026-11-19, PIPELINE-4705)
+
+`outage_recovery.py` copies its sources at run start
+(`dit.bq.pin_source_into_experiment`). Every stage and the oracle read
+the copies. `mode_equivalence.py` does not pin.
+
+### What the copies must hold
+
+The copies are windowed by what pipe-gaps reads. Read from pipe-gaps
+v0.10.0, the default worker image:
+
+- **Messages.** `messages.sql.j2` filters `DATE(timestamp) >= start_date
+  AND DATE(timestamp) < end_date`. The start it gets is not the run's
+  start: `DetectGapsConfig.messages_query_start_date` subtracts
+  `ceil(n_hours_before / 24)` days. A job over `[s, e)` reads the
+  messages of `[s - lookback, e)`.
+- **Segments.** The same query reads `seg_id` from the segments table
+  with no date filter. The whole table is read, so the whole table is
+  copied.
+- **Open gaps.** The side input reads the run's own output table, not a
+  source.
+
+So the messages copy covers `[--start - lookback, --end]`
+(`_messages_window`). Stage 1 and the oracle start at `--start`, and
+every job ends at `--end`.
+
+### Rules for workflow authors
+
+1. **A new stage must read inside the window, or the window must
+   grow.** A stage that starts before `--start`, or ends after `--end`,
+   would read fewer rows from the copy than from the source, without an
+   error. `test_the_messages_window_covers_what_every_stage_and_the_oracle_read`
+   checks the stages there are; extend it with any new one.
+2. **Re-read the pipe-gaps SQL when the default worker image moves.**
+   The window encodes v0.10.0's lookback. `messages.sql.j2` is the same
+   at v0.17.1, but a later change to the lookback, or a new date-less
+   read of the messages, would make the copy too small.
+3. **The cache key holds the copies' names.** Anything new that changes
+   what a job reads must show in the key: either through the names, or
+   as a param of its own.
+4. **`--synthetic-outage` filters the copy, not the source.** Stages 1
+   and 2 read the view; stage 3 and the oracle read the unfiltered
+   copy. With `--no-pin` the view filters the live source.
+
+### Worked example
+
+Default run, `--n-hours-before 12`:
+
+```
+messages copy:  DATE(timestamp) in [2019-12-31, 2021-01-01)   4.41 GB (the whole staging table)
+segments copy:  all rows                                       4.1 MB
+```
+
+Names (`<stamp>` is the run's start time in UTC, e.g. `20261119t101500z`):
+
+```
+dit_exp_<experiment>_outage_messages_positions_20191231_20210101_<stamp>
+dit_exp_<experiment>_outage_segs_activity_all_<stamp>
+```
+
+`--reuse-pin <stamp>` reads these again. It needs the same
+`--experiment-id`, `--start`, `--end`, `--n-hours-before` and source
+table names, since all of them are in the names. The outage dates and
+the recovery buffer may differ.

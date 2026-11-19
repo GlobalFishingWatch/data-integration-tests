@@ -330,7 +330,7 @@ Read at composer `origin/main` df5c973c7. The check exits 0: the workflows marke
   Accepted differences, each with its reason in the spec:
   - `--project`: DIT's own project; the SQL steps name it where production leaves it to the CLI's default.
   - `--in_normalized_messages_table`: DIT's pinned staging cohort.
-  - The three satellite-offset inputs of `segment`: the branch is off in DIT by default, because its inputs are date-sharded. Whether to keep `--include-satellite-offsets` at all is an open owner decision.
+  - The three satellite-offset inputs of `segment`: the branch is off in DIT by default, because its inputs are date-sharded. Whether to keep `--include-satellite-offsets` at all is an open owner decision; the workflow refuses the flag since 2026-11-19 (PIPELINE-4705).
 
   None of this was confirmed by a run. The check compares argv only.
 
