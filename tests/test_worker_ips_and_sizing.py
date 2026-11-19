@@ -51,7 +51,6 @@ INFRA_ARGV = [
 ]
 SEGMENT_ARGV = [
     "--experiment-id", "exp",
-    "--pin-source-at", "2026-06-03T10:00:00Z",
     "--binding", "before=v5.0.3",
     "--date-range", "2020-01-01,2020-01-01",
 ]
@@ -429,7 +428,7 @@ def _segment_argvs(*cli, runner="dataflow"):
     ):
         assert pipe_segment._run_binding(
             name="before", ref="v5.0.3", args=args, suffix="exp_before",
-            snapshot_fqns=pipe_segment._PipeSegmentSnapshotFQNs(normalized_messages="p.d.n"),
+            pinned=pipe_segment._PinnedSources(normalized_messages="p.d.n"),
         ) == 0
     assert [argv[0] for argv in calls] == [*SEGMENT_BEAM_STEPS, *SEGMENT_SQL_STEPS]
     return calls

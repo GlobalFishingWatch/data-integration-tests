@@ -15,15 +15,24 @@ through ``dit.runners.docker.run`` + ``dit.workflow.resolve_run_context``).
 Steps:
 
 1. Verify every binding's git ref exists in ``--pipeline-dir``.
-2. Snapshot the source data into the canonical
-   ``<project>.tech_great_expectations`` dataset (per-table
-   ``expiration_timestamp``, default 7 days; ``--snapshot-dest-project``
-   overrides for the cross-org dodge path -- see below). Sources:
-   ``normalized_messages`` (single partitioned table); when
-   ``--include-satellite-offsets`` is set, also ``satellite_positions_*``
-   shards + ``norad_to_receiver_*``. Snapshots land as
-   ``dit_exp_<sanitised(experiment_id)>_pipe_segment_<source_basename>``
-   tables via ``dit.bq.snapshot_into_experiment``.
+2. Pin the source by copying it at run start
+   (``dit.bq.pin_source_into_experiment``, PIPELINE-4705) into
+   ``world-fishing-827.tech_great_expectations`` (default 7-day TTL). The one
+   source is ``normalized_messages``, copied over the run's ``--date-range``:
+   ``segment`` reads it by ``DATE(<partition column>) BETWEEN start AND end``
+   and nothing else of it (``transform/read_messages.py`` at v5.0.3; no
+   lookback), and no other step reads it. The copy keeps the source's
+   partitioning, which pipe-segment reads the filter column from. Its name
+   ends in the pin stamp (the run's start time in UTC, e.g.
+   ``20261119t101500z``):
+   ``dit_exp_<experiment_id>_pipe_segment_<source table>_<start>_<end>_<stamp>``.
+   ``--reuse-pin <stamp>`` reuses an earlier run's copy, e.g. on a retry.
+   ``--pin-max-gb`` caps the bytes the copy may process. Copies replaced
+   BigQuery snapshots on 2026-11-19: BigQuery refuses a snapshot of a table
+   in another organisation, and no DIT identity may create one with an
+   expiration. ``--pin-source-at``, ``--snapshot-dest-project`` and
+   ``--snapshot-expiration-days`` are gone; each is rejected with what
+   replaces it.
 3. For each binding (sequential -- chdir for ``dit_docker.run`` isn't
    thread-safe; with 2 bindings the cost is negligible):
 
@@ -88,14 +97,17 @@ Production runs the last three in parallel; here they run one after the other.
 tables, so ``segment`` has no fragment history to stitch onto and
 ``segment_vessel_daily`` sees only the run's own days in its 30-day window.
 Both hold for every binding alike, so an A/B is fair; the outputs are not
-comparable with production's own tables. The satellite-offset branch is off
-unless ``--include-satellite-offsets`` is given (see the constants below).
+comparable with production's own tables. The satellite-offset branch is off,
+and ``--include-satellite-offsets`` is refused (see the constants below).
+
+``--dry-run`` skips the pipe-segment invocations and the diff phase, and only
+dry-runs the copy (reporting its bytes against the ``--pin-max-gb`` cap). It
+still sets up and tears down the worktrees.
 
 Example (DirectRunner smoke, 1 day, single binding to validate plumbing)::
 
     dit run workflows/pipe_segment/identity_match_key.py \\
         --experiment-id pipe-segment-smoke \\
-        --pin-source-at 2026-06-03T10:00:00Z \\
         --binding before=v5.0.3 \\
         --date-range 2020-01-01,2020-01-01 \\
         --runner DirectRunner \\
@@ -106,7 +118,6 @@ Example (Dataflow A/B, 1 day, after the experiment branches are pushed)::
 
     dit run workflows/pipe_segment/identity_match_key.py \\
         --experiment-id idmatchkey \\
-        --pin-source-at 2026-06-03T10:00:00Z \\
         --binding before=v5.0.3 \\
         --binding after=experiment/identity-match-key-transponder-only \\
         --date-range 2020-01-01,2020-01-01 \\
@@ -170,7 +181,8 @@ PROJECT = "world-fishing-827"
 DEFAULT_DEST_DATASET = os.environ.get("DIT_DEST_DATASET", "tech_great_expectations")
 DEFAULT_PROJECTS_DIR = os.environ.get("PROJECTS") or str(Path(__file__).resolve().parents[2].parent)
 DEFAULT_PIPELINE_DIR = os.path.join(DEFAULT_PROJECTS_DIR, "pipe-segment")
-DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
+DEFAULT_PIN_EXPIRATION_DAYS = 7
+DEFAULT_PIN_MAX_GB = dit_bq.DEFAULT_PIN_MAX_BYTES / 1e9
 
 # Canonical published pipe-segment image, pinned at the prod version that
 # composer-dags-production currently runs (``Versions.SEGMENT = "v5.0.3"`` in
@@ -206,48 +218,52 @@ GCP_VOLUME = "gcp:/root/.config"
 # Default source: the staging-cohort normalized messages table, matching the
 # dit convention used by pipe-gaps and port-visits (`pipe_ais_test_202408290000_*`).
 # Single date-partitioned table (partitioned on `timestamp`, clustered on `ssvid`);
-# see CLAUDE.md § "Staging data conventions" / README.md § "Staging data sources".
+# see README.md § "Source data targets".
 # Override via --source-normalized-table for ad-hoc runs against a different
 # normalized source (e.g. prod cohort, a custom-filtered subset).
 DEFAULT_SRC_NORMALIZED_TABLE = (
     f"{PROJECT}.pipe_ais_test_202408290000_internal.normalized_messages"
 )
 
-# Satellite-offsets inputs are NOT in the staging cohort; they're date-sharded
-# in prod. Opt in via --include-satellite-offsets to also run the offsets
-# branch of `segment` (and snapshot the relevant prod tables). For the
-# identity-match-key change under test, satellite offsets are not relevant,
-# so the default is OFF.
+# Role of the pinned copy in its name, and the column its window is on.
+# `segment` filters its source on DATE(<the source's partition column>), or on
+# DATE(timestamp) when the source is not time-partitioned
+# (utils/bq_source.py at v5.0.3). The default source is partitioned on
+# `timestamp` (checked with `bq show`, 2026-11-19). A source partitioned on
+# another column would be copied over one column and read over another; the
+# workflow does not check this.
+PIN_ROLE = "pipe_segment"
+NORMALIZED_WINDOW_COLUMN = "timestamp"
+
+# Satellite offsets: production's `segment` task always passes three
+# satellite-offset inputs. This workflow leaves them out, and that is an
+# accepted difference in its drift spec (composer_drift.py).
 #
-# Production's `segment` task always passes the three satellite-offset inputs.
-# Leaving them out is an accepted difference in this workflow's drift spec
-# (composer_drift.py), for these reasons (read from pipe-segment v5.0.3, not
-# run):
-#   * the satellite positions are date-sharded, and dit does not support
-#     date-sharded inputs;
+# `--include-satellite-offsets` asked for that branch. It cannot work, so the
+# flag is refused at argument parsing (PIPELINE-4705). Read from pipe-segment
+# v5.0.3, not run:
+#   * the satellite positions are date-sharded tables in another organisation
+#     (`gfw-int-pipe-v3`), and dit does not support date-sharded inputs;
 #   * the offsets query reads its message source as `<table>*` filtered on
 #     `_TABLE_SUFFIX` (assets/satellite_offsets.sql.j2), which matches a
 #     date-sharded source only. dit's source is one partitioned table, so the
 #     query would read no rows.
+# The code that snapshotted those inputs went with snapshot pinning. What is
+# left of the option is the refused flag, the branch of `_segment_args` that
+# emits the four flags, `SAT_OFFSET_OUTPUT_TABLES` and its compare key. None
+# of it is reachable from the command line. Whether to delete the option is
+# the owner's decision.
 # With the branch off, `messages_segmented` keeps messages that production
-# drops when a satellite's clock is off. Whether to remove this option is the
-# owner's decision; its behaviour is unchanged.
-#
-# Cross-org caveat for the opt-in: the satellite-positions source lives in
-# `gfw-int-pipe-v3` (org `115316357079`), which is a DIFFERENT GCP org from
-# `world-fishing-827` (org `433637338589`). BQ refuses cross-org snapshots,
-# so a default `--include-satellite-offsets` run that lets the dest project
-# default to `world-fishing-827` fails fast with "Cannot snapshot tables
-# across projects that are in different orgs". The escape hatch is
-# `--snapshot-dest-project gfw-int-pipe-v3` (matching `outage_recovery.py`'s
-# shape): all snapshots then land in `gfw-int-pipe-v3.tech_great_expectations`
-# and BQ accepts the same-org clone. The caller is responsible for ensuring
-# `--source-normalized-table` is ALSO in `gfw-int-pipe-v3`'s org when
-# `--include-satellite-offsets` is set, otherwise the normalized-messages
-# snapshot hits the same cross-org block.
-PROD_NORAD_TABLE = f"{PROJECT}.pipe_static.norad_to_receiver_v20230510"
-PROD_SAT_POS_DATASET = "gfw-int-pipe-v3.satellite_positions"
-PROD_SAT_POS_STEM = "satellite_positions_one_second_resolution_"  # date-sharded
+# drops when a satellite's clock is off.
+SATELLITE_OFFSETS_REFUSED = (
+    "--include-satellite-offsets cannot run and is refused (PIPELINE-4705). Its "
+    "inputs, the satellite positions, are date-sharded tables in another "
+    "organisation, and DIT does not support date-sharded inputs. pipe-segment's "
+    "offsets query also reads its message source through a table wildcard "
+    "(`<table>*` filtered on _TABLE_SUFFIX), which does not match a partitioned "
+    "table such as DIT's source. Drop the flag: the run then leaves the "
+    "satellite-offset branch off, as every run of this workflow has."
+)
 
 # Output tables produced by `segment`. Single date-partitioned tables since
 # pipe-segment v5.0.0 (PIPELINE-2074: sharded date tables to partitioned
@@ -259,7 +275,8 @@ SEGMENT_OUTPUT_TABLES = (
     "fragments",
 )
 
-# Only produced + diffed when --include-satellite-offsets is set.
+# Produced and diffed only with the satellite-offset branch, which no run can
+# ask for while --include-satellite-offsets is refused (see above).
 SAT_OFFSET_OUTPUT_TABLES = (
     "satellite_timing_offsets",
 )
@@ -367,6 +384,23 @@ COMPARE_KEYS = {
 # Argparse
 # --------------------------------------------------------------------------
 
+#: Flags removed with snapshot pinning (PIPELINE-4705), and what to do instead.
+REMOVED_FLAGS = {
+    "--pin-source-at": "the source is pinned by copying it at run start, and a copy "
+                       "cannot be taken at a past time. Drop the flag; to reuse an "
+                       "earlier run's copy, pass --reuse-pin <stamp>.",
+    "--snapshot-dest-project": "the pinned copy always lands in "
+                               f"{PROJECT}.{dit_bq.CANONICAL_DATASET}; a copy only reads "
+                               "its source, so a source in another organisation needs "
+                               "no flag. Drop it.",
+    "--snapshot-expiration-days": "use --pin-expiration-days.",
+}
+
+
+def _removed_flag_dest(flag: str) -> str:
+    return "removed_" + flag.lstrip("-").replace("-", "_")
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Cross-version A/B for pipe-segment, varying the gpsdio-segment dep.",
@@ -377,16 +411,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # output-table suffix shape is portable across them. (Copilot PR #44
     # comment.)
     add_experiment_id_arg(p)
-    p.add_argument("--pin-source-at", required=True,
-                   help="ISO 8601 timestamp for the source-data snapshot (e.g. 2026-06-03T10:00:00Z).")
+    for removed in REMOVED_FLAGS:
+        # Still parsed, hidden, so an old invocation fails with a message that
+        # names the replacement. nargs="?" so that holds with or without a value.
+        p.add_argument(removed, nargs="?", const="", default=None,
+                       dest=_removed_flag_dest(removed), help=argparse.SUPPRESS)
     p.add_argument("--binding", action="append", required=True, dest="bindings",
                    help="`name=ref` pair, repeatable. `name` must satisfy the experiment-id "
                         "regex (lowercase / digits / _ / -, max 32 chars) since it is embedded "
                         "into BQ table names and the docker compose project name. Each ref "
                         "must resolve in --pipeline-dir.")
     p.add_argument("--date-range", required=True,
-                   help="YYYY-MM-DD,YYYY-MM-DD. Forwarded to `segment` and used to derive "
-                        "the date-shard list snapshotted from the source dataset.")
+                   help="YYYY-MM-DD,YYYY-MM-DD, inclusive on both ends. Forwarded to the "
+                        "steps and used to window the pinned copy of the source.")
     p.add_argument("--runner", default="dataflow", choices=("DirectRunner", "dataflow"),
                    help="DirectRunner runs in-process inside the compose container; dataflow "
                         "submits to GCP. Default: dataflow. For Dataflow, --sdk_container_image "
@@ -395,15 +432,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="pipe-segment checkout used for git worktrees.")
     p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                    help="BQ dataset holding the output tables produced by each binding's run.")
-    p.add_argument("--snapshot-expiration-days", type=int, default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
-                   help="Per-table expiration_timestamp for the source snapshots, in days.")
-    p.add_argument("--snapshot-dest-project", default=PROJECT,
-                   help=f"Project that owns the snapshot tables (in `<project>.tech_great_expectations`). "
-                        f"Default: {PROJECT}. Override for the cross-org dodge path: BQ refuses to "
-                        f"snapshot across projects in different orgs, so when running with "
-                        f"--include-satellite-offsets (sources in `gfw-int-pipe-v3`, org "
-                        f"`115316357079`), set this to `gfw-int-pipe-v3` so source and dest live "
-                        f"in the same org. Mirrors workflows/pipe_gaps/outage_recovery.py.")
+    p.add_argument("--reuse-pin", default=None, metavar="STAMP",
+                   help="Reuse the pinned copy of an earlier run with the same --experiment-id, "
+                        "--date-range and source instead of copying again. STAMP is the pin "
+                        "stamp that run logged (e.g. 20261119t101500z). Fails if the copy is "
+                        "missing.")
+    p.add_argument("--pin-expiration-days", type=int, default=DEFAULT_PIN_EXPIRATION_DAYS,
+                   help=f"Days until the pinned copy expires. Default "
+                        f"{DEFAULT_PIN_EXPIRATION_DAYS}.")
+    p.add_argument("--pin-max-gb", type=float, default=DEFAULT_PIN_MAX_GB,
+                   help=f"Refuse to pin a source whose copy would process more than this many GB "
+                        f"(10^9 bytes), checked by a dry run. Default {DEFAULT_PIN_MAX_GB:g}.")
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
                    help=f"Pipeline image to run pipe-segment in. Default: {DEFAULT_IMAGE_TAG} "
                         f"(canonical published v5.0.3). For reviewed code at this default, the "
@@ -426,25 +465,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Run and diff the segment step only; skip the other five "
                         f"({', '.join(STEPS[1:])}). Useful for fast smoke tests.")
     p.add_argument("--dry-run", action="store_true",
-                   help="Skip pipe-segment invocations and the diff phase; still snapshots source "
-                        "and sets up worktrees. Lets you validate orchestration without burning runs.")
+                   help="Skip pipe-segment invocations and the diff phase; dry-run the copy only "
+                        "(its bytes are checked against --pin-max-gb and nothing is created); "
+                        "still sets up worktrees. Lets you validate orchestration without "
+                        "burning runs.")
     p.add_argument("--ssvid-filter-query", default=None,
                    help="Optional SSVID filter to thin the source data (forwarded to "
                         "segment's --ssvid_filter_query). Highly recommended for DirectRunner "
                         "smoke tests; format: comma-separated double-quoted strings.")
     p.add_argument("--source-normalized-table",
                    default=DEFAULT_SRC_NORMALIZED_TABLE,
-                   help=f"Fully-qualified FQN of the normalized AIS messages source. "
+                   help=f"Fully-qualified FQN of the normalized AIS messages source, which is "
+                        f"pinned by copy over --date-range. "
                         f"Default: {DEFAULT_SRC_NORMALIZED_TABLE} (staging cohort, "
-                        f"single date-partitioned table). pipe-segment's BigQuerySource "
-                        f"auto-detects partitioning vs sharding, so any normalized AIS "
-                        f"source table works (e.g. prod cohort, custom-filtered subset).")
+                        f"single date-partitioned table). Must be one table (not a view, not "
+                        f"date-sharded tables) partitioned on `timestamp`, e.g. the prod cohort "
+                        f"or a custom-filtered subset.")
     p.add_argument("--include-satellite-offsets", action="store_true",
-                   help="Also run the satellite-offsets branch of `segment` (requires "
-                        "satellite_positions and norad_to_receiver tables). Default OFF: "
-                        "the identity-match-key change under test doesn't touch sat offsets, "
-                        "and those tables are NOT mirrored to the staging cohort, so "
-                        "enabling this snapshots from prod instead.")
+                   help="REFUSED: this option cannot run (PIPELINE-4705). The satellite-offset "
+                        "branch of `segment` reads date-sharded satellite positions in another "
+                        "organisation, which DIT does not support, and its query reads the "
+                        "message source through a table wildcard that a partitioned table does "
+                        "not match. Passing the flag fails at argument parsing. Whether the "
+                        "option is deleted is an open decision.")
     p.add_argument("--service-account",
                    default="automated-testing@world-fishing-827.iam.gserviceaccount.com",
                    help="Service account for Dataflow runs.")
@@ -462,9 +505,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     args = p.parse_args(argv)
 
+    for removed, instead in REMOVED_FLAGS.items():
+        if getattr(args, _removed_flag_dest(removed)) is not None:
+            raise SystemExit(
+                f"{removed} was removed with snapshot pinning (PIPELINE-4705): {instead}"
+            )
+        delattr(args, _removed_flag_dest(removed))
+    if args.include_satellite_offsets:
+        raise SystemExit(SATELLITE_OFFSETS_REFUSED)
+
     args.bindings = [_parse_binding(b) for b in args.bindings]
-    args.pin_source_at = _parse_iso8601(args.pin_source_at)
     args.date_range = _parse_daterange(args.date_range)
+    if args.reuse_pin is not None:
+        try:
+            dit_bq.parse_pin_stamp(args.reuse_pin)
+        except ValueError as exc:
+            raise SystemExit(f"--reuse-pin: {exc}") from exc
+    if args.pin_max_gb <= 0:
+        raise SystemExit(f"--pin-max-gb must be > 0; got {args.pin_max_gb}")
+    if args.pin_expiration_days < 1:
+        raise SystemExit(f"--pin-expiration-days must be >= 1; got {args.pin_expiration_days}")
     if args.runner == "dataflow":
         _verify_job_names(args.experiment_id, args.bindings)
     # Per step: flag > ceiling env var > step default (resolve_max_num_workers).
@@ -533,39 +593,18 @@ def _verify_job_names(experiment_id: str, bindings: list[tuple[str, str]]) -> No
                 ) from exc
 
 
-def _parse_iso8601(s: str) -> datetime:
-    try:
-        if s.endswith("Z"):
-            return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
-        return datetime.fromisoformat(s)
-    except ValueError as exc:
-        raise SystemExit(f"--pin-source-at: invalid ISO 8601 timestamp {s!r}: {exc}") from exc
-
-
 def _parse_daterange(s: str) -> tuple[date, date]:
     parts = s.split(",")
     if len(parts) != 2:
         raise SystemExit(f"--date-range must be 'YYYY-MM-DD,YYYY-MM-DD'; got {s!r}")
     try:
-        return date.fromisoformat(parts[0]), date.fromisoformat(parts[1])
+        start, end = date.fromisoformat(parts[0]), date.fromisoformat(parts[1])
     except ValueError as exc:
         raise SystemExit(f"--date-range: invalid date in {s!r}: {exc}") from exc
-
-
-def _shard_dates(start: date, end: date) -> list[date]:
-    """Inclusive list of dates between ``start`` and ``end``."""
+    # Checked here, before anything is pinned: the copy's window needs it.
     if end < start:
         raise SystemExit(f"--date-range end ({end}) is before start ({start})")
-    out = []
-    cur = start
-    while cur <= end:
-        out.append(cur)
-        cur += timedelta(days=1)
-    return out
-
-
-def _shard_suffix(d: date) -> str:
-    return d.strftime("%Y%m%d")
+    return start, end
 
 
 # --------------------------------------------------------------------------
@@ -593,7 +632,7 @@ def _read_gpsdio_pin_at_ref(pipeline_dir: str, ref: str) -> str:
 
     Uses ``git show <ref>:<path>`` so we don't need to materialise a worktree
     just to read one file. Cheap enough to call per binding at preflight time
-    before any expensive snapshot/run work begins.
+    before any expensive copy or run begins.
 
     Layout shifted between pipe-segment versions:
     * v5.0.0 -- v5.0.2: deps in ``requirements/prod.in``.
@@ -638,7 +677,7 @@ def _verify_distinct_gpsdio_pins(
     otherwise silently produce an IDENTICAL diff — looking like "the change
     has no effect" when in fact the change isn't under test at all. Reads
     each ref's ``requirements/prod.in`` via ``git show`` (no worktree needed)
-    and aborts before snapshotting if all values collapse to one. Single-
+    and aborts before pinning if all values collapse to one. Single-
     binding runs are exempt (nothing to compare). (Copilot PR #44 round 2.)
     """
     pins = {name: _read_gpsdio_pin_at_ref(pipeline_dir, ref) for name, ref in bindings}
@@ -656,7 +695,7 @@ def _verify_distinct_gpsdio_pins(
 
 
 # --------------------------------------------------------------------------
-# Snapshot dataset
+# Pin the source (a copy in tech_great_expectations, dit.bq.pin_source_into_experiment)
 # --------------------------------------------------------------------------
 
 def _sanitize_for_dataset(s: str) -> str:
@@ -676,120 +715,96 @@ def _safe_label_value(value: str) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
-class _PipeSegmentSnapshotFQNs:
-    """Dest FQNs produced by :func:`_snapshot_source`.
+class _PinnedSources:
+    """What every binding reads: the pinned copy of the source.
 
-    All fields point at tables in ``<project>.tech_great_expectations``
-    (``project`` = ``--snapshot-dest-project``, defaulting to
-    ``world-fishing-827``) following the canonical-dataset shape
-    ``dit_exp_<sanitised(experiment_id)>_pipe_segment_<source_basename>``.
+    ``normalized_messages`` is a table in
+    ``world-fishing-827.tech_great_expectations`` named
+    ``dit_exp_<experiment_id>_pipe_segment_<source table>_<start>_<end>_<stamp>``
+    (``dit.bq.pinned_source_fqn``). Frozen so nothing changes the pin between
+    pinning and the bindings' runs.
 
-    ``sat_positions_stem`` is a FQN-prefix ending in ``_`` to which
-    pipe-segment appends ``<YYYYMMDD>`` per shard at read time -- this
-    matches how pipe-segment's CLI consumes the satellite-positions arg.
-    The two satellite-offsets fields are ``None`` when
-    ``--include-satellite-offsets`` is not set.
+    ``sat_positions_stem`` and ``norad`` are the two satellite-offset inputs
+    ``_segment_args`` would pass. Nothing sets them: the workflow refuses
+    ``--include-satellite-offsets`` (see ``SATELLITE_OFFSETS_REFUSED``). They
+    stay until the owner decides whether to delete the option.
     """
     normalized_messages: str
     sat_positions_stem: Optional[str] = None
     norad: Optional[str] = None
 
 
-def _snapshot_source(args: argparse.Namespace) -> _PipeSegmentSnapshotFQNs:
-    """Snapshot the input tables into ``<project>.tech_great_expectations``
-    and return the resulting dest FQNs.
+def _normalized_window(date_range: tuple[date, date]) -> dit_bq.SourceWindow:
+    """The normalized messages a run reads: its inclusive ``--date-range``.
 
-    Always snapshots ``args.source_normalized_table`` (single date-partitioned
-    table). If ``--include-satellite-offsets`` is set, also snapshots the
-    date-sharded prod satellite-positions table and the static norad table
-    that the segment offsets branch needs. ``args.snapshot_dest_project``
-    controls the dest project (cross-org dodge path).
-
-    KNOWN FOOTGUN -- ``if_existing="skip"`` (the default on
-    ``snapshot_into_experiment``) makes re-runs idempotent at the table
-    level: a re-run with the SAME ``--experiment-id`` but a DIFFERENT
-    ``--pin-source-at`` silently reuses the prior snapshot. Mitigated in
-    practice by ``--experiment-id`` defaulting to ``solo_<6-hex>`` (unique
-    per invocation) and the per-table TTL, but real for an explicit re-used
-    ``--experiment-id``. The deferred ``if_existing="verify_as_of"`` mode
-    (see ``snapshot_table.__doc__``) is the recommended resolution; tracked
-    in ``docs/snapshot-dataset-migration-2026-06.md`` as a follow-up after
-    the migration completes.
+    ``segment`` reads the source by ``DATE(timestamp) BETWEEN start AND end``
+    (``transform/read_messages.py`` at v5.0.3), with no lookback: what it
+    needs of earlier days comes from the binding's own fragments table. No
+    other step reads the source.
     """
-    role = "pipe_segment"
-    dest_project = args.snapshot_dest_project
-
-    # Normalized messages: single date-partitioned table -> single snapshot.
-    normalized_fqn = dit_bq.snapshot_into_experiment(
-        args.source_normalized_table,
-        experiment_id=args.experiment_id,
-        role=role,
-        expiration_days=args.snapshot_expiration_days,
-        as_of=args.pin_source_at,
-        project=dest_project,
-    )
-    logger.info(
-        "snapshotted normalized messages: %s -> %s (as_of=%s)",
-        args.source_normalized_table, normalized_fqn,
-        args.pin_source_at.isoformat(),
+    start, end = date_range
+    return dit_bq.SourceWindow(
+        column=NORMALIZED_WINDOW_COLUMN, start=start, end=end + timedelta(days=1),
     )
 
-    if not args.include_satellite_offsets:
-        return _PipeSegmentSnapshotFQNs(normalized_messages=normalized_fqn)
 
-    # Satellite-positions: one snapshot per date shard. The dest table
-    # names follow snapshot_into_experiment's convention; the CLI flag
-    # for pipe-segment is the FQN STEM (everything before <YYYYMMDD>)
-    # that pipe-segment appends per shard at read time.
-    start, end = args.date_range
-    shard_dates = _shard_dates(start, end)
-    logger.info(
-        "snapshotting %d date shard(s) of %s (satellite offsets opt-in)",
-        len(shard_dates), PROD_SAT_POS_STEM,
-    )
-    sat_dest_fqns: list[str] = []
-    for d in shard_dates:
-        sfx = _shard_suffix(d)
-        sat_dest_fqns.append(dit_bq.snapshot_into_experiment(
-            f"{PROD_SAT_POS_DATASET}.{PROD_SAT_POS_STEM}{sfx}",
+def _pin_sources(
+    args: argparse.Namespace, pinned_at: datetime, *, reuse: bool,
+) -> _PinnedSources:
+    """Pin the normalized messages under the stamp of ``pinned_at``, or with
+    ``reuse``, check that an earlier run's copy under that stamp exists.
+
+    A reused copy must match this run's experiment id, date range and source
+    table name, since all of them are in the name. With ``args.dry_run`` the
+    copy is only dry-run: its bytes are checked against the cap and nothing
+    is created.
+    """
+    window = _normalized_window(args.date_range)
+    if reuse:
+        normalized = dit_bq.require_pinned_source(
+            dit_bq.pinned_source_fqn(
+                args.source_normalized_table,
+                experiment_id=args.experiment_id,
+                role=PIN_ROLE,
+                pinned_at=pinned_at,
+                window=window,
+                project=PROJECT,
+            ),
+            project=PROJECT,
+        )
+    else:
+        normalized = dit_bq.pin_source_into_experiment(
+            args.source_normalized_table,
             experiment_id=args.experiment_id,
-            role=role,
-            expiration_days=args.snapshot_expiration_days,
-            as_of=args.pin_source_at,
-            project=dest_project,
-        ))
-    # Stem: strip the trailing date suffix from any one shard's dest FQN
-    # (they all share the same prefix; the date is the last
-    # `len(sample_suffix)` chars of the table name). Assert the contract
-    # explicitly before slicing -- silently producing a wrong stem if
-    # snapshot_into_experiment's naming ever changes is worse than failing
-    # loudly here. (Copilot review on PR #58.)
-    sample_dest = sat_dest_fqns[0]
-    sample_suffix = _shard_suffix(shard_dates[0])
-    assert sample_dest.endswith(sample_suffix), (
-        f"snapshot_into_experiment produced dest {sample_dest!r} that doesn't "
-        f"end with the shard date suffix {sample_suffix!r}; cannot strip it "
-        "safely to compute the satellite-positions stem. Did the naming "
-        "convention in dit.bq.snapshot_into_experiment change?"
-    )
-    sat_stem = sample_dest[:-len(sample_suffix)]
+            role=PIN_ROLE,
+            pinned_at=pinned_at,
+            window=window,
+            expiration_days=args.pin_expiration_days,
+            max_bytes=int(args.pin_max_gb * 1e9),
+            dry_run=args.dry_run,
+            project=PROJECT,
+        )
+    logger.info("pinned normalized messages: %s", normalized)
+    return _PinnedSources(normalized_messages=normalized)
 
-    # Single static aux table: norad_to_receiver.
-    norad_fqn = dit_bq.snapshot_into_experiment(
-        PROD_NORAD_TABLE,
-        experiment_id=args.experiment_id,
-        role=role,
-        expiration_days=args.snapshot_expiration_days,
-        as_of=args.pin_source_at,
-        project=dest_project,
-    )
-    logger.info("snapshotted norad: %s -> %s", PROD_NORAD_TABLE, norad_fqn)
 
-    return _PipeSegmentSnapshotFQNs(
-        normalized_messages=normalized_fqn,
-        sat_positions_stem=sat_stem,
-        norad=norad_fqn,
+def _pin(args: argparse.Namespace) -> _PinnedSources:
+    """Copy the source at run start, or with ``--reuse-pin`` reuse an earlier
+    run's copy."""
+    reuse = args.reuse_pin is not None
+    pinned_at = (
+        dit_bq.parse_pin_stamp(args.reuse_pin) if reuse
+        else datetime.now(timezone.utc).replace(microsecond=0)
     )
+    logger.info("pin stamp: %s (%s)", dit_bq.format_pin_stamp(pinned_at),
+                "reusing an earlier run's copy" if reuse else "a new copy")
+    logger.info("pinning: %s (copy in %s.%s)",
+                args.source_normalized_table, PROJECT, dit_bq.CANONICAL_DATASET)
+    pinned = _pin_sources(args, pinned_at, reuse=reuse)
+    if not reuse and not args.dry_run:
+        logger.info("to rerun on this copy, pass --reuse-pin %s",
+                    dit_bq.format_pin_stamp(pinned_at))
+    return pinned
 
 
 # --------------------------------------------------------------------------
@@ -865,7 +880,7 @@ def _dataflow_options(
 
 def _segment_args(
     *,
-    snapshot_fqns: _PipeSegmentSnapshotFQNs,
+    pinned: _PinnedSources,
     dest_dataset: str,
     suffix: str,
     experiment_id: str,
@@ -882,19 +897,17 @@ def _segment_args(
 ) -> list[str]:
     """CLI args for `pipe-segment segment`.
 
-    Source-table FQNs come from ``snapshot_fqns`` (produced by
-    :func:`_snapshot_source`): the normalized-messages snapshot lives in
-    ``snapshot_fqns.normalized_messages``; when
-    ``include_satellite_offsets`` is set, ``sat_positions_stem`` is the
-    FQN-prefix pipe-segment appends per-shard date suffixes to, and
-    ``norad`` is the static norad_to_receiver snapshot. pipe-segment's
-    BigQuerySource auto-detects partitioning vs sharding and filters by
+    The source table comes from ``pinned`` (produced by :func:`_pin`):
+    ``pinned.normalized_messages`` is the pinned copy. pipe-segment's
+    BigQuerySource finds it partitioned, as the source is, and filters by
     DATE(timestamp).
 
     Satellite-offset args only appear when ``include_satellite_offsets`` is
-    set; the satellite-offset branch isn't needed to exercise the identity-
-    match-key change under test, and its inputs are date-sharded in prod
-    (not mirrored to the staging cohort).
+    set, with ``pinned.sat_positions_stem`` (the FQN prefix pipe-segment
+    appends per-shard date suffixes to) and ``pinned.norad``. No run gets
+    there: the workflow refuses ``--include-satellite-offsets`` at argument
+    parsing and nothing sets the two fields. The branch is kept until the
+    owner decides whether to delete the option (PIPELINE-4705).
 
     The Dataflow options, the job name among them, come from
     :func:`_dataflow_options`.
@@ -903,7 +916,7 @@ def _segment_args(
     args = [
         "segment",
         f"--date_range={start.isoformat()},{end.isoformat()}",
-        f"--in_normalized_messages_table={snapshot_fqns.normalized_messages}",
+        f"--in_normalized_messages_table={pinned.normalized_messages}",
         f"--out_segmented_messages_table={_output_prefix('messages_segmented', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--out_segments_table={_output_prefix('segments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--fragments_table={_output_prefix('fragments', dest_dataset=dest_dataset, suffix=suffix)}",
@@ -922,21 +935,19 @@ def _segment_args(
         f"--staging_location={dataflow_staging_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
     ]
     if include_satellite_offsets:
-        # Pre-condition: _snapshot_source populated both satellite fields when
-        # include_satellite_offsets was set; assert for the type narrower.
-        assert snapshot_fqns.sat_positions_stem is not None, (
-            "include_satellite_offsets=True but sat_positions_stem is None; "
-            "_snapshot_source contract violated."
+        # Pre-condition: the caller set both satellite fields; assert for the
+        # type narrower. Nothing in the workflow does (see the docstring).
+        assert pinned.sat_positions_stem is not None, (
+            "include_satellite_offsets=True but sat_positions_stem is None."
         )
-        assert snapshot_fqns.norad is not None, (
-            "include_satellite_offsets=True but norad is None; "
-            "_snapshot_source contract violated."
+        assert pinned.norad is not None, (
+            "include_satellite_offsets=True but norad is None."
         )
         args.extend([
-            f"--in_normalized_sat_offset_messages_table={snapshot_fqns.normalized_messages}",
+            f"--in_normalized_sat_offset_messages_table={pinned.normalized_messages}",
             f"--out_sat_offsets_table={_output_prefix('satellite_timing_offsets', dest_dataset=dest_dataset, suffix=suffix)}",
-            f"--in_norad_to_receiver_table={snapshot_fqns.norad}",
-            f"--in_sat_positions_table={snapshot_fqns.sat_positions_stem}",
+            f"--in_norad_to_receiver_table={pinned.norad}",
+            f"--in_sat_positions_table={pinned.sat_positions_stem}",
         ])
     if ssvid_filter_query is not None:
         args.append(f"--ssvid_filter_query={ssvid_filter_query}")
@@ -1120,7 +1131,7 @@ def _step_argvs(
     *,
     binding_name: str,
     suffix: str,
-    snapshot_fqns: _PipeSegmentSnapshotFQNs,
+    pinned: _PinnedSources,
     worker_image: str | None,
 ) -> dict[str, list[str]]:
     """The argv of every step one binding runs, by step, in run order.
@@ -1143,7 +1154,7 @@ def _step_argvs(
 
     builders = {
         "segment": lambda: _segment_args(
-            snapshot_fqns=snapshot_fqns,
+            pinned=pinned,
             date_range=args.date_range,
             ssvid_filter_query=args.ssvid_filter_query,
             include_satellite_offsets=args.include_satellite_offsets,
@@ -1251,7 +1262,7 @@ def _run_binding(
     name: str,
     ref: str,
     args: argparse.Namespace,
-    snapshot_fqns: _PipeSegmentSnapshotFQNs,
+    pinned: _PinnedSources,
     suffix: str,
 ) -> int:
     worktree_dir = tempfile.mkdtemp(prefix=f"dit-pipe-segment-{name}-")
@@ -1296,7 +1307,7 @@ def _run_binding(
         # ends the binding.
         argvs = _step_argvs(
             args, binding_name=name, suffix=suffix,
-            snapshot_fqns=snapshot_fqns, worker_image=image_tag,
+            pinned=pinned, worker_image=image_tag,
         )
         for step, cli_args in argvs.items():
             rc = _run_pipe_subcommand(
@@ -1409,7 +1420,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     logger.info("experiment_id: %s", args.experiment_id)
-    logger.info("pin_source_at: %s", args.pin_source_at.isoformat())
     logger.info("bindings:      %s", args.bindings)
     logger.info("date_range:    %s..%s", args.date_range[0], args.date_range[1])
     logger.info("runner:        %s", args.runner)
@@ -1425,11 +1435,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("downstream:    SKIPPED (%s)", ", ".join(STEPS[1:]))
 
     _verify_refs(args.pipeline_dir, args.bindings)
-    # Cheap preflight: fail before snapshotting if the A/B is misconfigured
+    # Cheap preflight: fail before pinning if the A/B is misconfigured
     # with identical gpsdio-segment pins (an IDENTICAL diff would otherwise
     # look like "the change has no effect" when in fact nothing was tested).
     _verify_distinct_gpsdio_pins(args.pipeline_dir, args.bindings)
-    snapshot_fqns = _snapshot_source(args)
+    pinned = _pin(args)
 
     suffix_by_binding = {name: f"{args.experiment_id}_{name}" for name, _ in args.bindings}
 
@@ -1441,7 +1451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for name, ref in args.bindings:
         rc = _run_binding(
             name=name, ref=ref, args=args,
-            snapshot_fqns=snapshot_fqns,
+            pinned=pinned,
             suffix=suffix_by_binding[name],
         )
         rc_by_binding[name] = rc

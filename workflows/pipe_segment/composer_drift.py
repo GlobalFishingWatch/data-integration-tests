@@ -76,11 +76,11 @@ BEAM_ACCEPTED_DIFFERENCES = {
 #: positions are date-sharded, which DIT does not support by policy. The
 #: offsets query also reads its message source as ``<table>*`` filtered on
 #: ``_TABLE_SUFFIX`` (``assets/satellite_offsets.sql.j2`` at v5.0.3), so it
-#: cannot read DIT's source, one partitioned table. The workflow's
-#: ``--include-satellite-offsets`` passes the flags and is off by default;
-#: whether to keep that option is the owner's decision.
+#: cannot read DIT's source, one partitioned table. The workflow refuses
+#: ``--include-satellite-offsets``, which asked for the branch
+#: (PIPELINE-4705); whether to delete that option is the owner's decision.
 _SATELLITE_OFFSETS_REASON = (
-    "the satellite-offset branch is off in DIT by default: its inputs are "
+    "the satellite-offset branch is off in DIT: its inputs are "
     "date-sharded, which DIT does not support"
 )
 
@@ -103,17 +103,16 @@ SQL_ACCEPTED_DIFFERENCES = {
 
 _NOTE = (
     "production's three satellite-offset inputs are an accepted difference: "
-    "DIT leaves that branch off by default"
+    "DIT leaves that branch off"
 )
 
 
 def _dit_args(placeholders: Mapping[str, date]) -> argparse.Namespace:
     """The workflow's namespace for the snapshot run's inclusive dates. The
-    pin time and the binding ref are required flags that no token reads."""
+    binding ref is a required flag that no token reads."""
     start, end = placeholders["start_date"], placeholders["end_date"]
     return imk.parse_args([
         "--experiment-id", "composer-drift",
-        "--pin-source-at", f"{start.isoformat()}T00:00:00Z",
         "--binding", f"{_BINDING}=HEAD",
         "--date-range", f"{start.isoformat()},{end.isoformat()}",
     ])
@@ -127,7 +126,7 @@ def dit_step_tokens(step: str, placeholders: Mapping[str, date]) -> list[str]:
         args,
         binding_name=_BINDING,
         suffix=f"{args.experiment_id}_{_BINDING}",
-        snapshot_fqns=imk._PipeSegmentSnapshotFQNs(
+        pinned=imk._PinnedSources(
             normalized_messages=args.source_normalized_table,
         ),
         worker_image=args.image_tag,

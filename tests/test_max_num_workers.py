@@ -61,7 +61,6 @@ INFRA_ARGV = [
 ]
 SEGMENT_ARGV = [
     "--experiment-id", "exp",
-    "--pin-source-at", "2026-06-03T10:00:00Z",
     "--binding", "before=v5.0.3",
     "--date-range", "2020-01-01,2020-01-01",
 ]
@@ -337,7 +336,7 @@ def _segment_step_argvs(runner="dataflow", caps=None):
     one_day = (date(2020, 1, 1), date(2020, 1, 1))
     return {
         "segment": pipe_segment._segment_args(
-            snapshot_fqns=pipe_segment._PipeSegmentSnapshotFQNs(normalized_messages="p.d.n"),
+            pinned=pipe_segment._PinnedSources(normalized_messages="p.d.n"),
             date_range=one_day,
             ssvid_filter_query=None, include_satellite_offsets=False,
             max_num_workers=caps.get("segment"), **common,
@@ -382,7 +381,7 @@ def test_pipe_segment_run_binding_emits_each_resolved_cap(ceiling, extra, expect
     ):
         rc = pipe_segment._run_binding(
             name="before", ref="v5.0.3", args=args, suffix="exp_before",
-            snapshot_fqns=pipe_segment._PipeSegmentSnapshotFQNs(normalized_messages="p.d.n"),
+            pinned=pipe_segment._PinnedSources(normalized_messages="p.d.n"),
         )
 
     assert rc == 0

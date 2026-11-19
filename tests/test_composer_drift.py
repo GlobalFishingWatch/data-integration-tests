@@ -344,7 +344,7 @@ def test_pipe_segment_tokens_are_what_the_workflow_hands_the_runner() -> None:
         assert segment._run_binding(
             name=segment_drift._BINDING, ref="HEAD", args=args,
             suffix=f"{args.experiment_id}_{segment_drift._BINDING}",
-            snapshot_fqns=segment._PipeSegmentSnapshotFQNs(
+            pinned=segment._PinnedSources(
                 normalized_messages=args.source_normalized_table),
         ) == 0
 
