@@ -52,24 +52,33 @@ def _flag(argv, name):
 # the removed --pipeline-cli switch
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("value", ["v4", "v5"])
-def test_pipeline_cli_is_rejected_with_the_reason(value):
+@pytest.mark.parametrize("argv", [
+    ["--pipeline-cli", "v4"],
+    ["--pipeline-cli", "v5"],
+    ["--pipeline-cli=v5"],
+    ["--pipeline-cli"],                     # bare, last
+    ["--pipeline-cli", "--parallel"],       # bare, followed by another flag
+])
+def test_pipeline_cli_is_rejected_with_the_reason(argv):
     with pytest.raises(SystemExit, match="--pipeline-cli was removed"):
-        mod.parse_args(["--pipeline-cli", value])
+        mod.parse_args(argv)
 
 
 def test_parsed_args_carry_no_pipeline_cli():
     assert not hasattr(mod.parse_args([]), "pipeline_cli")
 
 
-@pytest.mark.parametrize("value", ["v4", "v5"])
-def test_cross_version_rejects_pipeline_cli_before_anything_is_pinned(value):
+@pytest.mark.parametrize("tail", [
+    ["--pipeline-cli", "v4"],
+    ["--pipeline-cli", "v5"],
+    ["--pipeline-cli"],                     # bare, last
+    ["--pipeline-cli", "--dry-run"],        # bare, followed by another flag
+])
+def test_cross_version_rejects_pipeline_cli_before_anything_is_pinned(tail):
     # Without the wrapper's own check the flag would pass through as an extra
     # and fail in every binding's ais.py, after the sources were pinned.
     with pytest.raises(SystemExit, match="--pipeline-cli was removed"):
-        xv.parse_args([
-            "--experiment-id", "e", "--binding", "before=main", "--pipeline-cli", value,
-        ])
+        xv.parse_args(["--experiment-id", "e", "--binding", "before=main", *tail])
 
 
 # --------------------------------------------------------------------------

@@ -1040,7 +1040,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "option for it.")
     # Removed 2026-11-19 with the v4 CLI. Rejected explicitly, with the reason,
     # so an old invocation does not fail on a bare "unrecognized arguments".
-    p.add_argument("--pipeline-cli", default=None, help=argparse.SUPPRESS)
+    # nargs="?" so a bare --pipeline-cli is rejected with the same message as
+    # --pipeline-cli v4, not with argparse's "expected one argument".
+    p.add_argument("--pipeline-cli", nargs="?", const="", default=None,
+                   help=argparse.SUPPRESS)
     p.add_argument("--source-dataset-stem", default=DEFAULT_SOURCE_DATASET_STEM,
                    help=f"Staging dataset stem (default {DEFAULT_SOURCE_DATASET_STEM}); "
                         "_internal and _published are appended to derive the three source "

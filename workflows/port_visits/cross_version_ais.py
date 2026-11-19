@@ -283,7 +283,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     p.add_argument("--pin-source-at", help=argparse.SUPPRESS)
     # Removed 2026-11-19 with the pipe-anchorages v4 CLI. Rejected here, before
     # anything is pinned, rather than in every binding's ais.py afterwards.
-    p.add_argument("--pipeline-cli", default=None, help=argparse.SUPPRESS)
+    # nargs="?" so a bare --pipeline-cli is rejected with the same message as
+    # --pipeline-cli v4, not with argparse's "expected one argument".
+    p.add_argument("--pipeline-cli", nargs="?", const="", default=None,
+                   help=argparse.SUPPRESS)
     p.add_argument("--binding", action="append", required=True, dest="bindings",
                    help="`name=ref` pair, repeatable. Both must be valid git refs in --pipeline-dir.")
     # --start / --end / --modes / --steps default to None and are filled in
