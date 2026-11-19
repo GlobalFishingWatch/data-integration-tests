@@ -1294,11 +1294,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Before resolve_run_context, which can push an auto-snapshot of a
         # dirty tree or build a worker image: a dry run changes nothing.
         logger.info("--dry-run: the copies are dry-run only; nothing is created")
-        _resolve_sources(args)
-        if args.no_pin:
-            logger.info("--dry-run with --no-pin: nothing is copied, so nothing to estimate")
-        if args.synthetic_outage:
-            logger.info("--dry-run: the --synthetic-outage view is not created")
+        if args.skip_pipelines:
+            logger.info("--dry-run with --skip-pipelines: such a run pins nothing")
+        else:
+            _resolve_sources(args)
+            if args.no_pin:
+                logger.info("--dry-run with --no-pin: nothing is copied, so nothing to estimate")
+            if args.synthetic_outage:
+                logger.info("--dry-run: the --synthetic-outage view is not created")
         logger.info("--dry-run: no pipeline and no comparison ran")
         return 0
 

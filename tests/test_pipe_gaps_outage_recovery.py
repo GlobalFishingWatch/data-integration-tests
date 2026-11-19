@@ -1153,6 +1153,15 @@ def test_main_dry_run_with_reuse_pin_checks_that_the_copies_exist() -> None:
     assert result["run"] == {}
 
 
+def test_main_dry_run_of_a_compare_only_run_estimates_nothing() -> None:
+    """--skip-pipelines pins nothing, so its dry run has no copy to report."""
+    result = _main("--dry-run", "--skip-pipelines")
+
+    assert result["rc"] == 0
+    result["pin"].assert_not_called()
+    result["compare"].assert_not_called()
+
+
 def test_main_skip_pipelines_pins_nothing() -> None:
     """A compare-only run reads no source. A copy costs a query, unlike the
     snapshot it replaced, so none is made."""
