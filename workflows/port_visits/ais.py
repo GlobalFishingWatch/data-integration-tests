@@ -90,11 +90,15 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     add_experiment_id_arg,
     add_infra_args,
+    add_max_num_workers_arg,
     add_modes_arg,
     add_no_cache_arg,
+    log_worker_caps,
+    max_num_workers_options,
     parse_choice_list,
     parse_modes,
     resolve_run_context,
+    worker_cap,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,8 +196,9 @@ DEFAULT_TAIL_DAYS = 3
 # CPU and IP quota. The default fits the 2020 staging cohort (142 ssvid); pass a
 # larger value for production slices (e.g. 16 for one month of AIS). Prod runs
 # the full-history port-visits step with 100 (core.ais.v3) or 250 (v5 backfill).
-# Making this a shared knob across all workflows, and choosing the right scale
-# per job, are follow-ups under the DIT epic PIPELINE-4698.
+# The flag, the DIT_MAX_NUM_WORKERS_CEILING env var and the emission are shared
+# (dit.workflow, PIPELINE-4701); choosing the right scale per job is a
+# follow-up under the DIT epic PIPELINE-4698.
 DEFAULT_MAX_NUM_WORKERS = 4
 
 DEFAULT_IMAGE_TAG = "gfw/pipe-anchorages:v4.6.4"
@@ -397,7 +402,7 @@ def _dataflow_pipeline_options(
         f"--staging_location={dataflow_staging_location(args.dataflow_temp_bucket)}",
         f"--subnetwork={args.dataflow_subnetwork}",
         # Bound autoscaling; see DEFAULT_MAX_NUM_WORKERS.
-        f"--max_num_workers={_max_num_workers(args)}",
+        *max_num_workers_options(_max_num_workers(args)),
         f"--sdk_container_image={args.worker_image}",
         f"--job_name={_make_job_name(args, step=step, mode=mode, iteration=iteration, total_iterations=total_iterations)}",
     ]
@@ -1026,11 +1031,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--end", default=DEFAULT_END, help="Inclusive end date.")
     p.add_argument("--tail-days", type=int, default=DEFAULT_TAIL_DAYS,
                    help="Number of tail days for bfd / bftruncate iteration.")
-    p.add_argument("--max-num-workers", type=int, default=DEFAULT_MAX_NUM_WORKERS,
-                   help=f"Dataflow autoscaling ceiling per job (default {DEFAULT_MAX_NUM_WORKERS}, "
-                        "sized for the 2020 staging cohort; e.g. 16 for one month of production "
-                        "AIS). Dataflow runner only. Does not affect output, so it is not part "
-                        "of the cache key.")
+    add_max_num_workers_arg(
+        p, default=DEFAULT_MAX_NUM_WORKERS,
+        help_detail="The default is sized for the 2020 staging cohort; e.g. 16 for one "
+                    "month of production AIS, 100 for production's full-history step.",
+    )
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG)
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
                    help="Dataflow worker container image with pipe_anchorages installed; "
@@ -1081,6 +1086,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.steps, choices=SELECTABLE_STEPS, flag="--steps", noun="step",
     )
     validate_steps(args.steps, args.thinned_message_table)
+    # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
+    args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
+    args.max_num_workers = args.worker_cap.workers
     return args
 
 
@@ -1094,8 +1102,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Negative values produce nonsensical iteration counts and invert "
             "the daily-tail date range."
         )
-    if args.max_num_workers < 1:
-        raise SystemExit(f"--max-num-workers must be >= 1; got {args.max_num_workers}.")
 
     repo_dir = os.getcwd()
 
@@ -1172,6 +1178,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("source segs_activity: %s", _segs_activity_table(args))
     logger.info("date range (inclusive): %s -> %s, tail_days=%d", args.start, args.end, args.tail_days)
     logger.info("runner: %s  pipeline_cli: %s", args.runner, args.pipeline_cli)
+    log_worker_caps({"every job": args.worker_cap})
 
     # Per-mode FQN to compare. Default to this run's freshly-suffixed output
     # tables (the last step's); the cache wrapper overwrites each with the

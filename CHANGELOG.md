@@ -17,6 +17,16 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 - **pipe-anchorages determinism on September 2026:** three runs of the PR, two of them with `--no-cache` (Cloud Build `8a1348d1`), are IDENTICAL.
 
 #### Added
+- **`dit.composer`: read production's rendered DAGs from composer-dags-production as data ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700) spike).** composer keeps one CI-checked render snapshot per DAG (`tests/render_dags/snapshots/*.py`), with each task's image, command and full argv for one run. dit reads a snapshot at a ref with `git show` and parses it with `ast.literal_eval`. It never imports or executes composer code and never touches composer's working tree. All 260 snapshots at composer 0a644da parse.
+  - **Library:** `load_dag` / `list_snapshots` / `resolve_ref` return `RenderedDag` / `RenderedTask` (image, version tag, cmds, arguments, data interval). `parse_argv` handles `--k=v` and `--k v`; `diff_flags` compares two argvs; `pinned_versions` lists each image's tags. `templatize` / `render_template` turn the run's dates into `{start_date}`, `{end_date}` (last day), `{end_date_exclusive}` and `{execution_date}` and back. A date that fits several placeholders is reported, not guessed.
+  - **`dit composer-dag <snapshot> [--task-prefix ...] [--templated]`:** prints a DAG's tasks as JSON. Read-only.
+  - **`workflows/port_visits/composer_drift.py`:** a read-only drift check of `ProductionTarget("ais-v5-datalake")` and the v4 argv builders against `core.ais.v5`. Exit 1 on drift. Expected differences are listed apart: DIT-owned flags (outputs, identity, placement, labels, worker cap), plus lineage (`--dataflow_service_options`, off in DIT on purpose) and `--network` (set by DIT's `--subnetwork`). `DataflowRunner` and `dataflow` count as the same runner (owner decisions, 2026-10-23).
+    - Today every target field matches.
+    - The argv still differs in `--worker_machine_type`, `--disk_size_gb` and `--no_use_public_ips`, which a separate change addresses, and in step 1's input tables.
+    - Nothing in `ProductionTarget` or the builders was changed.
+  - **Version drift the snapshots show:** production pins pipe-anchorages v4.6.4 (as DIT does). DIT's pipe-events (v4.2.17) and pipe-gaps (v0.10.0) pins are behind production's: v5.0.0 and v0.10.3 on `core.ais.v3`, and on `core.ais.v5` v8.0.1 and v0.17.0, both with renamed commands.
+
+  57 new tests on synthetic fixtures, one of which reads a real composer checkout when one is present; suite 661 → 718. Findings and proposed next steps: [`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md).
 - **`--baseline-production` on `workflows/port_visits/cross_version_ais.py`: compare a candidate with production's own output ([PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703)).** With `--baseline-production ais-v5-datalake --production-date D`, only the bindings run, usually just the PR. Each is diffed on `visit_id` against the table production wrote for D. Production is not re-run.
   - **Pins:** the run finds production's Dataflow job for D (the latest `Done` one; retries reuse the name). It pins production's inputs as time-travel views as of the job's creation, and production's output as of the time the job finished. Views copy nothing and work across organisations. `--production-inputs-as-of` / `--production-output-as-of` override the times.
   - **Fixed run shape:** the bindings run what production runs: `--steps port_visits`, `--modes 1_bf`, full history (2012-01-01) to D. Unset, these flags take those values; set to anything else, they are an error. Input overrides and `--reuse-pin` are rejected.
@@ -30,6 +40,25 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   - **Default behaviour:** `--start`, `--end`, `--modes` and `--steps` now default to `None` internally and are filled in after parsing, so production mode can tell a typed value from a default. Runs without `--baseline-production` behave exactly as before.
 
   Dry-run verified against production's 2026-10-20 run (job `2026-10-23_00_46_26-2424624824928045608`). Estimated full reads through the views: 1150.5 GB of thinned input, 69.6 GB `segment_info`, 103.4 GB `segs_activity`, and 443.0 GB of production output, so a live run needs `--pin-max-gb 1300`. 37 new tests; suite 624 → 661 (on top of `--no-cache`, #82). Runbook and caveats: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
+
+#### Changed
+- **`--max-num-workers` is one shared flag on every Dataflow workflow, with a global ceiling ([PIPELINE-4701](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4701)).** `world-fishing-827` is also the execution project of production Dataflow jobs, so an unbounded dit run could take regional quota from them. The flag, its validation, the resolution and the emission now live in `dit.workflow` (`add_max_num_workers_arg`, `worker_cap`, `max_num_workers_options`); each workflow passes its own default.
+  - **Precedence, the more specific setting winning:**
+    1. an explicit `--max-num-workers N` applies to every job and step, even above the ceiling;
+    2. otherwise the new **`DIT_MAX_NUM_WORKERS_CEILING`** env var, when set, lowers each default to `min(default, ceiling)`. It never raises one;
+    3. otherwise the workflow's or step's default.
+
+    The env var is validated like the flag (an integer of at least 1) and fails at argument parsing. `cross_version_ais.py` checks it before pinning anything. Each run logs its cap and its source (`cli`, `ceiling` or `default`) once.
+  - **Defaults:**
+    - **pipe-gaps** (`mode_equivalence.py`, `outage_recovery.py`): new flag, **default 50**, production's daily detect cap. This **lowers the effective cap from 100**: before, dit emitted nothing, so gfw-common's `Pipeline` default of 100 applied. Default Dataflow runs now pass `--max_num_workers=50`. DirectRunner (`--runner docker`) runs get no cap.
+    - `port_visits/ais.py`: 4, unchanged. `cross_version_ais.py` forwards the flag to every binding, and each binding's `ais.py` inherits the ceiling.
+    - `encounters/ais.py` and `vms.py`: 50, unchanged. Values below 1 are now rejected here too.
+    - `pipe_segment/identity_match_key.py`: new flag. Defaults per step are unchanged (`segment` 50, `segment_identity` 50, `segment_info` 20); the ceiling lowers each, an explicit value replaces all three.
+
+    Apart from pipe-gaps' new cap, default runs emit byte-identical Beam options, checked with a capture harness over all 18 option lists and pinned by tests.
+  - **Not in Cloud Build yet:** `cloudbuild-dit.yaml` passes no such variable into its build step, so a ceiling exported on the laptop does not reach a `make dit-cloud` run. Pass `--max-num-workers N` in `ARGS` there; wiring the ceiling through is a follow-up.
+
+  Dataflow runner only, and never part of a cache key, with or without a ceiling (tested for every cached workflow and mode). Gaps' in-process path hands the value to gfw-common as a string; gfw-common builds Beam options with `PipelineOptions.from_dictionary` in every tag from v0.10.0 to v0.23.0, which parses it with Beam's int type. 106 new tests in `tests/test_max_num_workers.py`, plus `tests/conftest.py`, which clears the ceiling so a developer's environment cannot change test results; suite 661 → 767.
 
 ### 2026-10-22
 

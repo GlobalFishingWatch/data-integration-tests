@@ -32,6 +32,13 @@
 # export DIT_DATAFLOW_TEMP_BUCKET="pipe-temp-us-central-ttl7"
 # export DIT_DATAFLOW_SUBNETWORK="regions/us-central1/subnetworks/gfw-internal-us-central1"
 
+# Global ceiling on every Dataflow workflow's worker cap (PIPELINE-4701). It
+# only lowers defaults: each job gets min(its default, this). An explicit
+# --max-num-workers N still wins, even above it. Read on the laptop only: a
+# `make dit-cloud` build does not see it (pass --max-num-workers in ARGS).
+# Unset by default.
+# export DIT_MAX_NUM_WORKERS_CEILING="8"
+
 # (pipe-gaps workflow only) Pre-existing BQ dataset used as Beam's temp
 # dataset for ReadFromBigQuery (avoids needing bigquery.datasets.create).
 # Default: ${PROJECT}.${DIT_DEST_DATASET}.

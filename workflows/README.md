@@ -18,6 +18,8 @@ mode-equivalence test.
 | `encounters/ais.py` | encounters_pipeline (encounters generation) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `encounter_id`) on both the raw and merged tables | no |
 | `encounters/vms.py` | encounters_pipeline (encounters generation, VMS) | same execution as `encounters/ais.py` (`ais.run(args)`); only defaults and help differ | same as `encounters/ais.py` | no |
 
+`port_visits/composer_drift.py` is not a test workflow. It is a read-only drift check that compares the port-visits `ProductionTarget` and v4 argv with production's rendered DAG in composer-dags-production, and runs nothing on GCP ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700), [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md)).
+
 ## Framework-extraction decision (2026-05-29) — `dit.phases` DEFERRED
 
 Phase 3 (the third consumer) was the designated point to decide whether to

@@ -367,7 +367,7 @@ pipe-events is **structurally different from the other two consumers**, which is
 
 ## Phase 4+ vision (one paragraph each)
 
-**Phase 4 — `composer-dags` sync.** `dit sync-params --from <composer-dags-checkout>` parses production DAGs and regenerates `params.yaml` rows so AIS/VMS shapes never drift between integration tests and prod. Trigger condition: a real prod-vs-test param drift bug.
+**Phase 4 — `composer-dags` sync.** `dit sync-params --from <composer-dags-checkout>` parses production DAGs and regenerates `params.yaml` rows so AIS/VMS shapes never drift between integration tests and prod. Trigger condition: a real prod-vs-test param drift bug. (Met by the pipe-anchorages v5 CLI drift. The 2026-10-23 spike found the data source: composer's CI-checked render snapshots, read without importing composer. The proposed order, a version-drift check before any params file, is in `docs/composer-snapshots-2026-10.md` § 7.)
 
 **Phase 5 — Mutation library.** Promote `restrict_ssvids` (currently `compute_restricted_ssvids` inside pipe-gaps' workflow) plus `drop_messages`, `shift_timestamps`, `set_segment_flag` into `dit.mutations` once a second consumer needs the same input-transform mechanism. Cap at ~5.
 
