@@ -212,6 +212,37 @@ def test_parse_argv_cannot_tell_a_bare_flag_before_a_positional_without_a_hint()
     assert hinted.flags == (composer.Flag("-v", None),)
 
 
+def test_parse_argv_reads_one_flag_with_several_values_only_with_a_hint() -> None:
+    # gfw-common CLIs take `--labels k=v k=v ...`: one flag, space-separated pairs.
+    tokens = ["pipe-widgets", "publish", "--labels", "a=1", "b=2", "c=3", "--quiet",
+              "--project=example-project"]
+
+    unhinted = composer.parse_argv(tokens)
+    assert unhinted.positionals == ("pipe-widgets", "publish", "b=2", "c=3")
+    assert unhinted.values("--labels") == ("a=1",)
+
+    hinted = composer.parse_argv(tokens, multi={"--labels"})
+    assert hinted.positionals == ("pipe-widgets", "publish")
+    assert hinted.values("--labels") == ("a=1", "b=2", "c=3")
+    assert hinted.flags[-2:] == (
+        composer.Flag("--quiet", None), composer.Flag("--project", "example-project"),
+    )
+
+
+def test_parse_argv_multi_value_flags_compare_equal_to_their_repeated_form() -> None:
+    single = composer.parse_argv(["run", "--labels", "b=2", "a=1"], multi={"--labels"})
+    repeated = composer.parse_argv(["run", "--labels=a=1", "--labels=b=2"], multi={"--labels"})
+
+    assert composer.diff_flags(single, repeated).identical
+    # With nothing after it, or a flag right after it, a multi-value flag is bare.
+    assert composer.parse_argv(["--labels", "--x=1"], multi={"--labels"}).flags == (
+        composer.Flag("--labels", None), composer.Flag("--x", "1"),
+    )
+    assert composer.parse_argv(["--labels"], multi={"--labels"}).flags == (
+        composer.Flag("--labels", None),
+    )
+
+
 def test_parse_argv_treats_everything_after_double_dash_as_positional() -> None:
     parsed = composer.parse_argv(["run", "--x=1", "--", "--not-a-flag", "y"])
 

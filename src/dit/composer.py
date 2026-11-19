@@ -43,7 +43,7 @@ import re
 import subprocess
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from datetime import date, datetime, timedelta
-from itertools import chain
+from itertools import chain, takewhile
 from pathlib import Path
 from typing import Any
 
@@ -356,7 +356,9 @@ def _is_flag(token: str) -> bool:
     return token.startswith("-") and len(token) > 1 and not _NEGATIVE_NUMBER.match(token)
 
 
-def _argv_items(tokens: Sequence[str], bare: Collection[str]) -> Iterator[str | Flag]:
+def _argv_items(
+    tokens: Sequence[str], bare: Collection[str], multi: Collection[str],
+) -> Iterator[str | Flag]:
     """Yield positionals (``str``) and :class:`Flag` items in argv order."""
     i = 0
     while i < len(tokens):
@@ -371,6 +373,10 @@ def _argv_items(tokens: Sequence[str], bare: Collection[str]) -> Iterator[str | 
             name, value = token.split("=", 1)
             yield Flag(name, value)
             i += 1
+        elif token in multi:
+            values = tuple(takewhile(lambda t: not _is_flag(t), tokens[i + 1:]))
+            yield from (Flag(token, v) for v in values) if values else (Flag(token, None),)
+            i += 1 + len(values)
         elif token not in bare and i + 1 < len(tokens) and not _is_flag(tokens[i + 1]):
             yield Flag(token, tokens[i + 1])
             i += 2
@@ -379,13 +385,18 @@ def _argv_items(tokens: Sequence[str], bare: Collection[str]) -> Iterator[str | 
             i += 1
 
 
-def parse_argv(tokens: Sequence[str], *, bare: Collection[str] = ()) -> ParsedArgv:
+def parse_argv(
+    tokens: Sequence[str], *, bare: Collection[str] = (), multi: Collection[str] = (),
+) -> ParsedArgv:
     """Split an argv into positionals and flags.
 
     Rules, in order:
 
     * ``--name=value`` (or ``-name=value``) is a flag with a value; the value
       is everything after the first ``=``, so ``--labels=k=v`` has value ``k=v``.
+    * ``--name v1 v2 ...`` with ``name`` in ``multi``: the flag takes every
+      following token up to the next flag, one :class:`Flag` per value. So
+      ``--labels a=1 b=2`` parses like ``--labels=a=1 --labels=b=2``.
     * ``--name value``: a flag followed by a token that is not itself a flag
       takes it as its value, unless ``name`` is in ``bare``.
     * Otherwise the flag is bare (value ``None``).
@@ -394,10 +405,13 @@ def parse_argv(tokens: Sequence[str], *, bare: Collection[str] = ()) -> ParsedAr
       not a flag.
 
     Without the pipeline's parser this cannot tell a bare flag followed by a
-    positional (``-v subcommand``) from ``--name value``; pass the bare flags
-    in ``bare`` when the argv has that shape.
+    positional (``-v subcommand``) from ``--name value``, nor a flag that takes
+    several values from one followed by positionals. Pass the bare flags in
+    ``bare`` and the multi-value flags in ``multi`` when the argv has those
+    shapes; without ``multi`` the extra values of ``--labels a=1 b=2`` read as
+    positionals.
     """
-    items = tuple(_argv_items(tokens, frozenset(bare)))
+    items = tuple(_argv_items(tokens, frozenset(bare), frozenset(multi)))
     return ParsedArgv(
         positionals=tuple(i for i in items if isinstance(i, str)),
         flags=tuple(i for i in items if isinstance(i, Flag)),
@@ -454,8 +468,9 @@ def diff_flags(
 #   {end_date}            the last day inside the interval, i.e. end minus one
 #                         day for a midnight-aligned end (inclusive end dates,
 #                         e.g. pipe-anchorages v4 --end_date)
-#   {end_date_exclusive}  end's date (exclusive end dates, e.g. pipe-events v8
-#                         --end-date, pipe-measures --date_range)
+#   {end_date_exclusive}  end's date (exclusive end dates, e.g. pipe-anchorages
+#                         v5 and pipe-events v8 --end-date, pipe-measures
+#                         --date_range)
 #   {execution_date}      the logical date, only where it differs from start's
 #                         date. Where they are equal (Airflow 2's standard
 #                         timetables) the snapshot cannot tell ``ds`` from
