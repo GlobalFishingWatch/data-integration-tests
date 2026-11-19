@@ -331,6 +331,103 @@ def _event_regions_table(args: argparse.Namespace) -> str:
 # The 4-step docker chain (one slice)
 # --------------------------------------------------------------------------
 
+def _common_argv(args: argparse.Namespace) -> list[str]:
+    """Top-level ``pipe`` arguments, before the operation name.
+
+    ``--project`` is a top-level pipe arg; ``-labels`` is per-operation
+    (registered on each subparser in ``pipe_events/utils/parse.py``), so it
+    must appear AFTER the operation name in each step's argv -- not here,
+    where the top-level parser would either reject it or consume the JSON as
+    the operation positional (real failure mode observed on the first live
+    cloud run).
+    """
+    return ["--project", args.pipeline_project]
+
+
+def _incremental_argv(
+    args: argparse.Namespace, *, sfield: str, mode: str, suffix: str,
+    slice_start: date, slice_end: date,
+) -> list[str]:
+    """argv for step 1 (``incremental_events``) for one score field over
+    ``[slice_start, slice_end)``."""
+    prefix = _mode_prefix(suffix, mode)
+    return [
+        *_common_argv(args),
+        "--table_description", f"Incremental fishing events based on {sfield}",
+        "incremental_events",
+        "-start", slice_start.isoformat(),
+        "-end", slice_end.isoformat(),
+        "-messages", _research_messages_table(args),
+        "-sfield", sfield,
+        "-dest", _dest_ds(args),
+        "-dest_tbl_prefix", f"{prefix}_{sfield}",
+        "-labels", args.labels,
+    ]
+
+
+def _filter_argv(
+    args: argparse.Namespace, *, sfield: str, mode: str, suffix: str,
+) -> list[str]:
+    """argv for step 2 (``incremental_filter_events``) for one score field."""
+    prefix = _mode_prefix(suffix, mode)
+    dest_ds = _dest_ds(args)
+    return [
+        *_common_argv(args),
+        "--table_description", f"Filtered fishing events based on {sfield}",
+        "incremental_filter_events",
+        "-sfield", sfield,
+        "-segsact", _segs_activity_table(args),
+        "-segvessel", _segment_vessel_table(args),
+        "-pvesselinfo", _product_vessel_info_summary_table(args),
+        "-mtbl", f"{dest_ds}.{prefix}_{sfield}_merged",
+        "-dest", dest_ds,
+        "-dest_tbl_prefix", f"{prefix}_{sfield}",
+        "-labels", args.labels,
+    ]
+
+
+def _auth_argv(
+    args: argparse.Namespace, *, mode: str, suffix: str, slice_end: date,
+) -> list[str]:
+    """argv for step 3 (``auth_and_regions_fishing_events``)."""
+    prefix = _mode_prefix(suffix, mode)
+    dest_ds = _dest_ds(args)
+    return [
+        *_common_argv(args),
+        "--table_description", "Fishing events with authorizations",
+        "auth_and_regions_fishing_events",
+        "-source_fishing", f"{dest_ds}.{prefix}_nnet_score_filtered",
+        "-source_nl", f"{dest_ds}.{prefix}_night_loitering_filtered",
+        "-idcore", _identity_core_table(args),
+        "-idauth", _identity_authorization_table(args),
+        "-measures", _spatial_measures_table(args),
+        "-regions", _event_regions_table(args),
+        "-allvessels", _product_vessel_info_summary_table(args),
+        "-dest", f"{dest_ds}.{prefix}_fishing_events_v",
+        "-dest_view", f"{dest_ds}.{prefix}_fishing_events",
+        "-rdate", slice_end.isoformat(),
+        "-labels", args.labels,
+    ]
+
+
+def _restrictive_argv(
+    args: argparse.Namespace, *, mode: str, suffix: str, slice_end: date,
+) -> list[str]:
+    """argv for step 4 (``fishing_restrictive``)."""
+    prefix = _mode_prefix(suffix, mode)
+    dest_ds = _dest_ds(args)
+    return [
+        *_common_argv(args),
+        "--table_description", "Restrictive fishing events used in products",
+        "fishing_restrictive",
+        "-source_events", f"{dest_ds}.{prefix}_fishing_events_v",
+        "-destrest", f"{dest_ds}.{prefix}_product_events_fishing_v",
+        "-destrestview", f"{dest_ds}.{prefix}_product_events_fishing",
+        "-rdate", slice_end.isoformat(),
+        "-labels", args.labels,
+    ]
+
+
 def _run_step(args: argparse.Namespace, step_args: list[str], *, label: str) -> None:
     """Run one ``pipe`` operation in the container; raise on non-zero exit."""
     rc = dit_docker.run(
@@ -366,15 +463,7 @@ def _run_slice(
     docker runner has no Dataflow job to label).
     """
     prefix = _mode_prefix(suffix, mode)
-    dest_ds = _dest_ds(args)
     end_shard = _date_shard(slice_end)
-    # ``--project`` is a top-level pipe arg; ``-labels`` is per-operation
-    # (registered on each subparser in ``pipe_events/utils/parse.py``), so it
-    # must appear AFTER the operation name in each step's argv -- not in
-    # ``common``, where the top-level parser would either reject it or consume
-    # the JSON as the operation positional (real failure mode observed on the
-    # first live cloud run).
-    common = ["--project", args.pipeline_project]
     logger.info(
         "pipe-events chain mode=%s slice=[%s, %s) iter=%d/%d prefix=%s",
         mode, slice_start, slice_end, iteration, total_iterations, prefix,
@@ -384,18 +473,8 @@ def _run_slice(
     for sfield in SCORE_FIELDS:
         _run_step(
             args,
-            [
-                *common,
-                "--table_description", f"Incremental fishing events based on {sfield}",
-                "incremental_events",
-                "-start", slice_start.isoformat(),
-                "-end", slice_end.isoformat(),
-                "-messages", _research_messages_table(args),
-                "-sfield", sfield,
-                "-dest", dest_ds,
-                "-dest_tbl_prefix", f"{prefix}_{sfield}",
-                "-labels", args.labels,
-            ],
+            _incremental_argv(args, sfield=sfield, mode=mode, suffix=suffix,
+                              slice_start=slice_start, slice_end=slice_end),
             label=f"incremental_events sfield={sfield} mode={mode}",
         )
 
@@ -403,57 +482,21 @@ def _run_slice(
     for sfield in SCORE_FIELDS:
         _run_step(
             args,
-            [
-                *common,
-                "--table_description", f"Filtered fishing events based on {sfield}",
-                "incremental_filter_events",
-                "-sfield", sfield,
-                "-segsact", _segs_activity_table(args),
-                "-segvessel", _segment_vessel_table(args),
-                "-pvesselinfo", _product_vessel_info_summary_table(args),
-                "-mtbl", f"{dest_ds}.{prefix}_{sfield}_merged",
-                "-dest", dest_ds,
-                "-dest_tbl_prefix", f"{prefix}_{sfield}",
-                "-labels", args.labels,
-            ],
+            _filter_argv(args, sfield=sfield, mode=mode, suffix=suffix),
             label=f"incremental_filter_events sfield={sfield} mode={mode}",
         )
 
     # 3. Authorizations (auth_and_regions_fishing_events).
     _run_step(
         args,
-        [
-            *common,
-            "--table_description", "Fishing events with authorizations",
-            "auth_and_regions_fishing_events",
-            "-source_fishing", f"{dest_ds}.{prefix}_nnet_score_filtered",
-            "-source_nl", f"{dest_ds}.{prefix}_night_loitering_filtered",
-            "-idcore", _identity_core_table(args),
-            "-idauth", _identity_authorization_table(args),
-            "-measures", _spatial_measures_table(args),
-            "-regions", _event_regions_table(args),
-            "-allvessels", _product_vessel_info_summary_table(args),
-            "-dest", f"{dest_ds}.{prefix}_fishing_events_v",
-            "-dest_view", f"{dest_ds}.{prefix}_fishing_events",
-            "-rdate", slice_end.isoformat(),
-            "-labels", args.labels,
-        ],
+        _auth_argv(args, mode=mode, suffix=suffix, slice_end=slice_end),
         label=f"auth_and_regions_fishing_events mode={mode} shard={end_shard}",
     )
 
     # 4. Restrictive (fishing_restrictive).
     _run_step(
         args,
-        [
-            *common,
-            "--table_description", "Restrictive fishing events used in products",
-            "fishing_restrictive",
-            "-source_events", f"{dest_ds}.{prefix}_fishing_events_v",
-            "-destrest", f"{dest_ds}.{prefix}_product_events_fishing_v",
-            "-destrestview", f"{dest_ds}.{prefix}_product_events_fishing",
-            "-rdate", slice_end.isoformat(),
-            "-labels", args.labels,
-        ],
+        _restrictive_argv(args, mode=mode, suffix=suffix, slice_end=slice_end),
         label=f"fishing_restrictive mode={mode} shard={end_shard}",
     )
 

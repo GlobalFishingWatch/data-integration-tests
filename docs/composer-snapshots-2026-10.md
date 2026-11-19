@@ -4,12 +4,16 @@ Spike for [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELI
 
 Code:
 - `src/dit/composer.py`: the reader. Stdlib only, never imports or executes composer code.
-- `workflows/port_visits/composer_drift.py`: the first consumer, a read-only drift check for the port-visits production target.
+- `src/dit/drift.py`: the drift check as a library: specs, the three levels per step, reports (section 8).
+- `workflows/composer_drift.py`: runs the check for every workflow.
+- `workflows/<pkg>/composer_drift.py`: one spec per workflow. `workflows/port_visits/composer_drift.py` was the first consumer and also keeps its own command line.
 - `dit composer-dag <snapshot>`: prints a DAG's tasks as JSON, optionally with the run's dates as placeholders.
 
 This is a point-in-time analysis. Production values change; rerun the check rather than trusting the numbers here.
 
 **Update 2026-11-19.** Re-read at composer `origin/main` **9f214877b** for pipe-anchorages only. Production's v5 DAGs (AIS and VMS) run pipe-anchorages **v5.0.1** with the v5 CLI since 2026-11-04 (v5.0.0 from 2026-10-26). DIT dropped the v4 CLI the same day and ported the drift check. Section 5 and the pipe-anchorages row of section 6 are rewritten for that state. Everything else, including the counts in sections 2 to 4 and the other pipelines' rows, is still as read at 0a644da.
+
+**Second update 2026-11-19.** The check now covers every workflow (section 8, read at composer `origin/main` **df5c973c7**). Section 8d has the result per workflow and replaces the other pipelines' rows of section 6 as the current state. Port visits' three remaining differences are accepted with reasons, so its check reports "in sync" (section 5b).
 
 ## 1. Why
 
@@ -69,7 +73,7 @@ The snapshots cover only what a DAG passes to a task. DIT's staging cohorts, DIT
 
 ## 5. Port visits: DIT against production
 
-Run with `dit run workflows/port_visits/composer_drift.py` (exit 1 means drift was found). DIT is configured as `--baseline-production` configures it: the target's tables, its history start, and the snapshot run's dates.
+Run with `dit run workflows/port_visits/composer_drift.py` (exit 1 means drift was found), or as part of the general check, `dit run workflows/composer_drift.py --workflow port_visits/ais --detail` (section 8). Both print the same report. Only the first takes `--snapshot`, for the backfill comparison below. DIT is configured as `--baseline-production` configures it: the target's tables, its history start, and the snapshot run's dates.
 
 This section is as of 2026-11-19 (composer 9f214877b, pipe-anchorages v5.0.1, DIT's v5-only builders). The check written on 2026-10-23 read the v4 flag names, because production's v5 DAG then still ran v4.6.4. Once production moved, it reported false field mismatches and could not compare the argv, so it was ported.
 
@@ -89,7 +93,7 @@ The target finds the job of the daily DAG `core.ais.v5`. Results against `core_a
 | `deployed_version` (pipe-anchorages v5.0.1) | match | match |
 | `worker_machine_type`, `disk_size_gb` | match | match |
 
-A second block, "DIT defaults", compares `ais.DEFAULT_PIPELINE_VERSION` (the pipe-anchorages version inside DIT's default overlay image) with the image tag of both production tasks. It matches (v5.0.1) in both snapshots. This is the line that turns to DIFF when production bumps the version.
+Each step's "version" line compares `ais.DEFAULT_PIPELINE_VERSION` (the pipe-anchorages version inside DIT's default overlay image) with the image tag of the production task. It matches (v5.0.1) for both steps in both snapshots. This is the line that turns to DIFF when production bumps the version. (Before the general check it was a separate block, "DIT defaults".)
 
 The brief asked for a comparison with `core_ais_v5_backfill`. The target was written from `dags/core/ais/v5.py`, which defines both DAGs, and its job-name prefix is the daily DAG's. So the backfill's prefix difference is expected, not drift.
 
@@ -112,16 +116,16 @@ Both steps run the same command (`pipe-anchorages port-state-transitions`, `pipe
 | Same | `--start-date`, `--end-date`, `--bq-in-named-anchorages`, `--runner` (spellings treated as equal), `--project`, `--region`, `--no_use_public_ips`, `--worker_machine_type`, `--disk_size_gb` | `--start-date`, `--end-date`, `--bq-in-port-state-transitions`, `--bq-in-segment-info`, `--bad-segs` (SQL byte-identical), and the same six Dataflow flags |
 | Expected to differ: DIT-owned | `--bq-out-port-state-transitions`, `--job_name`, `--labels`, `--service_account_email`, `--temp_location`, `--staging_location`, `--subnetwork`, `--max_num_workers`, `--sdk_container_image` | the same, with `--bq-out-port-visits` |
 | Expected to differ: accepted | `--dataflow_service_options` (lineage), `--network` | same |
-| Only in production (still reported) | `--no-rich-logging`, `--wait_for_job` | same |
-| Values differ | `--bq-in-messages` | none |
-| Only in DIT, outside the expected set | none | none |
+| Expected to differ: accepted by the owner on 2026-11-19 | `--no-rich-logging`, `--wait_for_job` | same |
+| Expected to differ: accepted for step 1 only | `--bq-in-messages` | not passed |
+| Only in production, only in DIT, or values differ, outside the expected set | none | none |
 
-So the check still exits 1, on three understood differences:
-- **`--bq-in-messages`** (step 1 only). The check runs step 1 on DIT's staging messages, because `ProductionTarget` has no step-1 tables. Unchanged from 2026-10-23, under the flag's new name.
+Until the general check landed, the check exited 1 on three understood differences. They are now accepted differences, each with a written reason, so port visits reports "in sync" and exits 0:
+- **`--bq-in-messages`** (step 1 only, `THIN_ACCEPTED_DIFFERENCES`). The check runs step 1 on DIT's staging messages. That is DIT's default by design, and `ProductionTarget` has no step-1 tables. The named-anchorages table of step 1 is still compared.
 - **`--no-rich-logging`.** A real option of the CLI: plain instead of coloured log output. It changes the log format only. DIT does not pass it.
 - **`--wait_for_job`.** Production still passes this v4 flag. The v5 CLI does not define it; gfw-common's `Pipeline` waits for batch jobs regardless (read at gfw-common v0.25.0). DIT does not pass it.
 
-Neither new difference changes output. Whether DIT should emit the two flags, or list them as accepted differences, is the owner's call; until then they stay reported.
+**Owner decision (2026-11-19, on PR #91).** The last two are accepted. Neither changes output. To have the check report them again, delete the two entries. To emit them instead, add them to `ais._pipeline_options` and delete the entries.
 
 Two changes to the expected set since PR #86:
 - The v4 names went with the v4 CLI: `--output_table` became the two `--bq-out-*` flags, and `--temp_dataset` (DIT-only) is gone. DIT now hands the staging dataset to its overlay image through a container environment variable, which is not part of the argv.
@@ -178,6 +182,8 @@ DIT's pipe-events pin is stale even against v3: `core.ais.v3` left v4.2.17 on 20
 
 In order of value per effort:
 
+*Status 2026-11-19:* items 1 and 2 are done together, as the general check of section 8. The source half of item 1 is covered only as far as each spec's flag comparison goes (section 8e).
+
 1. **Version- and source-drift check for every workflow (small, do first).** Map each workflow's default image to the snapshot(s) and task(s) it mirrors. Compare its tag and command names with `pinned_versions` and the parsed positionals. This alone would have flagged the pipe-events and pipe-gaps drift above, and production's eventual move to pipe-anchorages v5. It only needs image tags and command names, so it exposes no infrastructure.
 
    The owner's item 6 (2026-10-23) extends it to sources: warn when a workflow's default input tables differ from what production's task reads (the named-anchorages case). Table names stay in the check's local output, never in this repository.
@@ -189,6 +195,8 @@ In order of value per effort:
    - the separate sizing and private-IP PR lands;
    - the named-anchorages default is bumped;
    - step 1's messages input is settled. It differs only because `ProductionTarget` has no step-1 tables. Item 7 would supply it, or the target gains the table.
+
+   *Status 2026-11-19:* the check passes. The first two landed (#87, #88). The third is settled differently: the messages table is an accepted difference for step 1, because the staging cohort is DIT's default by design (section 5b).
 4. **Generate `ProductionTarget` from the snapshot.** The fields map one to one (section 5a proves the mapping). The run-date convention needs a multi-day snapshot or the DAG source, because daily snapshots are ambiguous. Keep the hand-written target until the drift check has run green for a while, then generate it, or keep both, with the check as the test.
 5. **Checked-in `params/<pipeline>.yaml` at a pinned composer commit.** This is Phase 4 of `docs/plan.md`. Templated argv (placeholders instead of dates) renders back with DIT's own dates (`render_template`). The repo is public, so an allow-list is mandatory: versions, commands, flag names, and the tables DIT targets. Never infrastructure values. Reviewed diffs on regeneration are the sync mechanism. Worth it once two or more workflows consume more than versions and commands; until then, step 1 and step 2 read the snapshot live.
 6. **CLI-generation adapters (v4 / v5).** The snapshot shows which generation production runs (image version plus command names: `thin_port_messages` is v4, `port-state-transitions` is v5). It does not show the other generation's argv: a PR on v5 has no snapshot while production is on v4. So the builders stay hand-written per generation. The production generation gets a golden test (snapshot argv rendered with DIT's dates against the builder's output), and a cross-version run picks each binding's adapter by its version. When production moves to v5, the v5 builder gets its golden test from the snapshot instead of from pipe-anchorages main.
@@ -201,4 +209,124 @@ In order of value per effort:
 
    The snapshots then serve a different purpose: telling DIT which task and labels to look for, and checking DIT's own defaults. Open points (section 5b): the view's lag against short time-travel windows, a per-pipeline label mapping, the output pin staying the job's `Done` time, and the Data Lineage API as an alternative.
 
-**Recommended next step:** item 1, including the source check, together with the named-anchorages bump. Item 7 is the direction for production-baseline runs. The owner has not yet ruled on the order of items 2, 4 and 5.
+**Recommended next step (2026-10-23):** item 1, including the source check, together with the named-anchorages bump. Item 7 is the direction for production-baseline runs. The owner has not yet ruled on the order of items 2, 4 and 5.
+
+**Recommended next step (2026-11-19):** port the workflows that section 8d shows as drifted, each against its spec, and decide where the check runs (item 2's open question; nothing runs it on a schedule yet).
+
+## 8. The general check: every workflow against production (2026-11-19)
+
+A drift audit on 2026-11-19 found that four of five pipelines' workflows no longer run what production runs. Nothing had told DIT. The port-visits check of section 5 is now a library with one spec per workflow, so each later port can be checked against production.
+
+### 8a. How it works
+
+Three parts:
+- **`src/dit/drift.py`**, the library. Stdlib and `dit.composer` only. It holds the spec types, the comparison and the report formatting.
+- **One spec per workflow, next to the workflow:** `workflows/<pkg>/composer_drift.py` exposes `SPECS`.
+- **One runner:** `workflows/composer_drift.py` runs every spec.
+
+```
+git -C ../composer-dags-production fetch origin
+dit run workflows/composer_drift.py --composer-dir ../composer-dags-production
+dit run workflows/composer_drift.py --workflow pipe_events/fishing --detail
+python -m workflows.composer_drift --strict
+```
+
+Options: `--composer-dir`, `--ref` (default `origin/main`), `--workflow NAME` (repeatable), `--detail`, `--strict`. The check reads the checkout with `git show` only. It never fetches, so fetch first.
+
+A spec (`dit.drift.WorkflowSpec`) names the composer snapshot the workflow mirrors and holds one `StepSpec` per step. A step names its composer task, DIT's default image, and a function that builds the tokens DIT would run for that snapshot's run dates: entrypoint, command, flags.
+
+Each step is checked on **three levels**, reported separately:
+
+| Level | DIT side | Production side |
+|---|---|---|
+| version | image name and pipeline version of DIT's default image | image name and tag of the task |
+| command | entrypoint and command words of DIT's tokens | the same of the task's argv |
+| flags | every flag DIT emits, by name and value | every flag of the task's argv |
+
+When the command differs, the flag differences are still listed, but marked **indicative only**. The two sides are then different CLI generations, so names and values do not line up. The counts show the size of the gap, not a list of defects.
+
+**Expected differences** are left out of the flag diff and listed apart:
+- *DIT-owned* flags carry DIT's own values on purpose: output tables, job names, labels, service account, GCS paths, worker cap, image path. `dit.drift.DATAFLOW_OWNED_FLAGS` holds the ones every Dataflow workflow shares; each spec adds its output tables.
+- *Accepted* differences are flags production passes and DIT leaves out, or values DIT sets differently. Each has a written reason, printed in the report. They can be accepted for the whole workflow or for one step.
+- An expected flag that only one side passes is marked `[production only]` or `[DIT only]`.
+
+A spec can add **field checks** for hand-copied values that are not flags of DIT's argv (port visits' `ProductionTarget`, pipe-gaps' worker sizing).
+
+**Output.** The default is a summary: one verdict line per workflow, and under it one row per step with the version, the command, and three counts (flags only in production, only in DIT, with differing values). The counts leave out the expected differences. A `*` marks indicative counts. `--detail` adds each workflow's full report.
+
+**Local reading only.** The summary holds versions, command names, task ids and counts. The detail prints production's argv values (tables, service accounts, buckets, network). Do not paste the detail into this repository, a commit message or a pull request.
+
+**Exit codes.** Each spec says whether its workflow is expected to be in sync today (`in_sync`).
+- 0: every workflow marked in sync has no drift beyond its expected differences.
+- 1: one of those drifts. With `--strict`: any workflow drifts.
+- 2: a snapshot or a task could not be read. The other workflows are still reported.
+
+Drift in a workflow not marked in sync is known work. It is reported and does not fail the check.
+
+### 8b. How DIT's tokens are built
+
+Each spec calls the workflow's own argv builders with a parsed-args namespace. No cloud call, no docker, no import of the pipeline package. The tokens are those of a plain run at the workflow's defaults, over the snapshot run's dates. So a table or a tuning value that differs from production's is reported, unless the spec accepts it.
+
+| Workflow | Builders | Run |
+|---|---|---|
+| `port_visits/ais.py` | `_thin_argv`, `_visits_argv` | as `--baseline-production` configures it (section 5) |
+| `encounters/ais.py`, `encounters/vms.py` | `_create_argv`, `_merge_argv` | one slice, inclusive `[start_date, end_date]`, mode `1_bf` |
+| `pipe_events/fishing.py` | `_incremental_argv`, `_filter_argv`, `_auth_argv`, `_restrictive_argv` | one slice, half-open `[start_date, end_date_exclusive)`, mode `1_bf` |
+| `pipe_gaps/mode_equivalence.py` | `_make_config`, `_cfg_to_cli_flags` | one detect over half-open `[start_date, end_date_exclusive)` |
+| `pipe_segment/identity_match_key.py` | `_segment_args`, `_segment_identity_args`, `_segment_info_args` | one binding, default options, inclusive `--date-range` |
+
+Notes:
+- **Encounters and pipe-events** built each step's argv inline in `_run_slice`. The argv now comes from the pure builders named above. The emitted argv is unchanged; the existing tests pin every docker call.
+- **pipe-gaps** has no command line with its default Dataflow runner. It builds a pipe-gaps config object in-process and passes Dataflow options to gfw-common as a mapping. Building that needs the pipe-gaps package at the version the workflow was written for. The spec compares the argv of the workflow's docker runner instead (`--runner docker`): the same config written as `pipe-gaps detect` flags. So the flags level covers the pipeline's own flags. The Dataflow options production passes on its command line are accepted differences there, and the worker sizing DIT mirrors is checked as two fields. `outage_recovery.py` has its own copy of the config builder and no spec of its own.
+- **pipe-segment** is checked against `core_ais_v3`. Production's AIS v5 DAG has no segmenter: it waits for the v3 DAG's segment group and reads its tables. The VMS v5 DAG has its own segment stage, which the workflow does not mirror.
+- **pipe-events:** the DAG's `fishing_intervals` group also has longline-set tasks. The workflow does not drive them, so they are not in the spec.
+- The wrappers `port_visits/cross_version_ais.py` and `pipe_events/cross_version_fishing.py` have no spec. They run the workflows above.
+
+If a step's tokens cannot be built offline, its `StepSpec` gives `command=` (entrypoint and command words, from the workflow's constants) instead of `tokens=`. The step then gets the version and command levels, and the report says the flags were not compared. No spec needs this today.
+
+### 8c. Adding or updating a spec
+
+1. Find the snapshot and the task ids: `dit composer-dag <snapshot> --task-prefix <group>`.
+2. Make sure each step's argv comes from a function of the parsed args, with no side effect. Extract one if the argv is built inline; keep the emitted argv unchanged.
+3. Write `workflows/<pkg>/composer_drift.py`: a token builder per step, the DIT-owned flags (the workflow's outputs plus `drift.DATAFLOW_OWNED_FLAGS` for a Dataflow workflow), the accepted differences with a reason each, and `SPECS`.
+4. Add the module's `SPECS` to `workflows/composer_drift.py`.
+5. Add the steps to `COMMANDS` in `tests/test_composer_drift.py`, and pin that the tokens equal what the workflow hands its runner.
+6. Run the check with `--detail` and read every difference. Fix the workflow, or accept the difference with a reason. When nothing is left, set `in_sync=True`. From then on drift fails the check.
+
+A port of a workflow to a new CLI generation rewrites the spec's flag names with it. The lists of a spec that is not in sync yet name the flags of the CLI DIT drives today, plus the Dataflow flags, whose names do not change with the CLI.
+
+### 8d. Result on 2026-11-19
+
+Read at composer `origin/main` df5c973c7. The check exits 0: port visits, the one workflow marked in sync, has no drift. `--strict` exits 1.
+
+- **Port visits: in sync.** All twelve `ProductionTarget` fields match. Both steps run pipe-anchorages v5.0.1 and the same commands. No flag differs outside the expected set.
+- **Encounters, AIS and VMS: drift on all three levels.**
+  - Version: DIT's default image is v4.4.0, production's v5 DAGs run v5.0.0.
+  - Command: DIT runs `create_raw_encounters` and `merge_encounters`; production runs `partial-encounters` and `encounters`.
+  - Flags (indicative): every pipeline flag is renamed, from underscore names to hyphenated `--bq-in-*` / `--bq-out-*`, `--start-date`, `--end-date` and so on. Production's end date is one day later than DIT's for the same run, which points at an exclusive end. Production passes `--no-rich-logging`. Its merge step starts at a constant history start.
+  - VMS only: production passes `--max-gap-seconds-inclusive` in step 1, and no bad-segments filter in step 2, where DIT's VMS workflow passes one.
+  - The Dataflow flags both sides pass compare the same: runner, project, region, private IPs, machine type, disk, `--wait_for_job`.
+- **pipe-events (fishing): drift on all three levels, in all six steps.**
+  - Version: DIT's default image is v4.2.17, production runs v9.0.0.
+  - Command: the entrypoint is `pipe` in DIT and `pipe-events` in production, and all four commands are renamed (for example `incremental_events` to `fishing_events_incremental`).
+  - Flags (indicative): only `--project` is the same. Every other flag is renamed, from single-dash names to `--bq-in-*`, `--bq-out-*`, `--score-field`, `--reference-date` and so on. Production also passes options DIT has no counterpart for: a field prefix and gear-type filters in the filter steps, a UDF dataset, a regions registry, and a nautical-time raster in the authorization step.
+- **pipe-gaps: drift on all three levels.**
+  - Version: DIT's worker image is v0.10.0, production runs v0.17.1.
+  - Command: DIT runs `detect`, production `raw-gaps`.
+  - Flags (indicative): `--date-range` became `--start-date` / `--end-date`, and the table flags are renamed. Production passes four options DIT lacks (`--versioned-suffix`, `--open-gaps-start-date`, `--good-seg-stabilization-days`, `--eval-last`). DIT passes `--window-period-d`, which production does not. `--min-gap-length` differs in value, and `--filter-good-seg` is a bare flag in production.
+  - The two worker-sizing fields match.
+- **pipe-segment: version and command match; flags do not.** All three steps run v5.0.3 and the same commands as production's AIS v3 DAG. The flag differences are real and not indicative:
+  - `segment`: production passes three satellite-offset input flags. DIT passes them only with `--include-satellite-offsets`, which is off by default. DIT passes `--setup_file` and `--experiments`, which production does not.
+  - `segment_identity`: DIT passes `--setup_file`. Production passes labels and a job name; DIT passes neither (both are DIT-owned, so they show as `[production only]`, not as drift).
+  - `segment_info`: production passes no Dataflow option at all. DIT passes six (`--runner`, `--setup_file`, `--wait_for_job`, `--region`, `--no_use_public_ips`, `--network`). `--source_segment_vessel` differs: DIT passes its identity table as a stand-in, production reads the output of a step DIT does not run.
+
+  These are for the workflow's owner to judge, so the spec reports them and is not marked in sync.
+
+### 8e. What the check does not cover
+
+- **One run per snapshot** (section 4). A flag production passes only on some dates is not seen.
+- **Inputs.** DIT's tokens use the workflow's default tables. A staging table differs from production's by design. Port visits accepts that for step 1. For the other workflows the port decides, per input, whether the difference is by design or drift. The owner's lineage principle (section 5b) still stands for comparisons against production.
+- **DIT-owned flags** are not compared, not even for presence. The report marks the one-sided ones; nobody is forced to read them.
+- **Anything outside the argv:** environment variables, the steps production runs and DIT does not, and whether a pipeline accepts the flags it is given.
+- **The environment it runs in.** DIT's tokens are what the workflows would run here. A `DIT_*` override in the shell (for example `DIT_DATAFLOW_REGION`) changes them, and a compared flag then differs. Run the check without such overrides.
+- **Where it runs.** Nothing runs the check on a schedule. A laptop with a fetched composer checkout works today.

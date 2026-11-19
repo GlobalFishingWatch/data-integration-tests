@@ -176,5 +176,6 @@ Found the hard way onboarding encounters (2026-07-30, six failed smokes). None a
    - As a workflow-side workaround, **with a Plan-changelog entry in `CLAUDE.md` recording the trade-off**.
 3. **Strongly Recommended** gaps don't block but should be filed as upstream issues and tracked.
 4. **Update this doc** in the same commit as the workflow is added — both the matrix and any new pipeline-class-specific sections if the new pipeline's architecture isn't already covered.
+5. **Add a drift spec** (`workflows/<pkg>/composer_drift.py`) in the same change, and run `dit run workflows/composer_drift.py --workflow <name> --detail`. The spec names the production task each step mirrors, and the check compares the workflow's version, command and flags with it. A workflow is "in sync" when nothing differs beyond the differences its spec accepts with a reason. The same applies when an existing workflow is ported to a new version of its pipeline. See [`composer-snapshots-2026-10.md`](composer-snapshots-2026-10.md) § 8c.
 
 The integration-test workflow must never carry pipeline-specific workarounds without an entry in the Plan changelog explaining why.

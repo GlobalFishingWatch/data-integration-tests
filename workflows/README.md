@@ -18,7 +18,25 @@ mode-equivalence test.
 | `encounters/ais.py` | encounters_pipeline (encounters generation) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `encounter_id`) on both the raw and merged tables | no |
 | `encounters/vms.py` | encounters_pipeline (encounters generation, VMS) | same execution as `encounters/ais.py` (`ais.run(args)`); only defaults and help differ | same as `encounters/ais.py` | no |
 
-`port_visits/composer_drift.py` is not a test workflow. It is a read-only drift check that compares the port-visits `ProductionTarget`, the default image's pipe-anchorages version and the argv with production's rendered DAG in composer-dags-production, and runs nothing on GCP ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700), [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md)).
+## Drift check against production (`composer_drift.py`)
+
+The `composer_drift.py` files are not test workflows. They are a read-only check that compares what each workflow would run with production's rendered DAG in composer-dags-production. Nothing runs on GCP or in docker ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700), [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md) § 8).
+
+- `composer_drift.py` (this directory) is the runner: `dit run workflows/composer_drift.py --composer-dir <checkout>`. It prints one row per workflow step (version, command, flag counts); `--detail` adds the full reports, which contain production values and are for local reading only.
+- `<pkg>/composer_drift.py` holds the spec of each workflow in that package: the composer snapshot and tasks it mirrors, and what may differ.
+
+| Spec | Workflow | Composer snapshot | Expected in sync today |
+|---|---|---|---|
+| `port_visits/ais` | `port_visits/ais.py` | `core_ais_v5` | yes |
+| `encounters/ais` | `encounters/ais.py` | `core_ais_v5` | no: the workflow drives an older CLI generation |
+| `encounters/vms` | `encounters/vms.py` | `core_vms_v5_daily` | no: same |
+| `pipe_events/fishing` | `pipe_events/fishing.py` | `core_ais_v5` | no: older CLI generation |
+| `pipe_gaps/mode_equivalence` | `pipe_gaps/mode_equivalence.py` | `core_ais_v5` | no: older pipe-gaps generation |
+| `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | no: version and command match, flags differ |
+
+The two cross-version wrappers and `pipe_gaps/outage_recovery.py` have no spec of their own. A workflow that is ported to what production runs gets its spec updated in the same change, and `in_sync=True` once the check passes. A new workflow gets a spec when it lands.
+
+`port_visits/composer_drift.py` also keeps its own command line, which additionally checks the port-visits `ProductionTarget` against another snapshot (`--snapshot core_ais_v5_backfill`).
 
 ## Framework-extraction decision (2026-05-29) — `dit.phases` DEFERRED
 

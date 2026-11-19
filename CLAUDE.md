@@ -72,6 +72,54 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-19 — Drift check generalised: `dit.drift`, one spec per workflow, one runner (PIPELINE-4700)
+
+**Trigger.** The 2026-11-19 drift audit found that four of five pipelines' workflows no longer run what production runs, and nothing had told DIT. The owner agreed the next step is a per-workflow drift check, so each later port can be checked against it. This does items 1 and 2 of `docs/composer-snapshots-2026-10.md` § 7 together. No workflow is ported here.
+
+**Shape.**
+- **Library `src/dit/drift.py`** (stdlib and `dit.composer` only). The generic parts moved out of `workflows/port_visits/composer_drift.py`: field checks, argv comparison, report model, formatting. New: frozen `StepSpec` and `WorkflowSpec`, `run_specs`, `exit_code`, a summary.
+- **One spec per workflow, next to it** (`workflows/<pkg>/composer_drift.py`, exposing `SPECS`).
+- **One runner**, `workflows/composer_drift.py`: `--composer-dir`, `--ref`, `--workflow`, `--detail`, `--strict`.
+
+**Three levels per step, reported separately.**
+- Version: image name and pipeline version of DIT's default image against the task's image.
+- Command: entrypoint and command words.
+- Flags: by name and value, minus the expected differences.
+
+When the command differs the flag differences are still listed, marked indicative only: a different CLI generation makes name-by-name comparison meaningless, but the counts show the size of the port.
+
+**Decisions.**
+- **`in_sync` per spec, and exit codes.** Only port visits is expected in sync today. Drift there exits 1. Drift in the other specs is reported and exits 0, because it is known work and the check must stay usable until each port lands. `--strict` exits 1 on any drift. Exit 2 when a snapshot or task cannot be read; the other workflows are still reported.
+- **Tokens come from the workflow's own builders, offline.** Each spec calls them with a parsed-args namespace: a plain run at the workflow's defaults over the snapshot run's dates. No cloud call, docker or pipeline import; a test fails on any subprocess.
+- **Encounters and pipe-events got builders** (`_create_argv`, `_merge_argv`; `_incremental_argv`, `_filter_argv`, `_auth_argv`, `_restrictive_argv`). `_run_slice` built the argv inline. The emitted argv is unchanged; the existing tests pin every docker call. Neither file feeds a run-cache key.
+- **`pipe_gaps/mode_equivalence.py` was left untouched on purpose.** Its sha1 is part of the run-cache key, so any edit makes every cached pipe-gaps row miss once. The spec composes the docker runner's argv itself (entrypoint, `detect`, `_cfg_to_cli_flags`), and two tests pin that against `_run_pipeline("docker", ...)` and against `main()`'s `base_cfg`.
+- **pipe-gaps: a departure from the brief's fallback.** The brief expected a version-and-command check if the builders were not callable without the package. They are: `_make_config` and `_cfg_to_cli_flags` import nothing from pipe-gaps. So the spec does a full flag comparison, of the docker runner's argv. With the default Dataflow runner the workflow has no command line (config in-process, Dataflow options as a mapping). Production's Dataflow flags are therefore accepted differences in this spec, and the mirrored machine type and disk are checked as two fields. The library still supports the fallback (`StepSpec(command=...)`); no spec uses it.
+- **pipe-segment is checked against `core_ais_v3`.** The AIS v5 DAG has no segmenter. Version and command match; the flags do not (`--setup_file`, `--experiments`, satellite-offset inputs off by default, Dataflow options on `segment_info`, the stand-in for `--source_segment_vessel`). They are reported, not accepted: they are the owner's to judge. So the spec is not marked in sync.
+- **Shared expected sets.** `DATAFLOW_OWNED_FLAGS`, `DATAFLOW_ACCEPTED_DIFFERENCES` and `RUNNER_EQUIVALENTS` in `dit.drift` hold what the owner approved for port visits on 2026-10-23 (PR #86). The encounters and pipe-gaps specs reuse them. That extends the approval to other workflows; open for the owner to confirm.
+- **Specs not in sync name today's flags.** Their DIT-owned and accepted lists hold the flags of the CLI DIT drives now, plus the Dataflow flags. The port rewrites them with the builders.
+- **Expected flags are marked when one-sided** (`[production only]`, `[DIT only]`). DIT-owned flags are not compared, so a missing `--labels` (pipe-segment's downstream steps) would otherwise be invisible.
+
+**Port visits.**
+- Same behaviour, on the library. Its own command line stays (`--target`, `--snapshot`). The version check is now each step's version level; the "DIT defaults" block is gone.
+- The three remaining differences are accepted, so the check reports "in sync" and exits 0: step 1's messages table (`THIN_ACCEPTED_DIFFERENCES`, step 1 only, DIT's staging cohort by design), `--no-rich-logging` and `--wait_for_job`.
+- **Owner decision (2026-11-19, on PR #91):** the last two are accepted. Deleting the two entries of `ACCEPTED_DIFFERENCES` flips them back.
+
+**Result against composer `origin/main` df5c973c7 (2026-11-19).** Port visits in sync. Encounters (AIS, VMS), pipe-events and pipe-gaps differ in version, command and flags. pipe-segment matches in version and command and differs in flags. In words, per workflow: `docs/composer-snapshots-2026-10.md` § 8d.
+
+**Public-repo constraint, unchanged.** No composer content is committed. Tests use synthetic DAGs: for most specs built from DIT's own tokens, so "production runs what DIT runs". The summary holds versions, command names, task ids and counts; the detail prints production values and is for local reading. One opt-in test module reads a real checkout when one is found and asserts structure plus "port visits is in sync". It fails when production changes its port-visits tasks, which is the signal.
+
+**Sections moved.**
+- New: `src/dit/drift.py`; `workflows/composer_drift.py`; `workflows/{encounters,pipe_events,pipe_gaps,pipe_segment}/composer_drift.py`; `tests/test_drift.py`, `tests/test_composer_drift.py`, `tests/test_composer_drift_live.py`.
+- `workflows/port_visits/composer_drift.py` (rebuilt on the library; `spec()`, `SPECS`, `THIN_ACCEPTED_DIFFERENCES`, two more accepted differences); `tests/test_port_visits_composer_drift.py` (ported, +3).
+- `workflows/encounters/ais.py`, `workflows/pipe_events/fishing.py` (builders extracted).
+- Docs: `docs/composer-snapshots-2026-10.md` (header, § 5, § 7 status, new § 8); `docs/plan.md` § Phase 4 vision (one sentence); README Features and Roadmap 7b; `workflows/README.md`; `docs/pipeline-contract.md` § Process (step 5); CHANGELOG § 2026-11-19.
+- Suite: 1,000 → 1,099 with a composer checkout; without one, the three tests that read it skip.
+
+**Sections NOT moved.**
+- No workflow is ported.
+- Nothing runs the check on a schedule (§ 7 item 2's open question).
+- Source drift is covered only through each spec's flag comparison; the lineage-based discovery of § 7 item 7 is untouched.
+
 ### 2026-11-19 — Port visits on the v5 CLI only; default image is DIT's overlay of pipe-anchorages v5.0.1; no auto-build
 
 **Trigger.** A drift audit on 2026-11-19 found that production's `core.ais.v5` DAG has run pipe-anchorages v5.0.1 with the v5 CLI since 2026-11-04 (v5.0.0 from 2026-10-26), while DIT still defaulted to v4.6.4 and the v4 CLI. DIT's opt-in v5 argv was still correct: the CLI, the SQL and the schemas did not change between b36aed6, which the v5 support was written against, and the tag. The drift check merged in #86 read the v4 flag names, so it reported false mismatches against today's composer.
