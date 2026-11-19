@@ -273,12 +273,12 @@ Each spec calls the workflow's own argv builders with a parsed-args namespace. N
 | `encounters/ais.py`, `encounters/vms.py` | `_create_argv`, `_merge_argv` | one slice, inclusive `[start_date, end_date]`, mode `1_bf` |
 | `pipe_events/fishing.py` | `_incremental_argv`, `_filter_argv`, `_auth_argv`, `_restrictive_argv` | one slice, half-open `[start_date, end_date_exclusive)`, mode `1_bf` |
 | `pipe_gaps/mode_equivalence.py` | `_make_config`, `_cfg_to_cli_flags` | one detect over half-open `[start_date, end_date_exclusive)` |
-| `pipe_segment/identity_match_key.py` | `_segment_args`, `_segment_identity_args`, `_segment_info_args` | one binding, default options, inclusive `--date-range` |
+| `pipe_segment/identity_match_key.py` | `_step_argvs` (one builder per step: `_segment_args`, `_segment_identity_args`, `_segment_vessel_daily_args`, `_segment_info_args`, `_vessel_info_args`, `_segment_vessel_args`) | one binding, default options, inclusive `--date-range`, all six steps |
 
 Notes:
 - **Encounters and pipe-events** built each step's argv inline in `_run_slice`. The argv now comes from the pure builders named above. The emitted argv is unchanged; the existing tests pin every docker call.
 - **pipe-gaps** has no command line with its default Dataflow runner. It builds a pipe-gaps config object in-process and passes Dataflow options to gfw-common as a mapping. Building that needs the pipe-gaps package at the version the workflow was written for. The spec compares the argv of the workflow's docker runner instead (`--runner docker`): the same config written as `pipe-gaps detect` flags. So the flags level covers the pipeline's own flags. The Dataflow options production passes on its command line are accepted differences there, and the worker sizing DIT mirrors is checked as two fields. `outage_recovery.py` has its own copy of the config builder and no spec of its own.
-- **pipe-segment** is checked against `core_ais_v3`. Production's AIS v5 DAG has no segmenter: it waits for the v3 DAG's segment group and reads its tables. The VMS v5 DAG has its own segment stage, which the workflow does not mirror.
+- **pipe-segment** is checked against `core_ais_v3`. Production's AIS v5 DAG has no segmenter: it waits for the v3 DAG's segment group and reads its tables. The VMS v5 DAG has its own segment stage, which the workflow does not mirror. The spec covers all six tasks of the group. The tables one step hands to the next are DIT-owned flags, so the check does not see how the chain is wired; the workflow's tests pin that.
 - **pipe-events:** the DAG's `fishing_intervals` group also has longline-set tasks. The workflow does not drive them, so they are not in the spec.
 - The wrappers `port_visits/cross_version_ais.py` and `pipe_events/cross_version_fishing.py` have no spec. They run the workflows above.
 
@@ -297,7 +297,7 @@ A port of a workflow to a new CLI generation rewrites the spec's flag names with
 
 ### 8d. Result on 2026-11-19
 
-Read at composer `origin/main` df5c973c7. The check exits 0: port visits, the one workflow marked in sync, has no drift. `--strict` exits 1.
+Read at composer `origin/main` df5c973c7. The check exits 0: the workflows marked in sync have no drift. That was port visits alone at first, and pipe-segment as well once its flags were fixed the same day (re-read at `origin/main` 2773dab18). `--strict` exits 1.
 
 - **Port visits: in sync.** All twelve `ProductionTarget` fields match. Both steps run pipe-anchorages v5.0.1 and the same commands. No flag differs outside the expected set.
 - **Encounters, AIS and VMS: drift on all three levels.**
@@ -315,12 +315,24 @@ Read at composer `origin/main` df5c973c7. The check exits 0: port visits, the on
   - Command: DIT runs `detect`, production `raw-gaps`.
   - Flags (indicative): `--date-range` became `--start-date` / `--end-date`, and the table flags are renamed. Production passes four options DIT lacks (`--versioned-suffix`, `--open-gaps-start-date`, `--good-seg-stabilization-days`, `--eval-last`). DIT passes `--window-period-d`, which production does not. `--min-gap-length` differs in value, and `--filter-good-seg` is a bare flag in production.
   - The two worker-sizing fields match.
-- **pipe-segment: version and command match; flags do not.** All three steps run v5.0.3 and the same commands as production's AIS v3 DAG. The flag differences are real and not indicative:
-  - `segment`: production passes three satellite-offset input flags. DIT passes them only with `--include-satellite-offsets`, which is off by default. DIT passes `--setup_file` and `--experiments`, which production does not.
-  - `segment_identity`: DIT passes `--setup_file`. Production passes labels and a job name; DIT passes neither (both are DIT-owned, so they show as `[production only]`, not as drift).
-  - `segment_info`: production passes no Dataflow option at all. DIT passes six (`--runner`, `--setup_file`, `--wait_for_job`, `--region`, `--no_use_public_ips`, `--network`). `--source_segment_vessel` differs: DIT passes its identity table as a stand-in, production reads the output of a step DIT does not run.
+- **pipe-segment: in sync, after the fixes of the same day.** The first run of the check found version and command matching and the flags not, in the three steps the workflow then drove:
+  - `segment`: production passes three satellite-offset input flags. DIT passes them only with `--include-satellite-offsets`, which is off by default. DIT passed `--setup_file` and `--experiments`, which production does not.
+  - `segment_identity`: DIT passed `--setup_file`. Production passes labels and a job name; DIT passed neither (both are DIT-owned, so they showed as `[production only]`, not as drift).
+  - `segment_info`: production passes no Dataflow option at all. DIT passed six (`--runner`, `--setup_file`, `--wait_for_job`, `--region`, `--no_use_public_ips`, `--network`). `--source_segment_vessel` differed: DIT passed its identity table as a stand-in, production reads the output of a step DIT did not run.
 
-  These are for the workflow's owner to judge, so the spec reports them and is not marked in sync.
+  The owner decided to fix them. The workflow now runs all six of the group's tasks, and the spec covers all six:
+  - `--setup_file` is gone from published-image runs and `--experiments` everywhere.
+  - `segment_vessel_daily`, `vessel_info` and `segment_vessel` were added. `segment_info` reads the `segment_vessel_daily` table.
+  - The four SQL steps get their tables, labels and `--project` only.
+  - Every step gets labels; both Beam steps get a job name.
+  - No flag differs outside the expected set. All six steps run v5.0.3 and production's commands.
+
+  Accepted differences, each with its reason in the spec:
+  - `--project`: DIT's own project; the SQL steps name it where production leaves it to the CLI's default.
+  - `--in_normalized_messages_table`: DIT's pinned staging cohort.
+  - The three satellite-offset inputs of `segment`: the branch is off in DIT by default, because its inputs are date-sharded. Whether to keep `--include-satellite-offsets` at all is an open owner decision.
+
+  None of this was confirmed by a run. The check compares argv only.
 
 ### 8e. What the check does not cover
 
