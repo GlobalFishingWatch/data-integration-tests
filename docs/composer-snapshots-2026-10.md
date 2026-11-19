@@ -102,10 +102,10 @@ Both steps run the same command (`pipe-anchorages thin_port_messages`, `pipe-anc
 
 | | `thin_port_messages` | `port_visits` |
 |---|---|---|
-| Same | `--start_date`, `--end_date`, `--runner` (spellings treated as equal), `--project`, `--region`, `--sdk_container_image`, `--wait_for_job` | the same, plus `--thinned_message_table`, `--vessel_id_table`, `--bad_segs` (SQL byte-identical) |
+| Same | `--start_date`, `--end_date`, `--runner` (spellings treated as equal), `--project`, `--region`, `--sdk_container_image`, `--wait_for_job`, and since the sizing change (#87) `--disk_size_gb`, `--worker_machine_type`, `--no_use_public_ips` | the same, plus `--thinned_message_table`, `--vessel_id_table`, `--bad_segs` (SQL byte-identical) |
 | Expected to differ: DIT-owned | `--output_table`, `--job_name`, `--labels`, `--service_account_email`, `--temp_location`, `--staging_location`, `--subnetwork`, `--max_num_workers`, `--temp_dataset` (DIT only) | same |
 | Expected to differ: accepted | `--dataflow_service_options` (lineage), `--network` | same |
-| Only in production (still reported) | `--disk_size_gb`, `--worker_machine_type`, `--no_use_public_ips` | same |
+| Only in production (still reported) | none since #87 (before it: `--disk_size_gb`, `--worker_machine_type`, `--no_use_public_ips`) | same |
 | Values differ | `--anchorage_table`, `--input_table` | none |
 | Only in DIT, outside the expected set | none | none |
 
@@ -113,9 +113,9 @@ How DIT's jobs actually ran, from `gcloud dataflow jobs describe` on 2026-10-23:
 
 **Owner decisions (2026-10-23, on PR #86):**
 1. **`--runner`.** DIT keeps `DataflowRunner`; production passes `dataflow`. Beam's `create_runner` matches partial runner names (Beam's runner guide), so both select the Dataflow runner. The check treats the two spellings as equal (`EQUIVALENT_VALUES`).
-2. **Machine type and disk.** Production-like sizing in production-baseline mode, plus optional `--worker-machine-type` / `--disk-size-gb` flags, unset by default. That work is on a separate PR, so this check keeps reporting both flags until it lands.
+2. **Machine type and disk.** Production-like sizing in production-baseline mode, plus optional `--worker-machine-type` / `--disk-size-gb` flags, unset by default. That work landed in #87, which went further on the owner's later answer: each step's sizing defaults to production's on every run. DIT now emits both flags, the check compares them like any other flag, and `ProductionTarget`'s `worker_machine_type` and `disk_size_gb` are checked as fields.
 3. **Lineage stays off in DIT, on purpose,** so DIT's test tables never enter production's lineage graph. `--dataflow_service_options` is an accepted difference.
-4. **Networking.** `--network` is an accepted difference: DIT's `--subnetwork` determines it. `--no_use_public_ips` will be emitted for every DIT Dataflow run. That is part of the same separate PR, so the check keeps reporting it until then.
+4. **Networking.** `--network` is an accepted difference: DIT's `--subnetwork` determines it. `--no_use_public_ips` will be emitted for every DIT Dataflow run. That landed in #87 too, so the flag now compares as the same.
 5. **`DIT_OWNED_FLAGS`** is approved as proposed.
 6. **Step 1 inputs: sync the named-anchorages default and automate source drift.**
    - The case: DIT's default (v20240117) was the newest version when the workflow was written. Production v5 now reads v20260302, from another project, and nothing flagged it. Production v3 still reads v20240117, also from another project.

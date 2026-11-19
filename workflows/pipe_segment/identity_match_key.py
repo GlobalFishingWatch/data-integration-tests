@@ -102,12 +102,20 @@ from dit.runners import docker as dit_docker
 from dit.workflow import (
     DEFAULT_DATAFLOW_TEMP_BUCKET,
     EXPERIMENT_ID_RE,
+    NO_PUBLIC_IPS_OPTION,
+    WorkerSizing,
     add_experiment_id_arg,
     add_max_num_workers_arg,
+    add_worker_sizing_args,
+    log_production_sizing_hint,
     log_worker_caps,
+    log_worker_sizings,
     max_num_workers_options,
     resolve_run_context,
+    resolve_worker_sizing,
     worker_cap,
+    worker_sizing_from_args,
+    worker_sizing_options,
 )
 
 logger = logging.getLogger(__name__)
@@ -231,6 +239,29 @@ def _step_max_num_workers(step: str, resolved: int | None) -> int:
     return STEP_MAX_NUM_WORKERS[step] if resolved is None else resolved
 
 
+# Worker sizing per step (--worker-machine-type / --disk-size-gb), mirroring
+# production (owner rule 2026-10-23; the caps above do not follow it).
+# composer-dags-production origin/main 0a644da, rendered snapshots
+# core_ais_v3.py, core_vms_v3_last_4days_daily.py and core_vms_v5_daily.py:
+# segment.segment and segment.segment_identity_daily both run with
+# --worker_machine_type=e2-standard-4 --disk_size_gb=50 (segment's predate the
+# flags in dit). segment.segment_info gets no Dataflow options in production,
+# so dit emits none there either and pipe-segment's own default applies.
+# Hand-written until PIPELINE-4700 reads them from composer. A flag replaces
+# that field in all three steps.
+STEP_WORKER_SIZING = {
+    "segment": WorkerSizing(machine_type="e2-standard-4", disk_size_gb=50),
+    "segment_identity": WorkerSizing(machine_type="e2-standard-4", disk_size_gb=50),
+    "segment_info": WorkerSizing(),
+}
+
+
+def _step_worker_sizing(step: str, resolved: WorkerSizing | None) -> WorkerSizing:
+    """The sizing for ``step``: its resolved sizing (``args.worker_sizings``)
+    when given, else the step's default."""
+    return STEP_WORKER_SIZING[step] if resolved is None else resolved
+
+
 # Compare-key map per output table. Verified against pipe_segment/schemas/
 # (segment_schema.py, message_schema.py) and segment_identity/pipeline.py.
 # Each row in the date-partitioned tables is uniquely identified by these
@@ -339,6 +370,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help_detail=f"Unset here means per step: {step_caps}, each lowered by the "
                     f"ceiling env var; an explicit value replaces all three.",
     )
+    add_worker_sizing_args(
+        p, defaults=STEP_WORKER_SIZING,
+        help_detail="An explicit value replaces that field in all three steps.",
+    )
     args = p.parse_args(argv)
 
     args.bindings = [_parse_binding(b) for b in args.bindings]
@@ -349,6 +384,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.worker_caps = {
         step: worker_cap(args.max_num_workers, default=default)
         for step, default in STEP_MAX_NUM_WORKERS.items()
+    }
+    # Per step and field: flag > production's step sizing (resolve_worker_sizing).
+    args.cli_worker_sizing = worker_sizing_from_args(args)
+    args.worker_sizings = {
+        step: resolve_worker_sizing(args.cli_worker_sizing, default)
+        for step, default in STEP_WORKER_SIZING.items()
     }
     return args
 
@@ -654,6 +695,7 @@ def _segment_args(
     service_account: str,
     include_satellite_offsets: bool,
     max_num_workers: Optional[int] = None,
+    worker_sizing: WorkerSizing | None = None,
 ) -> list[str]:
     """CLI args for `pipe-segment segment`.
 
@@ -732,10 +774,9 @@ def _segment_args(
             "--wait_for_job",
             "--region=us-central1",
             *max_num_workers_options(_step_max_num_workers("segment", max_num_workers)),
-            "--worker_machine_type=e2-standard-4",
-            "--disk_size_gb=50",
+            *worker_sizing_options(_step_worker_sizing("segment", worker_sizing)),
             "--experiments=use_runner_v2",
-            "--no_use_public_ips",
+            NO_PUBLIC_IPS_OPTION,
             "--network=gfw-internal-network",
             "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
             f"--service_account_email={service_account}",
@@ -755,6 +796,7 @@ def _segment_identity_args(
     worker_image: Optional[str],
     service_account: str,
     max_num_workers: Optional[int] = None,
+    worker_sizing: WorkerSizing | None = None,
 ) -> list[str]:
     """CLI args for `pipe-segment segment_identity`."""
     start, end = date_range
@@ -776,7 +818,8 @@ def _segment_identity_args(
             "--wait_for_job",
             "--region=us-central1",
             *max_num_workers_options(_step_max_num_workers("segment_identity", max_num_workers)),
-            "--no_use_public_ips",
+            *worker_sizing_options(_step_worker_sizing("segment_identity", worker_sizing)),
+            NO_PUBLIC_IPS_OPTION,
             "--network=gfw-internal-network",
             "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
             f"--service_account_email={service_account}",
@@ -794,6 +837,7 @@ def _segment_info_args(
     worker_image: Optional[str],
     service_account: str,
     max_num_workers: Optional[int] = None,
+    worker_sizing: WorkerSizing | None = None,
 ) -> list[str]:
     """CLI args for `pipe-segment segment_info`.
 
@@ -820,7 +864,8 @@ def _segment_info_args(
             "--wait_for_job",
             "--region=us-central1",
             *max_num_workers_options(_step_max_num_workers("segment_info", max_num_workers)),
-            "--no_use_public_ips",
+            *worker_sizing_options(_step_worker_sizing("segment_info", worker_sizing)),
+            NO_PUBLIC_IPS_OPTION,
             "--network=gfw-internal-network",
             "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
             f"--service_account_email={service_account}",
@@ -972,6 +1017,7 @@ def _run_binding(
             service_account=args.service_account,
             include_satellite_offsets=args.include_satellite_offsets,
             max_num_workers=args.worker_caps["segment"].workers,
+            worker_sizing=args.worker_sizings["segment"],
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -993,6 +1039,7 @@ def _run_binding(
             worker_image=image_tag,
             service_account=args.service_account,
             max_num_workers=args.worker_caps["segment_identity"].workers,
+            worker_sizing=args.worker_sizings["segment_identity"],
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -1010,6 +1057,7 @@ def _run_binding(
             worker_image=image_tag,
             service_account=args.service_account,
             max_num_workers=args.worker_caps["segment_info"].workers,
+            worker_sizing=args.worker_sizings["segment_info"],
         )
         rc = _run_pipe_subcommand(
             worktree_dir=worktree_dir, binding_name=name,
@@ -1128,6 +1176,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("pipeline_dir:  %s", args.pipeline_dir)
     logger.info("dest_dataset:  %s", args.dest_dataset)
     log_worker_caps(args.worker_caps)
+    log_worker_sizings(args.worker_sizings)
+    if args.runner == "dataflow":
+        log_production_sizing_hint(
+            args.cli_worker_sizing, args.worker_sizings, [args.source_normalized_table],
+        )
     if args.skip_downstream:
         logger.info("downstream:    SKIPPED (segment_identity, segment_info)")
 

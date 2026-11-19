@@ -185,6 +185,9 @@ def production_target_checks(
         FieldCheck("deployed_version", target.deployed_version,
                    f"{visits.image_name} {visits.version}" if visits.image else None,
                    "image of the port-visits task"),
+        FieldCheck("worker_machine_type", target.worker_machine_type,
+                   _single(v, "--worker_machine_type")),
+        FieldCheck("disk_size_gb", str(target.disk_size_gb), _single(v, "--disk_size_gb")),
     )
 
 
@@ -280,7 +283,7 @@ def dit_thin_tokens(placeholders: Mapping[str, date]) -> list[str]:
 
 def dit_visits_tokens(target: ProductionTarget, placeholders: Mapping[str, date]) -> list[str]:
     """What DIT runs for step 2 with ``--baseline-production``'s configuration:
-    the target's tables, ``[history_start, end_date]``."""
+    the target's tables and worker sizing, ``[history_start, end_date]``."""
     end = placeholders["end_date"]
     args = _dit_args(
         "--start", target.history_start.isoformat(), "--end", end.isoformat(),
@@ -288,6 +291,8 @@ def dit_visits_tokens(target: ProductionTarget, placeholders: Mapping[str, date]
         "--thinned-message-table", target.thinned_table,
         "--source-segment-info-fqn", target.segment_info_table,
         "--source-segs-activity-fqn", target.segs_activity_table,
+        "--worker-machine-type", target.worker_machine_type,
+        "--disk-size-gb", str(target.disk_size_gb),
     )
     return [_entrypoint(args), *ais._visits_argv(
         args, suffix="drift", mode=ais.MODE_BF, thinned_input=target.thinned_table,

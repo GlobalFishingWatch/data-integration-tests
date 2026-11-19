@@ -16,6 +16,17 @@ dit is a **testing-shaped consumer** of GFW infrastructure. Reading from prod ta
 - Release branches of pipeline repos.
 - Production's own prefixes in shared GCS buckets. The default Dataflow bucket (`DIT_DATAFLOW_TEMP_BUCKET=pipe-temp-us-central-ttl7`) is also production's, and production writes directly under `dataflow_temp/` and `dataflow_staging/`. Every dit job writes under `gs://<bucket>/dit/` instead. Build those paths only through `dit.dataflow_paths`, never by hand. Since 2026-10-22.
 - Production's regional Dataflow quota in `world-fishing-827`, which also runs production jobs. Every Dataflow workflow takes `--max-num-workers` through `dit.workflow.add_max_num_workers_arg`, resolves it with `worker_cap` in `parse_args`, logs it once with `log_worker_caps`, and emits it only through `max_num_workers_options`. A new workflow picks its own default and never raises an existing one. Precedence, the more specific setting winning: the explicit flag, else `min(default, DIT_MAX_NUM_WORKERS_CEILING)`, else the default. The ceiling env var reaches only processes started from the operator's shell: `cloudbuild-dit.yaml` passes no such variable into the build step, so cloud runs need `--max-num-workers` in `ARGS` until that is wired (follow-up). Since 2026-10-23 (PIPELINE-4701).
+- Production's external-IP quota, likewise shared. Every Dataflow job runs with private worker IPs, as production does: a workflow emits `dit.workflow.NO_PUBLIC_IPS_OPTION` (`--no_use_public_ips`) in its Dataflow options. pipe-gaps adds nothing, because gfw-common's own default is already private and dit passes nothing that overrides it (a test pins both). Since 2026-10-23.
+
+## Runner-only Dataflow knobs
+
+The worker cap (`--max-num-workers`), the worker machine type (`--worker-machine-type`) and the boot disk size (`--disk-size-gb`) change how fast a job runs and whether it runs out of memory. **Output must not depend on them.** So they are never part of a cache key, and a workflow whose output changes with them has a bug. Each goes through its `dit.workflow` helpers (`add_max_num_workers_arg` / `worker_cap`, `add_worker_sizing_args` / `resolve_worker_sizing` / `worker_sizing_options`), and each resolves the same way: the explicit flag wins, else the workflow's default. Since 2026-10-23.
+
+**Sizing defaults mirror production; overrides are encouraged for non-production data.**
+- Every Dataflow workflow defaults each step's machine type and disk to production's for the production step it mirrors. They live in a per-step `STEP_WORKER_SIZING` constant in the workflow, hand-written with a citation of composer-dags-production's rendered snapshot (`tests/render_dags/snapshots/<dag>.py`, task id, commit), until PIPELINE-4700 reads them as data. A step production runs without sizing options gets none (`WorkerSizing()`).
+- Where production's value is a Jinja conditional, the constant's comment says which branch it mirrors and why.
+- A new workflow follows the same rule. Worker caps do not: they keep their own defaults (above).
+- Production machine types cost more per worker-hour than a staging run needs. Pass a smaller `--worker-machine-type` / `--disk-size-gb` for non-production data: every flag's help says so, and a Dataflow run that keeps a production-mirrored field while reading the AIS staging cohort logs a `cost hint:` warning (`dit.workflow.log_production_sizing_hint`). The hint never prompts or blocks.
 
 **In scope (explicit exception):**
 
