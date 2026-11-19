@@ -102,9 +102,10 @@ def main(
     if args.detail:
         for report in reports:
             print("\n" + "=" * 78 + "\n" + drift.format_report(report))
-    for error in errors:
-        print(f"composer drift check could not read {error.spec.name}: {error.message}",
-              file=sys.stderr)
+    # One line per distinct cause: an unreadable checkout fails every spec alike.
+    for message in dict.fromkeys(error.message for error in errors):
+        names = ", ".join(e.spec.name for e in errors if e.message == message)
+        print(f"composer drift check could not read {names}: {message}", file=sys.stderr)
     return drift.exit_code(reports, errors, strict=args.strict)
 
 
