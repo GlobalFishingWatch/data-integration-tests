@@ -575,6 +575,76 @@ def _sql_string_literal(value: str) -> str:
     return f"'{escaped}'"
 
 
+def all_rows_predicate(partition_column: str) -> str:
+    """A predicate that is true for every row and names ``partition_column``::
+
+        (`col` IS NULL OR `col` IS NOT NULL)
+
+    BigQuery rejects a query on a table with ``require_partition_filter``
+    unless its WHERE filters on the partition column, so ``WHERE TRUE``
+    cannot read such a table in full. This predicate passes that check and
+    excludes nothing: not the rows whose partition column is NULL, which a
+    plain comparison would drop, and no sentinel value. It prunes no
+    partitions, so the read costs what the full table costs. A reader's own
+    filter on the column, on top of it, still prunes.
+
+    The idea is table-check's NULL-safe dummy partition filter, without its
+    sentinel date. Also the filter to use in hand-written SQL that must read
+    all of such a table.
+    """
+    return f"(`{partition_column}` IS NULL OR `{partition_column}` IS NOT NULL)"
+
+
+def _whole_table_predicate(client: bigquery.Client, source_table: str) -> str:
+    """The WHERE predicate for pinning all of ``source_table`` (no window).
+
+    * Partitioned on a column (time-unit or integer-range):
+      ``all_rows_predicate`` on that column, whether or not the table
+      requires a partition filter today. A pipeline can switch the
+      requirement on later (pipe-anchorages v5.0.1 did, on existing tables),
+      and a view pinned before the switch must stay readable after it. The
+      partition column is fixed for a table's life, so the predicate, and
+      with it a view's definition, depends on nothing that can change.
+    * Not partitioned, or a view: ``TRUE``.
+    * Partitioned by ingestion time: ``TRUE``, unless the table requires a
+      partition filter. Then ``ValueError``: the only column to filter on is
+      the ``_PARTITIONTIME`` pseudo-column, which ``SELECT *`` does not
+      carry, so a pin could not keep the rows' partitions. The caller passes
+      a window on the pseudo-column instead.
+    """
+    table = client.get_table(source_table)
+    column = next(
+        (
+            partitioning.field
+            for partitioning in (table.time_partitioning, table.range_partitioning)
+            if partitioning is not None and partitioning.field
+        ),
+        None,
+    )
+    if column is not None:
+        return all_rows_predicate(column)
+    if table.require_partition_filter:
+        raise ValueError(
+            f"{source_table} requires a partition filter and is partitioned by "
+            f"ingestion time, so it has no partition column to build an all-rows "
+            f"filter on. Pin it with a window on its pseudo-column instead, e.g. "
+            f"SourceWindow(column='_PARTITIONTIME', ...)."
+        )
+    return "TRUE"
+
+
+def _rows_line(window: SourceWindow | None, predicate: str) -> str:
+    """The ``Rows:`` line of a pin's description."""
+    if window is not None:
+        return f"Rows: WHERE {predicate}"
+    if predicate == "TRUE":
+        return "Rows: all (no filter)"
+    return (
+        f"Rows: all (WHERE {predicate} excludes no row; it names the partition "
+        f"column so the read passes a required partition filter)"
+    )
+
+
 def _pin_ddl(
     *,
     source_table: str,
@@ -636,9 +706,14 @@ def pin_source_into_experiment(
     * a description naming the source FQN, the filter, the pin and the copy
       job id (chosen before submission so the description can name it).
 
-    Without a window the whole table is copied (``WHERE TRUE``). BigQuery
-    rejects that for sources that require a partition filter, which forces a
-    window exactly where a full copy would be expensive.
+    Without a window the whole table is copied. The predicate is then
+    ``TRUE``, or for a source partitioned on a column
+    ``all_rows_predicate`` on that column, which BigQuery also accepts when
+    the source requires a partition filter (``WHERE TRUE`` is rejected
+    there) and which keeps the rows whose partition column is NULL. See
+    ``_whole_table_predicate``, also for ingestion-time partitioning. The
+    copy inherits the requirement through ``LIKE``. What stops an expensive
+    full copy is the cost guard, not the partition filter.
 
     Cost guard: the copy statement is dry-run first and refused with
     ``ValueError`` if it would process more than ``max_bytes``; the job
@@ -660,7 +735,11 @@ def pin_source_into_experiment(
     )
     expiration = _utc_now() + timedelta(days=expiration_days)
     job_id = f"dit_pin_{uuid.uuid4().hex}"
-    predicate = window.predicate() if window is not None else "TRUE"
+    client = bigquery.Client(project=project)
+    predicate = (
+        window.predicate() if window is not None
+        else _whole_table_predicate(client, source_table)
+    )
     labels = (
         ("dit_artifact", PIN_ARTIFACT_LABEL),
         ("dit_experiment_id", _label_value(experiment_id)),
@@ -671,7 +750,7 @@ def pin_source_into_experiment(
     description = "\n".join([
         "DIT pinned copy of a source table (data integration tests).",
         f"Source: {source_table}",
-        f"Rows: WHERE {predicate}" if window is not None else "Rows: all (no filter)",
+        _rows_line(window, predicate),
         f"Pinned at: {pinned_at.isoformat()}; the data is as of the start of "
         f"copy job {project}:{job_id}.",
         f"Experiment: {experiment_id}; role: {role}",
@@ -686,7 +765,6 @@ def pin_source_into_experiment(
         expiration=expiration,
     )
 
-    client = bigquery.Client(project=project)
     estimate = int(
         client.query(
             sql,
@@ -817,10 +895,17 @@ def pin_view_into_experiment(
     (``pinned_source_fqn``, stamped with ``as_of``).
 
     The DDL is ``CREATE VIEW IF NOT EXISTS <fqn> OPTIONS(...) AS SELECT *
-    FROM <src> FOR SYSTEM_TIME AS OF TIMESTAMP(<as_of>) WHERE <window or
-    TRUE>``. ``IF NOT EXISTS`` is safe here, unlike for copies: source,
-    ``as_of`` and window are all in the name, so a view of that name always
-    has the same definition and reruns are idempotent.
+    FROM <src> FOR SYSTEM_TIME AS OF TIMESTAMP(<as_of>) WHERE <predicate>``.
+    ``IF NOT EXISTS`` is safe here, unlike for copies: source, ``as_of`` and
+    window are all in the name, so a view of that name always has the same
+    definition and reruns are idempotent.
+
+    The predicate is the window's, or without a window the one that selects
+    every row (``_whole_table_predicate``): ``TRUE``, or for a source
+    partitioned on a column ``all_rows_predicate`` on that column. That one
+    lives in the view's definition, so a plain ``SELECT`` over the view
+    works even when the source requires a partition filter, and a reader's
+    own filter on the partition column still prunes.
 
     Labels match the copies' (``dit_artifact=source_pin_view``); the
     description names the source, the filter and ``as_of``.
@@ -845,7 +930,11 @@ def pin_view_into_experiment(
         project=project,
     )
     expiration = _utc_now() + timedelta(days=expiration_days)
-    predicate = window.predicate() if window is not None else "TRUE"
+    client = bigquery.Client(project=project)
+    predicate = (
+        window.predicate() if window is not None
+        else _whole_table_predicate(client, source_table)
+    )
     as_of_utc = as_of.astimezone(timezone.utc).isoformat()
     select = (
         f"SELECT * FROM `{source_table}` FOR SYSTEM_TIME AS OF TIMESTAMP('{as_of_utc}') "
@@ -864,7 +953,7 @@ def pin_view_into_experiment(
     description = "\n".join([
         "DIT pinned time-travel view of a source table (data integration tests).",
         f"Source: {source_table}",
-        f"Rows: WHERE {predicate}" if window is not None else "Rows: all (no filter)",
+        _rows_line(window, predicate),
         f"As of: {as_of_utc}",
         f"Experiment: {experiment_id}; role: {role}",
         f"Expires: {expiration.isoformat()} (unreadable earlier once {as_of_utc} "
@@ -879,7 +968,6 @@ def pin_view_into_experiment(
         f"AS {select}"
     )
 
-    client = bigquery.Client(project=project)
     estimate = int(
         client.query(
             select,

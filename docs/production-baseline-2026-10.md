@@ -21,9 +21,11 @@ Production reprocesses daily, so its inputs and its output both move. The compar
    - **T1** is the time the job reached `Done`. It follows the output write.
    - Table metadata cannot stand in for either. The production step updates its output table's description, and with it `lastModifiedTime`, at job **start**, before it writes.
    - `--production-inputs-as-of` and `--production-output-as-of` override T0 and T1. With both set, no job lookup happens.
-2. **Pin with time-travel views.** `dit.bq.pin_view_into_experiment` creates `CREATE VIEW IF NOT EXISTS … AS SELECT * FROM src FOR SYSTEM_TIME AS OF TIMESTAMP(t) WHERE <window or TRUE>` in `tech_great_expectations`:
+2. **Pin with time-travel views.** `dit.bq.pin_view_into_experiment` creates `CREATE VIEW IF NOT EXISTS … AS SELECT * FROM src FOR SYSTEM_TIME AS OF TIMESTAMP(t) WHERE <predicate>` in `tech_great_expectations`:
    - inputs as of T0: the thinned table over `[history start, D]`, plus `segment_info` and `segs_activity` whole;
-   - production's output as of T1.
+   - production's output as of T1, whole.
+
+   The predicate is the date window, or for a whole table one that selects every row. That is `TRUE` for an unpartitioned table. For a table partitioned on a column it is ``(`col` IS NULL OR `col` IS NOT NULL)``, because BigQuery rejects `WHERE TRUE` on a table that requires a partition filter. See "Tables that require a partition filter" below.
 
    Views copy nothing and work across organisations. The name carries source, window and `as_of`, so a view of a given name always has the same definition, and reruns are idempotent. They are labelled `dit_artifact=source_pin_view` and expire after `--pin-expiration-days` (default 7). Snapshots are not an option: BigQuery refuses them across organisations, and no DIT identity has `bigquery.tables.deleteSnapshot` on `tech_great_expectations`. Copies are not an option either, because they pin only "now".
 3. **Run the candidate** as production runs: `--steps port_visits` on the pinned thinned table, `--modes 1_bf`, `--start` at the target's history start and `--end D`. These flags are fixed: left unset they take those values, and any other value is an error, because a different run cannot match production's output. Open visits get their `end_timestamp` and confidence from the end date, so D must match too.
@@ -54,6 +56,25 @@ One target today, hand-written from `composer-dags-production` origin/main 0a644
 The production output's schema (22 fields, MONTH-partitioned and clustered on `end_timestamp`) is identical to DIT's v4.6.4 and PR #176 outputs from the 2026-07..09 runs.
 
 All four tables are rewritten in place, not recreated: on 2026-10-23 they had been created between 2025-07 and 2026-07 and modified that day. Time travel cannot reach before a table's creation, so if production ever switched to recreating a table, its pins would only last until the next recreation.
+
+## Tables that require a partition filter
+
+Since pipe-anchorages v5.0.1 (tagged 2026-11-04) the pipeline sets `require_partition_filter` on the port-visits table it writes. Production runs that version: on 2026-11-19 the production output's description named v5.0.1, and the table had the requirement, with MONTH partitioning on `end_timestamp`. BigQuery then rejects any query whose `WHERE` does not filter on `end_timestamp`:
+
+```
+Cannot query over table 'gfw-int-ais-datalake.port_visits_v1.port_visits' without a filter over column(s) 'end_timestamp' that can be used for partition elimination
+```
+
+`WHERE TRUE` is such a query, so the output pin failed at its dry run and a production-baseline run stopped before creating anything. Fixed 2026-11-19 in `dit.bq`, for views and copies alike. What it means for each reader:
+
+- **The pins.** A whole-table pin of a table partitioned on a column filters with ``(`end_timestamp` IS NULL OR `end_timestamp` IS NOT NULL)`` (`dit.bq.all_rows_predicate`). The predicate names the partition column, which is all BigQuery checks, and it is true for every row, including rows whose `end_timestamp` is NULL. It prunes nothing: the dry run of the output pin estimates 447.0 GB, the table's full size, directly and through `FOR SYSTEM_TIME AS OF`.
+- **Reads through the view.** The filter is in the view's definition, so `SELECT * FROM <view>` works without a filter. A reader's own filter on `end_timestamp` still prunes: one month through the view is estimated at 5.3 GB.
+- **The candidate's output.** A v5.0.1 candidate writes a table that requires the filter too. `table-check` detects the requirement with a dry run and adds a NULL-safe filter itself, so the diff step needs no change. Hand-written SQL on that table needs one; use the predicate above to read every row.
+- **Ingestion-time partitioning.** A table partitioned by ingestion time has no partition column. If it requires a partition filter, a whole-table pin is refused; pin it with a window on `_PARTITIONTIME`. No table of a current target is of that kind.
+
+The predicate follows the partition column, not the requirement, so a table partitioned on a column gets it whether or not the requirement is set. A pipeline can switch the requirement on for an existing table, and a view pinned before that must stay readable after it.
+
+All of the above was checked with dry runs on 2026-11-19. No pin was created and no live run was made.
 
 ## Timing
 
@@ -106,8 +127,10 @@ table-check's post-tolerance counts are inflated when keys repeat: its `_l2` ste
 The breakdown used for the 2026-09 and 2026-07..09 runs, with `PR` the candidate's output and `PROD` the production-output view:
 
 ```sql
-WITH a AS (SELECT visit_id, vessel_id, duration_hrs FROM `PROD` WHERE end_timestamp >= TIMESTAMP('1970-01-01')),
-     b AS (SELECT visit_id, vessel_id, duration_hrs FROM `PR` WHERE end_timestamp >= TIMESTAMP('1970-01-01')),
+WITH a AS (SELECT visit_id, vessel_id, duration_hrs FROM `PROD`
+           WHERE (end_timestamp IS NULL OR end_timestamp IS NOT NULL)),
+     b AS (SELECT visit_id, vessel_id, duration_hrs FROM `PR`
+           WHERE (end_timestamp IS NULL OR end_timestamp IS NOT NULL)),
      per_side AS (
        SELECT 'production' AS side, COUNT(*) AS n_rows, COUNT(DISTINCT visit_id) AS n_ids,
               COUNTIF(duration_hrs = 0) AS zero_dur FROM a
@@ -121,7 +144,7 @@ UNION ALL SELECT 'only_in_pr', COUNT(*), COUNT(DISTINCT visit_id), NULL, COUNTIF
 ORDER BY side
 ```
 
-The `end_timestamp` filter satisfies tables that require a partition filter. Reading through the view keeps working only until the deadline the run logged.
+The `end_timestamp` filter satisfies tables that require a partition filter and excludes no row. `PR` needs it once the candidate is v5.0.1 or later; `PROD`, the view, already carries it, and repeating it is harmless. Until 2026-11-19 this query filtered with `end_timestamp >= TIMESTAMP('1970-01-01')`, which drops rows whose `end_timestamp` is NULL. The production table had no such rows on 2026-11-19 (a dry run of `WHERE end_timestamp IS NULL` estimates 0 bytes), so the results below are not affected. Reading through the view keeps working only until the deadline the run logged.
 
 ## First live run (2026-10-23)
 
