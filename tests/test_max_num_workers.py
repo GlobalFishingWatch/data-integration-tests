@@ -8,7 +8,8 @@ so dit must never raise a cap by accident. These tests pin:
   default, in the pure resolver and in every workflow and pipe-segment step;
 * the shared helpers in ``dit.workflow`` (flag, validation, emission, logging);
 * each workflow's default: port visits 4, encounters 50, pipe-gaps 50,
-  pipe-segment 50 / 50 / 20 per step;
+  pipe-segment 50 for each of its two Beam steps (its four SQL steps are not
+  Dataflow jobs and take no cap);
 * the default emitted options where they did not change: the cap's value
   and position in each option list;
 * that a set cap actually reaches the job, including pipe-gaps' in-process
@@ -79,7 +80,9 @@ PARSERS = {
     **{name: (parse, argv) for name, (parse, argv, _) in SINGLE_CAP.items()},
     "pipe_segment": (pipe_segment.parse_args, SEGMENT_ARGV),
 }
-SEGMENT_DEFAULTS = {"segment": 50, "segment_identity": 50, "segment_info": 20}
+SEGMENT_DEFAULTS = {"segment": 50, "segment_identity": 50}
+#: pipe-segment's BigQuery SQL steps, which follow the two Beam steps.
+SEGMENT_SQL_STEPS = ["segment_vessel_daily", "segment_info", "vessel_info", "segment_vessel"]
 
 DEFAULT = object()  # in a case table: "the workflow's or step's default"
 
@@ -213,8 +216,8 @@ def test_every_workflow_resolves_the_same_way(name, ceiling, extra, expected, so
 #: (ceiling env, extra argv, {step: (cap or DEFAULT, source)}).
 SEGMENT_CASES = [
     ("", [], {s: (DEFAULT, CAP_FROM_DEFAULT) for s in SEGMENT_DEFAULTS}),
-    ("30", [], {"segment": (30, CAP_FROM_CEILING), "segment_identity": (30, CAP_FROM_CEILING),
-                "segment_info": (DEFAULT, CAP_FROM_DEFAULT)}),
+    ("1000", [], {s: (DEFAULT, CAP_FROM_DEFAULT) for s in SEGMENT_DEFAULTS}),
+    ("30", [], {s: (30, CAP_FROM_CEILING) for s in SEGMENT_DEFAULTS}),
     ("10", [], {s: (10, CAP_FROM_CEILING) for s in SEGMENT_DEFAULTS}),
     ("", ["--max-num-workers", "7"], {s: (7, CAP_FROM_CLI) for s in SEGMENT_DEFAULTS}),
     ("10", ["--max-num-workers", "80"], {s: (80, CAP_FROM_CLI) for s in SEGMENT_DEFAULTS}),
@@ -326,23 +329,21 @@ def test_encounters_cap_is_dataflow_only(module):
 
 
 def _segment_step_argvs(runner="dataflow", caps=None):
-    """The three pipe-segment steps' argv, in pipeline order; ``caps`` maps a
-    step to its resolved cap."""
+    """The two pipe-segment Beam steps' argv, in pipeline order; ``caps`` maps
+    a step to its resolved cap."""
     caps = caps or {}
     common = dict(dest_dataset="d", suffix="exp_before", runner=runner, worker_image="img",
-                  service_account="sa")
+                  service_account="sa", experiment_id="exp", binding_name="before")
     one_day = (date(2020, 1, 1), date(2020, 1, 1))
     return {
         "segment": pipe_segment._segment_args(
             snapshot_fqns=pipe_segment._PipeSegmentSnapshotFQNs(normalized_messages="p.d.n"),
-            experiment_id="exp", binding_name="before", date_range=one_day,
+            date_range=one_day,
             ssvid_filter_query=None, include_satellite_offsets=False,
             max_num_workers=caps.get("segment"), **common,
         ),
         "segment_identity": pipe_segment._segment_identity_args(
             date_range=one_day, max_num_workers=caps.get("segment_identity"), **common),
-        "segment_info": pipe_segment._segment_info_args(
-            max_num_workers=caps.get("segment_info"), **common),
     }
 
 
@@ -362,8 +363,9 @@ def test_pipe_segment_caps_are_dataflow_only():
 
 
 @pytest.mark.parametrize("ceiling, extra, expected", [
-    ("", ["--max-num-workers", "7"], [7, 7, 7]),
-    ("30", [], [30, 30, 20]),
+    ("", ["--max-num-workers", "7"], [7, 7]),
+    ("30", [], [30, 30]),
+    ("", [], [50, 50]),
 ])
 def test_pipe_segment_run_binding_emits_each_resolved_cap(ceiling, extra, expected,
                                                           monkeypatch):
@@ -384,9 +386,10 @@ def test_pipe_segment_run_binding_emits_each_resolved_cap(ceiling, extra, expect
         )
 
     assert rc == 0
-    assert [argv[0] for argv in cli_args] == ["segment", "segment_identity", "segment_info"]
+    assert [argv[0] for argv in cli_args] == [*SEGMENT_DEFAULTS, *SEGMENT_SQL_STEPS]
+    # The two Beam steps carry their caps; the four SQL steps carry none.
     assert [_cap_tokens(argv) for argv in cli_args] == [
-        [f"--max_num_workers={n}"] for n in expected
+        *([f"--max_num_workers={n}"] for n in expected), [], [], [], [],
     ]
 
 

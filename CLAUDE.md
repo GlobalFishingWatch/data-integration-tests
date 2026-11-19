@@ -72,6 +72,48 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-19 — pipe-segment workflow runs production's six steps with production's flags; drift spec in sync
+
+**Trigger.** The general drift check (PR #91) found `workflows/pipe_segment/identity_match_key.py` matching production's AIS v3 segment group in version (v5.0.3) and commands, but not in flags. Owner decision the same day: fix them. Stacked on #91.
+
+**Method and its limit.** Everything below comes from reading pipe-segment at tag v5.0.3 (`f4d39fe`) and composer's `core_ais_v3` snapshot at `origin/main` 2773dab18. Nothing was run: no docker, no BigQuery, no Dataflow. The audit that prompted the work was checked claim by claim against those sources first.
+
+**What changed in the workflow.**
+- **Six steps, in production's order** (`STEPS`): `segment`, `segment_identity` (Beam), then `segment_vessel_daily`, `segment_info`, `vessel_info`, `segment_vessel` (BigQuery SQL). The last three run in parallel in production and one after the other here. One pure function, `_step_argvs`, builds every step's argv; `_run_binding` loops over it and stops at the first failure. The drift spec calls the same function.
+- **`segment_info`'s input.** It got the identity table as `--source_segment_vessel`. Its query selects `vessel_id`, `seg_id` and `day` from that input (`assets/queries/segment_info.sql.j2`); the identity table has neither `vessel_id` nor `day`. It now reads `segment_vessel_daily`'s output.
+- **SQL steps get no Dataflow option.** At v5.0.3 these four commands build a BigQuery client and run queries. They parse only their own flags (`parse_known_args`), so the six Dataflow options DIT passed to `segment_info` were silently ignored. They now get tables, labels and `--project`. `STEP_MAX_NUM_WORKERS` and `STEP_WORKER_SIZING` drop `segment_info` (its cap of 20 never reached anything).
+- **`--project` on the SQL steps is kept, on purpose.** Production passes none there and gets the CLI's default. DIT names its project on every step so the billing project never depends on a pipeline's default. pipe-segment's own examples pass it too. Accepted in the spec with that reason.
+- **`--setup_file`.** Dropped for published-image runs: production passes none, and the image's `prod` stage has the installed package and no source tree. Kept for `--build-from-source` on Dataflow only, where the compose `dev` service mounts the worktree, so the file exists. There it is what carries the worktree's code to the workers (Beam's documented behaviour; not run).
+- **`--experiments=use_runner_v2`.** Dropped. Production passes none.
+- **Job name for `segment_identity`.** It had none, so its Dataflow job did not carry the `dit-<repo>-<step>` prefix. Both Beam steps now share `_dataflow_options`. Cost: `dit-pipe-segment-segment-identity-` leaves 27 characters for the binding name, where the regex allows 32. `_verify_job_names` rejects a longer name at parse time, on Dataflow only, instead of after the first job has run.
+
+**Workflow-side mitigation (pipeline-contract row 6): `--labels` on every step and runner.** `BigQueryHelper` does `dict([entry.split("=") for entry in labels])` with no `None` guard, in all six commands, so a step without labels raises `TypeError` before doing any work. Only `segment` got labels. The trade-off is the usual one: the workflow carries what upstream could guard. No upstream ask was filed.
+
+**Compare keys for the three new tables.** Each comes from the final `GROUP BY` of the step's query, so uniqueness follows from the SQL. No run has confirmed it.
+- `segment_vessel_daily`: `(seg_id, ssvid, day)`. One row per `(ssvid, seg_id)` per processed day; the join that adds the vessel id has one row per ssvid.
+- `vessel_info`: `(vessel_id, ssvid)`.
+- `segment_vessel`: `(seg_id, ssvid, vessel_id)`.
+- `vessel_id` is a hash of the ssvid and the most common identity values. In the two tables keyed on it, a changed identity shows as only-in-A and only-in-B rows, not as a field difference. The same shape as encounters' `encounter_id`.
+- The keys of the older tables are unchanged. Two of them rest on assumptions worth knowing: `segment_info`'s `seg_id` assumes a segment id belongs to one ssvid (the query groups by both), and `satellite_timing_offsets`'s key names `timestamp`, a column that table does not have (its schema has `hour`). The second is left alone with the option it belongs to.
+
+**Satellite offsets: unchanged, and an accepted difference.** Production's `segment` task passes three satellite-offset inputs. DIT's `--include-satellite-offsets` stays off by default and its behaviour is untouched. Reasons, in the spec and the workflow's comments: the satellite positions are date-sharded, which DIT does not support; and the offsets query reads its message source as `<table>*` filtered on `_TABLE_SUFFIX`, which a partitioned table does not match. Consequence: DIT's `messages_segmented` keeps messages production drops when a satellite's clock is off. Whether to remove the option is the owner's decision.
+
+**Drift spec.** `workflows/pipe_segment/composer_drift.py` covers all six tasks and is `in_sync=True`. The check reports no difference outside the expected set.
+- DIT-owned flags gain `--source_segment_vessel` and `--source_segment_vessel_daily`: tables one step hands to the next.
+- That has a cost the spec's docstring states: the check cannot see how the chain is wired, which is exactly the defect fixed here. `tests/test_pipe_segment_identity_match_key.py` and `tests/test_composer_drift.py` pin the wiring instead.
+- The SQL steps accept `--project` and nothing else, so a Dataflow option passed to one again is drift. A test pins that.
+
+**Beam pin (working agreement: Beam-pin symmetry).** `PIPE_SEGMENT_BEAM_VERSION` was 2.56.0, the pin of v5.0.2. v5.0.3 pins `apache-beam==2.71.0`, requires `~=2.71` and Python 3.12, and copies the Beam 2.71.0 SDK into its image. The constant is now 2.71.0. The `DEFAULT_IMAGE_TAG` did not move; the constant had not followed the bump to v5.0.3.
+
+**What a DIT run does not reproduce.** A binding starts from empty tables. `segment` reads the whole fragments table as history and finds none; `segment_vessel_daily` reads a 30-day window and finds only the run's days. Both are symmetric across bindings. Neither is production's state, so these outputs cannot be compared with production's tables.
+
+**Not done, by scope.**
+- A temp-dataset overlay image. Four `ReadFromBigQuery` sites, none with `temp_dataset`, no option. Dataflow as `automated-testing@` is expected to fail until there is one.
+- Source pinning by copy (PIPELINE-4705). The workflow still snapshots, so it is expected to stop at its first cloud step for every DIT identity. This also blocks the smoke run proposed in the PR.
+- Generalising beyond the identity-match-key experiment (`_verify_distinct_gpsdio_pins`, `--steps`), warm start from production's fragments, production baseline.
+
+**Sections moved.** `workflows/pipe_segment/identity_match_key.py` (docstring; `BEAM_STEPS`, `SQL_STEPS`, `STEPS`, `DOWNSTREAM_OUTPUT_TABLES`, `STEP_MAX_NUM_WORKERS`, `STEP_WORKER_SIZING`, `COMPARE_KEYS`; `_job_name`, `_verify_job_names`, `_step_labels`, `_dataflow_options`, `_sql_step_args`, the four SQL builders, `_step_argvs`; `_segment_args`, `_segment_identity_args`, `_run_binding`, help texts); `workflows/pipe_segment/composer_drift.py` (rewritten); `Makefile` and a comment in `cloudbuild-dit.yaml`; `tests/test_pipe_segment_identity_match_key.py` (8 → 46 tests), `tests/test_composer_drift.py`, `tests/test_max_num_workers.py`, `tests/test_worker_ips_and_sizing.py`, `tests/test_dataflow_paths.py` (suite 1,099 → 1,152); `docs/pipeline-contract.md` (pipe-segment column and note); `docs/composer-snapshots-2026-10.md` § 8b, § 8d; `workflows/pipe_segment/RUN_INSTRUCTIONS.md` (rewritten for v5.0.3); `workflows/README.md`; README Features and Roadmap 7b; CHANGELOG § 2026-11-19.
+
 ### 2026-11-19 — Drift check generalised: `dit.drift`, one spec per workflow, one runner (PIPELINE-4700)
 
 **Trigger.** The 2026-11-19 drift audit found that four of five pipelines' workflows no longer run what production runs, and nothing had told DIT. The owner agreed the next step is a per-workflow drift check, so each later port can be checked against it. This does items 1 and 2 of `docs/composer-snapshots-2026-10.md` § 7 together. No workflow is ported here.

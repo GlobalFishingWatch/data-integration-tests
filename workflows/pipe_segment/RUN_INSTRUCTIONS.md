@@ -4,21 +4,51 @@ End-to-end steps to A/B-test the gpsdio-segment identity-match-key change
 (reducing `match_key = (transponder_type, receiver_type, source)` to
 `(transponder_type,)`) via this workflow.
 
-## 1. Install the dit + pipe-segment dev environment
+**Status, 2026-11-19.** The workflow's command lines match what production
+runs (pipe-segment v5.0.3, the six tasks of the AIS v3 DAG's segment group;
+see [`composer_drift.py`](composer_drift.py)). That was established by reading
+code. The only recorded run is one laptop smoke of the `segment` step on
+2026-06-03. Three things still stand between this file and a full run:
+
+- **Source pinning.** Step 2 of the workflow snapshots its source table, and
+  no DIT identity can create a snapshot with an expiration in
+  `tech_great_expectations`. Until the workflow pins by copy
+  ([PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705))
+  it is expected to stop there.
+- **Dataflow as the test service account.** pipe-segment has no way to name
+  the dataset Beam stages query results in, and `automated-testing@` may not
+  create one. Sections 6 and 7 need an overlay image first, as port visits and
+  encounters have. Inferred from the code; not tried.
+- **Nothing here has run end to end.** Treat the expected results below as
+  expectations.
+
+## 1. Install dit
 
 ```bash
 cd ~/git/data_integration_tests
-make install-pipe-segment
+make install
 ```
 
-This installs dit in editable mode plus pipe-segment from `$(PROJECTS)/pipe-segment`
-(defaults to a sibling checkout; override via `PROJECTS=…` or `.envrc`).
+That is enough to run the workflow: it runs pipe-segment in its container and
+never imports it. `make install-pipe-segment` adds an editable install of
+`$(PROJECTS)/pipe-segment` (a sibling checkout by default; override via
+`PROJECTS=…` or `.envrc`) for stepping through its source. pipe-segment v5.0.3
+needs Python 3.12 or newer; the target pins apache-beam 2.71.0, the version
+v5.0.3 pins.
 
 For the laptop docker path, the auth named volume needs to be populated **once** before any docker run:
 
 ```bash
 docker volume create gcp
-docker compose -f ~/git/pipe-segment/compose.yaml run --rm gcloud auth application-default login
+```
+
+Then log in through a `gcloud` compose service that mounts that volume.
+pipe-segment v5.0.3's `docker-compose.yaml` has none (its services are `dev`,
+`test` and `bigquery`), so use another pipeline checkout that has one, for
+example:
+
+```bash
+docker compose -f ~/git/anchorages_pipeline/docker-compose.yaml run --rm gcloud auth application-default login
 ```
 
 In Cloud Build, `DIT_CLOUD_MODE=1` is set and the docker runner adds
@@ -64,34 +94,36 @@ git fetch --tags origin
 git checkout -b experiment/identity-match-key-transponder-only v5.0.3
 ```
 
-Repin gpsdio-segment to the fork in three places:
+At v5.0.3 the dependencies live in `pyproject.toml`; `requirements.txt` is
+compiled from it and is what the image installs first. Repin gpsdio-segment in
+both.
 
-### `requirements/prod.in` (line 3)
+### `pyproject.toml` (`[project] dependencies`)
 
 ```diff
--gpsdio-segment @ https://codeload.github.com/GlobalFishingWatch/gpsdio-segment/tar.gz/v3.0.0
-+gpsdio-segment @ git+https://github.com/GlobalFishingWatch/gpsdio-segment@<GPSDIO_FORK_SHA>
+-    "gpsdio-segment @ git+https://github.com/GlobalFishingWatch/gpsdio-segment.git@v3.0.0",
++    "gpsdio-segment @ git+https://github.com/GlobalFishingWatch/gpsdio-segment.git@<GPSDIO_FORK_SHA>",
 ```
-
-### `setup.py` (lines 34-35)
-
-Same URL change.
 
 ### Regenerate `requirements.txt`
 
 ```bash
-make upgrade-reqs    # pip-compile requirements/prod.in -o requirements.txt
+make reqs    # pip-compile in the dev container
 grep gpsdio-segment requirements.txt
-# should show: gpsdio-segment @ git+https://github.com/GlobalFishingWatch/gpsdio-segment@<GPSDIO_FORK_SHA>
+# should show: gpsdio-segment @ git+https://github.com/GlobalFishingWatch/gpsdio-segment.git@<GPSDIO_FORK_SHA>
 ```
 
 Commit and push:
 
 ```bash
-git add requirements/prod.in setup.py requirements.txt
+git add pyproject.toml requirements.txt
 git commit -m "experiment: repin gpsdio-segment to identity-match-key fork"
 git push -u origin experiment/identity-match-key-transponder-only
 ```
+
+The workflow reads each binding's pin from `pyproject.toml` (older tags:
+`requirements/prod.in`) and refuses a two-binding run whose bindings pin the
+same gpsdio-segment.
 
 ## 4. Image resolution (automatic — no manual builds needed)
 
@@ -109,12 +141,50 @@ The workflow resolves a per-binding image via `dit.workflow.resolve_run_context`
   worktree's working tree.
 
 For Dataflow, the same image is passed to `--sdk_container_image` so workers
-run the same per-binding code.
+run the same per-binding code. No `--setup_file` is passed, as in production:
+these images hold the installed package and no source tree. The one exception
+is `--build-from-source` on Dataflow, where the worktree is mounted and
+`--setup_file=./setup.py` ships its package to the workers.
 
-## 5. DirectRunner smoke (laptop, fast)
+## 5. What a binding runs
 
-Single-binding orchestration check against `v5.0.3`, 1 day, identity steps
-skipped, source = staging cohort:
+Six pipe-segment commands, in production's order. Each reads what the one
+before it wrote; the first failure ends the binding.
+
+| Step | Kind | Reads | Writes |
+|---|---|---|---|
+| `segment` | Beam | normalized messages | `messages_segmented`, `segments`, `fragments` |
+| `segment_identity` | Beam | `segments`, `fragments` | `segment_identity_daily` |
+| `segment_vessel_daily` | BigQuery SQL | `segment_identity_daily` | `segment_vessel_daily` |
+| `segment_info` | BigQuery SQL | `segment_identity_daily`, `segment_vessel_daily` | `segment_info` |
+| `vessel_info` | BigQuery SQL | `segment_identity_daily`, `segment_vessel_daily` | `vessel_info` |
+| `segment_vessel` | BigQuery SQL | `segment_vessel_daily` | `segment_vessel` |
+
+- `--runner` (and `--max-num-workers`, `--worker-machine-type`,
+  `--disk-size-gb`) apply to the two Beam steps only. The four SQL steps are
+  queries run by the container and behave the same on every runner.
+- `--skip-downstream` runs and diffs `segment` only.
+- Output tables are named `<table>_<experiment id>_<binding name>` in
+  `--dest-dataset` (default `tech_great_expectations`).
+- `--date-range` is inclusive on both ends.
+
+**Not production's state.** A binding starts from empty tables. `segment` has
+no fragment history to stitch onto, and `segment_vessel_daily` sees only the
+run's own days in its 30-day window. Both are the same for every binding, so
+the A/B is fair; the tables are not comparable with production's.
+
+**Satellite offsets.** Production's `segment` also reads satellite positions
+and writes clock offsets. `--include-satellite-offsets` asks for that here. It
+is off by default and should stay off: the satellite positions are
+date-sharded, which DIT does not support, their snapshot is blocked across
+organisations, and the offsets query reads its message source as date shards,
+which DIT's partitioned source is not. Whether the option stays is an open
+decision.
+
+## 6. DirectRunner smoke (laptop, fast)
+
+Single-binding orchestration check against `v5.0.3`, 1 day, a handful of
+vessels, source = staging cohort. Start with the `segment` step:
 
 ```bash
 cd ~/git/data_integration_tests
@@ -124,23 +194,29 @@ dit run workflows/pipe_segment/identity_match_key.py \
     --binding before=v5.0.3 \
     --date-range 2020-01-01,2020-01-01 \
     --runner DirectRunner \
-    --include-satellite-offsets \
+    --ssvid-filter-query '"<ssvid>","<ssvid>"' \
     --skip-downstream \
     --build-from-source
 ```
+
+Then drop `--skip-downstream` to run all six steps, and drop
+`--build-from-source` to run the published image.
 
 Expected:
 
 - `worktree … @ v5.0.3` log line per binding.
 - `gpsdio-segment pin -> …v3.0.0` log line per binding.
 - `commit=… image=…` log line per binding.
-- pipe-segment runs to completion against the staging snapshot.
+- One `invoking pipe-segment <step>` log line per step, six without
+  `--skip-downstream`.
 - Diff phase no-ops on a single binding (`itertools.combinations` is empty).
 - Output tables in `tech_great_expectations`:
   `messages_segmented_pipe_segment_smoke_before`,
   `segments_pipe_segment_smoke_before`, etc.
 
-## 6. Cloud-build smoke (one-binding, Dataflow)
+## 7. Cloud-build smoke (one-binding, Dataflow)
+
+Needs the two prerequisites in the status note at the top.
 
 ```bash
 make dit-cloud PIPELINE=pipe-segment \
@@ -150,14 +226,13 @@ make dit-cloud PIPELINE=pipe-segment \
           --binding before=v5.0.3 \
           --date-range 2020-01-01,2020-01-01 \
           --runner dataflow \
-          --include-satellite-offsets \
           --skip-downstream"
 ```
 
-Cloud-mode auth is automatic (`--network=cloudbuild` + `GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827`).
+Cloud-mode auth is automatic (`--network=cloudbuild`).
 Reviewed v5.0.3 → no kaniko build, pulls canonical image.
 
-## 7. Full Dataflow A/B (after experiment branches are pushed)
+## 8. Full Dataflow A/B (after experiment branches are pushed)
 
 ```bash
 make dit-cloud PIPELINE=pipe-segment \
@@ -167,8 +242,7 @@ make dit-cloud PIPELINE=pipe-segment \
           --binding before=v5.0.3 \
           --binding after=experiment/identity-match-key-transponder-only \
           --date-range 2020-01-01,2020-01-03 \
-          --runner dataflow \
-          --include-satellite-offsets"
+          --runner dataflow"
 ```
 
 For the "after" binding, `ensure_pipeline_image` kicks off a kaniko build
@@ -179,21 +253,42 @@ ref; cached on subsequent runs). Expected results:
   contents differ — that's the metric).
 - `segments` / `fragments`: identical or very nearly so (segmentation is
   driven by position kinematics, not identity matching).
-- `segment_identity_daily` / `segment_info`: most informative — they
-  aggregate per-segment identity assignments, and that's where the fix
-  most matters.
+- `segment_identity_daily`, `segment_vessel_daily`, `segment_info`: most
+  informative — they aggregate per-segment identity assignments, and that's
+  where the fix most matters. A changed identity shows as a field difference,
+  in `segment_vessel_daily` and `segment_info` also in `vessel_id`.
+- `vessel_info`, `segment_vessel`: `vessel_id` is part of their key and is a
+  hash of the ssvid and the vessel's most common identity values. A changed
+  identity therefore shows as one row only in "before" and one only in
+  "after", not as a field difference. Read those counts as changed vessels,
+  not as missing data.
 
-## 8. Cleanup
+Compare keys per table (`COMPARE_KEYS` in the workflow):
 
-```bash
-make dit-cancel RUN_ID=<run_id-printed-at-workflow-start>
-```
+| Table | Key |
+|---|---|
+| `messages_segmented` | `msgid` |
+| `segments` | `seg_id`, `frag_id` |
+| `fragments` | `frag_id` |
+| `segment_identity_daily` | `seg_id`, `first_timestamp` |
+| `segment_vessel_daily` | `seg_id`, `ssvid`, `day` |
+| `segment_info` | `seg_id` |
+| `vessel_info` | `vessel_id`, `ssvid` |
+| `segment_vessel` | `seg_id`, `ssvid`, `vessel_id` |
 
-Drops output tables (table-level only — never a snapshot dataset) and
-cancels any in-flight Dataflow jobs by `dit_run_id` label.
+## 9. Cleanup
 
-The snapshot dataset auto-expires after 7 days (configurable via
-`--snapshot-expiration-days`).
+This workflow does not use the run cache and does not stamp the `dit_run_id`
+label, so `make dit-cancel` finds nothing for it.
+
+- Output tables: every table name ends in `_<experiment id>_<binding name>`,
+  and each carries the labels `resource_creator=dit` and
+  `experiment_id=<experiment id>`. They have no expiration; drop them by hand.
+- Dataflow jobs: named `dit-pipe-segment-<step>-<experiment id>-<binding name>`.
+  Cancel a running one in the Dataflow console or with
+  `gcloud dataflow jobs cancel`.
+- Source snapshots expire after 7 days (configurable via
+  `--snapshot-expiration-days`).
 
 ## Troubleshooting
 
@@ -202,6 +297,9 @@ The snapshot dataset auto-expires after 7 days (configurable via
 | `gpsdio-segment pin -> …` identical across bindings | The "after" branch wasn't pushed, or the worktree didn't pick it up. Re-fetch the pipe-segment refs (`git -C ~/git/pipe-segment fetch origin`). |
 | All output-table diffs IDENTICAL | Either the "after" image wasn't actually built (check the kaniko build log for the relevant commit) or `--image-tag` was set to a single image overriding the per-binding auto-build. |
 | `rows_only_in_a` / `rows_only_in_b` non-zero on `messages_segmented` | Source data wasn't pinned (different snapshot for each binding). Re-run with the same `--pin-source-at`. |
-| `segment_info` step fails | This step expects a `segment_vessel` input but we wire it to `segment_identity_daily` instead. Use `--skip-downstream` for the smoke, or build a `segment_vessel` step beforehand for the full A/B. |
-| `Cannot copy across regions` during snapshot | The cross-project `gfw-int-pipe-v3.satellite_positions.*` source is in a different BQ region than the snapshot dataset. Skip `--include-satellite-offsets` or create the snapshot dataset in `us-central1` explicitly. |
-| BQ 403 "API has not been used in project …" in cloud-build | The `GOOGLE_CLOUD_QUOTA_PROJECT=world-fishing-827` injection didn't fire. Make sure you're calling via `dit_docker.run` (the workflow does) and that `DIT_CLOUD_MODE=1` is set. |
+| `rows_only_in_a` / `rows_only_in_b` non-zero on `vessel_info` or `segment_vessel` | Expected when identities change: `vessel_id` is in the key (section 8). |
+| A step fails with `TypeError: 'NoneType' object is not iterable` in `BigQueryHelper` | The step got no `--labels`. The workflow passes them on every step; check for a hand-built command line. |
+| `--binding name … is too long for the Dataflow job name` | On Dataflow a binding name may be at most 27 characters. Shorten it. |
+| The source snapshot is denied (`deleteSnapshot`) | Source pinning by snapshot does not work in `tech_great_expectations` (status note at the top). |
+| A Dataflow job fails creating `beam_temp_dataset_…` | The test service account may not create datasets, and pipe-segment cannot be told which dataset to use (status note at the top). |
+| `Cannot snapshot tables across projects that are in different orgs` | `--include-satellite-offsets` reads satellite positions from another organisation. Leave the option off (section 5). |

@@ -14,7 +14,7 @@ mode-equivalence test.
 | `port_visits/cross_version_ais.py` | anchorages_pipeline (port-visits) | N per-binding subprocess invocations of `ais.py`, each from a `git worktree` at that binding's ref; with `--baseline-production`, the candidate binding only, diffed against production's own output | truncate, same keys as `ais.py`, pairwise across bindings | via each binding's `ais.py` |
 | `pipe_events/fishing.py` | pipe-events (fishing events) | **BQ-SQL via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `event_id`) | no (deferred) |
 | `pipe_events/cross_version_fishing.py` | pipe-events (fishing events) | N per-binding subprocess invocations of `fishing.py` (each with its own **BQ-SQL via container** runtime, from a `git worktree` at that binding's ref) | truncate (`view_suffix=""`, `event_id`) across BOTH `_fishing_events` and `_product_events_fishing` views | no (deferred with `fishing.py`) |
-| `pipe_segment/identity_match_key.py` | pipe-segment (cross-version, gpsdio-segment match key) | Beam **via container** (`dit.runners.docker`), one binding at a time, each from a `git worktree` at that binding's ref | truncate (`view_suffix=""`), per-table keys (`COMPARE_KEYS`), pairwise across bindings | no |
+| `pipe_segment/identity_match_key.py` | pipe-segment (cross-version, gpsdio-segment match key) | **via container** (`dit.runners.docker`), one binding at a time, each from a `git worktree` at that binding's ref. Six steps, as in production's segment group: two Beam jobs (`segment`, `segment_identity`), then four **BQ-SQL** steps (`segment_vessel_daily`, `segment_info`, `vessel_info`, `segment_vessel`) | truncate (`view_suffix=""`), per-table keys (`COMPARE_KEYS`) over eight output tables, pairwise across bindings | no |
 | `encounters/ais.py` | encounters_pipeline (encounters generation) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `encounter_id`) on both the raw and merged tables | no |
 | `encounters/vms.py` | encounters_pipeline (encounters generation, VMS) | same execution as `encounters/ais.py` (`ais.run(args)`); only defaults and help differ | same as `encounters/ais.py` | no |
 
@@ -32,7 +32,7 @@ The `composer_drift.py` files are not test workflows. They are a read-only check
 | `encounters/vms` | `encounters/vms.py` | `core_vms_v5_daily` | no: same |
 | `pipe_events/fishing` | `pipe_events/fishing.py` | `core_ais_v5` | no: older CLI generation |
 | `pipe_gaps/mode_equivalence` | `pipe_gaps/mode_equivalence.py` | `core_ais_v5` | no: older pipe-gaps generation |
-| `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | no: version and command match, flags differ |
+| `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | yes (since 2026-11-19; all six tasks of the segment group) |
 
 The two cross-version wrappers and `pipe_gaps/outage_recovery.py` have no spec of their own. A workflow that is ported to what production runs gets its spec updated in the same change, and `in_sync=True` once the check passes. A new workflow gets a spec when it lands.
 
