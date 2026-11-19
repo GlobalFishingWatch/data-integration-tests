@@ -27,9 +27,10 @@ import argparse
 import dataclasses
 from datetime import date, datetime, timezone
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from google.cloud import bigquery
 
 from dit import bq as dit_bq
 from workflows.port_visits import cross_version_ais as mod
@@ -567,6 +568,72 @@ def test_pin_production_accepts_inputs_changed_after_production_finished() -> No
 def test_pin_production_dry_run_creates_no_views() -> None:
     _, _, _, view = _pin_production(_production_args("--dry-run"))
     assert all(call.kwargs["dry_run"] is True for call in view.call_args_list)
+
+
+def test_pin_production_reads_all_of_an_output_that_requires_a_partition_filter() -> None:
+    """Production's port-visits table requires a partition filter on
+    ``end_timestamp`` since pipe-anchorages v5.0.1, and BigQuery rejects
+    ``WHERE TRUE`` on it. The output is pinned whole, so its view must filter
+    on the partition column without excluding a row. Runs the real
+    ``dit.bq.pin_view_into_experiment`` on a mocked client, down to the SQL
+    it dry-runs."""
+    by_table = {
+        _TARGET.output_table: {
+            "timePartitioning": {"type": "MONTH", "field": "end_timestamp"},
+            "requirePartitionFilter": True,
+        },
+        _TARGET.thinned_table: {"timePartitioning": {"type": "MONTH", "field": "timestamp"}},
+    }
+
+    def get_table(fqn: str) -> bigquery.Table:
+        project, dataset, table = fqn.split(".")
+        return bigquery.Table.from_api_repr({
+            "tableReference": {"projectId": project, "datasetId": dataset, "tableId": table},
+            **by_table.get(fqn, {}),
+        })
+
+    client = MagicMock()
+    client.get_table.side_effect = get_table
+    client.query.return_value.total_bytes_processed = 10**9
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch.object(mod.dit_bq, "check_time_travel",
+                     return_value=datetime(2026, 10, 25, 7, 46, 26, tzinfo=timezone.utc)),
+        patch.object(mod.dit_bq, "table_last_modified",
+                     return_value=datetime(2026, 10, 23, 1, tzinfo=timezone.utc)),
+    ):
+        pinned = mod._pin_production(
+            _production_args(
+                "--dry-run",
+                "--production-inputs-as-of", "2026-10-23T07:46:26Z",
+                "--production-output-as-of", "2026-10-23T09:04:17Z",
+            ),
+            _TARGET,
+        )
+
+    # --dry-run: every statement sent is a dry run of one view's SELECT.
+    assert all(call.kwargs["job_config"].dry_run for call in client.query.call_args_list)
+    select_by_source = {
+        source: sql
+        for sql in (call.args[0] for call in client.query.call_args_list)
+        for source in (
+            _TARGET.output_table, _TARGET.thinned_table,
+            _TARGET.segment_info_table, _TARGET.segs_activity_table,
+        )
+        if f"FROM `{source}` " in sql
+    }
+    assert select_by_source[_TARGET.output_table] == (
+        f"SELECT * FROM `{_TARGET.output_table}` "
+        "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-10-23T09:04:17+00:00') "
+        "WHERE (`end_timestamp` IS NULL OR `end_timestamp` IS NOT NULL)"
+    )
+    # The windowed input keeps its window; unpartitioned inputs stay WHERE TRUE.
+    assert select_by_source[_TARGET.thinned_table].endswith(
+        "WHERE DATE(timestamp) >= '2012-01-01' AND DATE(timestamp) < '2026-10-21'"
+    )
+    assert select_by_source[_TARGET.segment_info_table].endswith("WHERE TRUE")
+    assert select_by_source[_TARGET.segs_activity_table].endswith("WHERE TRUE")
+    assert pinned.production_output.endswith("_production_output_port_visits_all_20261023t090417z")
 
 
 def test_pin_dispatches_production_mode_without_copying() -> None:

@@ -792,6 +792,10 @@ def _pin_production(args: argparse.Namespace, target: ProductionTarget) -> _Pinn
         spec.field: view(spec.source_table, spec.role, inputs_as_of, spec.window)
         for spec in specs
     }
+    # The output is pinned whole (no window). Production's port-visits table
+    # requires a partition filter since pipe-anchorages v5.0.1, which rejects
+    # WHERE TRUE; dit.bq filters on the partition column without excluding a
+    # row, inside the view, so readers of the view need no filter of their own.
     production_output = view(target.output_table, _PRODUCTION_OUTPUT_ROLE, output_as_of, None)
     for field, fqn in {**pinned, "production_output": production_output}.items():
         logger.info("pinned %s: %s", field, fqn)
