@@ -37,7 +37,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         # Submitter image identity (Fix 1): build_from_source decides whether
         # the key folds the published image's digest or a build marker.
         build_from_source=False,
-        image_tag="gfw/pipe-anchorages:v4.6.4",
+        image_tag="gcr.io/foo/pipe-anchorages:v5.0.1",
         submitter_image_digest="gcr.io/foo/pipe-anchorages@sha256:5ub",
         # Per-`main()` context normally set inside main():
         run_id="rid01",
@@ -45,7 +45,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         no_cache=False,
         commit_sha="abc1234",
         unreviewed=False,
-        worker_image="gcr.io/foo/pipe-anchorages:v4.6.4",
+        worker_image="gcr.io/foo/pipe-anchorages:v5.0.1",
         worker_image_digest="gcr.io/foo/pipe-anchorages@sha256:0011",
     )
     base.update(overrides)
@@ -129,7 +129,7 @@ def test_canonical_params_dict_per_table_fqn_override_wins():
 
 def test_default_named_anchorages_is_the_version_production_v5_reads():
     """Synced 2026-10-23 with composer's core.ais.v5 (port_visits.detect_port_events
-    --anchorage_table). The default reaches step 1 and its cache key, so the
+    --bq-in-named-anchorages). The default reaches step 1 and its cache key, so the
     bump makes the first step-1 run afterwards miss the cache."""
     assert mod.DEFAULT_NAMED_ANCHORAGES == (
         "global-fishing-watch.anchorages.named_anchorages_v20260302"
@@ -286,7 +286,7 @@ def _cached_row(**overrides: Any) -> dit_workflow.CachedRun:
         unreviewed_code=False,
         dit_commit="ditsha0",
         workflow_file_sha1=mod.WORKFLOW_FILE_SHA1,
-        worker_image="gcr.io/foo/pipe-anchorages:v4.6.4",
+        worker_image="gcr.io/foo/pipe-anchorages:v5.0.1",
         params={"mode": mod.MODE_BF},
         output_tables=["proj.ds.cached_visits"],
         dataflow_job_ids=[],

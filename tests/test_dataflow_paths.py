@@ -36,9 +36,8 @@ def test_helpers_put_every_location_under_the_dit_prefix():
     assert dataflow_paths.dataflow_staging_location("b") == "gs://b/dit/dataflow_staging"
 
 
-@pytest.mark.parametrize("cli", ["v4", "v5"])
-def test_port_visits_dataflow_jobs_use_the_prefix(cli):
-    args = port_visits_ais.parse_args(["--pipeline-cli", cli, "--dataflow-temp-bucket", "b"])
+def test_port_visits_dataflow_jobs_use_the_prefix():
+    args = port_visits_ais.parse_args(["--dataflow-temp-bucket", "b"])
     args.run_id, args.commit_sha, args.worker_image_tag, args.launched_by = "r", "c", "t", "u"
     calls = []
     with patch.object(port_visits_ais.dit_docker, "run",

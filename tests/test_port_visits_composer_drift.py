@@ -3,6 +3,11 @@
 The production DAGs here are synthetic: built in code from DIT's own
 ``ProductionTarget`` and defaults, plus invented infrastructure values
 (``example.invalid`` accounts and hosts). Nothing is copied from composer.
+
+They follow the shape of production's argv for the pipe-anchorages CLI it runs
+(v5.0.1): ``--bq-in-*`` / ``--bq-out-*`` flags, an exclusive ``--end-date``,
+production's own image at the same version as DIT's overlay, and ONE
+``--labels`` flag followed by space-separated pairs.
 """
 
 from __future__ import annotations
@@ -34,6 +39,11 @@ _PRODUCTION_ACCEPTED = (
     "--network=example-network",
 )
 
+#: Production's own image: another registry than DIT's overlay, same version.
+_PRODUCTION_IMAGE = (
+    f"registry.example.invalid/core/pipe-anchorages:{ais.DEFAULT_PIPELINE_VERSION}"
+)
+
 #: Invented values for the flags DIT owns.
 _PRODUCTION_OWNED = {
     "--service_account_email": "runner@example.invalid",
@@ -41,17 +51,22 @@ _PRODUCTION_OWNED = {
     "--staging_location": "gs://example-bucket/staging",
     "--subnetwork": "regions/us-central1/subnetworks/example-subnet",
     "--max_num_workers": "7",
+    "--sdk_container_image": _PRODUCTION_IMAGE,
 }
+
+#: Invented labels, in production's form: one flag, space-separated pairs.
+_PRODUCTION_LABELS = ("--labels", "example_project=demo", "example_mode=recurrent",
+                      "run_date=2026-03-05")
 
 
 def _replace(tokens: list[str], values: dict[str, str]) -> list[str]:
-    """Set ``--name=value`` flags in ``tokens``; drop labels and DIT-only flags."""
-    dropped = ("--labels=", "--temp_dataset=")
-    kept = [t for t in tokens if t.split("=", 1)[0] not in values and not t.startswith(dropped)]
-    return [*kept, *(f"{k}={v}" for k, v in values.items())]
+    """Set ``--name=value`` flags in ``tokens`` and swap DIT's labels for production's."""
+    kept = [t for t in tokens
+            if t.split("=", 1)[0] not in values and not t.startswith("--labels=")]
+    return [*_PRODUCTION_LABELS, *kept, *(f"{k}={v}" for k, v in values.items())]
 
 
-def _task(cmds: list[str], arguments: list[str], image: str = ais.DEFAULT_WORKER_IMAGE) -> dict:
+def _task(cmds: list[str], arguments: list[str], image: str = _PRODUCTION_IMAGE) -> dict:
     return {"image": image, "cmds": cmds, "arguments": arguments,
             "upstream_task_ids": [], "downstream_task_ids": []}
 
@@ -60,7 +75,7 @@ def _raw_dag(
     *, start: str = "2026-03-05", end: str = "2026-03-06",
     job_prefix: str = TARGET.job_name_prefix, visits_overrides: dict | None = None,
     production_only: tuple[str, ...] = _PRODUCTION_ONLY, visits_cmds: list[str] | None = None,
-    image: str = ais.DEFAULT_WORKER_IMAGE,
+    image: str = _PRODUCTION_IMAGE,
 ) -> dict:
     """A production DAG that runs what DIT runs, except for DIT-owned flags,
     the accepted production-only flags, ``production_only`` and the overrides."""
@@ -75,11 +90,11 @@ def _raw_dag(
     thin = drift.dit_thin_tokens(placeholders)
     visits = drift.dit_visits_tokens(TARGET, placeholders)
     thin_args = _replace(thin[2:], {
-        **_PRODUCTION_OWNED, "--output_table": TARGET.thinned_table,
+        **_PRODUCTION_OWNED, "--bq-out-port-state-transitions": TARGET.thinned_table,
         "--job_name": f"{job_prefix.replace('visits--', 'events--')}{run_date}",
     })
     visits_args = _replace(visits[2:], {
-        **_PRODUCTION_OWNED, "--output_table": TARGET.output_table,
+        **_PRODUCTION_OWNED, "--bq-out-port-visits": TARGET.output_table,
         "--job_name": f"{job_prefix}{run_date}", **(visits_overrides or {}),
     })
     return {
@@ -147,7 +162,7 @@ def test_a_job_name_without_a_run_date_keeps_its_name() -> None:
 
 
 def test_a_history_start_tied_to_the_interval_is_reported() -> None:
-    check = _check("history_start", visits_overrides={"--start_date": "2026-03-05"},
+    check = _check("history_start", visits_overrides={"--start-date": "2026-03-05"},
                    end="2026-03-20")
 
     assert not check.matches
@@ -160,10 +175,41 @@ def test_the_constant_history_start_is_described_as_constant() -> None:
 
 
 def test_deployed_version_follows_the_port_visits_image_tag() -> None:
+    assert _check("deployed_version").matches
+    assert TARGET.deployed_version == f"pipe-anchorages {ais.DEFAULT_PIPELINE_VERSION}"
+
     check = _check("deployed_version", image="registry.example.invalid/core/pipe-anchorages:v9.9.9")
 
     assert check.composer == "pipe-anchorages v9.9.9"
     assert not check.matches
+
+
+def test_the_default_image_version_is_checked_against_both_tasks() -> None:
+    # The image flag is DIT-owned (an overlay build under DIT's namespace), so
+    # the argv diff cannot see a production version bump; this check does.
+    same = drift.default_version_checks(_dag(), SOURCE)
+    bumped = drift.default_version_checks(
+        _dag(image="registry.example.invalid/core/pipe-anchorages:v9.9.9"), SOURCE,
+    )
+
+    assert [(c.dit, c.composer) for c in same] == [(ais.DEFAULT_PIPELINE_VERSION,) * 2] * 2
+    assert {c.note for c in same} == {
+        f"image tag of {SOURCE.thin_task}", f"image tag of {SOURCE.visits_task}",
+    }
+    assert all(c.matches for c in same)
+    assert [c.composer for c in bumped] == ["v9.9.9", "v9.9.9"]
+    assert not any(c.matches for c in bumped)
+
+
+def test_a_production_version_bump_is_drift_even_with_identical_flags() -> None:
+    image = "registry.example.invalid/core/pipe-anchorages:v9.9.9"
+    report = drift.build_report(
+        "ais-v5-datalake", _dag(production_only=(), image=image), SOURCE,
+    )
+
+    assert not any(c.drift for c in report.argv)
+    assert report.drift
+    assert "DIFF  default_pipeline_version" in drift.format_report(report)
 
 
 def test_a_different_production_sizing_is_reported() -> None:
@@ -182,11 +228,11 @@ def test_a_different_production_sizing_is_reported() -> None:
 
 def test_segs_activity_needs_exactly_one_table_in_bad_segs() -> None:
     check = _check("segs_activity_table", visits_overrides={
-        "--bad_segs": "(SELECT seg_id FROM `p.d.a` JOIN `p.d.b` USING (seg_id))",
+        "--bad-segs": "(SELECT seg_id FROM `p.d.a` JOIN `p.d.b` USING (seg_id))",
     })
 
     assert check.composer is None
-    assert check.note == "2 tables in --bad_segs"
+    assert check.note == "2 tables in --bad-segs"
 
 
 # --------------------------------------------------------------------------
@@ -206,14 +252,43 @@ def test_argv_differences_are_split_into_expected_and_drift() -> None:
     assert visits.diff.only_left == ()
     assert visits.diff.differing == ()
     assert set(visits.expected) == {
-        *_PRODUCTION_OWNED, "--output_table", "--job_name", "--labels", "--temp_dataset",
+        *_PRODUCTION_OWNED, "--bq-out-port-visits", "--job_name", "--labels",
         "--dataflow_service_options", "--network",
     }
-    assert {"--start_date", "--end_date", "--thinned_message_table", "--vessel_id_table",
-            "--bad_segs", "--project", "--region", "--sdk_container_image",
-            "--wait_for_job", "--runner", "--worker_machine_type", "--disk_size_gb",
-            "--no_use_public_ips"} <= set(visits.diff.same)
+    assert {"--start-date", "--end-date", "--bq-in-port-state-transitions",
+            "--bq-in-segment-info", "--bad-segs", "--project", "--region", "--runner",
+            "--worker_machine_type", "--disk_size_gb", "--no_use_public_ips",
+            } == set(visits.diff.same)
     assert visits.drift
+
+
+def test_step_1_flags_compare_under_their_v5_names() -> None:
+    thin = _comparisons(production_only=())[ais.STEP_THIN]
+
+    assert thin.command_matches
+    assert thin.dit.positionals == ("pipe-anchorages", "port-state-transitions")
+    assert {"--start-date", "--end-date", "--bq-in-named-anchorages", "--bq-in-messages",
+            "--project", "--region", "--runner", "--worker_machine_type", "--disk_size_gb",
+            "--no_use_public_ips"} == set(thin.diff.same)
+    assert "--bq-out-port-state-transitions" in thin.expected
+    assert not thin.drift
+
+
+def test_productions_space_separated_labels_stay_out_of_the_command() -> None:
+    # Production passes ONE --labels flag followed by its pairs. Parsed without
+    # the multi-value hint, every pair after the first reads as a positional
+    # and the commands no longer match.
+    task = _dag().task(SOURCE.visits_task)
+    assert task.arguments[:len(_PRODUCTION_LABELS)] == _PRODUCTION_LABELS
+
+    parsed = drift.parse_argv(task.argv)
+    assert parsed.positionals == ("pipe-anchorages", "port-visits")
+    assert parsed.values("--labels") == _PRODUCTION_LABELS[1:]
+    assert composer.parse_argv(task.argv).positionals[2:] == _PRODUCTION_LABELS[2:]
+
+    for comparison in _comparisons().values():
+        assert comparison.command_matches
+        assert "--labels" in comparison.expected
 
 
 def test_expected_differences_are_dit_owned_plus_accepted_with_reasons() -> None:
@@ -221,6 +296,12 @@ def test_expected_differences_are_dit_owned_plus_accepted_with_reasons() -> None
         "--dataflow_service_options", "--network",
     }
     assert all(drift.ACCEPTED_DIFFERENCES.values())
+    # The names are the v5 CLI's; nothing of the removed v4 CLI is left.
+    assert drift.DIT_OWNED_FLAGS == {
+        "--bq-out-port-state-transitions", "--bq-out-port-visits", "--job_name", "--labels",
+        "--service_account_email", "--temp_location", "--staging_location", "--subnetwork",
+        "--max_num_workers", "--sdk_container_image",
+    }
     # DIT emits production's sizing and private IPs itself, so these are
     # compared like any other flag: a difference is drift, not expected.
     assert not {"--worker_machine_type", "--disk_size_gb", "--no_use_public_ips"} & (
@@ -244,7 +325,7 @@ def test_runner_spellings_compare_equal() -> None:
 
 
 def test_canonical_values_rewrites_only_listed_spellings() -> None:
-    parsed = composer.parse_argv(["--runner=DataflowRunner", "--runner=DirectRunner", "--x"])
+    parsed = drift.parse_argv(["--runner=DataflowRunner", "--runner=DirectRunner", "--x"])
 
     assert drift.canonical_values(parsed).flags == (
         composer.Flag("--runner", "dataflow"),
@@ -259,7 +340,8 @@ def test_a_changed_value_or_command_is_drift() -> None:
     assert visits.diff.differing == ("--project",)
     assert visits.drift
 
-    renamed = _comparisons(production_only=(), visits_cmds=["pipe-anchorages", "port-visits"])
+    # e.g. production still on the removed v4 command.
+    renamed = _comparisons(production_only=(), visits_cmds=["pipe-anchorages", "port_visits"])
     assert not renamed[ais.STEP_VISITS].command_matches
     assert renamed[ais.STEP_VISITS].drift
 
@@ -268,15 +350,19 @@ def test_dit_tokens_use_the_snapshot_runs_dates() -> None:
     placeholders = {"start_date": date(2026, 3, 1), "end_date": date(2026, 3, 10),
                     "end_date_exclusive": date(2026, 3, 11)}
 
-    thin = composer.parse_argv(drift.dit_thin_tokens(placeholders))
-    visits = composer.parse_argv(drift.dit_visits_tokens(TARGET, placeholders))
+    thin = drift.parse_argv(drift.dit_thin_tokens(placeholders))
+    visits = drift.parse_argv(drift.dit_visits_tokens(TARGET, placeholders))
 
-    assert thin.positionals == ("pipe-anchorages", ais.STEP_THIN)
-    assert (thin.value("--start_date"), thin.value("--end_date")) == ("2026-03-01", "2026-03-10")
-    assert visits.positionals == ("pipe-anchorages", ais.STEP_VISITS)
-    assert visits.value("--start_date") == TARGET.history_start.isoformat()
-    assert visits.value("--end_date") == "2026-03-10"
-    assert visits.value("--thinned_message_table") == TARGET.thinned_table
+    # DIT's inclusive [start_date, end_date] reaches the pipeline as the
+    # half-open [start_date, end_date + 1 day), which is what production passes.
+    assert thin.positionals == ("pipe-anchorages", "port-state-transitions")
+    assert (thin.value("--start-date"), thin.value("--end-date")) == ("2026-03-01", "2026-03-11")
+    assert visits.positionals == ("pipe-anchorages", "port-visits")
+    assert visits.value("--start-date") == TARGET.history_start.isoformat()
+    assert visits.value("--end-date") == "2026-03-11"
+    assert visits.value("--bq-in-port-state-transitions") == TARGET.thinned_table
+    assert visits.value("--bq-in-segment-info") == TARGET.segment_info_table
+    assert f"`{TARGET.segs_activity_table}`" in visits.value("--bad-segs")
 
 
 # --------------------------------------------------------------------------
@@ -290,6 +376,8 @@ def test_format_report_lists_mismatches_and_the_verdict() -> None:
 
     assert report.drift
     assert "DIFF  job_name_prefix" in text
+    assert "ok    default_pipeline_version" in text
+    assert "command: same (pipe-anchorages port-visits)" in text
     assert "only in production: --example_production_value=11" in text
     assert "--network (determined by DIT's --subnetwork)" in text
     assert text.endswith("drift: yes")

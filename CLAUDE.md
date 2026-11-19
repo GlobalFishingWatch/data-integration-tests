@@ -72,6 +72,61 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-19 — Port visits on the v5 CLI only; default image is DIT's overlay of pipe-anchorages v5.0.1; no auto-build
+
+**Trigger.** A drift audit on 2026-11-19 found that production's `core.ais.v5` DAG has run pipe-anchorages v5.0.1 with the v5 CLI since 2026-11-04 (v5.0.0 from 2026-10-26), while DIT still defaulted to v4.6.4 and the v4 CLI. DIT's opt-in v5 argv was still correct: the CLI, the SQL and the schemas did not change between b36aed6, which the v5 support was written against, and the tag. The drift check merged in #86 read the v4 flag names, so it reported false mismatches against today's composer.
+
+**Owner decisions (2026-11-19).**
+- Drop the v4 path entirely, with no opt-in.
+- The default image is a DIT-built overlay of v5.0.1. Do not ask upstream for a staging-dataset option.
+- Keep the 2020 staging cohort (v3 lineage) as the default source for now.
+- VMS port visits and voyages are out of scope.
+
+**What was removed.** The v4 argv builders, `--pipeline-cli` and its plumbing, `--wait_for_job`, the `--temp_dataset` flag, and the v4 branch of the DirectRunner options. Both workflows still accept `--pipeline-cli` as a hidden flag only to reject it with the reason; the wrapper rejects it before anything is pinned, where it would otherwise have passed through as an extra and failed in every binding after the copies. Kept: DIT's step ids (`thin_port_messages`, `port_visits`) for `--steps`, job names and labels, and the inclusive `--start` / `--end` with `end + 1 day` at the boundary.
+
+**The auto-build problem, and the shape chosen.** `resolve_run_context` replaces a default worker image with a kaniko build of the commit when the checkout is unreviewed. With an overlay image as the default, that goes wrong in three ways:
+- the build is plain source, without the temp-dataset patch, so the Dataflow job fails on `bigquery.datasets.create`;
+- the submitter stays on the default image (v5.0.1 plus overlay) while the workers run the commit, and the overlay must be both;
+- it runs in the most common cases: a dirty tree, a DIT snapshot, and every cross-version binding whose ref is not merged, because the wrapper passes `--suffix` and the harness then classifies by ancestry of `origin/main`.
+
+A reviewed checkout was never affected: it runs the default image.
+
+Options weighed:
+- **(a) A guard inside `dit.worker_image`.** Rejected: the module is shared, and the rule is specific to a default that is an overlay.
+- **(b) Teach the auto-build to apply the overlay.** Rejected: the overlay build needs docker (`build.sh` runs the self-check inside the image), which the kaniko path does not have, and it would hide a build behind a default run.
+- **(c) A workflow-owned check, chosen.** `resolve_run_context` gains `check_images(pipeline_commit, unreviewed)`. When set, it runs once the commit is resolved, before any registry lookup, build or digest resolution, and nothing is auto-built. Default `None` leaves every other workflow unchanged.
+
+Port visits' `check_images` refuses when the code is unreviewed and the run would execute a default image: the submitter image unless `--build-from-source`, the worker image on Dataflow only, neither with `--skip-pipelines`. The message names the commit, the default image, `build.sh`, and both flags. Two side effects, both wanted:
+- `--runner docker --build-from-source` on unreviewed code no longer builds a worker image nobody pulls;
+- `--build-from-source` on Dataflow logs a warning, since the compose build has no overlay either. It is not refused: an operator with their own service account may still want it.
+
+**Limit of the guard.** "Reviewed" means merged into pipe-anchorages `origin/main`, not "equal to v5.0.1". A clean checkout of a later main commit runs the v5.0.1 image without a word. That matches how every other workflow treats its pinned default, and `composer_drift.py` now reports when production's version and the default's differ. A stricter check (HEAD must be the tagged commit) is left to the owner.
+
+**Cache key.** The `pipeline_cli` field is dropped. It existed to keep v5 rows apart from v4 rows. With one CLI there is nothing to separate, and no new run can hit an old v4 row, because the key holds the workflow file's sha1, which this change moved. Every earlier port-visits row misses once.
+
+**Trade-off of an overlay default, recorded per the working agreement on workflow-side workarounds.** The default image lives in DIT's namespace and must be rebuilt at every production version bump; the overlay README lists the steps. `DEFAULT_PIPELINE_VERSION` in `ais.py` names the version, and the drift check compares it with the image tag of production's tasks, so a bump shows as drift. Labels on every runner stay a second, older mitigation.
+
+**Drift check.** Ported to the v5 flag names. Production passes `--labels` once with space-separated pairs; `dit.composer.parse_argv(multi=...)` reads that as one flag, so the pairs no longer leak into the command. `DIT_OWNED_FLAGS` changes with the CLI: the two `--bq-out-*` flags replace `--output_table`, `--temp_dataset` leaves, and `--sdk_container_image` joins, because the default image is DIT's own by the owner's decision. That last one extends the set the owner approved on #86 and is flagged for confirmation in the PR. Run against composer `origin/main` 9f214877b:
+- every `ProductionTarget` field matches, and so does the version;
+- both commands match; dates, input tables, `--bad-segs`, runner, project, region, machine type, disk and private IPs are the same;
+- three differences remain and the check exits 1: step 1's messages table (the check runs step 1 on staging; unchanged since #86), and production's `--no-rich-logging` and `--wait_for_job`, which DIT does not pass. The first changes the log format only. The second is not defined by the v5 CLI; gfw-common's `Pipeline` waits for batch jobs regardless (read at v0.25.0, not run). Whether to emit them or accept them is the owner's call.
+
+**Beam pin.** `ANCHORAGES_PIPELINE_BEAM_VERSION` 2.69.0 → 2.76.0 in the same PR as the image default, per the symmetry agreement. Side effect found: `install-all` pins pipe-gaps' 2.71.0, which a pipe-anchorages checkout at v5 (`apache-beam~=2.76`) does not accept. Documented in the Makefile comment, not fixed; the port-visits workflows do not import pipe-anchorages.
+
+**Sections moved.**
+- `workflows/port_visits/ais.py`: docstring, `DEFAULT_PIPELINE_VERSION`, `DEFAULT_OVERLAY_IMAGE`, image defaults, `OVERLAY_DIR`, `PIPELINE_CLI_REMOVED`, the argv builders, pipeline options, `_docker_run_kwargs`, cache key, `_default_images_executed`, `check_images`, parser, `main`.
+- `workflows/port_visits/cross_version_ais.py`: docstring, `ProductionTarget` source comment and `deployed_version`, hidden `--pipeline-cli`, help texts. The pinning functions are untouched (#89 changes them).
+- `workflows/port_visits/composer_drift.py`; `src/dit/workflow.py` (`check_images`); `src/dit/composer.py` (`multi=`); `src/dit/worker_image.py` (docstring).
+- `Makefile`, `cloudbuild-dit.yaml` (comment).
+- Tests: new `tests/test_port_visits_images.py`; `tests/test_port_visits_v5_cli.py` rewritten for one CLI; `tests/test_port_visits_composer_drift.py` ported, synthetic fixtures only; additions to `tests/test_workflow.py` and `tests/test_composer.py`; the `--pipeline-cli` parametrisation dropped from four shared test files. Suite 944 → 979.
+- Docs: `docs/pipeline-contract.md` (column and a v5.0.1 note), the overlay README (image row with digest, "Default image"), `docs/conventions.md`, `docs/plan.md` § Phase 2, `docs/production-baseline-2026-10.md`, `docs/composer-snapshots-2026-10.md` (§ 5 and the § 6 row rewritten for today's composer), README (Features, Source data targets, Scenario D, Roadmap row 2, 7a, 7b), `workflows/README.md`, CHANGELOG § 2026-11-19.
+
+**Sections NOT moved.**
+- No Dataflow run on the v5.0.1 overlay image. It was self-checked when built (Beam 2.76.0, read counts 2 and 1, console script). A staging smoke is the next step.
+- No production-baseline run since production moved. Its output pin for the table's new partition-filter requirement is #89.
+- `docs/composer-snapshots-2026-10.md` §§ 2 to 4 and the other pipelines' rows of § 6 are still as read at composer 0a644da.
+- VMS port visits, voyages and `anchorages-visited-info` stay uncovered.
+
 ### 2026-11-19 — Whole-table pins pass a required partition filter (`--baseline-production` was broken)
 
 **Problem.** pipe-anchorages v5.0.1 sets `require_partition_filter` on the port-visits table it writes (`PortVisitsTableConfig`, MONTH on `end_timestamp`). Production runs v5.0.1, and on 2026-11-19 the production output had the requirement. A pin without a window used `WHERE TRUE`, which BigQuery rejects on such a table (recorded in the 2026-10-22 entry on copies). So `--baseline-production` failed at the dry run of the output pin, before anything was created.

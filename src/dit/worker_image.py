@@ -3,7 +3,7 @@
 Two consumers need a registry-pullable image that matches the pipeline code
 this dit run actually executes:
 
-* **Dataflow workers** (Beam consumers: pipe-gaps, port-visits). The submitter
+* **Dataflow workers** (Beam consumers: pipe-gaps). The submitter
   installs pipeline code from the snapshot, but Beam workers execute transforms
   from the container named by ``--sdk_container_image``. If a run executes
   unreviewed code (snapshot / dirty / unmerged) against the default published
@@ -31,6 +31,13 @@ run is ``unreviewed`` (the published default doesn't have these changes).
 An explicit ``--worker-image`` / ``--image-tag`` is always respected.
 Reviewed code at the pinned default version is pulled from the canonical
 registry; only unreviewed code triggers a fresh build under the dit namespace.
+
+**Port visits opts out** (2026-11-19). Its default image is a DIT overlay of
+pipe-anchorages (``docker/overlays/pipe-anchorages-temp-dataset/``), and the
+build here is plain source: no overlay, so the Dataflow job would fail
+creating a BigQuery staging dataset. ``workflows/port_visits/ais.py`` passes
+``check_images`` to :func:`dit.workflow.resolve_run_context`, which then skips
+this module and lets the workflow refuse unreviewed code on a default image.
 
 The kaniko Cloud Build (``docker/worker-image/cloudbuild.yaml``) targets the
 pipeline's Dockerfile ``prod`` stage by default; both Beam pipelines and

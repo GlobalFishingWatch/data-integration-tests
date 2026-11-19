@@ -425,6 +425,71 @@ def test_resolve_run_context_build_from_source_false_still_calls_ensure() -> Non
     mock_ensure.assert_called_once()
 
 
+@pytest.mark.parametrize("unreviewed", [True, False])
+def test_resolve_run_context_check_images_replaces_the_auto_build(unreviewed: bool) -> None:
+    """A workflow that passes check_images owns the image policy: the hook gets
+    the resolved commit and the unreviewed flag, nothing is auto-built, and the
+    worker image is used as given (port visits: a plain build cannot replace
+    its overlay default)."""
+    seen: list[tuple[str, bool]] = []
+    with (
+        patch.object(dit_workflow, "resolve_pipeline_commit",
+                     return_value=("abc1234", unreviewed)),
+        patch.object(dit_workflow, "snapshot_parent", return_value=None),
+        patch.object(dit_workflow, "ensure_pipeline_image") as mock_ensure,
+        patch.object(dit_workflow, "resolve_worker_image_to_digest",
+                     return_value="default@sha256:dead"),
+        patch.object(dit_workflow, "dit_commit", return_value="x"),
+    ):
+        ctx = dit_workflow.resolve_run_context(
+            repo_dir="/repo",
+            pipeline_name="anchorages_pipeline",
+            runner="dataflow",
+            require_clean=False,
+            suffix=None,
+            worker_image="default:img",
+            default_worker_image="default:img",
+            check_images=lambda commit, flag: seen.append((commit, flag)),
+        )
+
+    assert seen == [("abc1234", unreviewed)]
+    mock_ensure.assert_not_called()
+    assert ctx.worker_image == "default:img"
+    assert ctx.worker_image_digest == "default@sha256:dead"
+
+
+def test_resolve_run_context_check_images_refuses_before_any_image_work() -> None:
+    """A refusal from the hook stops the run before the digest lookup (a
+    registry call) and before a run id is published."""
+    def refuse(commit: str, unreviewed: bool) -> None:
+        raise SystemExit(f"no image for {commit}")
+
+    with (
+        patch.object(dit_workflow, "git_info", return_value=("feat567", False)),
+        patch.object(dit_workflow, "is_unreviewed", return_value=True),
+        patch.object(dit_workflow, "snapshot_parent", return_value=None),
+        patch.object(dit_workflow, "ensure_pipeline_image") as mock_ensure,
+        patch.object(dit_workflow, "resolve_worker_image_to_digest") as mock_digest,
+        patch.object(dit_workflow, "set_active_run_id") as mock_publish,
+        patch.object(dit_workflow, "dit_commit", return_value="x"),
+        pytest.raises(SystemExit, match="no image for feat567"),
+    ):
+        dit_workflow.resolve_run_context(
+            repo_dir="/repo",
+            pipeline_name="anchorages_pipeline",
+            runner="dataflow",
+            require_clean=False,
+            suffix="exp-after",
+            worker_image="default:img",
+            default_worker_image="default:img",
+            check_images=refuse,
+        )
+
+    mock_ensure.assert_not_called()
+    mock_digest.assert_not_called()
+    mock_publish.assert_not_called()
+
+
 # --------------------------------------------------------------------------
 # (d) run_with_cache
 # --------------------------------------------------------------------------

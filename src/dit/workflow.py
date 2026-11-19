@@ -676,6 +676,7 @@ def resolve_run_context(
     default_worker_image: str,
     resolve_digest: bool = True,
     build_from_source: bool = False,
+    check_images: Callable[[str, bool], None] | None = None,
 ) -> RunContext:
     """Resolve the committed ref, worker image, and per-run lineage context.
 
@@ -707,6 +708,15 @@ def resolve_run_context(
     unnecessary kaniko build is incurred for an image the runner won't pull.
     Beam consumers don't pass this; default False keeps their behaviour
     unchanged.
+
+    ``check_images`` (default None): the workflow takes over the image policy.
+    It is called as ``check_images(pipeline_commit, unreviewed)`` once the
+    commit is resolved, before any registry lookup, image build or digest
+    resolution, and raises ``SystemExit`` to refuse the run. With it set, no
+    image is ever auto-built and ``worker_image`` is used as given. For a
+    workflow whose default image an auto-build cannot replace: port visits'
+    default is a DIT overlay image, and a build from plain source has no
+    overlay.
     """
     if suffix is not None:
         pipeline_commit, dirty = git_info(repo_dir)
@@ -732,7 +742,12 @@ def resolve_run_context(
     # ``build_from_source=True`` short-circuits the auto-build entirely: the
     # docker runner will build the container from the working tree via
     # compose and ignore ``image_tag``, so the kaniko submit would be wasted.
-    if not build_from_source:
+    #
+    # ``check_images`` replaces the auto-build with the workflow's own check
+    # (see the docstring): it refuses or returns, and nothing is built.
+    if check_images is not None:
+        check_images(pipeline_commit, unreviewed)
+    elif not build_from_source:
         worker_image = ensure_pipeline_image(
             pipeline=pipeline_name,
             repo_dir=repo_dir,

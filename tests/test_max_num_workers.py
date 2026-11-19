@@ -265,9 +265,8 @@ def _port_visits_options(*cli):
     )
 
 
-@pytest.mark.parametrize("cli", ["v4", "v5"])
-def test_port_visits_default_options_are_unchanged(cli):
-    assert _port_visits_options("--pipeline-cli", cli)[:13] == [
+def test_port_visits_default_options_are_unchanged():
+    assert _port_visits_options()[:13] == [
         "--runner=DataflowRunner",
         "--project=world-fishing-827",
         "--region=us-central1",

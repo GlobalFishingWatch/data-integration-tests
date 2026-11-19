@@ -7,16 +7,25 @@ tables pairwise across bindings. Diff results are reported but do not fail the
 run — the *point* of cross-version testing is to surface behaviour change, so
 a non-empty diff is information, not error.
 
-Example: validate PIPELINE-1465 by comparing v4.6.4 against the fix branch::
+Example: compare the version production runs (v5.0.1, ``ais.py``'s default
+image) with a fix branch::
 
     dit run workflows/port_visits/cross_version_ais.py \\
-        --experiment-id pipeline-1465 \\
+        --experiment-id pipeline-4690 \\
         --start 2020-01-01 --end 2020-12-31 \\
-        --binding before=v4.6.4 \\
-        --binding after=fix/PIPELINE-1465_port_visit_start_location \\
-        --binding-worker-image after=gcr.io/world-fishing-827/pipe-anchorages-1465-after:latest \\
-        --modes 1_bf \\
-        --runner dataflow --parallel --build-from-source
+        --binding before=v5.0.1 \\
+        --binding after=<branch or sha> \\
+        --binding-image-tag after=<overlay image of that commit> \\
+        --binding-worker-image after=<overlay image of that commit> \\
+        --modes 1_bf --runner dataflow
+
+Both flags are needed for ``after``. ``ais.py`` drives the current
+pipe-anchorages CLI only (the v4 CLI and ``--pipeline-cli`` were removed on
+2026-11-19), and its default image is DIT's overlay of v5.0.1. A binding
+whose ref is not merged into ``origin/main`` and that would run that default
+image fails at its start, before any cloud call, with the build command
+(``docker/overlays/pipe-anchorages-temp-dataset/build.sh``). The sources are
+already pinned by then; rerun with ``--reuse-pin <stamp>``.
 
 Steps:
 
@@ -44,10 +53,10 @@ Steps:
    at the pinned copies; the pinned ``--start`` / ``--end``; a
    binding-scoped ``--suffix``; and optionally
    a per-binding ``--worker-image`` (from ``--binding-worker-image NAME=IMAGE``)
-   and submitter ``--image-tag`` (from ``--binding-image-tag NAME=IMAGE``;
-   required for ``--pipeline-cli v5`` runs, whose DIT overlay image must also
-   be the submitter). Each subprocess's stdout/stderr is line-prefixed ``[<binding>] `` so
-   parallel runs interleave readably.
+   and submitter ``--image-tag`` (from ``--binding-image-tag NAME=IMAGE``; the
+   DIT overlay image must be both, since the staging dataset is set at
+   pipeline construction). Each subprocess's stdout/stderr is line-prefixed
+   ``[<binding>] `` so parallel runs interleave readably.
 4. For each mode in ``--modes`` and each pair of bindings, compare the
    corresponding outputs of the last selected step:
    ``port_visits_<exp>-<binding>_<mode>`` on ``visit_id``, or with ``--steps
@@ -82,7 +91,7 @@ ran. Example, PR #176 against the AIS v5 datalake run for 2026-10-20::
         --experiment-id pipeline-4690-prod \\
         --baseline-production ais-v5-datalake --production-date 2026-10-20 \\
         --binding pr=<sha> --binding-worker-image pr=<image> \\
-        --binding-image-tag pr=<image> --pipeline-cli v5 \\
+        --binding-image-tag pr=<image> \\
         --pin-max-gb 1300 --max-num-workers 100 --runner dataflow
 
 ``--dry-run`` skips the ``ais.py`` invocations and the diff phase, and only
@@ -91,15 +100,15 @@ dry-runs the copies or views (reporting their bytes against the
 ``--baseline-production``, the job lookup and time-travel checks — useful for
 validating the orchestration without burning Dataflow or BigQuery cost.
 
-Note on cross-version semantics: ``ais.py``'s default ``--worker-image`` is a
-fixed published path (e.g. ``pipe-anchorages:v4.6.4``). Without
-``--binding-worker-image`` overrides, every binding's Dataflow workers run the
-SAME published code regardless of the worktree ref — only the submission-side
-orchestrator differs. For changes that live in worker code (most pipeline
-changes — Beam PTransforms, DoFns), per-binding ``--worker-image`` is
-required for the cross-version diff to be meaningful. Manually build + push
-each binding's worktree to a registry both you and the Dataflow worker SA can
-access (e.g. ``gcr.io/world-fishing-827/...``) and pass it here.
+Note on cross-version semantics: ``ais.py``'s default ``--image-tag`` and
+``--worker-image`` are one fixed image, DIT's overlay of pipe-anchorages
+v5.0.1. A binding without overrides runs that image whatever its ref is, as
+long as the ref is merged into ``origin/main``; two such bindings run the SAME
+code and their diff is empty by construction. To compare other code, build an
+overlay image of each binding's commit
+(``docker/overlays/pipe-anchorages-temp-dataset/build.sh``, which pushes under
+``gcr.io/world-fishing-827/dit/``) and pass it as ``--binding-image-tag`` and
+``--binding-worker-image``.
 """
 from __future__ import annotations
 
@@ -143,6 +152,7 @@ from dit.workflow import (
 from workflows.port_visits.ais import (
     COMPARE_KEYS_BY_STEP,
     MODE_BF,
+    PIPELINE_CLI_REMOVED,
     STEP_THIN,
     STEP_VISITS,
     validate_steps,
@@ -224,15 +234,17 @@ class ProductionTarget:
         )
 
 
-#: From composer-dags-production origin/main 0a644da (2026-10-22):
-#: dags/core/ais/v5.py (project, Versions.PORT_VISITS) and
-#: gfw/pipes/core/port_visits/v4.py (port_visits over 2012-01-01..D, full
-#: recompute, WRITE_TRUNCATE). Worker sizing from the rendered snapshot
+#: From composer-dags-production origin/main 9f214877b (2026-11-19):
+#: dags/core/ais/v5.py (project, tables, Versions.ANCHORAGES = v5.0.1, history
+#: start) and gfw/pipes/core/anchorages/v5.py (PortVisitsConfig: the
+#: port-visits task runs over [2012-01-01, D+1), a full load; the pipeline
+#: writes it with WRITE_TRUNCATE). Worker sizing from the rendered snapshot
 #: tests/render_dags/snapshots/core_ais_v5.py, task
 #: port_visits.detect_port_visits (--worker_machine_type=e2-highmem-4,
 #: --disk_size_gb=50): PortVisitsConfig.worker_machine_type in
-#: gfw/pipes/core/port_visits/v4.py and DataflowConfig.disk_size_gb in
-#: gfw/common/config/dataflow.py.
+#: gfw/pipes/core/anchorages/v5.py and DataflowConfig.disk_size_gb in
+#: gfw/common/config/dataflow.py. composer_drift.py checks every field against
+#: the snapshot.
 PRODUCTION_TARGETS = {
     target.name: target
     for target in (
@@ -246,7 +258,7 @@ PRODUCTION_TARGETS = {
             segment_info_table="global-fishing-watch.pipe_ais_v3_published.segment_info",
             segs_activity_table="gfw-int-ais-datalake.summarized_positions_v1.segs_activity",
             history_start=date(2012, 1, 1),
-            deployed_version="pipe-anchorages v4.6.4",
+            deployed_version="pipe-anchorages v5.0.1",
             worker_machine_type="e2-highmem-4",
             disk_size_gb=50,
         ),
@@ -269,6 +281,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     # inside their time-travel window. Rejected explicitly, so an old
     # invocation fails here rather than leaking into ais.py's extras.
     p.add_argument("--pin-source-at", help=argparse.SUPPRESS)
+    # Removed 2026-11-19 with the pipe-anchorages v4 CLI. Rejected here, before
+    # anything is pinned, rather than in every binding's ais.py afterwards.
+    # nargs="?" so a bare --pipeline-cli is rejected with the same message as
+    # --pipeline-cli v4, not with argparse's "expected one argument".
+    p.add_argument("--pipeline-cli", nargs="?", const="", default=None,
+                   help=argparse.SUPPRESS)
     p.add_argument("--binding", action="append", required=True, dest="bindings",
                    help="`name=ref` pair, repeatable. Both must be valid git refs in --pipeline-dir.")
     # --start / --end / --modes / --steps default to None and are filled in
@@ -319,14 +337,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
                    dest="binding_worker_images",
                    help="`name=image` pair, repeatable. Overrides --worker-image (passed to ais.py) for that one binding. "
                         "Lets cross-version actually exercise per-binding worker code, which the default static --worker-image does not. "
-                        "Bindings without an override use ais.py's default.")
+                        "Pass the same overlay image as --binding-image-tag. "
+                        "Bindings without an override use ais.py's default, DIT's overlay of the "
+                        "pipe-anchorages version production runs; ais.py refuses that default for "
+                        "a ref not merged into origin/main.")
     p.add_argument("--binding-image-tag", action="append", default=[],
                    dest="binding_image_tags",
                    help="`name=image` pair, repeatable. Overrides --image-tag (the SUBMITTER image "
                         "ais.py runs to build and submit the Beam graph) for that one binding. Needed "
-                        "with --pipeline-cli v5, where the DIT overlay image must also be the "
-                        "submitter: the BigQuery staging dataset is set at pipeline construction. "
-                        "Bindings without an override use ais.py's --image-tag.")
+                        "together with --binding-worker-image: the DIT overlay image must also be "
+                        "the submitter, since the BigQuery staging dataset is set at pipeline "
+                        "construction. Bindings without an override use ais.py's --image-tag.")
     p.add_argument("--thinned-message-table", default=None,
                    help="Fully-qualified BQ table holding pre-thinned port messages (e.g. "
                         "production's raw_port_events); only with --steps port_visits. The wrapper "
@@ -373,6 +394,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
             "--pin-source-at was removed: sources are now pinned by copying them at run "
             "start. Drop the flag; to reuse an earlier run's copies, pass --reuse-pin <stamp>."
         )
+    if args.pipeline_cli is not None:
+        raise SystemExit(PIPELINE_CLI_REMOVED)
+    del args.pipeline_cli
     if args.baseline_production is not None:
         _apply_production_mode(args)
     elif any(v is not None for v in (args.production_date, args.production_inputs_as_of,

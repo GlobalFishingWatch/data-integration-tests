@@ -8,6 +8,42 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ### 2026-11-19
 
+Port visits now runs what production runs: pipe-anchorages v5.0.1 and its CLI. Production's `core.ais.v5` DAG has run v5.0.1 since 2026-11-04 (v5.0.0 from 2026-10-26); DIT's default was still v4.6.4.
+
+#### Removed
+- **The pipe-anchorages v4 CLI and `--pipeline-cli`** (`workflows/port_visits/ais.py`, `cross_version_ais.py`). This breaks old invocations.
+  - The workflows no longer emit `thin_port_messages` / `port_visits` commands, underscore flags, `--wait_for_job` or the `--temp_dataset` flag. They emit the v5 CLI only: `port-state-transitions` / `port-visits`, `--bq-in-*` / `--bq-out-*`, an exclusive `--end-date`, labels on every runner.
+  - `--pipeline-cli` is gone. Passing it, with either value, stops the run with a message that says to drop the flag. `cross_version_ais.py` rejects it before anything is pinned.
+  - pipe-anchorages v4.6.4 and older can no longer be run through these workflows. The `core.ais.v3` DAG still pins v4.6.4; DIT does not cover it.
+  - Unchanged: DIT's step names (`--steps thin_port_messages,port_visits`, job names, the `dit_step` label), the inclusive `--start` / `--end` (the workflow passes the pipeline `end + 1 day`), the output table names and the comparison keys.
+
+#### Changed
+- **Default image: DIT's overlay build of pipe-anchorages v5.0.1.** `--image-tag` and `--worker-image` both default to `gcr.io/world-fishing-827/dit/pipe-anchorages:v5.0.1-767770f-temp-dataset-905dc761` (was the upstream v4.6.4 image). Upstream has no option to name Beam's BigQuery staging dataset, and DIT's service account may not create one, so production's own image cannot be the default. The image is listed, with its digest, in [`docker/overlays/pipe-anchorages-temp-dataset/README.md`](docker/overlays/pipe-anchorages-temp-dataset/README.md). It must be rebuilt, and the default bumped, whenever production bumps the version.
+- **Port visits no longer auto-builds a worker image, and refuses unreviewed code on a default image.** Before, a run of unreviewed code (a dirty tree, a DIT snapshot, a commit not merged into pipe-anchorages `origin/main`) on the default worker image made DIT build one with kaniko from plain source. Such an image has no overlay, so its Dataflow job would fail when Beam tries to create a staging dataset. Now:
+  - a reviewed checkout runs the default image, as before;
+  - for unreviewed code, a run that would execute a default image stops before any registry, Cloud Build, BigQuery or Dataflow call. The message names the commit and the build command (`docker/overlays/pipe-anchorages-temp-dataset/build.sh`). Pass the overlay image of the commit as both `--image-tag` and `--worker-image`; in a cross-version run, as `--binding-image-tag` and `--binding-worker-image`;
+  - `--runner docker --build-from-source` on unreviewed code still runs, and no longer triggers a build of a worker image nobody pulls;
+  - `--build-from-source` on Dataflow logs a warning: the compose build has no overlay.
+
+  In a cross-version run a refused binding fails at its start, after the sources were pinned; rerun with `--reuse-pin <stamp>`. Other pipelines' workflows keep the auto-build unchanged.
+- **Run cache: every earlier port-visits row misses once.** The `pipeline_cli` field is dropped from the cache key, since there is one CLI. No new run can hit an old v4 row: the key also contains the workflow file's sha1, which this change moved, so all earlier rows of `workflows/port_visits/ais.py` miss regardless.
+- **Beam pin for pipe-anchorages: 2.69.0 → 2.76.0** (`ANCHORAGES_PIPELINE_BEAM_VERSION` in the `Makefile`), the version v5.0.1 pins. It applies to `make install-port-visits*` and to `make dit-cloud PIPELINE=anchorages_pipeline`. `make install-all` pins pipe-gaps' 2.71.0 and does not resolve with a pipe-anchorages checkout at v5 (`apache-beam~=2.76`); the port-visits workflows do not need pipe-anchorages installed.
+- **`ProductionTarget("ais-v5-datalake")`:** `deployed_version` is now `pipe-anchorages v5.0.1`. All other fields were re-checked against composer `origin/main` 9f214877b and still match. The stale source comments (they cited a composer file that no longer exists) are fixed. The production-baseline run itself is unchanged here; its output pin is fixed in #89.
+- **Composer drift check ported to the v5 CLI** (`workflows/port_visits/composer_drift.py`). It read the v4 flag names, so against today's composer it reported false field mismatches and could not compare the argv.
+  - It reads the v5 flag names and compares DIT's only builders with production's argv.
+  - Production passes `--labels` once, followed by space-separated pairs. The check now parses that as one flag; before, the pairs showed up as part of the command.
+  - New check: the pipe-anchorages version in DIT's default image (`ais.DEFAULT_PIPELINE_VERSION`) against the image tag of production's tasks. A production version bump now shows as drift.
+  - `--sdk_container_image` joins the DIT-owned flags (the default image is DIT's own build, so its path differs by design). The v4 names `--output_table` and `--temp_dataset` leave the set; the two `--bq-out-*` flags replace the first.
+  - Run against composer 9f214877b on 2026-11-19: every `ProductionTarget` field matches, the version matches, both commands match, and the dates, input tables, `--bad-segs`, runner, project, region, machine type, disk and private IPs are the same. Three understood differences are still reported, so the check exits 1: step 1's messages table (the check runs it on DIT's staging table), and production's `--no-rich-logging` (log format) and `--wait_for_job` (not defined by the v5 CLI), which DIT does not pass.
+
+#### Added
+- **`dit.workflow.resolve_run_context(check_images=...)`.** A workflow can take over the image policy: the hook gets the resolved commit and the unreviewed flag before any image work, and no image is auto-built. Port visits is the only user. Default `None` leaves every other workflow as it was.
+- **`dit.composer.parse_argv(multi=...)`.** Flags named there take every following token up to the next flag (`--labels a=1 b=2`), one value each. Default `()` keeps the earlier behaviour.
+
+#### Not verified
+- No production-baseline run has been made since production moved to v5.0.1. The output pin's handling of the table's new partition-filter requirement is fixed separately, in #89.
+- No Dataflow job has run on the v5.0.1 overlay image yet. The image was self-checked when built (Beam 2.76.0, patch applied to all three reads, console script). The last staging run on the v5 CLI was on 2026-10-22, at pipe-anchorages b36aed6; the CLI, the SQL and the schemas did not change between that commit and v5.0.1.
+
 #### Fixed
 - **Whole-table pins failed on tables that require a partition filter, which broke `--baseline-production`.** Since pipe-anchorages v5.0.1 the production port-visits table requires a filter on `end_timestamp`. A pin without a date window selected its rows with `WHERE TRUE`, which BigQuery rejects on such a table, so `workflows/port_visits/cross_version_ais.py --baseline-production` stopped at the dry run of the output pin, before creating anything.
   - **Fix, in `dit.bq`, for copies and views** (`pin_source_into_experiment`, `pin_view_into_experiment`). Without a window, a source partitioned on a column is now filtered with ``(`col` IS NULL OR `col` IS NOT NULL)``. The predicate names the partition column, so BigQuery accepts it, and it is true for every row, including rows whose partition column is NULL. It prunes nothing, so the `--pin-max-gb` cap is what limits a whole-table pin. New helper `dit.bq.all_rows_predicate(column)`, also for hand-written SQL.

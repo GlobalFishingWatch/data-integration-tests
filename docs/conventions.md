@@ -52,19 +52,27 @@ All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-wi
 
 **Source-built variant** (2026-10-22, pipe-anchorages, [`docker/overlays/pipe-anchorages-temp-dataset/`](../docker/overlays/pipe-anchorages-temp-dataset/README.md)). When the commit under test has no published image, which is the normal case for a PR branch since pipelines build images only for `main` and tags, there is nothing to `FROM`. The overlay is then a patch file kept in dit and applied to the commit's own source: `git archive <commit>`, `git apply --check` then `git apply`, and `docker build --target prod` with the pipeline's Dockerfile. Baseline and candidate are built the same way, so the overlay never differs between the two sides of an A/B. The same rules apply: the build fails if the patch does not apply, it runs a self-check inside the built image, and the patch's content hash goes in the tag. This patch is test-only by decision and is not retired by an upstream release. Retire it only if upstream ever gains the capability natively.
 
+**An overlay image as a workflow's default** (2026-11-19, port visits). `workflows/port_visits/ais.py` defaults its submitter and worker image to the source-built overlay of pipe-anchorages v5.0.1, the version production runs. Two rules follow, and apply to any workflow that does the same:
+- The workflow opts out of the auto-build below (it passes `check_images` to `dit.workflow.resolve_run_context`). An auto-built image is plain source without the overlay, so it cannot stand in for the default.
+- For unreviewed code the workflow refuses to run a default image and names the overlay build command. The operator builds the overlay image of that commit and passes it explicitly.
+
+The default overlay image must be rebuilt, and the workflow's constants bumped, whenever production bumps the pipeline version. The overlay README lists the steps.
+
 The auto-built pipeline image row covers both **Dataflow worker images** (Beam workers pull the image) and **docker-runner pipeline images** (dit's docker runner pulls and runs the image directly). Same namespace, same kaniko build machinery, same `:dit-<pipeline_commit>` tag scheme; what changes is the consumer. **Trigger is symmetric across both consumers**: `dit.worker_image.ensure_pipeline_image` builds when ALL of (a) `worker_image == default_worker_image` (no explicit override) and (b) the run is `unreviewed`. Reviewed code at the pinned default is pulled from the canonical upstream registry (`us-central1-docker.pkg.dev/gfw-int-infrastructure/<repo>/<package>:vX.Y.Z`); only unreviewed code triggers a fresh build under the dit namespace. Canonical upstream publications are read-only to dit — never a write target.
 
 Examples:
 
 - `gcr.io/world-fishing-827/dit/ditbox:latest`
 - `gcr.io/world-fishing-827/dit/pipe-gaps:dit-<pipeline_commit>` (auto-built for unreviewed Beam code)
-- `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-1465-after` (cross-version, per-binding)
+- `gcr.io/world-fishing-827/dit/pipe-anchorages:v5.0.1-767770f-temp-dataset-905dc761` (source-built overlay; the port-visits default)
+- `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` (source-built overlay of a PR head; cross-version, per-binding)
 - `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (auto-built for unreviewed docker-runner code)
 
 Canonical upstream defaults the workflows pin (read-only to dit):
 
-- pipe-anchorages: `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-anchorages:v4.6.4`
 - pipe-events: `us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/github-globalfishingwatch-pipe-events:v4.2.17`
+
+pipe-anchorages is no longer in this list: until 2026-11-19 the port-visits workflows pinned the upstream v4.6.4 image, and now they default to dit's own overlay image (above).
 
 ## Auth in the cloud path (ditbox)
 

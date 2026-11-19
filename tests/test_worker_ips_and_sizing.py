@@ -271,7 +271,7 @@ def test_the_hint_is_a_warning_and_nothing_more(caplog):
 
 
 # --------------------------------------------------------------------------
-# port visits: both CLIs, both steps
+# port visits: both steps
 # --------------------------------------------------------------------------
 
 def _port_visits_argvs(*cli):
@@ -284,7 +284,7 @@ def _port_visits_argvs(*cli):
         port_visits._run_slice(args, mode=port_visits.MODE_BF, slice_start=date(2020, 1, 1),
                                slice_end=date(2020, 12, 31), suffix="s", iteration=1,
                                total_iterations=1)
-    assert [argv[0] for argv in calls][-1] in ("port_visits", "port-visits")
+    assert [argv[0] for argv in calls][-1] == "port-visits"
     return calls
 
 
@@ -296,9 +296,8 @@ def test_port_visits_steps_mirror_production():
     assert cross_version.PRODUCTION_TARGETS["ais-v5-datalake"].worker_sizing == E2_HIGHMEM_4
 
 
-@pytest.mark.parametrize("cli", ["v4", "v5"])
-def test_port_visits_dataflow_jobs_get_private_ips_and_production_sizing(cli):
-    argvs = _port_visits_argvs("--pipeline-cli", cli)
+def test_port_visits_dataflow_jobs_get_private_ips_and_production_sizing():
+    argvs = _port_visits_argvs()
     assert len(argvs) == 2
     for argv in argvs:
         assert _ip_tokens(argv) == [NO_PUBLIC_IPS_OPTION]
@@ -307,18 +306,16 @@ def test_port_visits_dataflow_jobs_get_private_ips_and_production_sizing(cli):
         assert argv[cap + 1:cap + 3] == E2_HIGHMEM_4_TOKENS
 
 
-@pytest.mark.parametrize("cli", ["v4", "v5"])
-def test_port_visits_direct_runner_gets_no_dataflow_options(cli):
-    for argv in _port_visits_argvs("--pipeline-cli", cli, "--runner", "docker", *SIZING_ARGV):
+def test_port_visits_direct_runner_gets_no_dataflow_options():
+    for argv in _port_visits_argvs("--runner", "docker", *SIZING_ARGV):
         assert _ip_tokens(argv) == [] and _sizing_tokens(argv) == []
 
 
-@pytest.mark.parametrize("cli", ["v4", "v5"])
-def test_port_visits_flags_override_production_field_by_field(cli):
-    for argv in _port_visits_argvs("--pipeline-cli", cli, *SIZING_ARGV):
+def test_port_visits_flags_override_production_field_by_field():
+    for argv in _port_visits_argvs(*SIZING_ARGV):
         cap = argv.index("--max_num_workers=4")
         assert argv[cap + 1:cap + 3] == SIZING_TOKENS
-    only_disk = _port_visits_argvs("--pipeline-cli", cli, "--disk-size-gb", "60")
+    only_disk = _port_visits_argvs("--disk-size-gb", "60")
     assert [_sizing_tokens(argv) for argv in only_disk] == [
         ["--worker_machine_type=e2-highmem-4", "--disk_size_gb=60"]
     ] * 2
