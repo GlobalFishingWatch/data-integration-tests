@@ -9,6 +9,7 @@ visited.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -845,11 +846,164 @@ def test_whole_table_pin_of_an_ingestion_time_source(pin: str) -> None:
 
 
 @_PIN_HELPERS
-def test_a_window_is_used_as_given_without_reading_the_source_metadata(pin: str) -> None:
+def test_a_window_is_used_as_given_whatever_the_source_metadata_says(pin: str) -> None:
+    """The source's partitioning never changes a window's predicate. The copy
+    helper still reads the metadata once, to tell a view from a table; the
+    time-travel view helper does not read it at all."""
     client, sql = _pin_sql(pin, _REQUIRES_FILTER, window=_WINDOW)
 
     assert sql.endswith("WHERE DATE(timestamp) >= '2026-09-01' AND DATE(timestamp) < '2026-10-01'")
-    client.get_table.assert_not_called()
+    if pin == "copy":
+        client.get_table.assert_called_once()
+    else:
+        client.get_table.assert_not_called()
+
+
+# -- copies of view sources ---------------------------------------------------
+#
+# BigQuery refuses `CREATE TABLE ... LIKE` on a view ("Cannot CREATE TABLE
+# LIKE ..., which is VIEW"), so a view is copied with a plain CTAS.
+
+_VIEW_SOURCE = "world-fishing-827.pipe_ais_test_202408290000_published.identity_authorization"
+_VIEW = _source_table(
+    type="VIEW",
+    view={"query": "SELECT * FROM `p.d.identity_authorization`"},
+    schema={"fields": [
+        {"name": "ssvid", "type": "STRING"},
+        {"name": "authorized_from", "type": "TIMESTAMP"},
+        {"name": "authorized_day", "type": "DATE"},
+        {"name": "authorized_local", "type": "DATETIME"},
+    ]},
+)
+_VIEW_WINDOW = SourceWindow(
+    column="authorized_from", start=date(2020, 1, 1), end=date(2021, 1, 1),
+)
+
+
+def _pin_a_view(client: MagicMock, **overrides) -> str:
+    kwargs = dict(
+        experiment_id="xv", role="cross_version_fishing", pinned_at=_PINNED_AT, window=None,
+    )
+    kwargs.update(overrides)
+    with (
+        patch("google.cloud.bigquery.Client", return_value=client),
+        patch("dit.bq._utc_now", return_value=_FIXED_NOW),
+    ):
+        return pin_source_into_experiment(_VIEW_SOURCE, **kwargs)
+
+
+def test_pin_of_a_view_is_a_plain_ctas_without_like() -> None:
+    """Same name shape, labels, expiration and no IF NOT EXISTS as a table's
+    copy; no LIKE, and no partition option on an unpartitioned copy."""
+    client = _make_pin_client_mock(source=_VIEW)
+    dest = _pin_a_view(client)
+
+    assert dest == (
+        "world-fishing-827.tech_great_expectations."
+        "dit_exp_xv_cross_version_fishing_identity_authorization_all_20261022t171500z"
+    )
+    dry_sql, sql = (call.args[0] for call in client.query.call_args_list)
+    assert dry_sql == sql
+    assert sql.startswith(
+        f"CREATE TABLE `{dest}` "
+        "OPTIONS(expiration_timestamp=TIMESTAMP('2026-06-15T12:00:00+00:00'), "
+        "labels=[('dit_artifact', 'source_pin'), "
+    )
+    assert " LIKE " not in sql
+    assert "PARTITION BY" not in sql
+    assert "partition_expiration_days" not in sql
+    assert "IF NOT EXISTS" not in sql
+    assert "('dit_experiment_id', 'xv')" in sql
+    assert "('dit_role', 'cross_version_fishing')" in sql
+    assert "('dit_pin', '20261022t171500z')" in sql
+    assert "('dit_source_table', 'identity_authorization')" in sql
+    assert sql.endswith(f"AS SELECT * FROM `{_VIEW_SOURCE}` WHERE TRUE")
+    client.get_table.assert_called_once_with(_VIEW_SOURCE)
+
+
+def test_pin_of_a_view_says_so_in_the_description() -> None:
+    client = _make_pin_client_mock(source=_VIEW)
+    _pin_a_view(client)
+
+    copy_call = client.query.call_args_list[1]
+    sql = copy_call.args[0]
+    assert "DIT pinned copy of a source view (data integration tests)." in sql
+    assert "this table holds the rows it returned, without partitioning or clustering." in sql
+    assert "Rows: all (no filter)" in sql
+    assert f"copy job world-fishing-827:{copy_call.kwargs['job_id']}." in sql
+
+
+def test_pin_of_a_view_keeps_the_dry_run_cap_and_the_billing_cap() -> None:
+    client = _make_pin_client_mock(source=_VIEW)
+    _pin_a_view(client, max_bytes=5 * 10**10)
+    dry_config, copy_config = (
+        call.kwargs["job_config"] for call in client.query.call_args_list
+    )
+    assert dry_config.dry_run is True
+    assert copy_config.maximum_bytes_billed == 5 * 10**10
+
+    client = _make_pin_client_mock(estimate=2 * 10**12, source=_VIEW)
+    with pytest.raises(ValueError, match="above the 1000.0 GB cap"):
+        _pin_a_view(client)
+    assert client.query.call_count == 1  # the dry run only
+
+    client = _make_pin_client_mock(source=_VIEW)
+    _pin_a_view(client, dry_run=True)
+    assert client.query.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("column", "partition_by"),
+    [
+        ("authorized_from", "TIMESTAMP_TRUNC(authorized_from, MONTH)"),
+        ("authorized_day", "DATE_TRUNC(authorized_day, MONTH)"),
+        ("authorized_local", "DATETIME_TRUNC(authorized_local, MONTH)"),
+    ],
+)
+def test_windowed_pin_of_a_view_is_partitioned_by_month_on_the_window_column(
+    column: str, partition_by: str,
+) -> None:
+    """A view has no partitioning to copy; the copy gets one on the column
+    its readers filter on, so they still prune."""
+    client = _make_pin_client_mock(source=_VIEW)
+    window = dataclasses.replace(_VIEW_WINDOW, column=column)
+    dest = _pin_a_view(client, window=window)
+
+    sql = client.query.call_args_list[1].args[0]
+    assert dest.endswith("_identity_authorization_20200101_20210101_20261022t171500z")
+    assert sql.startswith(
+        f"CREATE TABLE `{dest}` PARTITION BY {partition_by} "
+        "OPTIONS(expiration_timestamp=TIMESTAMP('2026-06-15T12:00:00+00:00'), "
+        "partition_expiration_days=NULL, labels=["
+    )
+    assert " LIKE " not in sql
+    assert f"partitioned by {partition_by}, without clustering." in sql
+    assert sql.endswith(
+        f"AS SELECT * FROM `{_VIEW_SOURCE}` "
+        f"WHERE DATE({column}) >= '2020-01-01' AND DATE({column}) < '2021-01-01'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "reason"),
+    [("ssvid", "a STRING column"), ("_PARTITIONTIME", "not a column of the view")],
+)
+def test_windowed_pin_of_a_view_needs_a_date_like_column(column: str, reason: str) -> None:
+    client = _make_pin_client_mock(source=_VIEW)
+    with pytest.raises(ValueError, match=f"cannot window the view .*{reason}"):
+        _pin_a_view(client, window=dataclasses.replace(_VIEW_WINDOW, column=column))
+    client.query.assert_not_called()
+
+
+def test_a_table_source_keeps_the_like_copy_when_its_metadata_names_its_type() -> None:
+    """`type: TABLE` (what the API returns for a table) takes the LIKE path."""
+    client = _make_pin_client_mock(source=_source_table(type="TABLE"))
+    _pin(client)
+
+    sql = client.query.call_args_list[1].args[0]
+    assert " LIKE `gfw-int-pipe-v3.pipe_ais_v3_internal.messages_positions` " in sql
+    assert "DIT pinned copy of a source table (data integration tests)." in sql
+    assert "The source is a view" not in sql
 
 
 @_PIN_HELPERS
