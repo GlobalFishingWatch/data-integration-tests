@@ -1,7 +1,7 @@
 # Production baseline: a candidate against production's own output (2026-10)
 
 **Jira:** [PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703) (epic [PIPELINE-4698](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4698)).
-**Status:** code, unit tests and dry runs against production's 2026-10-20 run (2026-10-23): one on the laptop and one in Cloud Build as `automated-testing@` (build `947240a8`). No live run yet.
+**Status:** verified live on 2026-10-23 (Cloud Build `7781dd48`, PR #176 against production's 2026-10-20 run; see "First live run" below). That followed dry runs on the laptop and in Cloud Build as `automated-testing@` (build `947240a8`).
 **Entry point:** `workflows/port_visits/cross_version_ais.py --baseline-production <target> --production-date D`.
 
 ## What it does
@@ -120,6 +120,34 @@ ORDER BY side
 ```
 
 The `end_timestamp` filter satisfies tables that require a partition filter. Reading through the view keeps working only until the deadline the run logged.
+
+## First live run (2026-10-23)
+
+**The run:** PIPELINE-4690's PR (pipe-anchorages #176, `14b4be8`, v5 CLI, overlay `…-905dc761`) against production's run for D = 2026-10-20. Production's job started 07:46:26Z and finished 09:04:17Z.
+- **Cloud Build:** `7781dd48`, DIT `main` at `c73836a`.
+- **Dataflow:** 10:11–11:50Z, 99 minutes. It ran on 100 × **e2-standard-2** (8 GB), the v5 CLI's default; production uses e2-highmem-4 (32 GB). Machine type affects speed, not output. Mirroring production's sizing in this mode is a separate PR.
+- **Analysis cost:** 73 GB for the breakdown above, 97 GB for the changed-field count.
+
+**Result, full history:**
+
+| | rows | distinct `visit_id` | duplicate rows | zero-duration |
+|---|---|---|---|---|
+| production (v4.6.4) | 412,190,532 | 412,187,731 | 2,801 | 6,944,787 |
+| PR #176 | 412,181,996 | 412,181,996 | 0 | 6,938,005 |
+| only in production | 9,789 | 7,096 (3,955 vessels) | | 6,849 |
+| only in PR | 1,361 | 1,361 (1,348 vessels) | | 630 |
+
+**Shared visits.** Of the 412,180,623 `visit_id`s that are unique on both sides, 2,715 differ in a key field (timestamps, duration, anchorages, confidence, positions; the `events` array is not compared):
+- 2,342 are longer;
+- 290 keep the same duration;
+- 83 are shorter;
+- 33 end in October 2026.
+
+table-check's "matched 412,180,635" is those ids plus 12 that are duplicated in production. Its "value diffs 4,407 (filtered −2,340)" is inflated by the duplicate-key behaviour above.
+
+**Attribution.** This compares production's code (v4.6.4) with the PR, which sits on pipe-anchorages main, 17 PRs past v4.6.4. So it includes main's changes as well as #176's. A September three-way run on the same pins separates them (README Roadmap 7a):
+- main alone changes about 1,100 visits against v4.6.4;
+- the PR changes about 4,000.
 
 ## Out of scope
 

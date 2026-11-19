@@ -2,7 +2,11 @@
 
 Planning doc for the next major arc: making dit callable **from pipeline repos during PRs** (today it is only invoked ad-hoc from dit itself — laptop `dit run` / `make dit-cloud`). Consolidates the readiness audit done 2026-06-11 against `docs/plan.md` § Next steps (items 2, 3, 3.5), [`llm-pr-gating.md`](llm-pr-gating.md), the cloud-build architecture decision (plan decision 7), and the post-M6 state of the repo.
 
-**Status (2026-06-11)**: plan filed; no implementation started. The prerequisite track (T1–T4 below) comes first, deliberately — none of it is speculative, each item closes a hole that PR cadence would turn from an annoyance into a standing leak.
+**Status (updated 2026-10-23)**: T1 (SIGTERM trap) and T2 (`--modes`) have landed (PRs #70 and #71; Plan-changelog entries dated 2026-06-11, squash-merged to main 2026-07-30). T1's live cancel verification is still outstanding (`docs/run-cache-impl.md` § M6). Nothing from T3–T6 is in this repo: no `dit.report` module, no release tag, no trigger yaml variant. Whether the T3 GitHub App token request was filed is not recorded here. The prerequisite track (T1–T4 below) comes first, deliberately — none of it is speculative, each item closes a hole that PR cadence would turn from an annoyance into a standing leak.
+
+**Open owner decision: tag timing.** T4 below says tag `v0.1.0` *first* and point triggers at the tag. README § Roadmap's last item still says tag *after* per-pipeline PR triggers land. The two docs disagree; the order is the owner's call and is not resolved here.
+
+(Status as filed, 2026-06-11: plan filed; no implementation started.)
 
 ## Goal — the two scenarios
 
@@ -28,11 +32,15 @@ Both scenarios assume the **staging cohort defaults** (cheap, frozen source); he
 
 ### T1 — Run-cache M6: SIGTERM trap in `dit run` (+ M5a cancel live-verification)
 
+**Landed** (PR #70): the trap. **Still open**: the live verification below.
+
 The remaining run-cache milestone (`docs/run-cache-impl.md` § M6), deliberately sequenced before triggers. **Why load-bearing here:** every force-push to a PR cancels the in-flight Cloud Build; today a cancelled build orphans its Dataflow jobs (4+ per run) and BQ artifacts. At ad-hoc cadence that is an occasional annoyance; at PR cadence it is a standing money + Dataflow-quota leak. The trap calls `cancel_run` (M5a, landed) on SIGTERM so the build tears down its own jobs/tables.
 
 Gates: **M5a's cancel path is still only mock-tested.** One live verification of `dataflow.jobs.cancel` + BQ table-delete for both the laptop user (`make dit-cancel`) and `automated-testing@` (the cloud SIGTERM path) is required — user-gated (live infra).
 
 ### T2 — `--modes` on the three mode-family workflows
+
+**Landed** (PR #71). The text below is the plan as filed.
 
 From the orchestration evaluation ([`workflow-orchestration-2026-06.md`](workflow-orchestration-2026-06.md), axis 2) — **graduates from nice-to-have to prerequisite**. The PR-run shape is "run the PR's `1_bf`, diff against main's `1_bf`" (cheap smoke), and the tiered-trigger design ("cheap staging bf on every PR; full 3-mode or heavy cohort on label") assumes mode-subset selection. Today `mode_equivalence` / `port_visits/ais` / `pipe_events/fishing` hardcode all modes.
 

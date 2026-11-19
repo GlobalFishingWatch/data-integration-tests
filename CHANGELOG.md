@@ -8,6 +8,14 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ### 2026-10-23
 
+#### Verified
+- **Production baseline, first live run.** PIPELINE-4690's PR (pipe-anchorages #176) was compared with production's own output for 2026-10-20, over the full history (Cloud Build `7781dd48`).
+  - It ran from DIT `main`, as `automated-testing@`.
+  - The time-travel views pinned production's inputs and output across organisations, and the Dataflow job read through them.
+  - The diff ran against the output view.
+  - The result is DIFFERENT, consistent with #176: production's 2,801 duplicate rows are gone, and 2,715 shared visits changed. Numbers are in `docs/production-baseline-2026-10.md`.
+- **pipe-anchorages determinism on September 2026:** three runs of the PR, two of them with `--no-cache` (Cloud Build `8a1348d1`), are IDENTICAL.
+
 #### Added
 - **`dit.composer`: read production's rendered DAGs from composer-dags-production as data ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700) spike).** composer keeps one CI-checked render snapshot per DAG (`tests/render_dags/snapshots/*.py`), with each task's image, command and full argv for one run. dit reads a snapshot at a ref with `git show` and parses it with `ast.literal_eval`. It never imports or executes composer code and never touches composer's working tree. All 260 snapshots at composer 0a644da parse.
   - **Library:** `load_dag` / `list_snapshots` / `resolve_ref` return `RenderedDag` / `RenderedTask` (image, version tag, cmds, arguments, data interval). `parse_argv` handles `--k=v` and `--k v`; `diff_flags` compares two argvs; `pinned_versions` lists each image's tags. `templatize` / `render_template` turn the run's dates into `{start_date}`, `{end_date}` (last day), `{end_date_exclusive}` and `{execution_date}` and back. A date that fits several placeholders is reported, not guessed.
