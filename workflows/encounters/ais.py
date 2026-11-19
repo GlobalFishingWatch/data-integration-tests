@@ -531,22 +531,13 @@ def _pipeline_options(
 # Slice runner: create_raw -> merge
 # --------------------------------------------------------------------------
 
-def _run_slice(
+def _create_argv(
     args: argparse.Namespace, *, mode: str, slice_start: date, slice_end: date,
     suffix: str, iteration: int, total_iterations: int,
-) -> None:
-    """One slice = one ``create_raw_encounters`` + one ``merge_encounters``.
-
-    ``create_raw_encounters`` runs over ``[slice_start, slice_end]`` and is
-    idempotent for that window: the pipeline issues a pre-write
-    ``DELETE ... WHERE DATE(start_time) BETWEEN start AND end`` -- bounded on
-    BOTH sides, so unlike pipe-gaps it does NOT take ownership of the tail.
-
-    ``merge_encounters`` runs over ``[args.start, slice_end]`` -- the full
-    history every call, matching the composer DAG
-    (``--start_date=data_available_from_date``) -- and writes WRITE_TRUNCATE.
-    """
-    create_args = [
+) -> list[str]:
+    """argv for ``create_raw_encounters`` over the inclusive slice
+    ``[slice_start, slice_end]``."""
+    return [
         "create_raw_encounters",
         f"--source_table={args.source_messages_fqn}",
         f"--raw_table={_raw_table(args, suffix, mode)}",
@@ -560,23 +551,14 @@ def _run_slice(
             iteration=iteration, total_iterations=total_iterations,
         ),
     ]
-    logger.info("create_raw_encounters %s [%s, %s] iter=%d/%d",
-                mode, slice_start, slice_end, iteration, total_iterations)
-    rc = dit_docker.run(
-        args.image_tag, create_args,
-        entrypoint=CLI_ENTRYPOINT,
-        volumes=[GCP_VOLUME],
-        service=COMPOSE_SERVICE,
-        container_env=CONTAINER_ENV,
-        build_from_source=args.build_from_source,
-    )
-    if rc != 0:
-        raise SystemExit(
-            f"create_raw_encounters failed (rc={rc}, mode={mode}, "
-            f"slice=[{slice_start}, {slice_end}])"
-        )
 
-    merge_args = [
+
+def _merge_argv(
+    args: argparse.Namespace, *, mode: str, slice_end: date,
+    suffix: str, iteration: int, total_iterations: int,
+) -> list[str]:
+    """argv for ``merge_encounters`` over ``[args.start, slice_end]`` inclusive."""
+    return [
         "merge_encounters",
         # Full-history rebuild, as prod does -- NOT the slice start.
         f"--start_date={args.start}",
@@ -593,6 +575,47 @@ def _run_slice(
             iteration=iteration, total_iterations=total_iterations,
         ),
     ]
+
+
+def _run_slice(
+    args: argparse.Namespace, *, mode: str, slice_start: date, slice_end: date,
+    suffix: str, iteration: int, total_iterations: int,
+) -> None:
+    """One slice = one ``create_raw_encounters`` + one ``merge_encounters``.
+
+    ``create_raw_encounters`` runs over ``[slice_start, slice_end]`` and is
+    idempotent for that window: the pipeline issues a pre-write
+    ``DELETE ... WHERE DATE(start_time) BETWEEN start AND end`` -- bounded on
+    BOTH sides, so unlike pipe-gaps it does NOT take ownership of the tail.
+
+    ``merge_encounters`` runs over ``[args.start, slice_end]`` -- the full
+    history every call, matching the composer DAG
+    (``--start_date=data_available_from_date``) -- and writes WRITE_TRUNCATE.
+    """
+    create_args = _create_argv(
+        args, mode=mode, slice_start=slice_start, slice_end=slice_end, suffix=suffix,
+        iteration=iteration, total_iterations=total_iterations,
+    )
+    logger.info("create_raw_encounters %s [%s, %s] iter=%d/%d",
+                mode, slice_start, slice_end, iteration, total_iterations)
+    rc = dit_docker.run(
+        args.image_tag, create_args,
+        entrypoint=CLI_ENTRYPOINT,
+        volumes=[GCP_VOLUME],
+        service=COMPOSE_SERVICE,
+        container_env=CONTAINER_ENV,
+        build_from_source=args.build_from_source,
+    )
+    if rc != 0:
+        raise SystemExit(
+            f"create_raw_encounters failed (rc={rc}, mode={mode}, "
+            f"slice=[{slice_start}, {slice_end}])"
+        )
+
+    merge_args = _merge_argv(
+        args, mode=mode, slice_end=slice_end, suffix=suffix,
+        iteration=iteration, total_iterations=total_iterations,
+    )
     logger.info("merge_encounters %s [%s, %s] iter=%d/%d",
                 mode, args.start, slice_end, iteration, total_iterations)
     rc = dit_docker.run(
