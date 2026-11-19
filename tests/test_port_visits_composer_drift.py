@@ -21,11 +21,11 @@ from workflows.port_visits.cross_version_ais import PRODUCTION_TARGETS
 TARGET = PRODUCTION_TARGETS["ais-v5-datalake"]
 SOURCE = drift.TARGET_SOURCES["ais-v5-datalake"]
 
-#: Invented production-only flags: sizing, networking, a service option.
+#: Invented production-only flags, which DIT does not emit. (DIT emits
+#: production's sizing and --no_use_public_ips itself, so those are not here.)
 _PRODUCTION_ONLY = (
-    "--disk_size_gb=11",
-    "--worker_machine_type=example-machine",
-    "--no_use_public_ips",
+    "--example_production_value=11",
+    "--example_production_switch",
 )
 
 #: Invented production-only flags the owner accepted as differences.
@@ -166,6 +166,20 @@ def test_deployed_version_follows_the_port_visits_image_tag() -> None:
     assert not check.matches
 
 
+def test_a_different_production_sizing_is_reported() -> None:
+    overrides = {"--worker_machine_type": "example-machine", "--disk_size_gb": "11"}
+
+    machine = _check("worker_machine_type", visits_overrides=overrides)
+    disk = _check("disk_size_gb", visits_overrides=overrides)
+    visits = _comparisons(visits_overrides=overrides, production_only=())[ais.STEP_VISITS]
+
+    assert (machine.dit, machine.composer) == (TARGET.worker_machine_type, "example-machine")
+    assert (disk.dit, disk.composer) == (str(TARGET.disk_size_gb), "11")
+    assert not machine.matches and not disk.matches
+    assert {"--worker_machine_type", "--disk_size_gb"} <= set(visits.diff.differing)
+    assert visits.drift
+
+
 def test_segs_activity_needs_exactly_one_table_in_bad_segs() -> None:
     check = _check("segs_activity_table", visits_overrides={
         "--bad_segs": "(SELECT seg_id FROM `p.d.a` JOIN `p.d.b` USING (seg_id))",
@@ -197,7 +211,8 @@ def test_argv_differences_are_split_into_expected_and_drift() -> None:
     }
     assert {"--start_date", "--end_date", "--thinned_message_table", "--vessel_id_table",
             "--bad_segs", "--project", "--region", "--sdk_container_image",
-            "--wait_for_job", "--runner"} <= set(visits.diff.same)
+            "--wait_for_job", "--runner", "--worker_machine_type", "--disk_size_gb",
+            "--no_use_public_ips"} <= set(visits.diff.same)
     assert visits.drift
 
 
@@ -206,7 +221,8 @@ def test_expected_differences_are_dit_owned_plus_accepted_with_reasons() -> None
         "--dataflow_service_options", "--network",
     }
     assert all(drift.ACCEPTED_DIFFERENCES.values())
-    # Still reported until the sizing / private-IP change lands (separate PR).
+    # DIT emits production's sizing and private IPs itself, so these are
+    # compared like any other flag: a difference is drift, not expected.
     assert not {"--worker_machine_type", "--disk_size_gb", "--no_use_public_ips"} & (
         drift.EXPECTED_DIFFERENCES
     )
@@ -274,7 +290,7 @@ def test_format_report_lists_mismatches_and_the_verdict() -> None:
 
     assert report.drift
     assert "DIFF  job_name_prefix" in text
-    assert "only in production: --disk_size_gb=11" in text
+    assert "only in production: --example_production_value=11" in text
     assert "--network (determined by DIT's --subnetwork)" in text
     assert text.endswith("drift: yes")
 
