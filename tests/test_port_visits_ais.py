@@ -127,6 +127,21 @@ def test_canonical_params_dict_per_table_fqn_override_wins():
     assert p["source_messages_fqn"] == "proj.ds.alt_messages"
 
 
+def test_default_named_anchorages_is_the_version_production_v5_reads():
+    """Synced 2026-10-23 with composer's core.ais.v5 (port_visits.detect_port_events
+    --anchorage_table). The default reaches step 1 and its cache key, so the
+    bump makes the first step-1 run afterwards miss the cache."""
+    assert mod.DEFAULT_NAMED_ANCHORAGES == (
+        "global-fishing-watch.anchorages.named_anchorages_v20260302"
+    )
+    args = mod.parse_args([])
+    assert args.named_anchorages == mod.DEFAULT_NAMED_ANCHORAGES
+    params = mod.canonical_params_dict(
+        _args(named_anchorages=args.named_anchorages), mod.MODE_BF,
+    )
+    assert params["named_anchorages"] == mod.DEFAULT_NAMED_ANCHORAGES
+
+
 def test_canonical_params_dict_stem_and_explicit_fqn_match_when_equivalent():
     """M4: a stem-default run and a per-table-FQN run pointing at the same
     three tables produce IDENTICAL cache rows -- the resolved FQNs are what
