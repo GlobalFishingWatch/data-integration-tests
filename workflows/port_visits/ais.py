@@ -185,8 +185,8 @@ DEFAULT_SOURCE_SEGS_ACTIVITY_FQN = (
 
 # Global anchorages reference (not staging-specific), read by step 1. The
 # version production v5 reads: composer-dags-production origin/main 0a644da,
-# dags/core/ais/v5.py (NAMED_ANCHORAGES) and the rendered snapshot
-# tests/render_dags/snapshots/core_ais_v5.py, task port_visits.detect_port_events
+# dags/core/ais/v5.py (NAMED_ANCHORAGES) and, in that same repo, the rendered
+# snapshot tests/render_dags/snapshots/core_ais_v5.py, task port_visits.detect_port_events
 # (--anchorage_table). Until 2026-10-23 dit defaulted to
 # world-fishing-827.anchorages.named_anchorages_v20240117, the latest version
 # when the workflow was written; keeping it in sync by hand is the source drift
