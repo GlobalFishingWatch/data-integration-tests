@@ -547,7 +547,7 @@ def _ctx():
 
 @pytest.mark.parametrize("module, argv", [
     (gaps_modes, ["--modes", "1_bf"]),
-    (gaps_outage, ["--no-snapshot"]),
+    (gaps_outage, ["--no-pin"]),
 ])
 @pytest.mark.parametrize("ceiling, cli, expected, logged", [
     ("", [], 50, "every job 50 (default)"),

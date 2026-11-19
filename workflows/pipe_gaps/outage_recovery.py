@@ -52,27 +52,46 @@ Total: 3 staged Dataflow jobs + 1 oracle = 4 jobs per run.
 
 Mechanism
 ---------
-A single source-state pin (``--pin-at``) is realised by
-``dit.bq.snapshot_into_experiment``: the workflow clones
-``research_messages`` and ``segs_activity`` into ``<project>.tech_great_expectations``
-(the canonical dit BQ artifact dataset, defaulting to
-``world-fishing-827.tech_great_expectations``; ``--snapshot-dest-project``
-overrides for the cross-org dodge path) under per-experiment table names
-``dit_exp_<sanitised(experiment_id)>_outage_<source_table_name>``. Each
-stage's pipeline reads from this same snapshot; pipe-gaps doesn't know
-it's reading a snapshot. Per-table ``expiration_timestamp`` is set at
-creation (``--snapshot-expiration-days``); BQ self-cleans.
+The sources are pinned by copying them at run start
+(``dit.bq.pin_source_into_experiment``, PIPELINE-4705), into
+``world-fishing-827.tech_great_expectations``. The copies keep the
+sources' partitioning and clustering, so pipe-gaps reads them as it reads
+the sources and does not know the difference. What is copied is what
+pipe-gaps reads over the whole run (read from pipe-gaps v0.10.0, the
+default worker image; ``messages.sql.j2`` is the same at v0.17.1):
 
-Only ONE snapshot is needed because the outage is simulated by skipping
-runs, not by snapshotting the source twice. With ``--synthetic-outage``
-the workflow ADDITIONALLY derives an outage-filtered VIEW of the messages
-snapshot via ``dit.bq.derived_source_into_experiment`` (the M6a helper;
-issue #59): stages 1+2 read the view, stage 3 + the oracle read the
-unfiltered snapshot. Snapshot and filter are orthogonal layers that
-compose -- the filter applies on top of whichever source path is active
-(snapshot / ``--skip-snapshots`` / ``--no-snapshot`` live read). The
-view's name encodes the outage geometry so re-running with different
-dates derives a fresh view instead of silently reusing a stale filter.
+* the messages over ``[--start - lookback, --end]``. pipe-gaps filters
+  them by ``DATE(timestamp)`` and starts ``ceil(--n-hours-before / 24)``
+  days before a run's start date (``messages_query_start_date``). Stage 1
+  and the oracle start at ``--start`` and every job ends at ``--end``, so
+  this window covers every stage;
+* the segments whole: pipe-gaps reads them without a date filter.
+
+Every copy's name ends in the pin stamp (the run's start time in UTC,
+e.g. ``20261119t101500z``):
+``dit_exp_<experiment_id>_outage_<source table>_<window or all>_<stamp>``.
+``--reuse-pin <stamp>`` reads an earlier run's copies instead of copying
+again. ``--no-pin`` reads the live sources. ``--pin-max-gb`` caps the
+bytes one copy may process, and ``--pin-expiration-days`` sets the
+copies' expiration. ``--dry-run`` reports each copy's bytes against the
+cap and stops: it creates nothing and runs no pipeline.
+
+Copies replaced BigQuery snapshots here on 2026-11-19. Snapshots failed on
+every path: BigQuery refuses a snapshot of a table in another
+organisation, and no DIT identity may create one with an expiration in
+``tech_great_expectations``. ``--pin-at``, ``--snapshot-dest-project``,
+``--snapshot-expiration-days``, ``--skip-snapshots`` and ``--no-snapshot``
+are gone; each is rejected with the flag that replaces it.
+
+One pin is enough because the outage is simulated by skipping runs, not
+by pinning the source twice. With ``--synthetic-outage`` the workflow
+also derives an outage-filtered VIEW of the pinned messages
+(``dit.bq.derived_source_into_experiment``, issue #59): stages 1 and 2
+read the view, stage 3 and the oracle read the unfiltered copy. Pin and
+filter are separate layers: the filter goes on top of whichever messages
+table the run reads (a new copy, a reused one, or with ``--no-pin`` the
+live source). The view's name holds the outage dates and the name of the
+table it filters, so other dates or another pin derive a new view.
 
 Expected results
 ----------------
@@ -106,38 +125,34 @@ Verified live (issue #59 2x2 matrix, 2026-06-10), with
 Defaults
 --------
 Following dit's staging-by-default convention (see
-``workflows/pipe_gaps/mode_equivalence.py``, ``README.md`` "Staging data
-sources"), the workflow defaults to the ``pipe_ais_test_202408290000``
-staging cohort -- same project as the snapshot dest
-(``world-fishing-827``), so no cross-org snapshot block.
+``workflows/pipe_gaps/mode_equivalence.py``, ``README.md`` "Source data
+targets"), the workflow defaults to the ``pipe_ais_test_202408290000``
+staging cohort. A default run copies about 4.4 GB of messages and 4 MB
+of segments (dry runs, 2026-11-19).
 
 The staging cohort is frozen 2020 AIS data; an outage in 2020 means a
 gap in the daily DAG schedule, not new source-side data evolution. To
-exercise prod-VMS where late-arrivals do create real evolution, override
-``--source-messages``, ``--source-segments``, and ``--snapshot-dest-project``
-(see ``--snapshot-dest-project`` help).
+exercise prod-VMS, where late arrivals do change the source, pass
+``--source-messages`` and ``--source-segments``. A copy only reads its
+source, so a source in another organisation needs no extra flag.
 
 Source-table requirements
 -------------------------
-The ``--source-messages`` / ``--source-segments`` tables must be
-**physical** tables (not views) within BQ's time-travel window at the
-moment ``--pin-at`` resolves to, because
-``CREATE SNAPSHOT TABLE ... CLONE ... FOR SYSTEM_TIME AS OF`` requires
-both. Both the staging defaults and the prod-VMS opt-in
+``--source-messages`` and ``--source-segments`` must be tables, not
+views: ``CREATE TABLE ... LIKE`` does not accept a view. The staging
+defaults and the prod-VMS tables
 (``gfw-int-vms-v3.pipe_vms_v3_internal.{research_messages,segs_activity}``)
-satisfy this. The published view
-``pipe_vms_v4_published.segs_activity`` is NOT a valid choice.
-
-The default ``--pin-at`` is today UTC midnight minus 1 day (always inside
-BQ's 7-day time-travel window); override for any specific reproduction.
-Re-runs of the same ``--experiment-id`` reuse the existing snapshot tables
-until they expire (default ``--snapshot-expiration-days = 7``).
+are tables. The published view ``pipe_vms_v4_published.segs_activity``
+is not a valid choice. The messages must have a ``timestamp`` column,
+which pipe-gaps filters on.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
+import math
 import os
 import re
 import uuid
@@ -193,16 +208,14 @@ from workflows.pipe_gaps.mode_equivalence import (
     STEP_WORKER_SIZING,
 )
 
-# Defaults point at the dit staging cohort (same project as the snapshot
-# destination -- world-fishing-827 -- so no cross-org block on ``CREATE
-# SNAPSHOT TABLE``). Matches the staging-by-default precedent set by
-# ``workflows/pipe_gaps/mode_equivalence.py``; see also the README's
-# "Staging data sources" section for the table inventory. To exercise
-# the actual prod-VMS bug shape (e.g. the 9cc... case), override
+# Defaults point at the dit staging cohort. Matches the staging-by-default
+# precedent set by ``workflows/pipe_gaps/mode_equivalence.py``; see also the
+# README's "Source data targets" section for the table inventory. To
+# exercise the actual prod-VMS bug shape (e.g. the 9cc... case), override
 # explicitly with ``--source-messages gfw-int-vms-v3.pipe_vms_v3_internal.research_messages``
-# and ``--source-segments gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity``
-# plus ``--snapshot-dest-project gfw-int-vms-v3`` (to dodge the cross-
-# org block, since the dest must live in the source's project).
+# and ``--source-segments gfw-int-vms-v3.pipe_vms_v3_internal.segs_activity``.
+# The pinned copies land in world-fishing-827 either way: a copy only reads
+# its source, which works across organisations.
 DEFAULT_SOURCE_MESSAGES = (
     f"{PROJECT}.pipe_ais_test_202408290000_internal.messages_positions"
 )
@@ -217,20 +230,11 @@ MODE_OUTAGE_RECOVERY = "5_outage_recovery"
 MODE_OUTAGE_ORACLE = "5_outage_oracle"
 
 
-# Default pin timestamp. Computed today-relative at parse_args time so a
-# default run always lands inside BQ's 7-day time-travel window (a
-# hardcoded default would go stale immediately).
-def _default_pin_at() -> str:
-    # ``isoformat(sep=" ")`` matches the space-separated form the CLI help /
-    # error messages document (``YYYY-MM-DD HH:MM:SS UTC``).
-    return _utc_floor_days_ago(1).isoformat(sep=" ").replace("+00:00", " UTC")
-
-
-# Default snapshot-table expiration. Matches cross_version_ais.py
-# (``DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7``): long enough for a typical
-# multi-day reproduction session, short enough to bound storage cost on
-# stale experiment-ids.
-DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
+# Defaults of the pinned copies, as in cross_version_ais.py: seven days is
+# long enough for a multi-day reproduction session and short enough to bound
+# the storage of stale experiments; the cap is dit.bq's 1 TB per copy.
+DEFAULT_PIN_EXPIRATION_DAYS = 7
+DEFAULT_PIN_MAX_GB = dit_bq.DEFAULT_PIN_MAX_BYTES / 1e9
 
 # Stage 1 covers the full year [2020-01-01, 2020-12-28] (the
 # condensed-DAG-history backfill). The outage + recovery geometry is
@@ -258,11 +262,17 @@ DEFAULT_END = "2020-12-31"
 # buffer >= 1 widens the DELETE to sweep the seeds too, masking the class.
 DEFAULT_RECOVERY_BUFFER_DAYS = 0
 
-# Role passed to ``dit.bq.snapshot_into_experiment`` so the dest tables
-# land at ``<project>.tech_great_expectations.dit_exp_<experiment>_outage_<source_table_name>``.
-# Single role -- the outage is simulated by skipping daily runs, not by
-# pinning source data at two different times, so one snapshot is enough.
-SNAPSHOT_ROLE = "outage"
+# Role in the pinned copies' names, which live in
+# ``world-fishing-827.tech_great_expectations``:
+# ``dit_exp_<experiment>_outage_<source table>_<window or all>_<stamp>``.
+# One role for both sources. The outage is simulated by skipping daily runs,
+# not by pinning the sources at two different times, so one pin is enough.
+PIN_ROLE = "outage"
+
+# Time column of the messages source. pipe-gaps filters the messages on
+# DATE(timestamp) (assets/queries/messages.sql.j2), so the copy is windowed
+# on the same column.
+MESSAGES_WINDOW_COLUMN = "timestamp"
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 COMPARE_VIEW_SUFFIX = "_last_versions"
@@ -272,15 +282,6 @@ WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
 WORKFLOW_NAME = "workflows/pipe_gaps/outage_recovery.py"
 
 logger = logging.getLogger(__name__)
-
-
-def _utc_floor_days_ago(days: int) -> datetime:
-    """Today UTC at 00:00:00, minus ``days`` days. Used for time-travel-
-    window-friendly default pin-at values.
-    """
-    return (datetime.now(tz=timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    ) - timedelta(days=days))
 
 
 _UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
@@ -323,103 +324,143 @@ def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# BQ snapshot helpers (dit-pattern, see workflows/port_visits/cross_version_ais.py)
+# Pin the sources (copies in tech_great_expectations, dit.bq.pin_source_into_experiment)
 # --------------------------------------------------------------------------
+#
+# Same shape as workflows/port_visits/cross_version_ais.py. What is copied is
+# what pipe-gaps reads over the whole run, read from pipe-gaps v0.10.0
+# (DEFAULT_WORKER_IMAGE):
+#
+# * Messages: assets/queries/messages.sql.j2 filters
+#   ``DATE(timestamp) >= start_date AND DATE(timestamp) < end_date``, and the
+#   DAG factory passes ``DetectGapsConfig.messages_query_start_date`` as the
+#   start: the run's start date minus ``ceil(n_hours_before / 24)`` days. So a
+#   job over ``[s, e)`` reads the messages of ``[s - lookback, e)``.
+# * Segments: the same query reads ``seg_id`` from the segments table with no
+#   date filter (only ``good_seg2``), so the whole table is read. The optional
+#   stabilization hook (``good_seg_stabilization_days``, off here) reads it
+#   whole too.
+# * The open-gaps side input reads the run's own output table, not a source.
 
-def _validate_distinct_source_basenames(args: argparse.Namespace) -> None:
-    """Raise ``ValueError`` if ``--source-messages`` and ``--source-segments``
-    have the same basename. Under the canonical-dataset shape they would
-    produce identical snapshot dest table names and collide.
 
-    Called once in :func:`main` so BOTH the snapshot-create path
-    (:func:`_snapshot_source_at`) AND the ``--skip-snapshots`` reconstruction
-    path inherit the protection -- otherwise the skip-snapshots path
-    silently computes colliding FQNs that point at non-existent / wrong
-    tables. Production sources have distinct basenames
-    (``research_messages`` vs ``segs_activity``); this only fires on
-    misconfigured CLI input.
+@dataclasses.dataclass(frozen=True)
+class _PinSpec:
+    """One source to pin: the table to copy and its window (None = whole table)."""
+    source_table: str
+    window: dit_bq.SourceWindow | None
+
+
+def _messages_window(start: date, end: date, n_hours_before: int) -> dit_bq.SourceWindow:
+    """The messages every stage and the oracle read, as one window.
+
+    ``start`` and ``end`` are the workflow's inclusive ``--start`` / ``--end``.
+    Each job reads from its own start minus the lookback, up to its inclusive
+    end. Stage 1 and the oracle start at ``start``, no stage starts earlier
+    (``parse_args`` checks the recovery buffer), and every job ends at or
+    before ``end``. So ``[start - lookback, end]`` covers all of them. The
+    lookback is pipe-gaps' own formula.
     """
-    msgs_basename = args.source_messages.rsplit(".", 1)[-1]
-    segs_basename = args.source_segments.rsplit(".", 1)[-1]
-    if msgs_basename == segs_basename:
-        raise ValueError(
-            "--source-messages and --source-segments have identical basenames "
-            f"({msgs_basename!r}); under the canonical-dataset snapshot shape "
-            "they would produce a single dest table name and collide. "
-            "Distinct basenames are required."
+    lookback = timedelta(days=math.ceil(n_hours_before / 24))
+    return dit_bq.SourceWindow(
+        column=MESSAGES_WINDOW_COLUMN,
+        start=start - lookback,
+        end=end + timedelta(days=1),
+    )
+
+
+def _pin_specs(args: argparse.Namespace) -> tuple[_PinSpec, _PinSpec]:
+    """(messages, segments): the messages over the run's read window, the
+    segments whole.
+
+    Both use ``PIN_ROLE``. Their names cannot collide even if the two sources
+    share a table name: the messages' name holds a window, the segments'
+    holds ``all``.
+    """
+    window = _messages_window(
+        date.fromisoformat(args.start), date.fromisoformat(args.end), args.n_hours_before,
+    )
+    return (
+        _PinSpec(args.source_messages, window),
+        _PinSpec(args.source_segments, None),
+    )
+
+
+def _pin_sources(
+    args: argparse.Namespace, pinned_at: datetime, *, reuse: bool,
+) -> tuple[str, str]:
+    """Pin both sources under the stamp of ``pinned_at`` and return
+    ``(messages, segments)``, the tables every job reads. With ``reuse``,
+    check that an earlier run's copies under that stamp exist instead.
+
+    Both copies share one stamp, so ``--reuse-pin <stamp>`` can recompute
+    both names. A reused copy must match this run's experiment id, window
+    and source table name, since all of them are in the name. With
+    ``args.dry_run`` the copies are only dry-run: their bytes are checked
+    against the cap and nothing is created.
+    """
+    def pin(spec: _PinSpec) -> str:
+        if reuse:
+            return dit_bq.require_pinned_source(
+                dit_bq.pinned_source_fqn(
+                    spec.source_table,
+                    experiment_id=args.experiment_id,
+                    role=PIN_ROLE,
+                    pinned_at=pinned_at,
+                    window=spec.window,
+                    project=PROJECT,
+                ),
+                project=PROJECT,
+            )
+        return dit_bq.pin_source_into_experiment(
+            spec.source_table,
+            experiment_id=args.experiment_id,
+            role=PIN_ROLE,
+            pinned_at=pinned_at,
+            window=spec.window,
+            expiration_days=args.pin_expiration_days,
+            max_bytes=int(args.pin_max_gb * 1e9),
+            dry_run=args.dry_run,
+            project=PROJECT,
         )
 
+    messages, segments = (pin(spec) for spec in _pin_specs(args))
+    logger.info("pinned messages: %s", messages)
+    logger.info("pinned segments: %s", segments)
+    return messages, segments
 
-def _outage_snapshot_dest_fqn(
-    *, experiment_id: str, source_table: str, project: str,
-) -> str:
-    """The dest FQN that :func:`dit.bq.snapshot_into_experiment` would
-    produce for an outage-snapshot of ``source_table``.
 
-    Pure function; no BQ call. Used by both :func:`_snapshot_source_at`
-    (which creates the snapshot) and the ``--skip-snapshots`` path
-    (which reconstructs the FQN without re-creating it).
-
-    Mirrors ``dit.bq.snapshot_into_experiment``'s canonical naming
-    convention by construction: same ``-`` → ``_`` sanitisation rule on
-    ``experiment_id``, same ``dit_exp_<sanitised(experiment_id)>_<role>_<source_table_name>``
-    shape under ``<project>.tech_great_expectations``. Role here is
-    :data:`SNAPSHOT_ROLE` (already underscore-safe; no sanitisation needed).
-    """
-    sanitised_experiment_id = experiment_id.replace("-", "_")
-    source_table_name = source_table.rsplit(".", 1)[-1]
-    return (
-        f"{project}.{dit_bq.CANONICAL_DATASET}."
-        f"dit_exp_{sanitised_experiment_id}_{SNAPSHOT_ROLE}_{source_table_name}"
+def _pin(args: argparse.Namespace) -> tuple[str, str]:
+    """Copy the sources at run start, or with ``--reuse-pin`` reuse an
+    earlier run's copies. Returns ``(messages, segments)``."""
+    reuse = args.reuse_pin is not None
+    pinned_at = (
+        dit_bq.parse_pin_stamp(args.reuse_pin) if reuse
+        else datetime.now(timezone.utc).replace(microsecond=0)
     )
+    logger.info("pin stamp: %s (%s)", dit_bq.format_pin_stamp(pinned_at),
+                "reusing an earlier run's copies" if reuse else "new copies")
+    logger.info("pinning: %s (copies in %s.%s)",
+                ", ".join(spec.source_table for spec in _pin_specs(args)),
+                PROJECT, dit_bq.CANONICAL_DATASET)
+    pinned = _pin_sources(args, pinned_at, reuse=reuse)
+    if not reuse and not args.dry_run:
+        logger.info("to rerun on these copies, pass --reuse-pin %s",
+                    dit_bq.format_pin_stamp(pinned_at))
+    return pinned
 
 
-def _snapshot_source_at(
-    args: argparse.Namespace, *, pin_at: datetime,
-) -> tuple[str, str]:
-    """Create snapshots of ``--source-messages`` and ``--source-segments``
-    at ``pin_at``.
-
-    Returns ``(messages_snapshot_fqn, segments_snapshot_fqn)`` which the
-    stages then pass as their ``bq_input_messages`` / ``bq_input_segments``.
-
-    Snapshots land in ``<project>.tech_great_expectations`` per the
-    canonical-dataset policy (see CLAUDE.md § Working agreements).
-    ``args.snapshot_dest_project`` controls the dest project; a prod-VMS
-    opt-in run (sources in ``gfw-int-vms-v3``, a different GCP org from
-    ``world-fishing-827``) must pass it so both sides live in the same
-    org and dodge BQ's cross-org snapshot block.
-
-    Precondition: callers must invoke
-    :func:`_validate_distinct_source_basenames` first (done at the top of
-    :func:`main`). Without distinct basenames the two snapshots collide
-    on a single dest table name.
-    """
-    msgs_fqn = dit_bq.snapshot_into_experiment(
-        args.source_messages,
-        experiment_id=args.experiment_id,
-        role=SNAPSHOT_ROLE,
-        expiration_days=args.snapshot_expiration_days,
-        as_of=pin_at,
-        project=args.snapshot_dest_project,
-    )
-    segs_fqn = dit_bq.snapshot_into_experiment(
-        args.source_segments,
-        experiment_id=args.experiment_id,
-        role=SNAPSHOT_ROLE,
-        expiration_days=args.snapshot_expiration_days,
-        as_of=pin_at,
-        project=args.snapshot_dest_project,
-    )
-    logger.info(
-        "snapshotted %s -> %s (as_of=%s)",
-        args.source_messages, msgs_fqn, pin_at.isoformat(),
-    )
-    logger.info(
-        "snapshotted %s -> %s (as_of=%s)",
-        args.source_segments, segs_fqn, pin_at.isoformat(),
-    )
-    return msgs_fqn, segs_fqn
+def _resolve_sources(args: argparse.Namespace) -> tuple[str, str]:
+    """The ``(messages, segments)`` tables every stage and the oracle read:
+    the pinned copies, or with ``--no-pin`` the live sources."""
+    if args.no_pin:
+        logger.warning(
+            "--no-pin: every job reads the live %s and %s. Safe only while the "
+            "sources do not change; on a moving source the 3+1 jobs would each "
+            "read a different state.",
+            args.source_messages, args.source_segments,
+        )
+        return args.source_messages, args.source_segments
+    return _pin(args)
 
 
 # --------------------------------------------------------------------------
@@ -436,10 +477,11 @@ def _snapshot_source_at(
 # the outage dates filtered OUT (via dit.bq.derived_source_into_
 # experiment, the M6a helper); stages 1+2 read the filtered view, while
 # stage 3 (recovery) + the oracle read the unfiltered source. The two
-# mechanisms COMPOSE: snapshot pins the source at a moment in time
+# mechanisms COMPOSE: the pin fixes the source as of run start
 # (meaningful on evolving sources), the filter mutates what stages see
-# (meaningful everywhere); the filter applies on top of whatever source
-# path is active (snapshot / skip-snapshots / --no-snapshot live read).
+# (meaningful everywhere); the filter applies on top of whichever messages
+# table the run reads (a new copy, a --reuse-pin copy, or the --no-pin
+# live source).
 #
 # Only the MESSAGES source is filtered. The segments input
 # (segs_activity) is a per-segment summary used for good-seg filtering;
@@ -466,9 +508,10 @@ def _synthetic_outage_role(outage_start: date, outage_end: date) -> str:
     Encoding the dates in the role (hence in the view name) means a
     re-run with the same --experiment-id but DIFFERENT outage dates
     derives a NEW view instead of silently reusing the old one with the
-    stale filter baked in -- the same staleness class as the documented
-    skip-existing snapshot footgun, dodged structurally here. Re-runs
-    with the SAME geometry hit `IF NOT EXISTS` and are idempotent.
+    stale filter baked in. The view's name also ends in the name of the
+    table it filters, and a pinned copy's name holds its pin stamp, so a
+    new pin derives a new view too. Re-runs with the SAME geometry on the
+    same table (``--reuse-pin``) hit `IF NOT EXISTS` and are idempotent.
     """
     return f"outage_filtered_{outage_start:%Y%m%d}_{outage_end:%Y%m%d}"
 
@@ -481,15 +524,21 @@ def _derive_synthetic_outage_view(
     outage_end: date,
 ) -> str:
     """Create (idempotently) the outage-filtered view over the resolved
-    messages source and return its FQN. Stages 1+2 read this; stage 3 +
-    the oracle keep reading ``source_messages_fqn`` unfiltered."""
+    messages table (the pinned copy, or with ``--no-pin`` the live source)
+    and return its FQN. Stages 1+2 read this; stage 3 + the oracle keep
+    reading ``source_messages_fqn`` unfiltered.
+
+    The view lives next to the copies and expires with them
+    (``--pin-expiration-days``). On a ``--reuse-pin`` rerun the existing
+    view is kept, with the expiration its first run gave it.
+    """
     filtered_fqn = dit_bq.derived_source_into_experiment(
         source_messages_fqn,
         experiment_id=args.experiment_id,
         role=_synthetic_outage_role(outage_start, outage_end),
         where_clause=_synthetic_outage_where_clause(outage_start, outage_end),
-        expiration_days=args.snapshot_expiration_days,
-        project=args.snapshot_dest_project,
+        expiration_days=args.pin_expiration_days,
+        project=PROJECT,
     )
     logger.info(
         "synthetic outage: stages 1+2 read %s (messages with "
@@ -529,10 +578,9 @@ def _make_config(
     Mirrors ``mode_equivalence._make_config``; the workflow-local copy
     exists so we can iterate the source-table FQNs per stage without
     drifting against mode_equivalence's signature. Source-state pinning
-    is handled OUTSIDE pipe-gaps via ``dit.bq.snapshot_into_experiment``
-    (see :func:`_snapshot_source_at` above), so the pipe-gaps process
-    receives ordinary table FQNs and is none the wiser about the
-    snapshot layer.
+    is handled OUTSIDE pipe-gaps via ``dit.bq.pin_source_into_experiment``
+    (see :func:`_pin` above), so the pipe-gaps process receives ordinary
+    table FQNs and is none the wiser about the pinned copies.
     """
     unknown_parsed_args: dict[str, Any] = {"project": PROJECT}
     if labels:
@@ -825,7 +873,7 @@ def execute_outage_oracle(
     image_tag: str,
 ) -> None:
     """Single-shot backfill ``[start, end]`` (inclusive) against the
-    source snapshot.
+    unfiltered pinned source.
 
     The ground-truth answer the staged ``execute_outage_recovery`` should
     match: what a clean one-shot run over the full range would produce
@@ -864,14 +912,27 @@ _RECOVERY_ONLY_KEYS = frozenset({
 def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     """Output-affecting params for a pipe-gaps outage-recovery run.
 
-    The pin timestamp is stored as its ISO-8601 string (normalised by
-    ``_parse_pin_at``); the snapshot table name + dest project are NOT
-    included in the cache key, because two runs with the same
-    ``--source-*`` + pin-at timestamp produce the same snapshot CONTENT
-    regardless of where the snapshot table lives (canonical-dataset
-    shape: snapshots are tables in ``tech_great_expectations``).
-    ``--max-num-workers``, ``--worker-machine-type`` and ``--disk-size-gb``
-    are runner-only and not in the key either.
+    The pinned inputs are identified by the copies' names
+    (``pinned_messages``, ``pinned_segments``): the tables the jobs read.
+    ``main`` sets them on ``args`` once the sources are resolved. A name
+    holds the experiment id, the source's table name, the window and the
+    pin stamp, so:
+
+    * a ``--reuse-pin`` rerun recomputes the same names and hits the cache;
+    * a new pin has a new stamp, so new names, and misses. Its copies were
+      taken at another time and may hold other data;
+    * with ``--no-pin`` both are ``None``. Live reads of the same sources
+      share cache rows: the flag is for sources that do not change, and
+      then the output does not depend on when they were read. Pass
+      ``--no-cache`` when that may not hold.
+
+    The stamp alone would not do: copies of two experiments can carry the
+    same stamp and still be two copy jobs. The source FQNs stay in the key
+    because a copy's name holds only the source's table name.
+
+    ``--max-num-workers``, ``--worker-machine-type``, ``--disk-size-gb``,
+    ``--pin-max-gb`` and ``--pin-expiration-days`` do not change the output
+    and are not in the key.
     """
     params: dict[str, Any] = {
         "mode": mode,
@@ -893,12 +954,10 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict[str, Any]
         ),
         "source_messages": args.source_messages,
         "source_segments": args.source_segments,
-        "pin_at": _parse_pin_at(args.pin_at).isoformat(),
-        # When set, the workflow reads live source tables instead of
-        # snapshots; pin_at is ignored but kept in the key for shape
-        # stability. The boolean differentiates live-source runs from
-        # snapshot runs that happen to share a pin_at.
-        "no_snapshot": bool(args.no_snapshot),
+        # The pinned copies the jobs read; both None for --no-pin live
+        # reads. See the docstring.
+        "pinned_messages": args.pinned_messages,
+        "pinned_segments": args.pinned_segments,
         # M6b: when set, stages 1+2 read a derived view of the messages
         # source with the outage dates filtered OUT (real source-data
         # divergence, not just stage-skipping). Same geometry with vs
@@ -953,49 +1012,25 @@ def _run_with_cache(
 # --------------------------------------------------------------------------
 
 
-def _parse_pin_at(value: str) -> datetime:
-    """Parse a pin-at string into a tz-aware datetime.
-
-    Accepts ISO-8601 with explicit zone offset, trailing ``Z``, or trailing
-    ``UTC``. Rejects naive timestamps -- BQ ``FOR SYSTEM_TIME AS OF`` (used
-    by ``snapshot_table`` under the hood) interprets naive against the
-    session zone, which is not the user's intent for an outage-recovery
-    reproduction (the test would silently drift when run from a non-UTC
-    session).
-    """
-    s = value.strip()
-    if s.endswith("UTC"):
-        candidate = s[:-3].rstrip() + "+00:00"
-    else:
-        candidate = s.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(candidate)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"pin-at timestamp {value!r} is not parseable as ISO-8601 "
-            f"(expected e.g. '2026-05-27 18:00:00 UTC')"
-        ) from exc
-    if parsed.tzinfo is None:
-        raise argparse.ArgumentTypeError(
-            f"pin-at timestamp {value!r} is missing an explicit time zone; "
-            f"add ' UTC' (e.g. '2026-05-27 18:00:00 UTC') or an offset "
-            f"(e.g. '+00:00')"
-        )
-    return parsed
+#: Flags removed with snapshot pinning (PIPELINE-4705), and what to do
+#: instead. Still parsed, hidden, so an old invocation fails with this
+#: message and not with argparse's "unrecognized arguments".
+REMOVED_FLAGS = {
+    "--pin-at": "sources are pinned by copying them at run start, and a copy "
+                "cannot be taken at a past time. Drop the flag.",
+    "--snapshot-dest-project": "pinned copies always land in "
+                               f"{PROJECT}.{dit_bq.CANONICAL_DATASET}; a copy only "
+                               "reads its source, so a source in another "
+                               "organisation needs no flag. Drop it.",
+    "--snapshot-expiration-days": "use --pin-expiration-days.",
+    "--skip-snapshots": "use --reuse-pin <stamp>, with the pin stamp the "
+                        "earlier run logged.",
+    "--no-snapshot": "use --no-pin.",
+}
 
 
-def _validate_pin_at(value: str) -> str:
-    """argparse type: parse + reject naive; return the (stripped) string.
-
-    The string form (not the parsed datetime) is what lives on ``args``
-    so a later ``_parse_pin_at`` re-parse hits the same validation path
-    (no need to special-case "already a datetime"). The cache key itself
-    normalises via ``_parse_pin_at(...).isoformat()``, so two equivalent
-    user-supplied forms (``'... UTC'`` vs ``'...+00:00'``) collapse to
-    one canonical key (see :func:`canonical_params_dict`).
-    """
-    _parse_pin_at(value)
-    return value.strip()
+def _removed_flag_dest(flag: str) -> str:
+    return "removed_" + flag.lstrip("-").replace("-", "_")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1003,12 +1038,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--runner", choices=list(RUNNERS), default="dataflow")
     p.add_argument(
         "--source-messages", default=DEFAULT_SOURCE_MESSAGES,
-        help=f"Physical messages table (must support time-travel). "
+        help=f"Messages table to pin (a table, not a view, with a `timestamp` "
+             f"column). Copied over [--start minus pipe-gaps' lookback, --end]. "
              f"Default: {DEFAULT_SOURCE_MESSAGES}",
     )
     p.add_argument(
         "--source-segments", default=DEFAULT_SOURCE_SEGMENTS,
-        help=f"Segments source. Default: {DEFAULT_SOURCE_SEGMENTS}",
+        help=f"Segments table to pin (a table, not a view). Copied whole. "
+             f"Default: {DEFAULT_SOURCE_SEGMENTS}",
     )
     p.add_argument(
         "--start", default=DEFAULT_START,
@@ -1058,32 +1095,47 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
               f"Default: {DEFAULT_RECOVERY_BUFFER_DAYS}."),
     )
     p.add_argument(
-        "--pin-at",
-        type=_validate_pin_at,
-        default=_default_pin_at(),
-        help=("UTC timestamp for the source-table snapshot used by all "
-              "stages and the oracle. Default: today UTC midnight minus "
-              "1 day (always inside BQ's time-travel window)."),
+        "--reuse-pin", default=None, metavar="STAMP",
+        help=("Reuse the pinned copies of an earlier run with the same "
+              "--experiment-id, --start, --end, --n-hours-before and sources "
+              "instead of copying again. STAMP is the pin stamp that run "
+              "logged (e.g. 20261119t101500z). Fails if a copy is missing. "
+              "The outage dates may differ: they do not change what is copied."),
     )
     p.add_argument(
-        "--snapshot-expiration-days", type=int,
-        default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
-        help=("Per-table `expiration_timestamp` set on the snapshot tables "
-              "in the canonical `tech_great_expectations` dataset, in days "
-              "(M2 of canonical-dataset migration: workflow no longer creates "
-              "per-experiment datasets; snapshots live in tech_great_expectations "
-              "with per-table TTL). Default: "
-              f"{DEFAULT_SNAPSHOT_EXPIRATION_DAYS}."),
+        "--no-pin", action="store_true",
+        help=("Do not pin: every job reads the live --source-messages and "
+              "--source-segments. Use ONLY when the sources do not change "
+              "during the run. The staging cohort (`pipe_ais_test_*`, 2020 "
+              "AIS data) is the canonical case. On prod-VMS or any other "
+              "moving source the 3+1 jobs would each read a different state: "
+              "DO NOT USE. The pin flags are then ignored. The run cache "
+              "treats live reads of the same sources as the same inputs; "
+              "pass --no-cache if the source may have changed since."),
     )
     p.add_argument(
-        "--snapshot-dest-project", default=PROJECT,
-        help=(f"Project that hosts the snapshot tables (in `tech_great_expectations`). Default: {PROJECT}. "
-              "Override to the source's project when running against a source "
-              "that lives in a different GCP org (e.g. "
-              "``--snapshot-dest-project gfw-int-vms-v3`` when --source-* "
-              "points at the prod VMS tables) -- "
-              "``CREATE SNAPSHOT TABLE`` refuses cross-org sources."),
+        "--pin-expiration-days", type=int, default=DEFAULT_PIN_EXPIRATION_DAYS,
+        help=(f"Days until the pinned copies, and the --synthetic-outage "
+              f"view, expire. Default {DEFAULT_PIN_EXPIRATION_DAYS}."),
     )
+    p.add_argument(
+        "--pin-max-gb", type=float, default=DEFAULT_PIN_MAX_GB,
+        help=(f"Refuse to pin a source whose copy would process more than "
+              f"this many GB (10^9 bytes), checked by a dry run. Default "
+              f"{DEFAULT_PIN_MAX_GB:g}."),
+    )
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help=("Dry-run the copies only: report each copy's estimated bytes "
+              "against --pin-max-gb, then stop. Nothing is created, and no "
+              "pipeline and no comparison runs. With --reuse-pin it checks "
+              "that the copies exist."),
+    )
+    for removed in REMOVED_FLAGS:
+        # nargs="?" so the flag is rejected with its own message whether or
+        # not a value follows it.
+        p.add_argument(removed, nargs="?", const="", default=None,
+                       dest=_removed_flag_dest(removed), help=argparse.SUPPRESS)
     p.add_argument("--ssvids", default="",
                    help="Comma-separated ssvids to restrict to; empty = all.")
     p.add_argument("--min-gap-length", type=float, default=DEFAULT_MIN_GAP_LENGTH)
@@ -1105,36 +1157,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                          "jobs remain sequential among themselves. Mirrors "
                          "mode_equivalence's --parallel. Wall-clock roughly "
                          "max(staged chain, oracle) instead of the sum."))
-    p.add_argument("--skip-snapshots", action="store_true",
-                   help=("Don't create snapshot tables; assume an earlier run "
-                         "of the same --experiment-id already did. Useful when "
-                         "iterating on the pipeline logic without re-snapshotting. "
-                         "NOTE: --pin-at is still parsed, validated and folded "
-                         "into the cache key, but the actual source-state "
-                         "pinning comes from the existing snapshot tables -- "
-                         "which were created with the earlier run's pin-at, NOT "
-                         "the current run's. If you change pin-at while "
-                         "--skip-snapshots is set, drop the snapshot tables "
-                         "(or use a fresh --experiment-id) to force re-creation."))
-    p.add_argument("--no-snapshot", action="store_true",
-                   help=("Bypass snapshotting entirely: every stage reads the "
-                         "live --source-messages / --source-segments tables "
-                         "directly, no FOR SYSTEM_TIME AS OF pin. Use ONLY when "
-                         "the source is frozen for the duration of the run -- "
-                         "the staging cohort (`pipe_ais_test_*`) is the canonical "
-                         "case (2020 AIS data, never changes). For prod-VMS or "
-                         "any live-ingest source this would silently sample "
-                         "different states across the 3+1 staged jobs -- DO NOT USE. "
-                         "When set, --pin-at and --snapshot-* flags are ignored "
-                         "(but still parsed for argparse coherence); the cache "
-                         "key includes a `no_snapshot=true` marker so runs with "
-                         "and without snapshotting don't conflate."))
     p.add_argument("--synthetic-outage", action="store_true",
                    help=("Simulate the outage in the SOURCE DATA, not just in the "
                          "stage schedule: derive a view of the messages source with "
                          "[--outage-start, --outage-end] filtered out (via "
                          "dit.bq.derived_source_into_experiment; lands next to the "
-                         "snapshots in tech_great_expectations, same TTL). Stages 1+2 "
+                         "pinned copies in tech_great_expectations, same TTL). Stages 1+2 "
                          "read the filtered view -- they see the source as it looked "
                          "DURING the outage; stage 3 (recovery) + the oracle read the "
                          "unfiltered source -- the recovery runs after the source "
@@ -1142,8 +1170,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                          "class on a frozen source (issue #59): without it, every "
                          "stage reads the full source and the staged run trivially "
                          "matches the oracle. Composes with all three source paths "
-                         "(snapshot / --skip-snapshots / --no-snapshot); the filter "
-                         "applies on top of whichever messages FQN the path resolves. "
+                         "(a new pin / --reuse-pin / --no-pin); the filter "
+                         "applies on top of whichever messages table the run reads. "
                          "Only the messages source is filtered (the segments input is "
                          "a per-segment summary; known simplification). The cache key "
                          "gains a `synthetic_outage=true` marker (recovery mode only "
@@ -1158,6 +1186,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE)
 
     args = p.parse_args(argv)
+
+    for removed, instead in REMOVED_FLAGS.items():
+        if getattr(args, _removed_flag_dest(removed)) is not None:
+            p.error(f"{removed} was removed with snapshot pinning (PIPELINE-4705): {instead}")
+        delattr(args, _removed_flag_dest(removed))
 
     # Cross-validate stage boundaries:
     #     start <= backfill_end < outage_start <= outage_end < end
@@ -1207,27 +1240,36 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f"you want a deeper recovery window."
         )
 
-    # --snapshot-expiration-days = 0 / negative would compute an invalid
-    # expiration_timestamp inside snapshot_into_experiment; fail early
-    # with an actionable message.
-    if args.snapshot_expiration_days < 1:
+    # 0 or a negative value would give the copies an expiration in the
+    # past; fail early with an actionable message.
+    if args.pin_expiration_days < 1:
         p.error(
-            f"--snapshot-expiration-days must be >= 1; got "
-            f"{args.snapshot_expiration_days}."
+            f"--pin-expiration-days must be >= 1; got {args.pin_expiration_days}."
+        )
+    if args.pin_max_gb <= 0:
+        p.error(f"--pin-max-gb must be > 0; got {args.pin_max_gb}.")
+    if args.reuse_pin is not None:
+        try:
+            dit_bq.parse_pin_stamp(args.reuse_pin)
+        except ValueError as exc:
+            p.error(f"--reuse-pin: {exc}")
+
+    # --no-pin (live reads) and --reuse-pin (an earlier run's copies) both
+    # decide what the jobs read and contradict each other. Reject the pair
+    # at parse time so an ambiguous combination can't reach the read path.
+    # (Copilot review on PR #63, for the flags' predecessors.)
+    if args.no_pin and args.reuse_pin is not None:
+        p.error(
+            "--no-pin and --reuse-pin are mutually exclusive. --no-pin reads "
+            "the live sources (nothing is copied or reused); --reuse-pin "
+            "reads the copies of an earlier run with the same "
+            "--experiment-id. Pick one."
         )
 
-    # --no-snapshot (live source reads) and --skip-snapshots (reuse prior
-    # snapshot tables) are mutually-exclusive safety-sensitive modes; the
-    # if/elif in main() would silently let --no-snapshot win. Reject at
-    # arg-parse time so an ambiguous combination can't reach the read path.
-    # (Copilot review on PR #63.)
-    if args.no_snapshot and args.skip_snapshots:
-        p.error(
-            "--no-snapshot and --skip-snapshots are mutually exclusive. "
-            "--no-snapshot reads the live source directly (no snapshots "
-            "created or read); --skip-snapshots reuses snapshot tables "
-            "from an earlier run with the same --experiment-id. Pick one."
-        )
+    # What the jobs read, for the cache key. main() sets both once the
+    # sources are resolved; they stay None for --no-pin live reads.
+    args.pinned_messages = None
+    args.pinned_segments = None
 
     # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
     args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
@@ -1247,6 +1289,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     outage_start = date.fromisoformat(args.outage_start)
     outage_end = date.fromisoformat(args.outage_end)
     end = date.fromisoformat(args.end)
+
+    if args.dry_run:
+        # Before resolve_run_context, which can push an auto-snapshot of a
+        # dirty tree or build a worker image: a dry run changes nothing.
+        logger.info("--dry-run: the copies are dry-run only; nothing is created")
+        _resolve_sources(args)
+        if args.no_pin:
+            logger.info("--dry-run with --no-pin: nothing is copied, so nothing to estimate")
+        if args.synthetic_outage:
+            logger.info("--dry-run: the --synthetic-outage view is not created")
+        logger.info("--dry-run: no pipeline and no comparison ran")
+        return 0
+
     repo_dir = os.getcwd()
 
     # The docker runner always builds from the working tree (see
@@ -1283,7 +1338,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.cli_worker_sizing, {"every job": args.worker_sizing},
             [args.source_messages, args.source_segments],
         )
-    logger.info("Pin-at:        %s", args.pin_at)
     logger.info("Stage 1 (initial backfill):           [%s, %s]", start, backfill_end)
     logger.info("       outage (skipped):              [%s, %s]",
                 outage_start, outage_end)
@@ -1303,93 +1357,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dit_labels = _dit_run_labels(args)
     logger.info("dit labels: %s", dit_labels)
 
-    # Source-state pinning. Three paths:
-    #   1. --no-snapshot: read live source tables directly, no snapshot.
-    #      ONLY safe for frozen-source cases (staging cohort); for live
-    #      sources every stage would sample a different point in time.
-    #   2. --skip-snapshots: reuse existing snapshot tables from an earlier
-    #      same-experiment-id run (no creation).
-    #   3. Default: create one snapshot via snapshot_into_experiment.
-    if args.no_snapshot:
-        logger.warning(
-            "--no-snapshot: every stage reads live %s / %s directly. "
-            "Safe only when the source is frozen; for prod-VMS or live "
-            "sources this would silently sample different states across "
-            "stages. --pin-at (%s) is ignored.",
-            args.source_messages, args.source_segments, args.pin_at,
-        )
-        src_msgs = args.source_messages
-        src_segs = args.source_segments
-    elif args.skip_snapshots:
-        # The basename precondition only matters on snapshot paths --
-        # snapshot dest FQNs collide if both sources share a basename.
-        _validate_distinct_source_basenames(args)
-        # CAREFUL: this re-uses snapshot tables created by an earlier run
-        # of the same --experiment-id. The pin-at value you pass now is
-        # only used for cache-key composition (and validation) -- it is
-        # NOT compared against the snapshot's actual FOR SYSTEM_TIME AS OF
-        # creation timestamp. If those drift apart, the workflow reads a
-        # stale source state while logging the new pin, which would
-        # produce misleading results and cache pollution. Drop the
-        # snapshot tables (or use a fresh --experiment-id) to refresh.
-        src_msgs = _outage_snapshot_dest_fqn(
-            experiment_id=args.experiment_id,
-            source_table=args.source_messages, project=args.snapshot_dest_project,
-        )
-        src_segs = _outage_snapshot_dest_fqn(
-            experiment_id=args.experiment_id,
-            source_table=args.source_segments, project=args.snapshot_dest_project,
-        )
-        logger.warning(
-            "--skip-snapshots: re-using existing snapshot tables for "
-            "experiment-id=%r. pin-at value (%s) is NOT verified against "
-            "the snapshot's actual creation timestamp; if you've changed "
-            "pin-at since the snapshot was created, drop tables %s, %s "
-            "and re-run without --skip-snapshots.",
-            args.experiment_id, args.pin_at, src_msgs, src_segs,
-        )
-    else:
-        # Same basename-collision precondition as the skip-snapshots branch.
-        _validate_distinct_source_basenames(args)
-        src_msgs, src_segs = _snapshot_source_at(
-            args, pin_at=_parse_pin_at(args.pin_at),
-        )
-    logger.info("source tables: %s, %s", src_msgs, src_segs)
-
-    # M6b (issue #59): derive the outage-filtered messages view on top of
-    # whichever source path resolved above -- the snapshot/filter layers
-    # compose. Stages 1+2 read the filtered view (threaded through
-    # execute_outage_recovery's filtered_messages param); stage 3 + the
-    # oracle keep reading src_msgs unfiltered.
-    filtered_msgs: Optional[str] = None
-    if args.synthetic_outage:
-        filtered_msgs = _derive_synthetic_outage_view(
-            args,
-            source_messages_fqn=src_msgs,
-            outage_start=outage_start,
-            outage_end=outage_end,
-        )
-
-    base_cfg = dict(
-        bq_input_messages=src_msgs,
-        bq_input_segments=src_segs,
-        ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
-        min_gap_length=args.min_gap_length,
-        n_hours_before=args.n_hours_before,
-        window_period_d=args.window_period_d,
-        filter_good_seg=(args.filter_good_seg == "True"),
-        skip_open_gaps=args.skip_open_gaps,
-        service_account=args.service_account,
-        bq_temp_dataset=args.bq_temp_dataset or None,
-        dataflow_region=args.dataflow_region or None,
-        dataflow_temp_bucket=args.dataflow_temp_bucket or None,
-        dataflow_subnetwork=args.dataflow_subnetwork or None,
-        worker_image=args.worker_image or None,
-        labels=dit_labels,
-        max_num_workers=args.max_num_workers,
-        worker_sizing=args.worker_sizing,
-    )
-
     base = f"{PROJECT}.{args.dest_dataset}.outage_{suffix}"
     recovery_table = f"{base}_{MODE_OUTAGE_RECOVERY}"
     oracle_table = f"{base}_{MODE_OUTAGE_ORACLE}"
@@ -1398,6 +1365,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("  %s  (single-shot oracle)",       oracle_table)
 
     if not args.skip_pipelines:
+        # What every job reads: copies made now, an earlier run's copies
+        # (--reuse-pin), or the live sources (--no-pin). Only here, not with
+        # --skip-pipelines: a compare-only run reads no source, and a copy
+        # costs a query.
+        src_msgs, src_segs = _resolve_sources(args)
+        logger.info("source tables: %s, %s", src_msgs, src_segs)
+        if not args.no_pin:
+            # For the cache key (canonical_params_dict).
+            args.pinned_messages, args.pinned_segments = src_msgs, src_segs
+
+        # M6b (issue #59): derive the outage-filtered messages view on top of
+        # whichever messages table resolved above -- the pin and the filter
+        # compose. Stages 1+2 read the filtered view (threaded through
+        # execute_outage_recovery's filtered_messages param); stage 3 + the
+        # oracle keep reading src_msgs unfiltered.
+        filtered_msgs: Optional[str] = None
+        if args.synthetic_outage:
+            filtered_msgs = _derive_synthetic_outage_view(
+                args,
+                source_messages_fqn=src_msgs,
+                outage_start=outage_start,
+                outage_end=outage_end,
+            )
+
+        base_cfg = dict(
+            bq_input_messages=src_msgs,
+            bq_input_segments=src_segs,
+            ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
+            min_gap_length=args.min_gap_length,
+            n_hours_before=args.n_hours_before,
+            window_period_d=args.window_period_d,
+            filter_good_seg=(args.filter_good_seg == "True"),
+            skip_open_gaps=args.skip_open_gaps,
+            service_account=args.service_account,
+            bq_temp_dataset=args.bq_temp_dataset or None,
+            dataflow_region=args.dataflow_region or None,
+            dataflow_temp_bucket=args.dataflow_temp_bucket or None,
+            dataflow_subnetwork=args.dataflow_subnetwork or None,
+            worker_image=args.worker_image or None,
+            labels=dit_labels,
+            max_num_workers=args.max_num_workers,
+            worker_sizing=args.worker_sizing,
+        )
         recovery_kwargs = dict(
             runner=args.runner,
             base_cfg=base_cfg,
