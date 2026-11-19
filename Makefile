@@ -50,8 +50,11 @@ DEPS_FLAG = $(if $(FULLDEPS),,--no-deps)
 # symmetry across laptop and cloud installs" under Working agreements.
 # pipe-gaps:v0.10.0 -> apache-beam==2.71.0
 PIPE_GAPS_BEAM_VERSION            := 2.71.0
-# pipe-anchorages:v4.6.4 -> apache-beam==2.69.0
-ANCHORAGES_PIPELINE_BEAM_VERSION  := 2.69.0
+# pipe-anchorages:v5.0.1 -> apache-beam==2.76.0 (its requirements.txt and the
+# Beam SDK its Dockerfile copies). v5.0.1 is what production runs and what
+# DIT's default overlay image holds (workflows/port_visits/ais.py,
+# DEFAULT_OVERLAY_IMAGE). Was 2.69.0 for v4.6.4 until 2026-11-19.
+ANCHORAGES_PIPELINE_BEAM_VERSION  := 2.76.0
 # pipe-segment:v5.0.3 -> apache-beam==2.56.0
 PIPE_SEGMENT_BEAM_VERSION         := 2.56.0
 # pipe-events deliberately omitted: it's a BQ-SQL-via-container pipeline,
@@ -73,9 +76,13 @@ install-port-visits install-port-visits-ref snapshot-port-visits:  BEAM_VERSION 
 install-pipe-segment install-pipe-segment-ref snapshot-pipe-segment: BEAM_VERSION := $(PIPE_SEGMENT_BEAM_VERSION)
 # install-all installs all four pipelines into one venv: the only one
 # whose laptop submitter actually IS the laptop venv is pipe-gaps (others
-# use docker runner), so pin to pipe-gaps' beam version. This also
-# satisfies the other pipelines' ~= ranges (pipe-anchorages ~=2.69 and
-# pipe-segment ~=2.56 both accept 2.71.0).
+# use docker runner), so pin to pipe-gaps' beam version. pipe-segment's
+# ~=2.56 accepts 2.71.0. pipe-anchorages from v5.0.0 on requires
+# apache-beam~=2.76, which 2.71.0 does not satisfy: with a pipe-anchorages
+# checkout at v5 this target fails to resolve (it resolved while the
+# checkout was at v4.6.4, ~=2.69). The port-visits workflows do not import
+# pipe_anchorages (they run it in its image), so install the other
+# pipelines one by one until this target is reworked.
 install-all: BEAM_VERSION := $(PIPE_GAPS_BEAM_VERSION)
 
 # Helper: write a beam==$(BEAM_VERSION) constraint file to a temp path,
@@ -229,7 +236,7 @@ publish-ditbox:
 #   REF=<sha-or-tag>  # pipeline ref to install non-editably; empty = editable from source upload
 #   DIT_REF=<ref>     # dit ref to clone (default main)
 #   BEAM_VERSION=<x.y.z>  # pin apache-beam to match the worker image's beam version
-#                          # (pipe-gaps:v0.10.0 = 2.71.0; pipe-anchorages:v4.6.4 = 2.69.0;
+#                          # (pipe-gaps:v0.10.0 = 2.71.0; pipe-anchorages:v5.0.1 = 2.76.0;
 #                          # pipe-segment:v5.0.3 = 2.56.0). Auto-defaulted below
 #                          # per PIPELINE from the constants at the top of this
 #                          # Makefile (same values the laptop install targets use).
@@ -238,7 +245,10 @@ publish-ditbox:
 #   make dit-cloud \
 #       PIPELINE=anchorages_pipeline \
 #       WORKFLOW=workflows/port_visits/ais.py \
-#       ARGS="--runner dataflow --parallel --build-from-source"
+#       ARGS="--runner dataflow --parallel"
+# (port visits runs DIT's default overlay image; for a pipe-anchorages commit
+# not merged into origin/main, add --image-tag and --worker-image with an
+# overlay image of that commit, see docker/overlays/pipe-anchorages-temp-dataset/.)
 
 # Per-pipeline default for BEAM_VERSION on the cloud path. Override by
 # passing BEAM_VERSION=x.y.z on the make command line. Empty -> no
