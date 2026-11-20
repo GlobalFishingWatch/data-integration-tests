@@ -876,8 +876,13 @@ def _dataflow_options(
     max_num_workers: int | None,
     worker_sizing: WorkerSizing | None,
     build_from_source: bool,
+    job_name: str | None = None,
 ) -> list[str]:
     """The Dataflow options of one Beam step, as production's task passes them.
+
+    ``job_name`` replaces the per-binding name (:func:`_job_name`); the
+    mode-equivalence workflow (``ais.py``) names its jobs by mode and
+    iteration.
 
     ``--setup_file=./setup.py`` is passed only with ``build_from_source``.
     Production passes none: the published image has the package installed and
@@ -901,7 +906,8 @@ def _dataflow_options(
         "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
         f"--service_account_email={service_account}",
         "--job_name="
-        + _job_name(step, experiment_id=experiment_id, binding_name=binding_name),
+        + (job_name
+           or _job_name(step, experiment_id=experiment_id, binding_name=binding_name)),
         *([f"--sdk_container_image={worker_image}"] if worker_image is not None else []),
     ]
 
@@ -921,6 +927,9 @@ def _segment_args(
     max_num_workers: Optional[int] = None,
     worker_sizing: WorkerSizing | None = None,
     build_from_source: bool = False,
+    labels: Sequence[str] | None = None,
+    job_name: str | None = None,
+    extra_flags: Sequence[str] = (),
 ) -> list[str]:
     """CLI args for `pipe-segment segment`.
 
@@ -928,6 +937,13 @@ def _segment_args(
     ``pinned.normalized_messages`` is the pinned copy. pipe-segment's
     BigQuerySource finds it partitioned, as the source is, and filters by
     DATE(timestamp).
+
+    The last three parameters are for the mode-equivalence workflow
+    (``ais.py``), which shares this builder. ``labels`` replaces the
+    per-binding ``--labels`` (:func:`_step_labels`), ``job_name`` the
+    per-binding Dataflow job name, and ``extra_flags`` are appended after the
+    table flags (``--incremental`` and its tables). Left at their defaults,
+    the argv is what it was before they existed.
 
     No satellite flag is ever passed (``--in_normalized_sat_offset_messages_table``,
     ``--in_norad_to_receiver_table``, ``--in_sat_positions_table``,
@@ -946,7 +962,9 @@ def _segment_args(
         f"--out_segmented_messages_table={_output_prefix('messages_segmented', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--out_segments_table={_output_prefix('segments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--fragments_table={_output_prefix('fragments', dest_dataset=dest_dataset, suffix=suffix)}",
-        *_step_labels("segment", experiment_id=experiment_id, binding_name=binding_name),
+        *extra_flags,
+        *(_step_labels("segment", experiment_id=experiment_id, binding_name=binding_name)
+          if labels is None else labels),
         # Project + runner.
         f"--project={PROJECT}",
         f"--runner={runner}",
@@ -972,6 +990,7 @@ def _segment_args(
             max_num_workers=max_num_workers,
             worker_sizing=worker_sizing,
             build_from_source=build_from_source,
+            job_name=job_name,
         ))
     return args
 
