@@ -852,7 +852,7 @@ def check_incremental_support(args: argparse.Namespace, repo_dir: str) -> None:
     if not incremental or args.skip_pipelines:
         return
     since = _version_text(INCREMENTAL_SINCE)
-    selected = f"--segmenter {SEGMENTER_INCREMENTAL} ({', '.join(incremental)})"
+    selected = f"the {SEGMENTER_INCREMENTAL} segmenter ({', '.join(incremental)})"
 
     if args.build_from_source:
         command_file = Path(repo_dir) / _SEGMENT_COMMAND_FILE

@@ -615,7 +615,7 @@ because `seg_id` is in the key.
 
 | Symptom | Likely cause |
 |---|---|
-| `--segmenter incremental … needs pipe-segment v5.1.0 or later` | An executed image is older than the flag, or its tag names no version (M3). |
+| `the incremental segmenter … needs pipe-segment v5.1.0 or later` | An executed image is older than the flag, or its tag names no version (M3). |
 | `this pipe-segment checkout is unreviewed` | The run would execute the default image on code it does not hold (M3). |
 | `these output tables already hold rows` | `--suffix` names an earlier run's tables. Use another suffix, or `--skip-pipelines` to compare them as they are. |
 | An incremental job fails with `Only N of M days … have messages` | A day of the window has no messages in the source. pipe-segment's own check; choose another window. |
