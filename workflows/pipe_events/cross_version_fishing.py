@@ -1,8 +1,8 @@
 """Cross-version experiment for pipe-events fishing events.
 
-Pins the source data via BQ snapshots at a fixed timestamp, runs
+Pins the source data by copying it at run start, runs
 ``workflows/pipe_events/fishing.py`` once per pipeline-version binding (with
-each binding pointed at the snapshotted inputs), and then diffs corresponding
+each binding pointed at the pinned copies), and then diffs corresponding
 output views pairwise across bindings on ``event_id``. Diff results are
 reported but do not fail the run -- the *point* of cross-version testing is
 to surface behaviour change, so a non-empty diff is information, not error.
@@ -12,7 +12,7 @@ branch by comparing it against ``main``::
 
     dit run workflows/pipe_events/cross_version_fishing.py \\
         --experiment-id refactor-stage-two \\
-        --pin-source-at 2026-08-12T09:00:00Z \\
+        --start 2020-01-01 --end 2021-01-01 \\
         --binding main=main \\
         --binding refactor=refactor/fishing_events_incremental_stage_two \\
         --modes 1_bf \\
@@ -21,21 +21,36 @@ branch by comparing it against ``main``::
 Steps:
 
 1. Verify every binding's git ref exists in ``$PROJECTS/pipe-events``.
-2. ``dit.bq.snapshot_into_experiment`` the SEVEN moving source tables
-   (``research_messages``, ``segs_activity``, ``segment_vessel``,
-   ``product_vessel_info_summary``, ``identity_core``,
-   ``identity_authorization``, ``event_regions``) from their configured
-   locations at ``--pin-source-at`` into the canonical
-   ``<project>.tech_great_expectations`` dataset as
-   ``dit_exp_<sanitised(exp)>_cross_version_<source_basename>`` tables with
-   per-table ``expiration_timestamp`` (default 7-day TTL).
+2. Pin the SEVEN moving sources with ``dit.bq.pin_source_into_experiment``:
+   copy each into ``<project>.tech_great_expectations`` (default 7-day TTL).
+   What is copied follows what pipe-events reads (its SQL, checked from
+   v4.2.17, ``fishing.py``'s default image, to v9.0.0):
+
+   * ``research_messages``: the only source read by date. Step 1 reads
+     ``DATE(timestamp)`` from one day before a slice's start up to its
+     exclusive end, so the copy holds ``[--start - 1 day, --end)``, which
+     covers every slice of every mode (see ``_messages_window``). The copy
+     keeps the source's partitioning and clustering.
+   * ``segs_activity``, ``segment_vessel``, ``product_vessel_info_summary``,
+     ``identity_core``, ``identity_authorization``, ``event_regions``: read
+     without a date filter, so copied whole.
+
+   A source that is a view is copied too, as a plain table of the rows it
+   returns (on the staging cohort: ``identity_core`` and
+   ``identity_authorization``, which select from production's identity
+   tables, and ``event_regions``).
+
+   Every copy's name ends in the pin stamp (the run's start time in UTC,
+   e.g. ``20261119t171500z``). ``--reuse-pin <stamp>`` reuses an earlier
+   run's copies instead, e.g. on a retry. Pinning replaced BigQuery
+   snapshots: BigQuery refuses a snapshot of a table in another
+   organisation and of a view, and no DIT identity may create one with an
+   expiration.
 
    The eighth ``fishing.py`` source, ``spatial_measures_20201105``, is
-   deliberately NOT snapshotted. Its ``_YYYYMMDD`` filename suffix is a
-   content-addressable version literal -- snapshotting a version-pinned
-   static table buys nothing (7-day TTL cleanup on a permanently unchanging
-   table, gratuitous storage, and it obscures the "this file lives forever
-   at this address" contract). All bindings read the shared default for
+   deliberately NOT pinned. Its ``_YYYYMMDD`` filename suffix is a
+   content-addressable version literal -- copying a version-pinned static
+   table (58 GB) buys nothing. All bindings read the shared default for
    that table.
 
 3. For each binding (in parallel by default; ``--sequential-bindings`` opts
@@ -47,9 +62,10 @@ Steps:
    ``--source-product-vessel-info-summary-fqn``,
    ``--source-identity-core-fqn``,
    ``--source-identity-authorization-fqn``,
-   ``--source-event-regions-fqn``) pointing at the canonical snapshots, plus
-   a binding-scoped ``--suffix``. Each subprocess's stdout/stderr is
-   line-prefixed ``[<binding>] `` so parallel runs interleave readably.
+   ``--source-event-regions-fqn``) pointing at the pinned copies; the
+   pinned ``--start`` / ``--end`` / ``--tail-days``; and a binding-scoped
+   ``--suffix``. Each subprocess's stdout/stderr is line-prefixed
+   ``[<binding>] `` so parallel runs interleave readably.
 
 4. For each mode in ``--modes`` and each pair of bindings, compare the
    corresponding ``<suffix>_<mode>_fishing_events`` view AND the
@@ -59,9 +75,16 @@ Steps:
 The overall exit code is non-zero iff any binding failed; an individual
 binding failure does not abort siblings.
 
-``--dry-run`` skips the ``fishing.py`` invocations and the diff phase but
-still performs snapshotting and worktree setup/teardown -- useful for
-validating the orchestration without burning BQ cost.
+``--start`` / ``--end`` (half-open, ``fishing.py``'s convention) and
+``--tail-days`` are this wrapper's flags, not pass-through extras: they
+decide the dates ``research_messages`` is copied over, and they are forwarded
+to every binding so no binding runs outside the copy.
+
+``--dry-run`` skips the ``fishing.py`` invocations and the diff phase, and
+only dry-runs the copies (nothing is created; each copy's estimated bytes are
+logged and checked against ``--pin-max-gb``), but still performs worktree
+setup/teardown -- useful for validating the orchestration and the cost of the
+pin without running anything.
 
 Note on cross-version semantics vs port_visits: ``fishing.py`` is
 docker-only (no Dataflow submitter/worker split), so this wrapper does NOT
@@ -97,20 +120,23 @@ import tempfile
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit.workflow import parse_modes
 
-# fishing.py owns the canonical mode set + dataset defaults; import so the
-# two can't drift.
+# fishing.py owns the canonical mode set + dataset and date defaults; import
+# so the two can't drift.
 from workflows.pipe_events.fishing import (
+    DEFAULT_END,
     DEFAULT_INTERNAL_DS,
     DEFAULT_PIPE_REGIONS_LAYERS,
     DEFAULT_PIPE_STATIC,
     DEFAULT_PUBLISHED_DS,
+    DEFAULT_START,
+    DEFAULT_TAIL_DAYS,
 )
 from workflows.pipe_events.fishing import (
     MODES as FISHING_MODES,
@@ -126,7 +152,8 @@ DEFAULT_PROJECTS_DIR = os.environ.get("PROJECTS") or str(
     Path(__file__).resolve().parents[2].parent
 )
 DEFAULT_PIPELINE_DIR = os.path.join(DEFAULT_PROJECTS_DIR, "pipe-events")
-DEFAULT_SNAPSHOT_EXPIRATION_DAYS = 7
+DEFAULT_PIN_EXPIRATION_DAYS = 7
+DEFAULT_PIN_MAX_GB = dit_bq.DEFAULT_PIN_MAX_BYTES / 1e9
 
 FISHING_WORKFLOW = Path(__file__).with_name("fishing.py")
 
@@ -146,58 +173,117 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
         description="Cross-version experiment for pipe-events fishing events.",
     )
     p.add_argument("--experiment-id", required=True,
-                   help="Slug for the experiment; appears in snapshot dataset name and "
-                        "output-table suffixes. Sanitisation: hyphens become underscores in "
-                        "snapshot dest table names.")
-    p.add_argument("--pin-source-at", required=True,
-                   help="ISO 8601 timestamp for the source-data snapshot "
-                        "(e.g. 2026-08-12T10:00:00Z).")
+                   help="Slug for the experiment; appears in pinned-copy names and "
+                        "output-table suffixes. Hyphens become underscores in the copies' "
+                        "names.")
+    # Removed 2026-11 (PIPELINE-4705): sources are pinned by copying them at
+    # run start, and a copy cannot be taken at a past time without time
+    # travel. --snapshot-expiration-days went with the snapshots. Both are
+    # rejected explicitly, so an old invocation fails here rather than
+    # leaking into every binding's fishing.py extras after the copies.
+    p.add_argument("--pin-source-at", help=argparse.SUPPRESS)
+    p.add_argument("--snapshot-expiration-days", help=argparse.SUPPRESS)
     p.add_argument("--binding", action="append", required=True, dest="bindings",
                    help="`name=ref` pair, repeatable. Both must be valid git refs in "
                         "--pipeline-dir. Name must match [a-z0-9][a-z0-9_-]{0,31} because it "
                         "flows into a BQ table suffix.")
+    # The wrapper owns the run's dates: they decide the window of the
+    # research_messages copy, so they are validated before anything is pinned
+    # and forwarded to every binding.
+    p.add_argument("--start", default=DEFAULT_START,
+                   help=f"Inclusive start date (half-open window [start, end)), forwarded to "
+                        f"every binding and used to window the pinned research_messages. "
+                        f"Default {DEFAULT_START}.")
+    p.add_argument("--end", default=DEFAULT_END,
+                   help=f"Exclusive end date (half-open window [start, end)), forwarded to "
+                        f"every binding and used to window the pinned research_messages. "
+                        f"Default {DEFAULT_END}.")
+    p.add_argument("--tail-days", type=int, default=DEFAULT_TAIL_DAYS,
+                   help=f"Number of tail days of the bfd / bftruncate daily iteration, "
+                        f"forwarded to every binding. Default {DEFAULT_TAIL_DAYS}.")
     p.add_argument("--modes", default=DEFAULT_MODES,
                    help=f"Comma-separated mode names whose output views get diffed pairwise. "
                         f"Default {DEFAULT_MODES}.")
     p.add_argument("--pipeline-dir", default=DEFAULT_PIPELINE_DIR,
                    help="pipe-events checkout used for git worktrees.")
     # Source dataset knobs -- the wrapper's own copies of fishing.py's
-    # dataset defaults. Threaded into _snapshot_source so the SOURCE side
-    # of the snapshot points at whichever cohort the user selected.
+    # dataset defaults. They name the tables that are pinned, so the copies
+    # are of whichever cohort the user selected.
     p.add_argument("--internal-ds", default=DEFAULT_INTERNAL_DS,
-                   help="Source internal AIS dataset (research_messages, segment_vessel).")
+                   help="Source internal AIS dataset to pin from (research_messages, "
+                        "segment_vessel).")
     p.add_argument("--published-ds", default=DEFAULT_PUBLISHED_DS,
-                   help="Source published AIS dataset (segs_activity, identity_*, vessel info).")
+                   help="Source published AIS dataset to pin from (segs_activity, identity_*, "
+                        "vessel info).")
     p.add_argument("--pipe-static", default=DEFAULT_PIPE_STATIC,
                    help="Source pipe_static dataset. NOTE: spatial_measures_20201105 is NOT "
-                        "snapshotted (content-addressable version literal); this knob is "
-                        "accepted for parity with fishing.py but has no effect on the snapshot "
-                        "phase. Every binding reads fishing.py's default spatial_measures FQN.")
+                        "pinned (content-addressable version literal); this knob is accepted "
+                        "for parity with fishing.py but has no effect. Every binding reads "
+                        "fishing.py's default spatial_measures FQN.")
     p.add_argument("--pipe-regions-layers", default=DEFAULT_PIPE_REGIONS_LAYERS,
-                   help="Source pipe_regions_layers dataset (event_regions).")
+                   help="Source pipe_regions_layers dataset to pin from (event_regions).")
     p.add_argument("--dest-dataset", default=DEFAULT_DEST_DATASET,
                    help="BQ dataset holding the output tables produced by each binding's "
                         "fishing.py run.")
-    p.add_argument("--snapshot-expiration-days", type=int,
-                   default=DEFAULT_SNAPSHOT_EXPIRATION_DAYS,
-                   help="default_table_expiration for the created snapshot tables, in days. "
-                        "Bump for pipe3-scale invocations where a single sequential run could "
-                        "outlive the default 7-day window.")
+    p.add_argument("--reuse-pin", default=None, metavar="STAMP",
+                   help="Reuse the pinned copies of an earlier run with the same "
+                        "--experiment-id, --start, --end and sources instead of copying "
+                        "again. STAMP is the pin stamp that run logged (e.g. "
+                        "20261119t171500z). Fails if any copy is missing.")
+    p.add_argument("--pin-expiration-days", type=int, default=DEFAULT_PIN_EXPIRATION_DAYS,
+                   help=f"Days until the pinned copies expire. Default "
+                        f"{DEFAULT_PIN_EXPIRATION_DAYS}. Raise it for a run that could outlive "
+                        f"them.")
+    p.add_argument("--pin-max-gb", type=float, default=DEFAULT_PIN_MAX_GB,
+                   help=f"Refuse to pin a source whose copy would process more than this many "
+                        f"GB (10^9 bytes), checked by a dry run. Per copy, not per run. Default "
+                        f"{DEFAULT_PIN_MAX_GB:g}.")
     p.add_argument("--dry-run", action="store_true",
-                   help="Skip fishing.py invocations and pairwise diffs; still creates "
-                        "snapshots and worktrees.")
+                   help="Skip fishing.py invocations and pairwise diffs; dry-run the copies "
+                        "only (nothing is created; each estimate is logged against "
+                        "--pin-max-gb); still sets up and tears down worktrees.")
     p.add_argument("--sequential-bindings", action="store_true",
                    help="Run bindings serially instead of the default (parallel). Useful "
                         "when debugging a single binding's logs without interleave.")
     args, fishing_extra_args = p.parse_known_args(argv)
+    if args.pin_source_at is not None:
+        raise SystemExit(
+            "--pin-source-at was removed: sources are now pinned by copying them at run "
+            "start. Drop the flag; to reuse an earlier run's copies, pass --reuse-pin <stamp>."
+        )
+    if args.snapshot_expiration_days is not None:
+        raise SystemExit(
+            "--snapshot-expiration-days was removed with snapshot pinning; "
+            "use --pin-expiration-days."
+        )
+    del args.pin_source_at, args.snapshot_expiration_days
     args.bindings = [_parse_binding(b) for b in args.bindings]
     args.modes = parse_modes(args.modes, choices=FISHING_MODES)
-    args.pin_source_at = _parse_iso8601(args.pin_source_at)
     # Validate binding names against the BQ-safe subset -- they flow into
     # output-table suffixes as ``{experiment_id}-{binding_name}``. A typo
     # like ``--binding refactor/stage_two=...`` would otherwise produce an
-    # invalid BQ table name only at snapshot/write time, deep into the run.
+    # invalid BQ table name only at write time, deep into the run.
     _validate_binding_names(args.bindings)
+    # The same checks fishing.py makes in main(), made here before anything
+    # is pinned rather than in every binding afterwards.
+    args.start = _parse_date("--start", args.start)
+    args.end = _parse_date("--end", args.end)
+    if args.end <= args.start:
+        raise SystemExit(
+            f"--end ({args.end}) must be after --start ({args.start}); the window is "
+            f"half-open [start, end)."
+        )
+    if args.tail_days < 1:
+        raise SystemExit(f"--tail-days must be >= 1; got {args.tail_days}")
+    if args.reuse_pin is not None:
+        try:
+            dit_bq.parse_pin_stamp(args.reuse_pin)
+        except ValueError as exc:
+            raise SystemExit(f"--reuse-pin: {exc}") from exc
+    if args.pin_max_gb <= 0:
+        raise SystemExit(f"--pin-max-gb must be > 0; got {args.pin_max_gb}")
+    if args.pin_expiration_days < 1:
+        raise SystemExit(f"--pin-expiration-days must be >= 1; got {args.pin_expiration_days}")
     return args, fishing_extra_args
 
 
@@ -245,14 +331,11 @@ def _validate_binding_names(bindings: list[tuple[str, str]]) -> None:
         )
 
 
-def _parse_iso8601(s: str) -> datetime:
-    # Accept both "...Z" and explicit offsets.
+def _parse_date(flag: str, s: str) -> date:
     try:
-        if s.endswith("Z"):
-            return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
-        return datetime.fromisoformat(s)
+        return date.fromisoformat(s)
     except ValueError as exc:
-        raise SystemExit(f"--pin-source-at: invalid ISO 8601 timestamp {s!r}: {exc}") from exc
+        raise SystemExit(f"{flag}: invalid date {s!r}; expected YYYY-MM-DD") from exc
 
 
 # --------------------------------------------------------------------------
@@ -276,43 +359,46 @@ def _verify_refs(pipeline_dir: str, bindings: list[tuple[str, str]]) -> None:
 
 
 # --------------------------------------------------------------------------
-# Snapshot tables (canonical-dataset shape)
+# Pin the sources (copies in tech_great_expectations, dit.bq.pin_source_into_experiment)
 # --------------------------------------------------------------------------
 
-# Role used by dit.bq.snapshot_into_experiment.
+# Role in the pinned-copy names.
 #
 # The role is workflow-specific -- NOT the bare "cross_version" that
-# port_visits/cross_version_ais.py uses -- because a shared basename can
-# collide across workflows for the same --experiment-id. Concrete case:
-# both this workflow and cross_version_ais.py snapshot a `segs_activity`
-# table, so with role="cross_version" both dest FQNs resolve to
-# `...tech_great_expectations.dit_exp_<exp>_cross_version_segs_activity`.
-# Because snapshot_into_experiment defaults to if_existing="skip", the
-# second workflow silently adopts the first workflow's snapshot -- pinned
-# at a different --pin-source-at and possibly derived from a different
-# dataset. snapshot_into_experiment's own docstring puts the duty here:
-# "Caller is responsible for keeping roles disjoint per workflow so
-# concurrent experiments don't collide on a table name." The precedent
-# is cross_version_ais.py's own second role (_THINNED_SNAPSHOT_ROLE) --
-# same trap, same fix.
-_SOURCE_SNAPSHOT_ROLE = "cross_version_fishing"
+# port_visits/cross_version_ais.py uses -- so the two workflows' copies of a
+# shared basename (both pin a `segs_activity`) stay apart by name for one
+# --experiment-id, also when their pin stamps happen to coincide.
+_SOURCE_PIN_ROLE = "cross_version_fishing"
+
+# Time column of research_messages, and how far before a slice's start
+# pipe-events reads it. Step 1 (fishing-events-1-incremental.sql.j2) filters
+#     DATE(timestamp) >= DATE_SUB(DATE(start_date), INTERVAL 1 DAY)
+#     AND DATE(timestamp) < DATE(end_date)
+# for the merge with the previous day's open events. The filter is the same
+# in every release from v4.2.17 (fishing.py's default image) to v9.0.0.
+_MESSAGES_WINDOW_COLUMN = "timestamp"
+_MESSAGES_PAD_DAYS = 1
 
 
 @dataclasses.dataclass(frozen=True)
-class _CrossVersionSnapshotFQNs:
-    """The seven canonical snapshot FQNs that ``_snapshot_source`` produces,
-    threaded through ``_run_binding`` -> ``_fishing_args_for_binding`` so
-    each binding's ``fishing.py`` invocation reads from the canonical-dataset
-    snapshots instead of from the live source datasets.
+class _PinnedSources:
+    """What every binding reads: the seven pinned copies, and the run shape
+    (``start`` / ``end`` half-open, ``tail_days``) the ``research_messages``
+    copy was windowed for. Threaded through ``_run_binding`` ->
+    ``_fishing_args_for_binding``, which forwards the run shape too, so a
+    binding cannot run over dates its copy does not hold.
 
-    Seven fields, NOT eight: ``spatial_measures_20201105`` is content-
-    addressable by its ``_YYYYMMDD`` filename suffix and is not snapshotted
-    (see module docstring). All bindings share fishing.py's default for
-    that table.
+    Seven tables, NOT eight: ``spatial_measures_20201105`` is content-
+    addressable by its ``_YYYYMMDD`` filename suffix and is not pinned (see
+    module docstring). All bindings share fishing.py's default for that
+    table.
 
-    Frozen so callers can't accidentally mutate the FQNs between snapshot
-    creation and ``fishing.py`` invocation.
+    Frozen so nothing changes the pins between pinning and the
+    ``fishing.py`` invocations.
     """
+    start: date
+    end: date
+    tail_days: int
     research_messages: str
     segs_activity: str
     segment_vessel: str
@@ -322,66 +408,143 @@ class _CrossVersionSnapshotFQNs:
     event_regions: str
 
 
-def _snapshot_source(args: argparse.Namespace) -> _CrossVersionSnapshotFQNs:
-    """Snapshot the seven moving pipe-events source tables at
-    ``--pin-source-at`` into the canonical ``tech_great_expectations``
-    dataset via ``dit.bq.snapshot_into_experiment``. Returns the dest FQNs
-    as a frozen dataclass for threading downstream.
+@dataclasses.dataclass(frozen=True)
+class _PinSpec:
+    """One source to pin: the ``_PinnedSources`` field it fills, the table
+    (or view) to copy, and its window (None = whole)."""
+    field: str
+    source_table: str
+    window: dit_bq.SourceWindow | None
 
-    ``spatial_measures_20201105`` is deliberately NOT snapshotted; see the
-    module docstring for the content-addressable rationale.
 
-    KNOWN FOOTGUN inherited from ``snapshot_into_experiment``:
-    ``if_existing="skip"`` (the helper's default) makes per-source-table
-    re-runs idempotent BUT silently keeps the prior snapshot if the same
-    ``--experiment-id`` is re-run with a different ``--pin-source-at``.
-    ``--experiment-id`` is REQUIRED in this workflow (no auto-generated
-    default) -- use a fresh experiment id per distinct pin timestamp; the
-    7-day TTL on each snapshot table cleans up afterwards.
+def _messages_window(start: date, end: date, tail_days: int) -> dit_bq.SourceWindow:
+    """The dates of ``research_messages`` that any slice of any mode reads.
+
+    ``fishing.py`` runs these slices over the half-open ``[start, end)``:
+
+    * ``1_bf``: ``[start, end)``;
+    * ``2_bfd``: ``[start, end - tail_days)``, then one-day slices
+      ``[d, d + 1)`` for the last ``tail_days`` days;
+    * ``3_bftruncate``: ``[start, end)``, then the same one-day slices.
+
+    Each slice reads from ``_MESSAGES_PAD_DAYS`` before its start up to its
+    exclusive end. The earliest slice start is ``start``, or the first tail
+    day ``end - tail_days`` if that is earlier (a tail longer than the run),
+    and no slice ends after ``end``. The window does not depend on the
+    selected modes, so one set of copies serves any ``--modes`` on a rerun.
+    """
+    first_slice_start = min(start, end - timedelta(days=tail_days))
+    return dit_bq.SourceWindow(
+        column=_MESSAGES_WINDOW_COLUMN,
+        start=first_slice_start - timedelta(days=_MESSAGES_PAD_DAYS),
+        end=end,
+    )
+
+
+def _pin_specs(args: argparse.Namespace) -> list[_PinSpec]:
+    """The seven sources a run pins. ``research_messages`` is the only one
+    pipe-events reads by date, so the only one windowed; the other six are
+    read without a date filter (steps 2 and 3) and copied whole.
+
+    ``spatial_measures_20201105`` is deliberately absent; see the module
+    docstring.
     """
     # Use dataset knobs verbatim -- they already carry the project. Splitting
     # ``project.dataset`` on ``.`` and re-prefixing PROJECT silently discards
     # a user-supplied project (e.g. ``--internal-ds gfw-int-vms-v3.some_internal``
-    # snapshotting from world-fishing-827 instead), which best-case produces
-    # a mid-run 404 and worst-case snapshots the wrong data from a same-named
-    # dataset in the default project. Match fishing.py's ``_run_slice``
+    # pinning from world-fishing-827 instead), which best-case produces a
+    # mid-run 404 and worst-case copies the wrong data from a same-named
+    # dataset in the default project. Match fishing.py's source resolvers
     # (``f"{args.internal_ds}.research_messages"``, etc.) so "the wrapper
-    # snapshots exactly what fishing.py would have read" holds by
-    # construction, not by coincidence with the defaults. Cross-org sources
-    # are already real (encounters/vms.py targets gfw-int-vms-v3) and
-    # snapshot_into_experiment carries a ``project`` param for cross-org
-    # writes.
+    # pins exactly what fishing.py would have read" holds by construction,
+    # not by coincidence with the defaults. A copy only reads its source, so
+    # a source in another organisation works.
     #
     # (This deliberately diverges from cross_version_ais.py, which DOES need
     # ``PROJECT`` re-prefixing because its ``--source-dataset-stem`` is a
     # bare stem with no project.)
-    src_research_messages = f"{args.internal_ds}.research_messages"
-    src_segs_activity = f"{args.published_ds}.segs_activity"
-    src_segment_vessel = f"{args.internal_ds}.segment_vessel"
-    src_pvis = f"{args.published_ds}.product_vessel_info_summary"
-    src_identity_core = f"{args.published_ds}.identity_core"
-    src_identity_auth = f"{args.published_ds}.identity_authorization"
-    src_event_regions = f"{args.pipe_regions_layers}.event_regions"
+    return [
+        _PinSpec(
+            "research_messages", f"{args.internal_ds}.research_messages",
+            _messages_window(args.start, args.end, args.tail_days),
+        ),
+        _PinSpec("segs_activity", f"{args.published_ds}.segs_activity", None),
+        _PinSpec("segment_vessel", f"{args.internal_ds}.segment_vessel", None),
+        _PinSpec(
+            "product_vessel_info_summary",
+            f"{args.published_ds}.product_vessel_info_summary", None,
+        ),
+        _PinSpec("identity_core", f"{args.published_ds}.identity_core", None),
+        _PinSpec(
+            "identity_authorization", f"{args.published_ds}.identity_authorization", None,
+        ),
+        _PinSpec("event_regions", f"{args.pipe_regions_layers}.event_regions", None),
+    ]
 
-    def _snap(source: str) -> str:
-        return dit_bq.snapshot_into_experiment(
-            source,
+
+def _pin_sources(
+    args: argparse.Namespace, pinned_at: datetime, *, reuse: bool,
+) -> _PinnedSources:
+    """Pin every ``_pin_specs`` source under the stamp of ``pinned_at``, or
+    with ``reuse``, check that an earlier run's copies under that stamp exist.
+
+    All copies share one stamp, so ``--reuse-pin <stamp>`` can recompute
+    every name. A reused copy must match this run's experiment id, window
+    and source table name, since all of them are in the name.
+
+    With ``--dry-run`` nothing is created: each copy is dry-run only, which
+    logs its estimated bytes and still refuses one above ``--pin-max-gb``.
+    """
+    def pin(spec: _PinSpec) -> str:
+        if reuse:
+            return dit_bq.require_pinned_source(
+                dit_bq.pinned_source_fqn(
+                    spec.source_table,
+                    experiment_id=args.experiment_id,
+                    role=_SOURCE_PIN_ROLE,
+                    pinned_at=pinned_at,
+                    window=spec.window,
+                    project=PROJECT,
+                ),
+                project=PROJECT,
+            )
+        return dit_bq.pin_source_into_experiment(
+            spec.source_table,
             experiment_id=args.experiment_id,
-            role=_SOURCE_SNAPSHOT_ROLE,
-            as_of=args.pin_source_at,
-            expiration_days=args.snapshot_expiration_days,
+            role=_SOURCE_PIN_ROLE,
+            pinned_at=pinned_at,
+            window=spec.window,
+            expiration_days=args.pin_expiration_days,
+            max_bytes=int(args.pin_max_gb * 1e9),
+            dry_run=args.dry_run,
             project=PROJECT,
         )
 
-    return _CrossVersionSnapshotFQNs(
-        research_messages=_snap(src_research_messages),
-        segs_activity=_snap(src_segs_activity),
-        segment_vessel=_snap(src_segment_vessel),
-        product_vessel_info_summary=_snap(src_pvis),
-        identity_core=_snap(src_identity_core),
-        identity_authorization=_snap(src_identity_auth),
-        event_regions=_snap(src_event_regions),
+    pinned = {spec.field: pin(spec) for spec in _pin_specs(args)}
+    for field, fqn in pinned.items():
+        logger.info("pinned %s: %s", field, fqn)
+    return _PinnedSources(
+        start=args.start, end=args.end, tail_days=args.tail_days, **pinned,
     )
+
+
+def _pin(args: argparse.Namespace) -> _PinnedSources:
+    """Pin what the bindings read: new copies of the sources, stamped with
+    the run's start time, or an earlier run's copies with --reuse-pin."""
+    reuse = args.reuse_pin is not None
+    pinned_at = (
+        dit_bq.parse_pin_stamp(args.reuse_pin) if reuse
+        else datetime.now(timezone.utc).replace(microsecond=0)
+    )
+    logger.info("pin stamp: %s (%s)", dit_bq.format_pin_stamp(pinned_at),
+                "reusing an earlier run's copies" if reuse else "new copies")
+    logger.info("pinning: %s (copies in %s.tech_great_expectations)",
+                ", ".join(spec.source_table for spec in _pin_specs(args)), PROJECT)
+    pinned = _pin_sources(args, pinned_at, reuse=reuse)
+    if not reuse and not args.dry_run:
+        logger.info("to rerun on these copies, pass --reuse-pin %s",
+                    dit_bq.format_pin_stamp(pinned_at))
+    return pinned
 
 
 # --------------------------------------------------------------------------
@@ -391,7 +554,7 @@ def _snapshot_source(args: argparse.Namespace) -> _CrossVersionSnapshotFQNs:
 def _fishing_args_for_binding(
     extra_args: list[str],
     *,
-    snapshot_fqns: _CrossVersionSnapshotFQNs,
+    pinned: _PinnedSources,
     suffix: str,
     experiment_id: str,
     dest_dataset: str,
@@ -402,11 +565,13 @@ def _fishing_args_for_binding(
 
     Emits E4's per-table FQN flags (added by
     ``feat(pipe-events): per-table source-FQN flags on fishing.py``) so
-    each binding reads from the canonical-dataset snapshots. The snapshots
-    live in ``tech_great_expectations`` (not in a ``<stem>_internal`` /
+    each binding reads the pinned copies. The copies live in
+    ``tech_great_expectations`` (not in a ``<stem>_internal`` /
     ``<stem>_published`` shape that ``--internal-ds`` / ``--published-ds``
     could address), so per-table FQNs are the only way to route fishing.py
-    at them.
+    at them. ``--start`` / ``--end`` / ``--tail-days`` come from the pin
+    too: the ``research_messages`` copy holds only the dates that run shape
+    reads.
 
     Note ``spatial_measures_20201105`` is intentionally NOT overridden --
     it's content-addressable by its filename literal; every binding reads
@@ -422,22 +587,22 @@ def _fishing_args_for_binding(
     threads only what fishing.py can act on.
     """
     # ALL of these are ALWAYS dropped in cross-version runs -- the wrapper
-    # exclusively owns them (it snapshotted the inputs and knows the
-    # canonical dest FQNs). A user-supplied --source-*-fqn (etc.) in extras
-    # could otherwise leak an unpinned table into one binding, defeating
-    # the cross-version pin.
+    # exclusively owns them (it pinned the inputs and knows the copies' FQNs
+    # and window). A user-supplied --source-*-fqn (etc.) in extras could
+    # otherwise leak an unpinned table into one binding, defeating the
+    # cross-version pin.
     #
     # Split into value-taking flags (drop_kvs -- swallow the arg AND the
     # next token) vs store_true flags (drop_bare -- swallow only the arg
     # itself; conflating the two eats the following unrelated flag).
     drop_kvs = {
         # Dataset knobs: can only address <stem>_internal / <stem>_published
-        # / pipe_static / pipe_regions_layers shapes -- can't reach
-        # tech_great_expectations snapshots. Would produce a misleading
+        # / pipe_static / pipe_regions_layers shapes -- can't reach the
+        # copies in tech_great_expectations. Would produce a misleading
         # startup log even if their values were ignored downstream.
         "--internal-ds", "--published-ds", "--pipe-static", "--pipe-regions-layers",
         # All 8 per-table FQN flags. Even --source-spatial-measures-fqn is
-        # dropped: the wrapper does not snapshot spatial_measures, but if a
+        # dropped: the wrapper does not pin spatial_measures, but if a
         # user-extra pointed one binding at a different spatial_measures
         # version the cross-version comparison would silently diverge on
         # region membership. Force every binding to fishing.py's default.
@@ -445,6 +610,10 @@ def _fishing_args_for_binding(
         "--source-segment-vessel-fqn", "--source-product-vessel-info-summary-fqn",
         "--source-identity-core-fqn", "--source-identity-authorization-fqn",
         "--source-spatial-measures-fqn", "--source-event-regions-fqn",
+        # The run shape decides which dates of research_messages a binding
+        # reads; the copy holds only the wrapper's. (parse_args consumes
+        # these, so they reach here only from a direct caller.)
+        "--start", "--end", "--tail-days",
         # Wrapper-owned run identity + mode selection.
         "--suffix", "--experiment-id",
         # --modes is the wrapper's own flag (it selects which modes to run
@@ -493,17 +662,21 @@ def _fishing_args_for_binding(
             continue
         out.append(arg)
     out.extend([
-        # Per-table FQN overrides route fishing.py at the M1-helper-produced
-        # snapshots in tech_great_expectations. Each binding reads from the
-        # SAME snapshots so any output divergence is attributable to
-        # pipeline code, not source-data drift.
-        "--source-research-messages-fqn", snapshot_fqns.research_messages,
-        "--source-segs-activity-fqn", snapshot_fqns.segs_activity,
-        "--source-segment-vessel-fqn", snapshot_fqns.segment_vessel,
-        "--source-product-vessel-info-summary-fqn", snapshot_fqns.product_vessel_info_summary,
-        "--source-identity-core-fqn", snapshot_fqns.identity_core,
-        "--source-identity-authorization-fqn", snapshot_fqns.identity_authorization,
-        "--source-event-regions-fqn", snapshot_fqns.event_regions,
+        # Per-table FQN overrides route fishing.py at the pinned copies in
+        # tech_great_expectations. Each binding reads the SAME copies so any
+        # output divergence is attributable to pipeline code, not
+        # source-data drift.
+        "--source-research-messages-fqn", pinned.research_messages,
+        "--source-segs-activity-fqn", pinned.segs_activity,
+        "--source-segment-vessel-fqn", pinned.segment_vessel,
+        "--source-product-vessel-info-summary-fqn", pinned.product_vessel_info_summary,
+        "--source-identity-core-fqn", pinned.identity_core,
+        "--source-identity-authorization-fqn", pinned.identity_authorization,
+        "--source-event-regions-fqn", pinned.event_regions,
+        # The run shape the research_messages copy was windowed for.
+        "--start", pinned.start.isoformat(),
+        "--end", pinned.end.isoformat(),
+        "--tail-days", str(pinned.tail_days),
         # Forward the mode selection so each binding RUNS only the modes we
         # will diff.
         "--modes", ",".join(modes),
@@ -544,7 +717,7 @@ def _run_binding(
     name: str,
     ref: str,
     experiment_id: str,
-    snapshot_fqns: _CrossVersionSnapshotFQNs,
+    pinned: _PinnedSources,
     suffix: str,
     dest_dataset: str,
     modes: Sequence[str],
@@ -571,7 +744,7 @@ def _run_binding(
 
         argv = _fishing_args_for_binding(
             fishing_extra_args,
-            snapshot_fqns=snapshot_fqns, suffix=suffix,
+            pinned=pinned, suffix=suffix,
             experiment_id=experiment_id,
             dest_dataset=dest_dataset,
             modes=modes,
@@ -717,20 +890,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args, fishing_extra_args = parse_args(argv)
 
     logger.info("experiment_id: %s", args.experiment_id)
-    logger.info("pin_source_at: %s", args.pin_source_at.isoformat())
+    logger.info("date window (half-open): [%s, %s), tail_days=%d",
+                args.start, args.end, args.tail_days)
     logger.info("bindings: %s", args.bindings)
     logger.info("modes: %s", args.modes)
     logger.info("pipeline_dir: %s", args.pipeline_dir)
     logger.info(
-        "source: internal=%s  published=%s  regions=%s "
-        "(canonical dest: %s.tech_great_expectations)",
-        args.internal_ds, args.published_ds, args.pipe_regions_layers, PROJECT,
+        "source: internal=%s  published=%s  regions=%s",
+        args.internal_ds, args.published_ds, args.pipe_regions_layers,
     )
-    logger.info("spatial_measures NOT snapshotted (content-addressable version literal); "
+    logger.info("spatial_measures NOT pinned (content-addressable version literal); "
                 "every binding reads fishing.py's default")
 
     _verify_refs(args.pipeline_dir, args.bindings)
-    snapshot_fqns = _snapshot_source(args)
+    pinned = _pin(args)
 
     # Each binding gets a deterministic suffix the diff step can address.
     suffix_by_binding = {
@@ -741,7 +914,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rc = _run_binding(
             name=name, ref=ref,
             experiment_id=args.experiment_id,
-            snapshot_fqns=snapshot_fqns,
+            pinned=pinned,
             suffix=suffix_by_binding[name],
             dest_dataset=args.dest_dataset,
             modes=args.modes,
