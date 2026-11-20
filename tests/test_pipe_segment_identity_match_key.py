@@ -692,12 +692,16 @@ def test_a_binding_name_too_long_for_a_job_name_fails_at_parse_time() -> None:
 
 # -- _run_binding: the order, and stopping at the first failure --------------
 
-def _run_binding(args: argparse.Namespace, *, rc_by_step: dict[str, int] | None = None):
+def _run_binding(
+    args: argparse.Namespace, *, rc_by_step: dict[str, int] | None = None,
+    resolved_image: str = "registry.example.invalid/pipe-segment:v0",
+):
     """Run one binding with the docker runner patched; returns ``(rc, calls)``
-    where each call is ``(image, argv, keyword arguments)``."""
+    where each call is ``(image, argv, keyword arguments)``. ``resolved_image``
+    is the image the harness hands back for the binding."""
     rc_by_step = rc_by_step or {}
     calls = []
-    ctx = SimpleNamespace(worker_image="registry.example.invalid/pipe-segment:v0",
+    ctx = SimpleNamespace(worker_image=resolved_image,
                           pipeline_commit="c", unreviewed=False)
 
     def fake_run(image, argv, **kwargs):
@@ -727,9 +731,74 @@ def test_run_binding_runs_the_six_steps_in_order_with_the_pinned_argv(runner: st
         assert image == "registry.example.invalid/pipe-segment:v0"
         assert kwargs["entrypoint"] == "pipe-segment"
         # Credentials and the project reach every step, the SQL ones included.
+        # So does the dataset an overlay image stages its BigQuery reads in.
         assert kwargs["volumes"] == [mod.GCP_VOLUME]
-        assert kwargs["container_env"] == {"GOOGLE_CLOUD_PROJECT": "world-fishing-827"}
+        assert kwargs["container_env"] == {
+            "GOOGLE_CLOUD_PROJECT": "world-fishing-827",
+            "DIT_BQ_TEMP_DATASET": "world-fishing-827.tech_great_expectations",
+        }
         assert kwargs["build_from_source"] is False
+
+
+# -- The default image and its temp dataset ----------------------------------
+
+def test_the_default_image_is_the_overlay_of_the_version_the_ais_dag_pins() -> None:
+    args = _run_args()
+
+    assert mod.DEFAULT_PIPELINE_VERSION == "v5.1.0"
+    assert args.image_tag == mod.DEFAULT_IMAGE_TAG == mod.DEFAULT_OVERLAY_IMAGE
+    assert mod.DEFAULT_OVERLAY_IMAGE == (
+        "gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54")
+    # The submitter and the Dataflow workers run the same image.
+    rc, calls = _run_binding(args, resolved_image=args.image_tag)
+    assert rc == 0
+    assert {image for image, _, _ in calls} == {mod.DEFAULT_OVERLAY_IMAGE}
+    assert [t for _, argv, _ in calls for t in argv if t.startswith("--sdk_container_image")] == [
+        f"--sdk_container_image={mod.DEFAULT_OVERLAY_IMAGE}"] * 2
+
+
+def test_bq_temp_dataset_reaches_the_container_and_no_argv() -> None:
+    """The overlay reads a container variable. pipe-segment has no option for
+    it, so no step's argv may carry it."""
+    rc, calls = _run_binding(_run_args("dataflow", "--bq-temp-dataset", "p.staging"))
+
+    assert rc == 0 and len(calls) == 6
+    for _, argv, kwargs in calls:
+        assert kwargs["container_env"]["DIT_BQ_TEMP_DATASET"] == "p.staging"
+        assert not any("temp_dataset" in token or "p.staging" in token for token in argv)
+    assert [argv for _, argv, _ in calls] == list(_expected("dataflow").values())
+
+
+def test_an_auto_built_image_on_dataflow_gets_a_warning_about_the_overlay(caplog) -> None:
+    def warnings(runner: str, resolved: str | None) -> list[str]:
+        caplog.clear()
+        args = _run_args(runner)
+        with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+            _run_binding(args, resolved_image=resolved or args.image_tag)
+        return [r.getMessage() for r in caplog.records if "temp-dataset overlay" in r.getMessage()]
+
+    built = "gcr.io/world-fishing-827/dit/pipe-segment:dit-abc1234"
+    (warning,) = warnings("dataflow", built)
+    assert built in warning and f"{mod.OVERLAY_DIR}/build.sh" in warning
+    # The image as given, or a runner without workers: nothing to warn about.
+    assert warnings("dataflow", None) == []
+    assert warnings("DirectRunner", built) == []
+
+
+# -- No --incremental: an accepted difference from the AIS DAG ---------------
+
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_no_binding_passes_incremental(runner: str) -> None:
+    """The AIS DAG passes ``--incremental`` since 2026-11-20. A binding may be a
+    ref that does not know the flag and would ignore it silently, so the
+    cross-version A/B stays on full history for every binding."""
+    _, calls = _run_binding(_run_args(runner))
+    tokens = [token for _, argv, _ in calls for token in argv]
+
+    assert not any(token.split("=")[0] in {
+        "--incremental", "--in_segments_table", "--in_fragments_table",
+    } for token in tokens)
+    assert "No ``--incremental`` here" in (mod.__doc__ or "")
 
 
 def test_run_binding_stops_at_the_first_failing_step() -> None:

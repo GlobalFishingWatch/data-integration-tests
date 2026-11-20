@@ -170,7 +170,7 @@ Image tags are each task's pinned version, and `cmds` + `arguments` give the com
 | pipe-events | v4.2.17, entrypoint `pipe`: `incremental_events`, `incremental_filter_events`, `auth_and_regions_fishing_events`, `fishing_restrictive` | **v5.0.0**, same entrypoint and command names | **v8.0.1**, entrypoint `pipe-events`, renamed commands (`fishing_events_incremental`, `fishing_events_incremental_filter`, `fishing_events_auth_and_regions`, `fishing_events_restrictive`), hyphenated `--key=value` flags, exclusive `--end-date` |
 | pipe-gaps | v0.10.0 worker image, `detect` | **v0.10.3**, `detect` / `publish` | **v0.17.0**, `raw-gaps` / `gap-events` |
 | pipe-encounters | v4.4.0 (`create_raw_encounters`, `merge_encounters`) | v4.4.0, same commands | **v4.6.0**, same commands (`create_raw_encounters`, `merge_encounters`) |
-| pipe-segment | v5.0.3 | v5.0.3 | no AIS task; VMS v5 pins v5.0.3 |
+| pipe-segment (re-read 2026-11-20, composer e4cb29361) | **v5.1.0**, on DIT's overlay image; `segment` with `--incremental` in the mode-equivalence workflow, without it in the cross-version one | **v5.1.0** since 2026-11-20 (v5.0.3 before), `segment` with `--incremental` | no AIS task; VMS v5 pins v5.0.3, without `--incremental` |
 
 So yes: the snapshots show which pipe-anchorages version each DAG pins, and that DIT's pipe-events and pipe-gaps pins differ from production's in version and, for v5, in command names. On 2026-10-23 every DAG pinned pipe-anchorages v4.6.4. The v5 DAGs' move to v5.0.0 and v5.0.1 was visible in the snapshots from the day it merged, but nothing ran the check, which is the gap item 1 below describes.
 
@@ -338,6 +338,16 @@ Read at composer `origin/main` df5c973c7. The check exits 0: the workflows marke
   - The reason in the spec: the offsets must be computed from the full message feed, not from a test cohort; the full feed is too large to read on every test run; and pipe-segment cannot read precomputed offsets.
   - The reason given on 2026-11-19, that the inputs are date-sharded, is true but secondary.
   - What it means for comparisons, with the figures: [`workflows/pipe_segment/RUN_INSTRUCTIONS.md`](../workflows/pipe_segment/RUN_INSTRUCTIONS.md) § "No satellite timing offsets in DIT".
+
+  **The DAG moved on 2026-11-20, and the check reported it the same day.** This is the first change the general check caught live.
+  - **What changed:** composer-dags-production PR #3145, merged 2026-11-20 17:26 UTC, set the AIS v3 DAG's segment group to pipe-segment v5.1.0 and added `--incremental` to the `segment` task. The VMS v5 DAG still pins v5.0.3 and passes no such flag. This is the DAGs' configuration at composer `origin/main` e4cb29361; no production run was looked at.
+  - **What the check said** that evening, for both pipe-segment specs (`pipe_segment/identity_match_key` and the new `pipe_segment/ais`): `DIFF v5.0.3 -> v5.1.0` on every step, one production-only flag on `segment`, exit 1.
+  - **What DIT changed:**
+    - Both workflows default to the DIT overlay image of v5.1.0 (`docker/overlays/pipe-segment-temp-dataset/`). The specs state the version, since an overlay tag is not a plain version.
+    - `pipe_segment/ais.py` defaults to the incremental segmenter. Its default job passes `--incremental`, which the check compares; a second step mirrors the same task with the full-history reference job, where the flag is an accepted difference.
+    - `pipe_segment/identity_match_key.py` keeps full history for every binding, and the DAG's `--incremental` is an accepted difference of its `segment` step. A binding may be a ref that does not know the flag and would ignore it silently, and a binding is one job from empty tables.
+  - **Result:** both specs in sync again, runner exit 0.
+  - **What it shows about the gap in item 1 of section 7:** the change was caught because someone ran the check by hand that day. Nothing would have run it otherwise.
 
 ### 8e. What the check does not cover
 

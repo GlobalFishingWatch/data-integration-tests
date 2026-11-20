@@ -15,6 +15,7 @@ mode-equivalence test.
 | `pipe_events/fishing.py` | pipe-events (fishing events) | **BQ-SQL via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `event_id`) | no (deferred) |
 | `pipe_events/cross_version_fishing.py` | pipe-events (fishing events) | N per-binding subprocess invocations of `fishing.py` (each with its own **BQ-SQL via container** runtime, from a `git worktree` at that binding's ref) | truncate (`view_suffix=""`, `event_id`) across BOTH `_fishing_events` and `_product_events_fishing` views | no (deferred with `fishing.py`) |
 | `pipe_segment/identity_match_key.py` | pipe-segment (cross-version, gpsdio-segment match key) | **via container** (`dit.runners.docker`), one binding at a time, each from a `git worktree` at that binding's ref. Six steps, as in production's segment group: two Beam jobs (`segment`, `segment_identity`), then four **BQ-SQL** steps (`segment_vessel_daily`, `segment_info`, `vessel_info`, `segment_vessel`) | truncate (`view_suffix=""`), per-table keys (`COMPARE_KEYS`) over eight output tables, pairwise across bindings | no |
+| `pipe_segment/ais.py` | pipe-segment (mode equivalence of the `segment` step) | Beam **via container** (`dit.runners.docker`). The unit is a (mode, segmenter) variant: modes `1_bf`, `2_bfd`, `3_bftruncate` and the opt-in `4_daily` (every day its own job); segmenters `incremental` (pipe-segment's `--incremental`, v5.1.0; the default, as the AIS DAG's task passes it) and `full-history`. Each variant has its own tables and runs its jobs in order. The default run is full history in one job against three incremental shapes | truncate (`view_suffix=""`), on `segments` (`seg_id`, `frag_id`; the discriminating one), `messages_segmented` (`msgid`) and `fragments` (`frag_id`), pairwise across variants | no |
 | `encounters/ais.py` | encounters_pipeline (encounters generation) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `encounter_id`) on both the raw and merged tables | no |
 | `encounters/vms.py` | encounters_pipeline (encounters generation, VMS) | same execution as `encounters/ais.py` (`ais.run(args)`); only defaults and help differ | same as `encounters/ais.py` | no |
 
@@ -32,7 +33,8 @@ The `composer_drift.py` files are not test workflows. They are a read-only check
 | `encounters/vms` | `encounters/vms.py` | `core_vms_v5_daily` | no: same |
 | `pipe_events/fishing` | `pipe_events/fishing.py` | `core_ais_v5` | no: older CLI generation |
 | `pipe_gaps/mode_equivalence` | `pipe_gaps/mode_equivalence.py` | `core_ais_v5` | no: older pipe-gaps generation |
-| `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | yes (since 2026-11-19; all six tasks of the segment group) |
+| `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | yes (since 2026-11-19; all six tasks of the segment group). Re-synced on 2026-11-20, when the DAG moved to v5.1.0: the default image is the v5.1.0 overlay, and the DAG's `--incremental` is an accepted difference of the `segment` step, because every binding runs full history |
+| `pipe_segment/ais` | `pipe_segment/ais.py` | `core_ais_v3` | yes (since 2026-11-20). Two steps mirror the one `segment` task: the default, incremental job, whose `--incremental` is compared with the DAG's and whose two table flags are DIT's own; and the full-history reference job, which leaves the flag out on purpose |
 
 The two cross-version wrappers and `pipe_gaps/outage_recovery.py` have no spec of their own. A workflow that is ported to what production runs gets its spec updated in the same change, and `in_sync=True` once the check passes. A new workflow gets a spec when it lands.
 
@@ -106,3 +108,14 @@ Both conditions now hold:
 Planned extraction order, one step at a time: `dit.cross_version` first, then the
 shared run scaffolding, then `dit.phases` (date slicing only; per-slice execution
 stays in each workflow), then `dit.cohorts`. Nothing is extracted yet.
+
+### Note (2026-11-20): a third consumer of the single-day slices, and a second image guard
+
+`pipe_segment/ais.py` slices dates like `port_visits/ais.py` and
+`encounters/ais.py` (bf, backfill-then-daily, backfill-then-rerun), and adds a
+fourth shape, one job per day. It holds the slicing as a pure function
+(`plan_slices`, with `check_chain` asserting that the jobs are consecutive), which
+is the form a shared `dit.phases` would take. It also copies port visits' image
+guard (`check_images`, `_default_images_executed`): two workflows now default to a
+DIT overlay image and refuse unreviewed code on it. Neither is extracted here;
+both are candidates for the extraction above.

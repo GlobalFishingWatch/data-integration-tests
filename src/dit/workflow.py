@@ -590,8 +590,13 @@ def add_modes_arg(
     choices: Sequence[str],
     cached: bool = True,
     help_suffix: str = "",
+    default: Sequence[str] | None = None,
 ) -> None:
     """Add ``--modes`` (comma-separated subset; defaults to all of ``choices``).
+
+    ``default`` names the modes a run without the flag executes, when that is
+    not all of them: a workflow with an expensive opt-in mode (pipe-segment's
+    ``4_daily``, one job per day of the window) keeps it out of the default.
 
     The value stays a raw string on the namespace; call :func:`parse_modes`
     to validate it (workflows do this in their ``parse_args`` so a bad value
@@ -604,7 +609,9 @@ def add_modes_arg(
     on this invocation. Claiming the cache behaviour unconditionally would make
     the CLI help wrong for that consumer -- Copilot review on PR #71.
     """
-    default = ",".join(choices)
+    is_all = default is None or tuple(default) == tuple(choices)
+    default = ",".join(choices if default is None else default)
+    default_note = "(all)" if is_all else f"(of {','.join(choices)})"
     reuse_note = (
         "Modes are cached independently, so running a subset now and more "
         "later reuses the earlier modes' output."
@@ -615,7 +622,7 @@ def add_modes_arg(
     parser.add_argument(
         "--modes", default=default,
         help=(
-            f"Comma-separated subset of modes to run. Default: {default} (all). "
+            f"Comma-separated subset of modes to run. Default: {default} {default_note}. "
             f"Use a subset for a cheap smoke (e.g. --modes {choices[0]}); "
             f"comparisons run only for pairs where both modes ran, and a "
             f"single-mode run performs no comparison at all. {reuse_note}"

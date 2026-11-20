@@ -112,7 +112,7 @@ Steps:
 The six steps
 -------------
 Each binding runs what production's segment group runs (the ``segment.*``
-tasks of the AIS v3 DAG, pipe-segment v5.0.3), in this order:
+tasks of the AIS v3 DAG, pipe-segment v5.1.0), in this order:
 
 1. ``segment`` (Beam): normalized messages -> ``messages_segmented``,
    ``segments``, ``fragments``.
@@ -146,6 +146,26 @@ Both hold for every binding alike, so an A/B is fair; the outputs are not
 comparable with production's own tables. Nor does a run apply the satellite
 timing offsets (see "No satellite timing offsets in DIT" above).
 
+**No ``--incremental`` here.** Since 2026-11-20 the AIS v3 DAG passes
+``--incremental`` to ``segment`` (pipe-segment v5.1.0; composer-dags-production
+PR #3145). This workflow does not, and its drift spec accepts that difference.
+Why:
+
+* **Bindings are arbitrary refs.** A ref older than v5.1.0 does not know the
+  flag, and pipe-segment hands unknown flags to Beam instead of rejecting them
+  (``cli/main.py`` line 47, ``parse_known_args``). Inferred, not run: such a
+  binding would run full history while the other ran incremental, and the A/B
+  would compare two segmenters instead of two refs.
+* **Nothing here exercises what the flag changes.** It changes where a job
+  takes the state of the day before its range from. A binding runs one
+  ``segment`` job from empty tables, so that state is empty either way.
+* **Whether the two segmenters agree is the subject of ``ais.py``**, the
+  mode-equivalence workflow, and no run has confirmed it yet. Until one has,
+  the cross-version A/B stays on the segmenter that needs no stored state.
+
+Passing it later is one entry in ``_segment_args``'s ``extra_flags`` plus a
+check that every binding's ref declares the flag.
+
 ``--dry-run`` skips the pipe-segment invocations and the diff phase, and only
 dry-runs the copy (reporting its bytes against the ``--pin-max-gb`` cap). It
 still sets up and tears down the worktrees.
@@ -154,7 +174,7 @@ Example (DirectRunner smoke, 1 day, single binding to validate plumbing)::
 
     dit run workflows/pipe_segment/identity_match_key.py \\
         --experiment-id pipe-segment-smoke \\
-        --binding before=v5.0.3 \\
+        --binding before=v5.1.0 \\
         --date-range 2020-01-01,2020-01-01 \\
         --runner DirectRunner \\
         --skip-downstream \\
@@ -164,7 +184,7 @@ Example (Dataflow A/B, 1 day, after the experiment branches are pushed)::
 
     dit run workflows/pipe_segment/identity_match_key.py \\
         --experiment-id idmatchkey \\
-        --binding before=v5.0.3 \\
+        --binding before=v5.1.0 \\
         --binding after=experiment/identity-match-key-transponder-only \\
         --date-range 2020-01-01,2020-01-01 \\
         --runner dataflow
@@ -230,18 +250,51 @@ DEFAULT_PIPELINE_DIR = os.path.join(DEFAULT_PROJECTS_DIR, "pipe-segment")
 DEFAULT_PIN_EXPIRATION_DAYS = 7
 DEFAULT_PIN_MAX_GB = dit_bq.DEFAULT_PIN_MAX_BYTES / 1e9
 
-# Canonical published pipe-segment image, pinned at the prod version that
-# composer-dags-production currently runs (``Versions.SEGMENT = "v5.0.3"`` in
-# ``dags/core/ais/v3.py``). Read-only to dit by IAM per the absolute prod-infra
-# boundary; the docker runner pulls from here for reviewed code at the default
-# version. For unreviewed code (snapshot / unmerged experiment branch),
-# ``resolve_run_context`` -> ``ensure_pipeline_image`` auto-builds a content-
-# addressable ``gcr.io/world-fishing-827/dit/pipe-segment:dit-<commit>`` via
-# the M-pivot-4 kaniko machinery, and the docker runner pulls THAT.
+#: The pipe-segment version the AIS v3 DAG's segment group is configured for:
+#: ``SEGMENT = "v5.1.0"`` in composer-dags-production's ``dags/core/ais/v3.py``
+#: since its PR #3145 (merged 2026-11-20; ``origin/main`` e4cb29361 read the
+#: same day). Until then it was v5.0.3, which the VMS v5 DAG still pins. This
+#: is what the DAG says; no production run was looked at. Shared with
+#: ``ais.py``; ``composer_drift.py`` compares it with the tasks' image tags.
+DEFAULT_PIPELINE_VERSION = "v5.1.0"
+
+#: Where DIT's overlay images of pipe-segment are built.
+OVERLAY_DIR = "docker/overlays/pipe-segment-temp-dataset"
+
+#: The default image of both pipe-segment workflows: pipe-segment
+#: DEFAULT_PIPELINE_VERSION (commit 4ddde03) with DIT's temp-dataset overlay
+#: (``temp_dataset.patch``, sha256 04b40b54...), as ``build.sh`` in
+#: OVERLAY_DIR names it. The published image cannot be the default: upstream
+#: has no way to name the dataset Beam stages query results in, and DIT's
+#: service account may not create one.
+#: NOT BUILT YET (2026-11-20): the tag follows from the commit and the patch,
+#: and the image exists once ``build.sh <repo> v5.1.0 v5.1.0 --push`` has run.
+#: When the DAG's version moves: build the overlay image of the new tag, then
+#: bump both constants.
+DEFAULT_OVERLAY_IMAGE = (
+    f"gcr.io/world-fishing-827/dit/pipe-segment:"
+    f"{DEFAULT_PIPELINE_VERSION}-4ddde03-temp-dataset-04b40b54"
+)
+
+# This workflow's default image, for reviewed code. For unreviewed code
+# (snapshot / unmerged experiment branch), ``resolve_run_context`` ->
+# ``ensure_pipeline_image`` auto-builds a content-addressable
+# ``gcr.io/world-fishing-827/dit/pipe-segment:dit-<commit>`` via the M-pivot-4
+# kaniko machinery, and the docker runner pulls THAT. Such a build is plain
+# source without the overlay: fine on DirectRunner, expected to fail on
+# Dataflow as the test service account (``_run_binding`` warns).
 # ``--build-from-source`` short-circuits both paths (compose builds the
 # ``dev`` service from the worktree's working tree).
-DEFAULT_IMAGE_TAG = (
-    "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-segment:v5.0.3"
+DEFAULT_IMAGE_TAG = DEFAULT_OVERLAY_IMAGE
+
+#: Container variable the overlay patch reads to pass ``temp_dataset`` to
+#: Beam's ReadFromBigQuery (see OVERLAY_DIR). An image without the overlay
+#: ignores it.
+TEMP_DATASET_ENV = "DIT_BQ_TEMP_DATASET"
+
+#: Pre-existing dataset Beam stages query results in.
+DEFAULT_BQ_TEMP_DATASET = os.environ.get(
+    TEMP_DATASET_ENV, f"{PROJECT}.{DEFAULT_DEST_DATASET}"
 )
 
 # Compose service + entrypoint pipe-segment v5.0.x exposes:
@@ -479,13 +532,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         f"(10^9 bytes), checked by a dry run. Default {DEFAULT_PIN_MAX_GB:g}.")
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
                    help=f"Pipeline image to run pipe-segment in. Default: {DEFAULT_IMAGE_TAG} "
-                        f"(canonical published v5.0.3). For reviewed code at this default, the "
+                        f"(DIT's temp-dataset overlay of pipe-segment "
+                        f"{DEFAULT_PIPELINE_VERSION}, the version the AIS DAG is configured "
+                        f"for; see {OVERLAY_DIR}). For reviewed code at this default, the "
                         f"docker runner pulls it directly. For unreviewed code (snapshot / "
                         f"unmerged experiment branch), resolve_run_context auto-builds a "
                         f"content-addressable gcr.io/world-fishing-827/dit/pipe-segment:dit-"
-                        f"<commit> via M-pivot-4 kaniko and uses THAT instead. An explicit "
+                        f"<commit> via M-pivot-4 kaniko and uses THAT instead; that build has "
+                        f"no overlay, so on Dataflow as the test service account it is "
+                        f"expected to fail. An explicit "
                         f"override is respected per binding (applied to every binding's "
                         f"resolve_run_context call -- use for manual prebuilt images).")
+    p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET,
+                   help="Existing BigQuery dataset Beam stages query results in; env-var "
+                        "fallback DIT_BQ_TEMP_DATASET (default ${PROJECT}.${DIT_DEST_DATASET}). "
+                        "Passed to the container as the DIT_BQ_TEMP_DATASET variable, which "
+                        "an overlay image reads; pipe-segment has no option for it, and an "
+                        "image without the overlay ignores it.")
     p.add_argument("--build-from-source", action="store_true",
                    help="Build pipe-segment from each worktree via `docker compose build dev` "
                         "instead of pulling/building an image. Compose mounts the worktree's "
@@ -674,7 +737,7 @@ def _read_gpsdio_pin_at_ref(pipeline_dir: str, ref: str) -> str:
       a resolved SHA, not the canonical declared URL.
 
     Probes paths in v5.0.3-first order so the common case (the workflow's
-    default ``DEFAULT_IMAGE_TAG`` = v5.0.3) is fast.
+    default image, v5.1.0) is fast.
     """
     for path in ("pyproject.toml", "requirements/prod.in", "requirements.txt"):
         result = subprocess.run(
@@ -876,8 +939,13 @@ def _dataflow_options(
     max_num_workers: int | None,
     worker_sizing: WorkerSizing | None,
     build_from_source: bool,
+    job_name: str | None = None,
 ) -> list[str]:
     """The Dataflow options of one Beam step, as production's task passes them.
+
+    ``job_name`` replaces the per-binding name (:func:`_job_name`); the
+    mode-equivalence workflow (``ais.py``) names its jobs by mode and
+    iteration.
 
     ``--setup_file=./setup.py`` is passed only with ``build_from_source``.
     Production passes none: the published image has the package installed and
@@ -901,7 +969,8 @@ def _dataflow_options(
         "--subnetwork=regions/us-central1/subnetworks/gfw-internal-us-central1",
         f"--service_account_email={service_account}",
         "--job_name="
-        + _job_name(step, experiment_id=experiment_id, binding_name=binding_name),
+        + (job_name
+           or _job_name(step, experiment_id=experiment_id, binding_name=binding_name)),
         *([f"--sdk_container_image={worker_image}"] if worker_image is not None else []),
     ]
 
@@ -921,6 +990,9 @@ def _segment_args(
     max_num_workers: Optional[int] = None,
     worker_sizing: WorkerSizing | None = None,
     build_from_source: bool = False,
+    labels: Sequence[str] | None = None,
+    job_name: str | None = None,
+    extra_flags: Sequence[str] = (),
 ) -> list[str]:
     """CLI args for `pipe-segment segment`.
 
@@ -928,6 +1000,13 @@ def _segment_args(
     ``pinned.normalized_messages`` is the pinned copy. pipe-segment's
     BigQuerySource finds it partitioned, as the source is, and filters by
     DATE(timestamp).
+
+    The last three parameters are for the mode-equivalence workflow
+    (``ais.py``), which shares this builder. ``labels`` replaces the
+    per-binding ``--labels`` (:func:`_step_labels`), ``job_name`` the
+    per-binding Dataflow job name, and ``extra_flags`` are appended after the
+    table flags (``--incremental`` and its tables). Left at their defaults,
+    the argv is what it was before they existed.
 
     No satellite flag is ever passed (``--in_normalized_sat_offset_messages_table``,
     ``--in_norad_to_receiver_table``, ``--in_sat_positions_table``,
@@ -946,7 +1025,9 @@ def _segment_args(
         f"--out_segmented_messages_table={_output_prefix('messages_segmented', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--out_segments_table={_output_prefix('segments', dest_dataset=dest_dataset, suffix=suffix)}",
         f"--fragments_table={_output_prefix('fragments', dest_dataset=dest_dataset, suffix=suffix)}",
-        *_step_labels("segment", experiment_id=experiment_id, binding_name=binding_name),
+        *extra_flags,
+        *(_step_labels("segment", experiment_id=experiment_id, binding_name=binding_name)
+          if labels is None else labels),
         # Project + runner.
         f"--project={PROJECT}",
         f"--runner={runner}",
@@ -972,6 +1053,7 @@ def _segment_args(
             max_num_workers=max_num_workers,
             worker_sizing=worker_sizing,
             build_from_source=build_from_source,
+            job_name=job_name,
         ))
     return args
 
@@ -1208,6 +1290,7 @@ def _run_pipe_subcommand(
     image_tag: str,
     cli_args: list[str],
     build_from_source: bool,
+    bq_temp_dataset: str = DEFAULT_BQ_TEMP_DATASET,
 ) -> int:
     """One ``pipe-segment`` subcommand (any of ``STEPS``) via dit_docker.run.
 
@@ -1227,6 +1310,12 @@ def _run_pipe_subcommand(
     this escape hatch (inline ``-e GOOGLE_CLOUD_PROJECT=...`` on docker
     compose); see ``dit.runners.docker.run.__doc__`` for the env vs
     container_env distinction.
+
+    ``DIT_BQ_TEMP_DATASET`` (``bq_temp_dataset``) is for DIT's overlay images:
+    their patched BigQuery reads stage in that existing dataset, where Beam
+    would otherwise create one, which DIT's service account may not. It is an
+    environment variable, not an argument, so no step's argv changes; an image
+    without the overlay ignores it.
     """
     project_name = f"dit-pipe-segment-{binding_name}"
     logger.info("[%s] invoking pipe-segment %s (image=%s)",
@@ -1235,7 +1324,10 @@ def _run_pipe_subcommand(
         return dit_docker.run(
             image_tag,
             cli_args,
-            container_env={"GOOGLE_CLOUD_PROJECT": PROJECT},
+            container_env={
+                "GOOGLE_CLOUD_PROJECT": PROJECT,
+                TEMP_DATASET_ENV: bq_temp_dataset,
+            },
             entrypoint=CLI_ENTRYPOINT,
             volumes=[GCP_VOLUME],
             service=COMPOSE_SERVICE,
@@ -1309,6 +1401,17 @@ def _run_binding(
                     " (UNREVIEWED)" if ctx.unreviewed else "",
                     image_tag)
 
+        if image_tag != args.image_tag and args.runner == "dataflow":
+            # The harness replaced the image with a build of the binding's
+            # commit. That build is plain source: no temp-dataset overlay.
+            logger.warning(
+                "[%s] %s was auto-built from plain source, without DIT's temp-dataset "
+                "overlay. On Dataflow, Beam will try to create its own BigQuery staging "
+                "dataset as %s, which DIT's default service account may not. Build an "
+                "overlay image of the commit (%s/build.sh) and pass it as --image-tag.",
+                name, image_tag, args.service_account, OVERLAY_DIR,
+            )
+
         if args.dry_run:
             logger.info("[%s] --dry-run set; skipping pipe-segment invocations.", name)
             return 0
@@ -1324,6 +1427,7 @@ def _run_binding(
                 worktree_dir=worktree_dir, binding_name=name,
                 image_tag=image_tag, cli_args=cli_args,
                 build_from_source=args.build_from_source,
+                bq_temp_dataset=args.bq_temp_dataset,
             )
             if rc != 0:
                 logger.error("[%s] %s step failed with rc=%d", name, step, rc)

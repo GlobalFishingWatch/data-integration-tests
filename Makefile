@@ -55,12 +55,14 @@ PIPE_GAPS_BEAM_VERSION            := 2.71.0
 # DIT's default overlay image holds (workflows/port_visits/ais.py,
 # DEFAULT_OVERLAY_IMAGE). Was 2.69.0 for v4.6.4 until 2026-11-19.
 ANCHORAGES_PIPELINE_BEAM_VERSION  := 2.76.0
-# pipe-segment:v5.0.3 -> apache-beam==2.71.0 (its requirements.txt; its
+# pipe-segment:v5.1.0 -> apache-beam==2.71.0 (its requirements.txt; its
 # pyproject.toml requires apache-beam[gcp]~=2.71 and Python >= 3.12, and its
-# Dockerfile copies the Beam 2.71.0 SDK). v5.0.3 is what production runs and
-# DIT's default image (workflows/pipe_segment/identity_match_key.py,
-# DEFAULT_IMAGE_TAG). Was 2.56.0, the pin of v5.0.2, until 2026-11-19: that
-# constraint contradicts v5.0.3's own requirement.
+# Dockerfile copies the Beam 2.71.0 SDK). v5.1.0 is what the AIS v3 DAG is
+# configured for since 2026-11-20 and what DIT's default image holds
+# (workflows/pipe_segment/identity_match_key.py, DEFAULT_OVERLAY_IMAGE).
+# v5.0.3, which the VMS v5 DAG still pins, has the same Beam pin. Was 2.56.0,
+# the pin of v5.0.2, until 2026-11-19: that constraint contradicts the
+# requirement of v5.0.3 and later.
 PIPE_SEGMENT_BEAM_VERSION         := 2.71.0
 # pipe-events deliberately omitted: it's a BQ-SQL-via-container pipeline,
 # the laptop venv never constructs a Beam graph for it, and no published
@@ -81,7 +83,7 @@ install-port-visits install-port-visits-ref snapshot-port-visits:  BEAM_VERSION 
 install-pipe-segment install-pipe-segment-ref snapshot-pipe-segment: BEAM_VERSION := $(PIPE_SEGMENT_BEAM_VERSION)
 # install-all installs all four pipelines into one venv: the only one
 # whose laptop submitter actually IS the laptop venv is pipe-gaps (others
-# use docker runner), so pin to pipe-gaps' beam version. pipe-segment v5.0.3
+# use docker runner), so pin to pipe-gaps' beam version. pipe-segment v5.1.0
 # requires ~=2.71 and pins 2.71.0 itself. pipe-anchorages from v5.0.0 on requires
 # apache-beam~=2.76, which 2.71.0 does not satisfy: with a pipe-anchorages
 # checkout at v5 this target fails to resolve (it resolved while the
@@ -242,7 +244,7 @@ publish-ditbox:
 #   DIT_REF=<ref>     # dit ref to clone (default main)
 #   BEAM_VERSION=<x.y.z>  # pin apache-beam to match the worker image's beam version
 #                          # (pipe-gaps:v0.10.0 = 2.71.0; pipe-anchorages:v5.0.1 = 2.76.0;
-#                          # pipe-segment:v5.0.3 = 2.71.0). Auto-defaulted below
+#                          # pipe-segment:v5.1.0 = 2.71.0). Auto-defaulted below
 #                          # per PIPELINE from the constants at the top of this
 #                          # Makefile (same values the laptop install targets use).
 #
