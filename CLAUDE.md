@@ -48,6 +48,14 @@ Read these in order before coding:
   Tagged releases (next bullet) are the natural maturity step that takes `_DIT_REF=main` off the default critical path entirely — at `v0.1.0` the default flips to the tag, `main` becomes opt-in for testing, and breaking changes on main stop affecting anyone who hasn't asked to be a tester.
 - **Releases tag `main` as `v0.X.Y`** when a meaningful set of features has landed (pre-1.0 incrementing minor freely). At tag time, move `CHANGELOG.md`'s `[Unreleased]` content under a new `## [v0.X.Y] — YYYY-MM-DD` heading and start a fresh `[Unreleased]` block. GitHub Releases auto-populate from tags via `gh release create v0.X.Y --notes-from-tag` or by writing release notes manually.
 - **CHANGELOG.md is the user-facing change log.** `CHANGELOG.md` records what's available to users of `dit` (CLI flags, new helpers, new workflows, fixes). The Plan changelog in this file is dev-internal — plan-doc evolution, design refinements, why a commit happened. Both get an entry when a user-visible feature lands; CHANGELOG framed for users, Plan changelog framed for the next maintainer.
+- **Claims about production need evidence from data, not from reading code.** Before stating that production is broken, or why a production table changed, check in this order:
+  1. the data on both sides of the change: sources, providers and key columns, day by day;
+  2. what production's jobs actually ran: the BigQuery job history (query text, referenced tables, rows written);
+  3. known context: the knowledge base and Jira.
+
+  A code reading, or an agent's report of one, is a hypothesis. Label it as one, check it before repeating it, and build no recommendation or escalation on it. The same holds for audits: "the tag says" is not "production does".
+
+  Why: on 2026-11-19 an audit read pipe-segment's satellite-offsets query, saw that it only matches date-sharded tables, and concluded that this was why production's `satellite_timing_offsets` has no rows after 2026-04-21. That was wrong. The AIS feed changed provider in the days after 2026-04-21, and the new feed's messages carry no receiver IDs, so there is nothing to compute per-receiver offsets from. The wrong explanation was repeated for a day, shaped advice on a DIT option, and was nearly passed to the pipeline's owners. One query of the message sources by day showed the real cause.
 
 ## Installing pipeline dependencies
 
