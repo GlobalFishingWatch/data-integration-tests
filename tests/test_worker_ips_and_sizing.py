@@ -37,6 +37,7 @@ from workflows.encounters import ais as encounters_ais
 from workflows.encounters import vms as encounters_vms
 from workflows.pipe_gaps import mode_equivalence as gaps_modes
 from workflows.pipe_gaps import outage_recovery as gaps_outage
+from workflows.pipe_segment import ais as pipe_segment_modes
 from workflows.pipe_segment import identity_match_key as pipe_segment
 from workflows.port_visits import ais as port_visits
 from workflows.port_visits import cross_version_ais as cross_version
@@ -78,6 +79,7 @@ PARSERS = {
     "pipe_gaps_modes": (gaps_modes.parse_args, []),
     "pipe_gaps_outage": (gaps_outage.parse_args, ["--experiment-id", "exp"]),
     "pipe_segment": (pipe_segment.parse_args, SEGMENT_ARGV),
+    "pipe_segment_modes": (pipe_segment_modes.parse_args, []),
 }
 
 STAGING_TABLE = "world-fishing-827.pipe_ais_test_202408290000_internal.messages_positions"

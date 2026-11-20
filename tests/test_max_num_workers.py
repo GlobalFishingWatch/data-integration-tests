@@ -9,7 +9,7 @@ so dit must never raise a cap by accident. These tests pin:
 * the shared helpers in ``dit.workflow`` (flag, validation, emission, logging);
 * each workflow's default: port visits 4, encounters 50, pipe-gaps 50,
   pipe-segment 50 for each of its two Beam steps (its four SQL steps are not
-  Dataflow jobs and take no cap);
+  Dataflow jobs and take no cap), pipe-segment's mode-equivalence workflow 4;
 * the default emitted options where they did not change: the cap's value
   and position in each option list;
 * that a set cap actually reaches the job, including pipe-gaps' in-process
@@ -46,6 +46,7 @@ from workflows.encounters import ais as encounters_ais
 from workflows.encounters import vms as encounters_vms
 from workflows.pipe_gaps import mode_equivalence as gaps_modes
 from workflows.pipe_gaps import outage_recovery as gaps_outage
+from workflows.pipe_segment import ais as pipe_segment_modes
 from workflows.pipe_segment import identity_match_key as pipe_segment
 from workflows.port_visits import ais as port_visits
 from workflows.port_visits import cross_version_ais as cross_version
@@ -73,6 +74,7 @@ SINGLE_CAP = {
     "encounters_vms": (encounters_vms.parse_args, [], 50),
     "pipe_gaps_modes": (gaps_modes.parse_args, [], 50),
     "pipe_gaps_outage": (gaps_outage.parse_args, ["--experiment-id", "exp"], 50),
+    "pipe_segment_modes": (pipe_segment_modes.parse_args, [], 4),
 }
 #: Every parser that takes --max-num-workers: (parse_args, argv).
 PARSERS = {
