@@ -10,22 +10,44 @@ End-to-end steps to A/B-test the gpsdio-segment identity-match-key change
 (reducing `match_key = (transponder_type, receiver_type, source)` to
 `(transponder_type,)`) via this workflow.
 
-**Status, 2026-11-19.** The workflow's command lines match what production
-runs (pipe-segment v5.0.3, the six tasks of the AIS v3 DAG's segment group;
-see [`composer_drift.py`](composer_drift.py)). That was established by reading
-code. The only recorded run is one laptop smoke of the `segment` step on
-2026-06-03. Two things still stand between this file and a full run:
+**Status, 2026-11-20.** The workflow's command lines match what the AIS v3
+DAG's segment group is configured for (pipe-segment v5.1.0, six tasks; see
+[`composer_drift.py`](composer_drift.py)), with one accepted difference: the
+DAG's `segment` task passes `--incremental` and this workflow does not (below).
+That was established by reading code and the DAG's rendered snapshot. The only
+recorded run is one laptop smoke of the `segment` step on 2026-06-03, on
+v5.0.3. Two things still stand between this file and a full run:
 
 - **Dataflow as the test service account.** pipe-segment has no way to name
   the dataset Beam stages query results in, and `automated-testing@` may not
-  create one. Sections 6 and 7 need an overlay image first, as port visits and
-  encounters have. Inferred from the code; not tried. The patches for such an
-  image exist since 2026-11-20
-  ([`docker/overlays/pipe-segment-temp-dataset/`](../../docker/overlays/pipe-segment-temp-dataset/README.md));
-  no image is built yet, and this workflow does not yet hand the overlay its
-  dataset (`ais.py`, the mode-equivalence workflow, does).
+  create one. Inferred from the code; not tried. Since 2026-11-20 the default
+  image is DIT's overlay of v5.1.0
+  ([`docker/overlays/pipe-segment-temp-dataset/`](../../docker/overlays/pipe-segment-temp-dataset/README.md)),
+  and the workflow hands it the dataset (`--bq-temp-dataset`). **The image is
+  not built yet**, so sections 6 to 8 cannot pull it until it is. An
+  unreviewed binding still gets a plain auto-built image without the overlay
+  (section 4).
 - **Nothing here has run end to end.** Treat the expected results below as
   expectations.
+
+**The version moved on 2026-11-20.** Until that day the AIS DAG pinned v5.0.3
+and passed no `--incremental`. composer-dags-production PR #3145 changed both,
+and DIT's drift check reported it the same evening. The VMS v5 DAG still pins
+v5.0.3. Examples below use `v5.1.0`; an experiment branch should fork from it.
+
+**No `--incremental` in this workflow.** Every binding runs the full-history
+segmenter:
+
+- A binding may be a ref older than v5.1.0. Such code hands the unknown flag
+  to Beam instead of rejecting it (read, not tried), so the two sides of the
+  A/B would run different segmenters.
+- A binding is one `segment` job from empty tables, so the state the flag
+  reads is empty either way.
+- Whether the two segmenters agree is what `ais.py` tests, and no run has
+  confirmed it yet.
+
+The drift spec accepts the DAG's flag for the `segment` step, with this
+reason.
 
 Source pinning no longer stands in the way. The workflow pinned its source
 with a BigQuery snapshot, which no DIT identity can create in
@@ -96,9 +118,9 @@ make install
 That is enough to run the workflow: it runs pipe-segment in its container and
 never imports it. `make install-pipe-segment` adds an editable install of
 `$(PROJECTS)/pipe-segment` (a sibling checkout by default; override via
-`PROJECTS=…` or `.envrc`) for stepping through its source. pipe-segment v5.0.3
+`PROJECTS=…` or `.envrc`) for stepping through its source. pipe-segment v5.1.0
 needs Python 3.12 or newer; the target pins apache-beam 2.71.0, the version
-v5.0.3 pins.
+v5.1.0 pins.
 
 For the laptop docker path, the auth named volume needs to be populated **once** before any docker run:
 
@@ -107,7 +129,7 @@ docker volume create gcp
 ```
 
 Then log in through a `gcloud` compose service that mounts that volume.
-pipe-segment v5.0.3's `docker-compose.yaml` has none (its services are `dev`,
+pipe-segment v5.1.0's `docker-compose.yaml` has none (its services are `dev`,
 `test` and `bigquery`), so use another pipeline checkout that has one, for
 example:
 
@@ -155,10 +177,10 @@ Record the resulting SHA — call it `<GPSDIO_FORK_SHA>`. You'll need it for ste
 ```bash
 cd ~/git/pipe-segment
 git fetch --tags origin
-git checkout -b experiment/identity-match-key-transponder-only v5.0.3
+git checkout -b experiment/identity-match-key-transponder-only v5.1.0
 ```
 
-At v5.0.3 the dependencies live in `pyproject.toml`; `requirements.txt` is
+At v5.1.0 (as since v5.0.3) the dependencies live in `pyproject.toml`; `requirements.txt` is
 compiled from it and is what the image installs first. Repin gpsdio-segment in
 both.
 
@@ -189,20 +211,30 @@ The workflow reads each binding's pin from `pyproject.toml` (older tags:
 `requirements/prod.in`) and refuses a two-binding run whose bindings pin the
 same gpsdio-segment.
 
-## 4. Image resolution (automatic — no manual builds needed)
+## 4. Image resolution
 
 The workflow resolves a per-binding image via `dit.workflow.resolve_run_context`:
 
-- **"before=v5.0.3"** binding: reviewed code at the default tag → docker
-  runner pulls `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-segment:v5.0.3`
-  directly. No build.
+- **"before=v5.1.0"** binding: reviewed code at the default tag → the docker
+  runner pulls the default image, DIT's overlay of v5.1.0
+  (`gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54`;
+  not built yet on 2026-11-20). It holds v5.1.0 whatever the reviewed ref is.
 - **"after=experiment/…"** binding: unreviewed code → `ensure_pipeline_image`
   auto-builds `gcr.io/world-fishing-827/dit/pipe-segment:dit-<commit>` via
-  kaniko, idempotent (skipped if the tag already exists).
+  kaniko, idempotent (skipped if the tag already exists). **That build is
+  plain source, without the overlay.** On DirectRunner that does not matter.
+  On Dataflow as the test service account the job is expected to fail when
+  Beam creates its staging dataset, and the workflow logs a warning.
 - **Explicit override**: `--image-tag <FQN>` is respected for all bindings.
-- **Laptop fast-iter**: `--build-from-source` bypasses both the canonical
-  pull and the kaniko build — compose builds the `dev` service from the
+  There is no per-binding image flag, so an A/B of two overlay images on
+  Dataflow is not possible yet.
+- **Laptop fast-iter**: `--build-from-source` bypasses both the default
+  image and the kaniko build — compose builds the `dev` service from the
   worktree's working tree.
+
+Every step's container gets `DIT_BQ_TEMP_DATASET` (from `--bq-temp-dataset`,
+default `world-fishing-827.tech_great_expectations`). An overlay image stages
+its BigQuery reads there; any other image ignores the variable.
 
 For Dataflow, the same image is passed to `--sdk_container_image` so workers
 run the same per-binding code. No `--setup_file` is passed, as in production:
@@ -267,14 +299,14 @@ them. See "No satellite timing offsets in DIT" at the top.
 
 ## 6. DirectRunner smoke (laptop, fast)
 
-Single-binding orchestration check against `v5.0.3`, 1 day, a handful of
+Single-binding orchestration check against `v5.1.0`, 1 day, a handful of
 vessels, source = staging cohort. Start with the `segment` step:
 
 ```bash
 cd ~/git/data_integration_tests
 dit run workflows/pipe_segment/identity_match_key.py \
     --experiment-id pipe-segment-smoke \
-    --binding before=v5.0.3 \
+    --binding before=v5.1.0 \
     --date-range 2020-01-01,2020-01-01 \
     --runner DirectRunner \
     --ssvid-filter-query '"<ssvid>","<ssvid>"' \
@@ -283,11 +315,11 @@ dit run workflows/pipe_segment/identity_match_key.py \
 ```
 
 Then drop `--skip-downstream` to run all six steps, and drop
-`--build-from-source` to run the published image.
+`--build-from-source` to run the default image, once it is built.
 
 Expected:
 
-- `worktree … @ v5.0.3` log line per binding.
+- `worktree … @ v5.1.0` log line per binding.
 - `gpsdio-segment pin -> …v3.0.0` log line per binding.
 - `commit=… image=…` log line per binding.
 - One `invoking pipe-segment <step>` log line per step, six without
@@ -299,20 +331,20 @@ Expected:
 
 ## 7. Cloud-build smoke (one-binding, Dataflow)
 
-Needs the overlay image named in the status note at the top.
+Needs the default overlay image, which is not built yet (status note at the top).
 
 ```bash
 make dit-cloud PIPELINE=pipe-segment \
     WORKFLOW=workflows/pipe_segment/identity_match_key.py \
     ARGS="--experiment-id pipe-segment-cloud-smoke \
-          --binding before=v5.0.3 \
+          --binding before=v5.1.0 \
           --date-range 2020-01-01,2020-01-01 \
           --runner dataflow \
           --skip-downstream"
 ```
 
 Cloud-mode auth is automatic (`--network=cloudbuild`).
-Reviewed v5.0.3 → no kaniko build, pulls canonical image.
+Reviewed v5.1.0 → no kaniko build; the docker runner pulls the default overlay image.
 
 ## 8. Full Dataflow A/B (after experiment branches are pushed)
 
@@ -320,7 +352,7 @@ Reviewed v5.0.3 → no kaniko build, pulls canonical image.
 make dit-cloud PIPELINE=pipe-segment \
     WORKFLOW=workflows/pipe_segment/identity_match_key.py \
     ARGS="--experiment-id idmatchkey \
-          --binding before=v5.0.3 \
+          --binding before=v5.1.0 \
           --binding after=experiment/identity-match-key-transponder-only \
           --date-range 2020-01-01,2020-01-03 \
           --runner dataflow"
@@ -328,7 +360,10 @@ make dit-cloud PIPELINE=pipe-segment \
 
 For the "after" binding, `ensure_pipeline_image` kicks off a kaniko build
 of `gcr.io/world-fishing-827/dit/pipe-segment:dit-<commit>` (one-time per
-ref; cached on subsequent runs). Expected results:
+ref; cached on subsequent runs). **That image has no temp-dataset overlay**
+(section 4), so on Dataflow as the test service account this A/B is expected
+to fail on the "after" binding until the workflow can take an overlay image
+per binding. On DirectRunner it is not affected. Expected results:
 
 - `messages_segmented`: **DIFFERENT** (per-row identity/destinations dict
   contents differ — that's the metric).
@@ -385,7 +420,7 @@ label, so `make dit-cancel` finds nothing for it.
 | `pinning … would process … GB, above the … GB cap` | The copy of the run's dates is larger than `--pin-max-gb`. Narrow `--date-range`, or raise the cap on purpose. |
 | `pinned copy … does not exist` with `--reuse-pin` | The copy expired, or the stamp, `--experiment-id`, `--date-range` or source table differ from the run that made it. |
 | The copy is denied `bigquery.tables.create` | The identity may not create tables in `tech_great_expectations`. With gcloud impersonating `dq-monitoring@`, that is the case. |
-| A Dataflow job fails creating `beam_temp_dataset_…` | The test service account may not create datasets, and pipe-segment cannot be told which dataset to use (status note at the top). |
+| A Dataflow job fails creating `beam_temp_dataset_…` | The image has no overlay: the auto-built image of an unreviewed binding, or `--build-from-source` (section 4). The test service account may not create datasets. |
 | `--include-satellite-offsets was removed` | DIT runs no satellite timing offsets ("No satellite timing offsets in DIT" at the top). Drop the flag. |
 | DIT's `messages_segmented` has more rows than production's for some hours of 2020 | Expected: production dropped those hours' messages for satellite clock offsets, and DIT does not. Same section. |
 | `… was removed with snapshot pinning` | `--pin-source-at`, `--snapshot-dest-project` or `--snapshot-expiration-days` was passed. The message names what to use instead. |
@@ -414,22 +449,41 @@ inclusive; `--tail-days`, default 3):
 | `4_daily` | every day as its own job, in order. Not in the default `--modes` | 31 |
 
 A **segmenter** is which of pipe-segment's two segmenters each job runs
-(`--segmenter`, default `full-history`):
+(`--segmenter`, default `incremental`):
 
-- `full-history`: what production's DAG runs. Each job reads every fragment in
-  its fragments table and matches them all again.
 - `incremental`: pipe-segment's `--incremental` (v5.1.0, pipe-segment PR #227).
-  Each job starts from the segments of the day before its date range.
+  Each job starts from the segments of the day before its date range. The
+  default, because the AIS v3 DAG's `segment` task passes it since 2026-11-20
+  (composer-dags-production PR #3145). That is the DAG's configuration; whether
+  a production run has executed with it was not checked.
+- `full-history`: pipe-segment's own default. Each job reads every fragment in
+  its fragments table and matches them all again. What the AIS DAG passed
+  until 2026-11-20, and what the VMS v5 DAG, on v5.0.3, still does.
 
 A `--modes` entry is a variant:
 
 - a bare mode (`2_bfd`) runs with every segmenter of `--segmenter`;
-- `mode:segmenter` (`2_bfd:incremental`) runs exactly that pair.
+- `mode:segmenter` (`1_bf:full-history`) runs exactly that pair.
 
 So `--segmenter full-history,incremental` runs the cross product, and a list of
 qualified entries runs only the pairs named. The first variant in canonical
 order (by mode, then segmenter) is the reference; `1_bf:full-history` when it
 is selected.
+
+**The default run** (no `--modes`, no `--segmenter`) is
+`1_bf:full-history,1_bf,2_bfd,3_bftruncate`:
+
+| Variant | Jobs on January 2020 | Role |
+|---|---|---|
+| `1_bf:full-history` | 1 | the reference: every segment matched from the window's fragments in one pass, no state handed from job to job |
+| `1_bf:incremental` | 1 | the incremental matching without any hand-over between jobs |
+| `2_bfd:incremental` | 4 | a backfill, then three daily runs: the shape the DAG now runs every day |
+| `3_bftruncate:incremental` | 4 | three days rerun in order on top of a full backfill |
+
+Ten jobs, six pairs, eighteen comparisons, 363 MB pinned. A run of
+incremental shapes alone would only show that incremental agrees with itself,
+so the reference stays full history. `1_bf:incremental` tells a difference in
+the matching from a difference in the hand-over.
 
 `4_daily` is a mode and not `--tail-days` set to the window's length, because
 `--tail-days` applies to every mode of a run, and one run must be able to hold
@@ -462,16 +516,20 @@ is selected.
 ## M3. Images
 
 - The default `--image-tag` and `--worker-image` are DIT's overlay of
-  pipe-segment v5.0.3, the version production's DAG pins
+  pipe-segment v5.1.0, the version the AIS DAG is configured for
   ([overlay README](../../docker/overlays/pipe-segment-temp-dataset/README.md)).
   **It is not built yet.**
-- **`incremental` needs an image of v5.1.0 or later.** On older code
-  pipe-segment hands `--incremental` to Beam, which ignores it (read from
-  `cli/main.py` and `pipeline.py`; not tried), so the job would run full
-  history and the comparison would pass without testing anything. The workflow
-  refuses before any cloud call. It reads the version from the start of the
-  image tag (`v5.1.0-…`); an image whose tag names no version needs
+- **`incremental` needs an image of v5.1.0 or later**, which the default image
+  is. On older code pipe-segment hands `--incremental` to Beam, which ignores
+  it (read from `cli/main.py` and `pipeline.py`; not tried), so the job would
+  run full history and the comparison would pass without testing anything. The
+  workflow refuses before any cloud call. It reads the version from the start
+  of the image tag (`v5.1.0-…`); an image whose tag names no version needs
   `--assume-incremental-support`.
+- **To run the version the VMS DAG pins**, pass the v5.0.3 overlay image as
+  both flags and select full history only:
+  `--segmenter full-history --modes 1_bf,2_bfd,3_bftruncate`. With an
+  incremental variant left in the selection the run is refused.
 - Unreviewed pipe-segment code (a dirty tree, a DIT snapshot, a commit not
   merged into `origin/main`) is refused on a default image. Build an overlay
   image of the commit and pass it as both flags. DIT never auto-builds one.
@@ -482,11 +540,10 @@ is selected.
 
 ```bash
 cd "$PROJECTS/pipe-segment"
-dit run "$DIT/workflows/pipe_segment/ais.py" --experiment-id seg-plan --dry-run \
-    --modes 1_bf,2_bfd,2_bfd:incremental,3_bftruncate:incremental,4_daily:incremental \
-    --image-tag gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54 \
-    --worker-image gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54
+dit run "$DIT/workflows/pipe_segment/ais.py" --experiment-id seg-plan --dry-run
 ```
+
+That plans the default run. Add `--modes` to plan another, e.g. the one of M6.
 
 (`$DIT` is this repository's checkout.) It logs the pin's size from a BigQuery
 dry run, every variant's tables, every job with its dates and what it reads,
@@ -503,10 +560,11 @@ cd "$PROJECTS/pipe-segment" && git checkout v5.1.0
 dit run "$DIT/workflows/pipe_segment/ais.py" --experiment-id seg-smoke \
     --runner docker --build-from-source \
     --start 2020-01-01 --end 2020-01-03 \
-    --modes 1_bf,4_daily:incremental
+    --modes 1_bf:full-history,4_daily
 ```
 
-Four local DirectRunner runs (one over three days, then three single days),
+Four local DirectRunner runs (full history over three days, then three
+incremental single days),
 three comparisons. It reads about 33 MB for the pin (dry run, 2026-11-20) and
 about 220,000 messages. Cost: BigQuery only, a few cents at most (estimated).
 It is the first run of the incremental start-of-run checks against real tables
@@ -514,22 +572,24 @@ from DIT, and the first look at whether `table-check` treats the array columns
 as expected. `--build-from-source` has no overlay, so Beam creates its own
 staging dataset with your credentials.
 
-**Step 2, Dataflow, once the two overlay images exist.** The same window in
-Cloud Build:
+**Step 2, Dataflow, once the default overlay image exists.** The same window
+in Cloud Build, on the default image:
 
 ```bash
 make dit-cloud PIPELINE=pipe-segment REF=v5.1.0 \
     WORKFLOW=workflows/pipe_segment/ais.py \
     ARGS="--experiment-id seg-smoke-df \
           --start 2020-01-01 --end 2020-01-03 \
-          --modes 1_bf,4_daily:incremental \
-          --image-tag gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54 \
-          --worker-image gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54"
+          --modes 1_bf:full-history,4_daily"
 ```
 
 Four Dataflow jobs of at most 4 workers each. Rough cost: under USD 1,
 estimated from a few worker-minutes per job; not measured. It is the first
 test of the overlay on Dataflow as the test service account.
+
+**Step 3, the default run.** The same command without `--start`, `--end` and
+`--modes`: January 2020, ten jobs (the table in M1). Estimated at about USD 1;
+not measured.
 
 ## M6. The pipe-segment PR #227 test
 
@@ -548,14 +608,19 @@ equal full history. On the staging cohort, January 2020, pipe-segment v5.1.0:
 make dit-cloud PIPELINE=pipe-segment REF=v5.1.0 \
     WORKFLOW=workflows/pipe_segment/ais.py \
     ARGS="--experiment-id pr227 \
-          --modes 1_bf,2_bfd,2_bfd:incremental,3_bftruncate:incremental,4_daily:incremental \
-          --image-tag gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54 \
-          --worker-image gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54 \
+          --modes 1_bf:full-history,2_bfd:full-history,2_bfd:incremental,3_bftruncate:incremental,4_daily:incremental \
           --parallel"
 ```
 
-Locally, from a clean pipe-segment checkout at v5.1.0, the same flags follow
-`dit run "$DIT/workflows/pipe_segment/ais.py"`.
+It runs on the default image, the overlay of v5.1.0, so it needs no image
+flag. Every entry names its segmenter, so the command does not depend on the
+default of `--segmenter`. Locally, from a clean pipe-segment checkout at
+v5.1.0, the same flags follow `dit run "$DIT/workflows/pipe_segment/ais.py"`.
+
+Since 2026-11-20 this is no longer a test of an opt-in: the AIS DAG passes
+`--incremental`. The default run (M1) holds A, C and E plus `1_bf:incremental`;
+this one adds B, full history in the daily shape, and D, every day as its own
+job.
 
 - **44 Dataflow jobs**, each capped at 4 workers. With `--parallel` the five
   variants run side by side; D's 31 jobs run one after the other and set the
