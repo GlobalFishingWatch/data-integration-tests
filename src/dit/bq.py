@@ -480,6 +480,11 @@ def derived_source_into_experiment(
 # inside their time-travel window. `CREATE TABLE ... LIKE` keeps the
 # source's partitioning and clustering, so pipelines read the copy as
 # cheaply as the source.
+#
+# A source that is a view cannot be copied that way (`Cannot CREATE TABLE
+# LIKE ..., which is VIEW`), and cannot be snapshotted either. It is copied
+# with a plain `CREATE TABLE ... AS SELECT`: the copy is a table of the rows
+# the view returned. See `pin_source_into_experiment`.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -596,7 +601,13 @@ def all_rows_predicate(partition_column: str) -> str:
 
 
 def _whole_table_predicate(client: bigquery.Client, source_table: str) -> str:
-    """The WHERE predicate for pinning all of ``source_table`` (no window).
+    """``_all_rows_predicate_of`` the metadata of ``source_table``, read here."""
+    return _all_rows_predicate_of(client.get_table(source_table), source_table)
+
+
+def _all_rows_predicate_of(table: bigquery.Table, source_table: str) -> str:
+    """The WHERE predicate for pinning all of ``source_table`` (no window),
+    from its metadata ``table``.
 
     * Partitioned on a column (time-unit or integer-range):
       ``all_rows_predicate`` on that column, whether or not the table
@@ -612,7 +623,6 @@ def _whole_table_predicate(client: bigquery.Client, source_table: str) -> str:
       carry, so a pin could not keep the rows' partitions. The caller passes
       a window on the pseudo-column instead.
     """
-    table = client.get_table(source_table)
     column = next(
         (
             partitioning.field
@@ -662,15 +672,88 @@ def _pin_ddl(
     is cleared, since a source keeping e.g. 365 days of partitions would
     otherwise drop an older window's partitions as they land.
     """
-    label_list = ", ".join(
-        f"({_sql_string_literal(k)}, {_sql_string_literal(v)})" for k, v in labels
-    )
     return (
         f"CREATE TABLE `{dest_table}` LIKE `{source_table}` "
         f"OPTIONS("
         f"expiration_timestamp=TIMESTAMP('{expiration.isoformat()}'), "
         f"partition_expiration_days=NULL, "
-        f"labels=[{label_list}], "
+        f"labels=[{_label_list(labels)}], "
+        f"description={_sql_string_literal(description)}) "
+        f"AS SELECT * FROM `{source_table}` WHERE {predicate}"
+    )
+
+
+def _label_list(labels: Sequence[tuple[str, str]]) -> str:
+    return ", ".join(
+        f"({_sql_string_literal(k)}, {_sql_string_literal(v)})" for k, v in labels
+    )
+
+
+#: ``table_type`` of a source that ``CREATE TABLE ... LIKE`` refuses and that
+#: is copied with a plain ``CREATE TABLE ... AS SELECT`` instead.
+_VIEW_TABLE_TYPE = "VIEW"
+
+#: Month-truncation function per column type, for the partitioning of a
+#: windowed copy of a view.
+_MONTH_TRUNC_BY_TYPE = {
+    "TIMESTAMP": "TIMESTAMP_TRUNC",
+    "DATE": "DATE_TRUNC",
+    "DATETIME": "DATETIME_TRUNC",
+}
+
+
+def _view_copy_partition_by(
+    table: bigquery.Table, source_table: str, window: SourceWindow,
+) -> str:
+    """The ``PARTITION BY`` expression of a windowed copy of the view
+    ``source_table``: the window column truncated to the month.
+
+    A view has no partitioning to copy, so a windowed copy gets one on the
+    column its readers filter on, and they prune it as they would the table
+    behind the view. Months, because a window of many years would exceed
+    BigQuery's partition limits by day. ``ValueError`` when the column is not
+    a top-level TIMESTAMP, DATE or DATETIME column of the view.
+    """
+    field_type = next(
+        (field.field_type for field in table.schema if field.name == window.column),
+        None,
+    )
+    trunc = _MONTH_TRUNC_BY_TYPE.get(field_type)
+    if trunc is None:
+        raise ValueError(
+            f"cannot window the view {source_table} on {window.column!r}: it is "
+            f"{'not a column of the view' if field_type is None else f'a {field_type} column'}, "
+            f"and a window needs a TIMESTAMP, DATE or DATETIME column. Pin the "
+            f"view whole (no window) instead."
+        )
+    return f"{trunc}({window.column}, MONTH)"
+
+
+def _view_pin_ddl(
+    *,
+    source_table: str,
+    dest_table: str,
+    predicate: str,
+    partition_by: str | None,
+    labels: Sequence[tuple[str, str]],
+    description: str,
+    expiration: datetime,
+) -> str:
+    """Plain ``CREATE TABLE ... AS SELECT`` for a pinned copy of a view.
+
+    No ``LIKE``: BigQuery refuses it on a view. The options are the copy's
+    own, since nothing is inherited. With ``partition_by`` (a windowed copy)
+    ``partition_expiration_days`` is cleared as for table sources, so that a
+    dataset default cannot drop an old window's partitions.
+    """
+    partitioning = f"PARTITION BY {partition_by} " if partition_by is not None else ""
+    partition_option = "partition_expiration_days=NULL, " if partition_by is not None else ""
+    return (
+        f"CREATE TABLE `{dest_table}` {partitioning}"
+        f"OPTIONS("
+        f"expiration_timestamp=TIMESTAMP('{expiration.isoformat()}'), "
+        f"{partition_option}"
+        f"labels=[{_label_list(labels)}], "
         f"description={_sql_string_literal(description)}) "
         f"AS SELECT * FROM `{source_table}` WHERE {predicate}"
     )
@@ -715,6 +798,22 @@ def pin_source_into_experiment(
     copy inherits the requirement through ``LIKE``. What stops an expensive
     full copy is the cost guard, not the partition filter.
 
+    A source that is a view (read from the source's metadata) is copied with
+    a plain ``CREATE TABLE ... AS SELECT``, because BigQuery refuses ``LIKE``
+    on a view. The copy is a table of the rows the view returned at copy
+    time, with the same name shape, labels, description, expiration and cost
+    guard. What differs:
+
+    * Whole (no window): no partitioning and no clustering, since a view has
+      none to copy. The predicate is ``TRUE``. If a table behind the view
+      requires a partition filter, BigQuery rejects that at the dry run and
+      the caller passes a window.
+    * Windowed: the predicate is the window's, on the view's column, and the
+      copy is partitioned by month on that column
+      (``_view_copy_partition_by``) so date-filtered readers still prune.
+      Clustering is not carried over. Whether the read of the view itself
+      prunes depends on the view's SQL; the cost guard reports it.
+
     Cost guard: the copy statement is dry-run first and refused with
     ``ValueError`` if it would process more than ``max_bytes``; the job
     also carries ``max_bytes`` as ``maximum_bytes_billed``. ``dry_run=True``
@@ -736,9 +835,17 @@ def pin_source_into_experiment(
     expiration = _utc_now() + timedelta(days=expiration_days)
     job_id = f"dit_pin_{uuid.uuid4().hex}"
     client = bigquery.Client(project=project)
+    # One free metadata read: it tells a view from a table, and gives the
+    # partition column for a pin without a window.
+    source = client.get_table(source_table)
+    is_view = source.table_type == _VIEW_TABLE_TYPE
     predicate = (
         window.predicate() if window is not None
-        else _whole_table_predicate(client, source_table)
+        else _all_rows_predicate_of(source, source_table)
+    )
+    view_partition_by = (
+        _view_copy_partition_by(source, source_table, window)
+        if is_view and window is not None else None
     )
     labels = (
         ("dit_artifact", PIN_ARTIFACT_LABEL),
@@ -747,22 +854,36 @@ def pin_source_into_experiment(
         ("dit_pin", format_pin_stamp(pinned_at)),
         ("dit_source_table", _label_value(source_table.rsplit(".", 1)[-1])),
     )
+    view_lines = [
+        "The source is a view: this table holds the rows it returned, "
+        + (
+            f"partitioned by {view_partition_by}, without clustering."
+            if view_partition_by is not None
+            else "without partitioning or clustering."
+        )
+    ] if is_view else []
     description = "\n".join([
-        "DIT pinned copy of a source table (data integration tests).",
+        f"DIT pinned copy of a source {'view' if is_view else 'table'} "
+        f"(data integration tests).",
         f"Source: {source_table}",
+        *view_lines,
         _rows_line(window, predicate),
         f"Pinned at: {pinned_at.isoformat()}; the data is as of the start of "
         f"copy job {project}:{job_id}.",
         f"Experiment: {experiment_id}; role: {role}",
         f"Expires: {expiration.isoformat()}",
     ])
-    sql = _pin_ddl(
+    ddl_kwargs = dict(
         source_table=source_table,
         dest_table=dest_table,
         predicate=predicate,
         labels=labels,
         description=description,
         expiration=expiration,
+    )
+    sql = (
+        _view_pin_ddl(partition_by=view_partition_by, **ddl_kwargs) if is_view
+        else _pin_ddl(**ddl_kwargs)
     )
 
     estimate = int(
@@ -773,8 +894,9 @@ def pin_source_into_experiment(
         or 0
     )
     logger.info(
-        "pinning %s -> %s (%s): dry run estimates %.1f GB (cap %.1f GB)",
-        source_table, dest_table, predicate, estimate / 1e9, max_bytes / 1e9,
+        "pinning %s%s -> %s (%s): dry run estimates %.3f GB (cap %.1f GB)",
+        source_table, " (a view)" if is_view else "", dest_table, predicate,
+        estimate / 1e9, max_bytes / 1e9,
     )
     if estimate > max_bytes:
         raise ValueError(

@@ -252,7 +252,7 @@ def _product_events_view(args: argparse.Namespace, suffix: str, mode: str) -> st
 # port_visits M4 discipline and avoids generating invalid SQL if a caller
 # accidentally passes an empty flag (e.g. shell expansion of an unset
 # variable). ``cross_version_fishing.py`` (E5) uses these overrides to point
-# each binding at snapshots in ``tech_great_expectations`` that don't follow
+# each binding at pinned copies in ``tech_great_expectations`` that don't follow
 # the ``<stem>_internal`` / ``<stem>_published`` shape.
 # --------------------------------------------------------------------------
 
@@ -283,7 +283,7 @@ def _product_vessel_info_summary_table(args: argparse.Namespace) -> str:
     Called at BOTH call sites in ``_run_slice`` -- the filter step's
     ``-pvesselinfo`` AND the auth step's ``-allvessels`` -- so one override
     governs both. The pin that they always agree is load-bearing for
-    cross-version: splitting them would let one binding read a snapshot while
+    cross-version: splitting them would let one binding read a pinned copy while
     the other read live, defeating the comparison.
     """
     if args.source_product_vessel_info_summary_fqn:
@@ -634,7 +634,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Per-table FQN overrides (E4 of pipe-events cross-version arc). Default
     # None so absence triggers dataset-derivation in the helpers; explicit
     # FQNs win. cross_version_fishing.py (E5) uses these to point at
-    # snapshots in tech_great_expectations that don't follow the
+    # pinned copies in tech_great_expectations that don't follow the
     # <stem>_internal / <stem>_published shape. Empty string is treated as
     # unset (matches port_visits M4 discipline).
     p.add_argument("--source-research-messages-fqn", default=None,
@@ -771,7 +771,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # actually reads even when cross_version_fishing.py has swapped datasets
     # underneath via per-table FQN overrides. Replaces the pre-E4 stem-only
     # log (which would be misleading for cross-version runs reading from
-    # tech_great_expectations snapshots).
+    # pinned copies in tech_great_expectations).
     logger.info("source research_messages:            %s", _research_messages_table(args))
     logger.info("source segs_activity:                %s", _segs_activity_table(args))
     logger.info("source segment_vessel:               %s", _segment_vessel_table(args))

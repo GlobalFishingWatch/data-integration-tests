@@ -8,6 +8,11 @@ Empirical audit of `dit.bq.snapshot_table` / `snapshot_dataset` against two edge
 
 **Update 2026-10-22.** A second blocker this audit missed: since the canonical-dataset migration, snapshots go into `tech_great_expectations` with an expiration, which needs `bigquery.tables.deleteSnapshot`. Neither `automated-testing@` (Data Editor) nor the operator account has it there, so no snapshot into that dataset has ever succeeded (Cloud Build `5153fd50`). `workflows/port_visits/cross_version_ais.py` now pins by copying (`dit.bq.pin_source_into_experiment`, `CREATE TABLE … LIKE … AS SELECT`), which reads across organisations and needs only `bigquery.tables.create`. The other snapshot consumers (`pipe_events/cross_version_fishing.py`, `pipe_segment/identity_match_key.py`, `pipe_gaps/outage_recovery.py` without `--no-snapshot`) still snapshot and are still blocked. The `--snapshot-dest-project` workaround below writes into the production organisation and conflicts with dit's prod-infra boundary.
 
+**Update 2026-11-19 (PIPELINE-4705).** `pipe_events/cross_version_fishing.py` now pins by copying too, so the statement above no longer applies to it. Its sources show the view case of this audit in practice: three of its seven sources are views on the staging cohort (`identity_core`, `identity_authorization`, `event_regions`), so a snapshot run would have failed on them even with the permission.
+- A view cannot be copied with `LIKE` either: BigQuery answers `Cannot CREATE TABLE LIKE ..., which is VIEW` (dry run, 2026-11-19).
+- `dit.bq.pin_source_into_experiment` reads the source's type and copies a view with a plain `CREATE TABLE … AS SELECT`. The copy is a table of the rows the view returned at copy time, which is the pin a snapshot of a view could never give.
+- Still on snapshots, and still blocked: `pipe_segment/identity_match_key.py` and `pipe_gaps/outage_recovery.py` without `--no-snapshot`.
+
 ## TL;DR
 
 | Edge case | Result | Risk class |
