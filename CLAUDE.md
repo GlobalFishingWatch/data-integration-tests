@@ -80,6 +80,49 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-20 — Mode equivalence for the segmenter (`workflows/pipe_segment/ais.py`); pipe-segment temp-dataset overlay
+
+**Trigger.** Every other onboarded pipeline has a mode-equivalence workflow; the segmenter had only the cross-version `identity_match_key.py`. pipe-segment PR #227 (merged 2026-11-20, v5.1.0, 4ddde03) adds an opt-in `--incremental` to `segment`, and its claim is a mode-equivalence claim: incremental day-by-day equals full history. The owner wants that PR run through DIT.
+
+**Nothing has run.** No image was built, no Dataflow job submitted, no table written. Everything below about pipe-segment was read from its code at v5.0.3 (f4d39fe) and v5.1.0 (4ddde03). BigQuery was used for dry runs and free metadata reads only.
+
+**Decisions.**
+- **The unit is a (mode, segmenter) variant, selected through `--modes` alone.** An entry is a mode, run with every segmenter of `--segmenter`, or `mode:segmenter`. Considered and rejected:
+  - the cross product only (`--modes` x `--segmenter`): the PR's test is five of the eight pairs, 44 jobs where the cross product is 80;
+  - a separate `--variants` flag: two flags for one selection.
+- **A fourth mode, `4_daily`, for "every day as its own job".** Not `--tail-days` set to the window: `--tail-days` applies to every mode of a run, and the PR's test needs "backfill, then three days" and "every day" in one run. It is opt-in (31 jobs on the default window), which needed `dit.workflow.add_modes_arg(default=...)`. **Open for the owner:** whether it belongs in the default, since it is the strictest test.
+- **Each variant has its own three tables, and they must be empty.** A full-history job reads its whole fragments table with no date bound (`transform/read_fragments.py`: no condition when `start_date` is `None`), and an incremental job starts from the stored segments. The PR's author got doubled message counts from a fragments table that already held the window. So `require_empty_outputs` refuses tables with rows, by a free metadata read, before the pin.
+- **Every plan is checked to chain** (`check_chain`, pure): the first job starts the window, each later job starts no later than the day after the last day written, and the last job ends the window. That covers the PR's rules (consecutive days, no gap, reruns in order through the end). It is checked for every mode at parse time, not only for incremental variants: a full-history job needs the fragments up to the day before it just as much.
+- **`incremental` is refused on an image that does not name v5.1.0 or later in its tag.** Why a refusal and not a warning: pipe-segment's command line hands unknown flags to Beam (`cli/main.py` line 47, `parse_known_args`). Inferred, not run: on v5.0.3 `--incremental` would be ignored, the job would run full history, and the comparison would pass without testing anything. Detection choices:
+  - the image tag, which must start with the version (the overlay label). No registry or docker call;
+  - a tag that names no version is refused too, with `--assume-incremental-support` as the way through;
+  - with `--build-from-source` the working tree's `segment` command is read for the flag.
+- **The comparison is pairwise, and the log says which table tells most.** `segments` is the discriminating one (segment id carried across days, cumulative values). `fragments` are built from one vessel's messages of one day (`pipeline.py` lines 326 to 336 at v5.1.0), so they detect chaining errors only weakly. Any difference exits 1, as in the other mode-equivalence workflows. **Open for the owner:** pairwise is 30 comparisons for the PR's five variants; comparing each variant with the reference only would be 12.
+- **The array columns.** `identities` and `destinations` in `fragments`, and the four `daily_*` / `cumulative_*` columns in `segments`, are `ARRAY<STRUCT<...>>` of scalars (`transform/fragment.py`, `schemas/segment_schema.py`). `table-check` documents multiset comparison for that shape. So the element-order differences the PR's author saw are expected not to show. A hypothesis until a run confirms it.
+- **Default image: a DIT overlay of v5.0.3, with port visits' image policy.** pipe-segment has no staging-dataset option, so production's image cannot run on Dataflow as the test service account (inferred, as before). `check_images` is copied from `port_visits/ais.py`: no auto-build, unreviewed code refused on a default image. The default tag is fixed by the commit and the patch's hash, and a test pins both; the image itself does not exist yet.
+- **One patch per pipe-segment generation.** v5.1.0 rewrote three of v5.0.3's four read sites (job labels, PR #228) and added a fifth read, so neither patch applies to the other tag (`git apply --check`, both directions). `build.sh` applies the first that fits. `verify_overlay.py` counts the reads of the whole package, so a read in a new module fails the build too; its static half runs in DIT's tests, against the patches and, when a checkout with both tags is present, against the patched trees.
+- **`identity_match_key.py`'s `segment` builder is shared, not copied.** `_segment_args` and `_dataflow_options` gained `labels`, `job_name` and `extra_flags`, defaulting to what they emitted before. So a full-history job passes the flags the drift check already compares with production, and the new drift spec is in sync by construction.
+- **No run cache.** `run_with_cache` returns one comparison table per unit and a variant has three. Not straightforward, so left out; the help says so. The jobs carry `dit_run_id`, so cancellation still finds them.
+- **Dry run without side effects.** It reads the commit through `resolve_pipeline_commit(runner="docker")`, which never snapshots, and skips `resolve_run_context`. For a dirty tree it therefore reports HEAD, where a real Dataflow run would snapshot first.
+
+**Workflow-side workarounds for missing contract items.** One, already known: the temp dataset (contract row 5), by overlay. No new one.
+
+**Claims about production.** That production's `segment` task pins v5.0.3 and passes no `--incremental` comes from composer's rendered snapshot `core_ais_v3` at cb0c9a3b7 (the local checkout's `origin/main`, read 2026-11-20), which is what the drift check reads. It is a statement about the DAG, not about a job that ran.
+
+**Not done, and why.**
+- No image built and no run: outside this change's remit; each waits for the owner's go-ahead. Proposed order in README Roadmap 7e.
+- `identity_match_key.py` is not wired to the overlay (it does not set the variable and defaults to the published image). Its emitted argv had to stay byte-identical here.
+- No cross-version wrapper for the segmenter per mode, no `--steps` (the workflow runs `segment` only), no expiration on the output tables.
+- `check_images` and the bf / bfd / bftruncate slicing now exist in two and three workflows; noted in `workflows/README.md` as extraction candidates, not extracted.
+
+**Sections moved.**
+- New: `workflows/pipe_segment/ais.py`; `docker/overlays/pipe-segment-temp-dataset/` (two patches, `build.sh`, `verify_overlay.py`, README); `tests/test_pipe_segment_ais.py` (174), `tests/test_pipe_segment_overlay.py` (31).
+- `workflows/pipe_segment/identity_match_key.py`: `_dataflow_options`, `_segment_args` (three optional parameters each or between them; defaults unchanged).
+- `workflows/pipe_segment/composer_drift.py`: `MODE_EQUIVALENCE_SPEC`, `mode_equivalence_tokens`, `INCREMENTAL_ACCEPTED_DIFFERENCES`; `SPECS` holds both.
+- `src/dit/workflow.py`: `add_modes_arg(default=...)`.
+- Tests: `tests/test_composer_drift.py` (registry, fixture for tasks mirrored by several steps, five new tests), `tests/test_modes_flag.py`, `tests/test_max_num_workers.py`, `tests/test_worker_ips_and_sizing.py`. Suite 1,265 to 1,488.
+- Docs: README (Features, Source data targets, Roadmap 7e); `workflows/README.md` (both tables, a note on the extraction candidates); `workflows/pipe_segment/RUN_INSTRUCTIONS.md` (part "Mode equivalence of the segment step", with the PR #227 command); `docs/pipeline-contract.md` (pipe-segment row 5 and audit note); `docs/conventions.md` (overlay images); CHANGELOG § 2026-11-20.
+
 ### 2026-11-20 — No satellite timing offsets in DIT; the option is removed (PIPELINE-4705)
 
 **Owner decision (2026-11-20, on PR #94).** DIT's segmenter workflows do not run pipe-segment's satellite timing offsets, and this is to be stated very clearly. The entry below left `--include-satellite-offsets` refused but in place and asked whether to delete it. It is deleted.
