@@ -314,8 +314,8 @@ def test_pipe_segment_tokens_are_one_default_bindings_argv() -> None:
     assert seg.value("--runner") == identity.value("--runner") == "dataflow"
     assert seg.value("--sdk_container_image") == segment.DEFAULT_IMAGE_TAG
     assert seg.value("--max_num_workers") == str(segment.STEP_MAX_NUM_WORKERS["segment"])
-    # Satellite offsets are opt-in, so a default run passes none of their flags.
-    assert "--in_sat_positions_table" not in seg.names()
+    # DIT runs no satellite timing offsets: no run passes any of their flags.
+    assert not set(segment_drift.SATELLITE_FLAGS) & set(seg.names())
     # A default run is a published-image run: no setup file, as in production.
     assert "--setup_file" not in seg.names() + identity.names()
     assert "--experiments" not in seg.names() + identity.names()
@@ -344,7 +344,7 @@ def test_pipe_segment_tokens_are_what_the_workflow_hands_the_runner() -> None:
         assert segment._run_binding(
             name=segment_drift._BINDING, ref="HEAD", args=args,
             suffix=f"{args.experiment_id}_{segment_drift._BINDING}",
-            snapshot_fqns=segment._PipeSegmentSnapshotFQNs(
+            pinned=segment._PinnedSources(
                 normalized_messages=args.source_normalized_table),
         ) == 0
 
@@ -354,16 +354,27 @@ def test_pipe_segment_tokens_are_what_the_workflow_hands_the_runner() -> None:
     ]
 
 
-def test_pipe_segment_accepts_the_satellite_inputs_and_owns_the_handed_over_tables() -> None:
+def test_pipe_segment_accepts_the_satellite_flags_and_owns_the_handed_over_tables() -> None:
     spec = segment_drift.SPEC
     by_step = {step.step: step for step in spec.steps}
 
-    # Production's satellite-offset inputs are accepted for `segment` only.
-    satellite = {"--in_normalized_sat_offset_messages_table", "--in_norad_to_receiver_table",
-                 "--in_sat_positions_table"}
+    # Production's four satellite flags (three inputs and the offsets output)
+    # are accepted for `segment` only, with the real reason: DIT runs no
+    # satellite timing offsets.
+    satellite = set(segment_drift.SATELLITE_FLAGS)
+    assert satellite == {
+        "--in_normalized_sat_offset_messages_table", "--in_norad_to_receiver_table",
+        "--in_sat_positions_table", "--out_sat_offsets_table",
+    }
     assert satellite <= set(by_step["segment"].accepted)
-    assert all("date-sharded" in by_step["segment"].accepted[flag] for flag in satellite)
+    for flag in satellite:
+        reason = by_step["segment"].accepted[flag]
+        assert "DIT runs no satellite timing offsets" in reason
+        assert "full message feed, not a test cohort" in reason
+        assert "cannot read precomputed offsets" in reason
     assert not any(satellite & set(by_step[step].accepted) for step in segment.STEPS[1:])
+    # None of them is DIT-owned: DIT sets no value of its own for them.
+    assert not satellite & spec.dit_owned
     # The tables one step hands to the next carry DIT's own names.
     assert {"--source_segment_identity", "--source_segment_vessel",
             "--source_segment_vessel_daily", "--destination"} <= spec.dit_owned
@@ -507,6 +518,45 @@ def test_a_dataflow_option_on_a_pipe_segment_sql_step_is_drift() -> None:
     report = drift.check_step(segment_drift.SPEC, with_runner, dag)
     assert report.drift
     assert report.argv.diff.only_left == ("--runner", "--region")
+
+
+def test_productions_satellite_flags_do_not_make_pipe_segment_drift() -> None:
+    """Production's `segment` task passes four satellite flags; DIT passes
+    none. The step stays in sync, and the report gives the reason."""
+    step = _step("pipe_segment/identity_match_key", "segment")
+    mirror = _mirror_task(step)
+    with_satellite = {
+        **mirror,
+        "arguments": [
+            *mirror["arguments"],
+            *(f"{flag}=example.dataset.table" for flag in segment_drift.SATELLITE_FLAGS),
+        ],
+    }
+    dag = composer.dag_from_snapshot(
+        {**_port_visits_raw_dag(production_only=()), "tasks": {step.task_id: with_satellite}},
+        snapshot="synthetic",
+    )
+
+    report = drift.check_step(segment_drift.SPEC, step, dag)
+
+    assert not report.drift
+    assert set(segment_drift.SATELLITE_FLAGS) <= set(report.argv.production.names())
+    assert not set(segment_drift.SATELLITE_FLAGS) & set(report.argv.dit.names())
+    assert all(
+        "DIT runs no satellite timing offsets" in report.reasons[flag]
+        for flag in segment_drift.SATELLITE_FLAGS
+    )
+    # A satellite flag on another step is not waved through.
+    other = _step("pipe_segment/identity_match_key", "segment_identity")
+    other_mirror = _mirror_task(other)
+    other_dag = composer.dag_from_snapshot(
+        {**_port_visits_raw_dag(production_only=()), "tasks": {other.task_id: {
+            **other_mirror,
+            "arguments": [*other_mirror["arguments"], "--in_sat_positions_table=example.d.t"],
+        }}},
+        snapshot="synthetic",
+    )
+    assert drift.check_step(segment_drift.SPEC, other, other_dag).drift
 
 
 def test_drift_in_port_visits_exits_1(tmp_path, capsys) -> None:

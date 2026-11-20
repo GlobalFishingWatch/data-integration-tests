@@ -330,9 +330,14 @@ Read at composer `origin/main` df5c973c7. The check exits 0: the workflows marke
   Accepted differences, each with its reason in the spec:
   - `--project`: DIT's own project; the SQL steps name it where production leaves it to the CLI's default.
   - `--in_normalized_messages_table`: DIT's pinned staging cohort.
-  - The three satellite-offset inputs of `segment`: the branch is off in DIT by default, because its inputs are date-sharded. Whether to keep `--include-satellite-offsets` at all is an open owner decision.
+  - The four satellite flags of `segment` (three inputs and `--out_sat_offsets_table`): see below.
 
   None of this was confirmed by a run. The check compares argv only.
+
+  **No satellite timing offsets in DIT (owner decision, 2026-11-20).** Production's `segment` task passes the four satellite flags. DIT passes none: its segmenter workflows do not run satellite timing offsets, and `--include-satellite-offsets` is removed. The spec accepts all four for the `segment` step (`--out_sat_offsets_table` was listed as DIT-owned before; DIT sets no value for it).
+  - The reason in the spec: the offsets must be computed from the full message feed, not from a test cohort; the full feed is too large to read on every test run; and pipe-segment cannot read precomputed offsets.
+  - The reason given on 2026-11-19, that the inputs are date-sharded, is true but secondary.
+  - What it means for comparisons, with the figures: [`workflows/pipe_segment/RUN_INSTRUCTIONS.md`](../workflows/pipe_segment/RUN_INSTRUCTIONS.md) § "No satellite timing offsets in DIT".
 
 ### 8e. What the check does not cover
 

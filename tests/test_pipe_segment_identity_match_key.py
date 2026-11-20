@@ -1,203 +1,374 @@
 """Tests for ``workflows/pipe_segment/identity_match_key.py``.
 
-Two parts:
+Three parts:
 
-* The canonical-dataset migration (M3): the ``--snapshot-dest-project`` CLI
-  flag, the ``_PipeSegmentSnapshotFQNs`` dataclass shape, and the
-  ``_snapshot_source`` invocation pattern over
-  ``dit.bq.snapshot_into_experiment``.
+* Source pinning by copy (PIPELINE-4705): the window of the pinned source,
+  new and reused pins, the dry run, and the removed snapshot flags.
+* No satellite timing offsets in DIT (2026-11-20): the removed
+  ``--include-satellite-offsets`` is rejected, no step's argv carries a
+  satellite flag, and no offsets table is written, compared or keyed.
 * The six-step chain a binding runs, shaped like production's segment group
   (2026-11-19): every step's argv on both runners, the labels on every step,
   no Dataflow option on the four BigQuery SQL steps, which table each step
   reads and writes, the compare keys, and the order ``_run_binding`` runs the
   steps in.
 
-No docker, BigQuery or Dataflow call: the runner and the comparison are
-patched. What the pipeline does with these argvs is not tested here.
+No docker, BigQuery or Dataflow call: ``dit.bq``'s pin helpers, the runner
+and the comparison are patched. What the pipeline does with these argvs is
+not tested here.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
-from datetime import date, datetime, timezone
+import logging
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from dit import bq as dit_bq
 from workflows.pipe_segment import identity_match_key as mod
 
+_PINNED_AT = datetime(2026, 11, 19, 10, 15, 0, tzinfo=timezone.utc)
+_STAMP = "20261119t101500z"
+_SOURCE = "world-fishing-827.pipe_ais_test_202408290000_internal.normalized_messages"
+_GE = "world-fishing-827.tech_great_expectations"
 
-# -- CLI flag: --snapshot-dest-project ------------------------------------
+
+# -- parse_args: pin flags, removed flags, the satellite-offsets refusal ----
 
 def _base_args(extra: list[str] | None = None) -> list[str]:
     """Minimal argv passing parse_args' required-arg validation."""
     return [
         "--experiment-id", "test01",
-        "--pin-source-at", "2026-06-03T10:00:00Z",
         "--binding", "before=v5.0.3",
         "--date-range", "2020-01-01,2020-01-01",
     ] + (extra or [])
 
 
-def test_snapshot_dest_project_defaults_to_PROJECT() -> None:
+def test_pin_flags_default_to_a_new_seven_day_pin_under_the_library_cap() -> None:
     args = mod.parse_args(_base_args())
-    assert args.snapshot_dest_project == mod.PROJECT == "world-fishing-827"
+
+    assert args.reuse_pin is None
+    assert args.pin_expiration_days == 7
+    # dit.bq's 1 TB cap per copy.
+    assert args.pin_max_gb == 1000.0
+    assert args.dry_run is False
 
 
-def test_snapshot_dest_project_accepts_cross_org_override() -> None:
-    args = mod.parse_args(_base_args(["--snapshot-dest-project", "gfw-int-pipe-v3"]))
-    assert args.snapshot_dest_project == "gfw-int-pipe-v3"
+@pytest.mark.parametrize("argv, instead", [
+    (["--pin-source-at", "2026-06-03T10:00:00Z"], "copying it at run start.*--reuse-pin"),
+    (["--snapshot-dest-project", "gfw-int-pipe-v3"], "needs no flag"),
+    (["--snapshot-expiration-days", "30"], "use --pin-expiration-days"),
+    # A removed flag without its value gets the same message, not argparse's
+    # "expected one argument".
+    (["--pin-source-at"], "copying it at run start"),
+])
+def test_removed_snapshot_flags_are_rejected_with_what_replaces_them(
+    argv: list[str], instead: str,
+) -> None:
+    with pytest.raises(
+        SystemExit,
+        match=rf"{argv[0]} was removed with snapshot pinning \(PIPELINE-4705\).*{instead}",
+    ):
+        mod.parse_args(_base_args(argv))
 
 
-# -- _PipeSegmentSnapshotFQNs dataclass ------------------------------------
+def test_removed_flags_leave_no_trace_on_the_namespace() -> None:
+    args = mod.parse_args(_base_args())
 
-def test_snapshot_fqns_normalized_only_when_satellite_offsets_off() -> None:
-    """When --include-satellite-offsets is not set, the dataclass exposes
-    only ``normalized_messages``; the satellite-offsets fields default to None."""
-    fqns = mod._PipeSegmentSnapshotFQNs(
-        normalized_messages="world-fishing-827.tech_great_expectations.dit_exp_test01_pipe_segment_normalized_messages",
-    )
-    assert fqns.normalized_messages.endswith("_normalized_messages")
-    assert fqns.sat_positions_stem is None
-    assert fqns.norad is None
+    assert not [name for name in vars(args) if name.startswith("removed_")]
+    assert not {"pin_source_at", "snapshot_dest_project", "snapshot_expiration_days"} & set(
+        vars(args))
 
 
-def test_snapshot_fqns_is_frozen() -> None:
-    """Dataclass is frozen: downstream code can't mutate snapshot pointers
-    out from under callers reading them."""
-    fqns = mod._PipeSegmentSnapshotFQNs(
-        normalized_messages="proj.tech_great_expectations.x",
-    )
+#: The four satellite flags of pipe-segment's ``segment`` command. DIT passes none.
+SATELLITE_FLAGS = {
+    "--in_normalized_sat_offset_messages_table", "--in_norad_to_receiver_table",
+    "--in_sat_positions_table", "--out_sat_offsets_table",
+}
+
+
+@pytest.mark.parametrize("flag", [
+    ["--include-satellite-offsets"],            # bare, as the flag was used
+    ["--include-satellite-offsets", "true"],    # with a value
+    ["--include-satellite-offsets=1"],
+])
+def test_include_satellite_offsets_is_rejected_before_any_cloud_call(flag: list[str]) -> None:
+    """DIT runs no satellite timing offsets. The removed flag is rejected at
+    argument parsing, bare or with a value, with the real reasons."""
+    with (
+        patch.object(mod.dit_bq, "pin_source_into_experiment") as pin,
+        patch.object(mod.subprocess, "run") as run,
+        pytest.raises(SystemExit) as rejected,
+    ):
+        mod.main(_base_args(flag))
+
+    message = str(rejected.value)
+    assert message == mod.SATELLITE_OFFSETS_REMOVED
+    assert message.startswith("--include-satellite-offsets was removed: DIT's segmenter "
+                              "workflows do not run satellite timing offsets")
+    # The real reasons, not only the shard argument.
+    assert "full message feed, not from a test cohort" in message
+    assert "too large to read on every test run" in message
+    assert "no option to read precomputed offsets" in message
+    assert "date-sharded" in message
+    assert "RUN_INSTRUCTIONS.md" in message
+    # Nothing ran: no ref check, no copy.
+    pin.assert_not_called()
+    run.assert_not_called()
+
+
+def test_the_satellite_rejection_comes_before_every_other_argument_check() -> None:
+    """Even with an otherwise invalid invocation, the user learns first that
+    the option is gone."""
+    with pytest.raises(SystemExit, match="--include-satellite-offsets was removed"):
+        mod.parse_args(_base_args(["--include-satellite-offsets", "--reuse-pin", "nonsense"]))
+
+
+def test_the_removed_satellite_flag_is_hidden_and_leaves_no_trace() -> None:
+    args = mod.parse_args(_base_args())
+
+    assert not [name for name in vars(args) if "satellite" in name]
+    with pytest.raises(SystemExit), patch("sys.stdout") as stdout:
+        mod.parse_args(["--help"])
+    shown = "".join(call.args[0] for call in stdout.write.call_args_list)
+    assert "--date-range" in shown
+    assert "satellite" not in shown
+
+
+def test_invalid_reuse_pin_is_rejected() -> None:
+    with pytest.raises(SystemExit, match="--reuse-pin: invalid pin stamp"):
+        mod.parse_args(_base_args(["--reuse-pin", "2026-11-19T10:15:00Z"]))
+
+
+@pytest.mark.parametrize("flag, value, message", [
+    ("--pin-max-gb", "0", "--pin-max-gb must be > 0"),
+    ("--pin-max-gb", "-5", "--pin-max-gb must be > 0"),
+    ("--pin-expiration-days", "0", "--pin-expiration-days must be >= 1"),
+])
+def test_non_positive_pin_knobs_are_rejected(flag: str, value: str, message: str) -> None:
+    with pytest.raises(SystemExit, match=message):
+        mod.parse_args(_base_args([flag, value]))
+
+
+def test_a_date_range_that_ends_before_it_starts_is_rejected() -> None:
+    """Checked at parse time: the copy's window needs start <= end."""
+    with pytest.raises(SystemExit, match="is before start"):
+        mod.parse_args([
+            "--experiment-id", "test01", "--binding", "before=v5.0.3",
+            "--date-range", "2020-01-02,2020-01-01",
+        ])
+
+
+# -- _PinnedSources dataclass -----------------------------------------------
+
+def test_pinned_sources_hold_the_copy_and_no_satellite_input() -> None:
+    """The normalized messages are the only source: DIT runs no satellite
+    timing offsets, so there is no satellite input to pin."""
+    pinned = mod._PinnedSources(normalized_messages=f"{_GE}.copy")
+    assert pinned.normalized_messages == f"{_GE}.copy"
+    assert [field.name for field in dataclasses.fields(pinned)] == ["normalized_messages"]
+
+
+def test_pinned_sources_is_frozen() -> None:
+    """Frozen so nothing changes the pin between pinning and the bindings'
+    runs."""
+    pinned = mod._PinnedSources(normalized_messages="proj.tech_great_expectations.x")
     with pytest.raises(dataclasses.FrozenInstanceError):
-        fqns.normalized_messages = "other"  # type: ignore[misc]
+        pinned.normalized_messages = "other"  # type: ignore[misc]
 
 
-# -- _snapshot_source ------------------------------------------------------
+# -- What is pinned: the window ----------------------------------------------
 
-def _snapshot_args(**overrides: Any) -> argparse.Namespace:
+def _pin_args(**overrides: Any) -> argparse.Namespace:
     base = dict(
         experiment_id="test01",
-        source_normalized_table="world-fishing-827.pipe_ais_test_202408290000_internal.normalized_messages",
-        pin_source_at=datetime(2026, 6, 3, 10, 0, 0, tzinfo=timezone.utc),
-        snapshot_expiration_days=7,
-        snapshot_dest_project="world-fishing-827",
-        include_satellite_offsets=False,
+        source_normalized_table=_SOURCE,
         date_range=(date(2020, 1, 1), date(2020, 1, 1)),
+        pin_expiration_days=7,
+        pin_max_gb=1000.0,
+        reuse_pin=None,
+        dry_run=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
-def test_snapshot_source_no_satellite_offsets_calls_helper_once() -> None:
-    """The base case (default --include-satellite-offsets off) makes exactly
-    one ``snapshot_into_experiment`` call -- for normalized_messages."""
-    args = _snapshot_args()
-    expected_normalized = (
-        "world-fishing-827.tech_great_expectations."
-        "dit_exp_test01_pipe_segment_normalized_messages"
+@pytest.mark.parametrize("date_range, window_end", [
+    ((date(2020, 1, 1), date(2020, 1, 1)), date(2020, 1, 2)),
+    ((date(2020, 1, 1), date(2020, 1, 31)), date(2020, 2, 1)),
+    ((date(2020, 12, 30), date(2021, 1, 2)), date(2021, 1, 3)),
+])
+def test_the_window_is_the_inclusive_date_range_with_no_lookback(
+    date_range: tuple[date, date], window_end: date,
+) -> None:
+    """``segment`` reads ``DATE(timestamp) BETWEEN start AND end`` and nothing
+    before it (pipe-segment v5.0.3): the half-open window ends a day later."""
+    window = mod._normalized_window(date_range)
+
+    assert window == dit_bq.SourceWindow(
+        column="timestamp", start=date_range[0], end=window_end,
     )
-    with patch.object(
-        mod.dit_bq, "snapshot_into_experiment", return_value=expected_normalized
-    ) as mock_helper:
-        fqns = mod._snapshot_source(args)
-
-    assert mock_helper.call_count == 1
-    call = mock_helper.call_args
-    assert call.args == (args.source_normalized_table,)
-    assert call.kwargs["experiment_id"] == "test01"
-    assert call.kwargs["role"] == "pipe_segment"
-    assert call.kwargs["expiration_days"] == 7
-    assert call.kwargs["as_of"] == args.pin_source_at
-    assert call.kwargs["project"] == "world-fishing-827"
-
-    assert fqns.normalized_messages == expected_normalized
-    assert fqns.sat_positions_stem is None
-    assert fqns.norad is None
-
-
-def test_snapshot_source_with_satellite_offsets_calls_helper_for_each_source() -> None:
-    """With ``--include-satellite-offsets``: one call for normalized_messages,
-    N calls for satellite_positions shards (one per date in date_range),
-    and one call for norad_to_receiver."""
-    args = _snapshot_args(
-        include_satellite_offsets=True,
-        date_range=(date(2020, 1, 1), date(2020, 1, 3)),  # 3 days
-    )
-    # The helper's return value is the dest FQN; mock returns reflect the
-    # canonical naming so the stem computation has something predictable
-    # to strip from.
-    def fake_return(source_table: str, *, experiment_id: str, role: str, **_: Any) -> str:
-        basename = source_table.rsplit(".", 1)[-1]
-        return f"world-fishing-827.tech_great_expectations.dit_exp_{experiment_id}_{role}_{basename}"
-
-    with patch.object(
-        mod.dit_bq, "snapshot_into_experiment", side_effect=fake_return,
-    ) as mock_helper:
-        fqns = mod._snapshot_source(args)
-
-    # 1 normalized + 3 satellite-position shards + 1 norad = 5 calls.
-    assert mock_helper.call_count == 5
-
-    assert fqns.normalized_messages.endswith("_normalized_messages")
-    assert fqns.norad is not None and fqns.norad.endswith("_norad_to_receiver_v20230510")
-    assert fqns.sat_positions_stem is not None
-
-
-def test_snapshot_source_sat_positions_stem_strips_date_suffix() -> None:
-    """The satellite-positions stem must equal a per-shard dest FQN with
-    the trailing ``<YYYYMMDD>`` stripped; pipe-segment appends the date at
-    read time so the stem must end exactly where the date begins. Verify
-    by capturing every dest FQN ``_snapshot_source`` produced and asserting
-    that re-appending each shard's date to the stem reproduces a
-    captured dest FQN — that's the load-bearing guarantee."""
-    args = _snapshot_args(
-        include_satellite_offsets=True,
-        date_range=(date(2020, 1, 1), date(2020, 1, 3)),  # 3 shards
+    assert window.predicate() == (
+        f"DATE(timestamp) >= '{date_range[0].isoformat()}' "
+        f"AND DATE(timestamp) < '{window_end.isoformat()}'"
     )
 
-    produced: list[str] = []
 
-    def fake_return(source_table: str, *, experiment_id: str, role: str, **_: Any) -> str:
-        basename = source_table.rsplit(".", 1)[-1]
-        dest = f"world-fishing-827.tech_great_expectations.dit_exp_{experiment_id}_{role}_{basename}"
-        produced.append(dest)
-        return dest
+def test_the_window_matches_the_date_range_segment_is_given() -> None:
+    """The copy holds exactly the days ``segment`` is asked to read."""
+    args = _run_args("dataflow", "--date-range", "2020-03-01,2020-03-05")
+    window = mod._normalized_window(args.date_range)
+    segment = mod._step_argvs(
+        args, binding_name="before", suffix=SFX, worker_image=None,
+        pinned=mod._PinnedSources(normalized_messages="p.d.normalized"),
+    )["segment"]
 
-    with patch.object(
-        mod.dit_bq, "snapshot_into_experiment", side_effect=fake_return,
+    start, end = _value(segment, "--date_range").split(",")
+    assert date.fromisoformat(start) == window.start
+    assert date.fromisoformat(end) + timedelta(days=1) == window.end
+
+
+# -- _pin_sources / _pin: a new copy, reuse, dry run -------------------------
+
+def test_pin_sources_copies_the_normalized_messages_over_the_window() -> None:
+    args = _pin_args(
+        date_range=(date(2020, 1, 1), date(2020, 1, 3)), pin_max_gb=250.0,
+        pin_expiration_days=3,
+    )
+    with patch.object(mod.dit_bq, "pin_source_into_experiment",
+                      return_value=f"{_GE}.copy") as pin:
+        pinned = mod._pin_sources(args, _PINNED_AT, reuse=False)
+
+    pin.assert_called_once()
+    call = pin.call_args
+    assert call.args == (_SOURCE,)
+    assert call.kwargs == dict(
+        experiment_id="test01",
+        role="pipe_segment",
+        pinned_at=_PINNED_AT,
+        window=dit_bq.SourceWindow("timestamp", date(2020, 1, 1), date(2020, 1, 4)),
+        expiration_days=3,
+        max_bytes=250 * 10**9,
+        dry_run=False,
+        project="world-fishing-827",
+    )
+    assert pinned == mod._PinnedSources(normalized_messages=f"{_GE}.copy")
+
+
+def test_pin_sources_dry_run_reaches_the_helper() -> None:
+    """--dry-run must not create the copy: it can process up to the cap."""
+    with patch.object(mod.dit_bq, "pin_source_into_experiment") as pin:
+        mod._pin_sources(_pin_args(dry_run=True), _PINNED_AT, reuse=False)
+
+    assert pin.call_args.kwargs["dry_run"] is True
+
+
+def test_pin_sources_reuse_only_checks_the_recomputed_name() -> None:
+    with (
+        patch.object(mod.dit_bq, "pin_source_into_experiment") as pin,
+        patch.object(
+            mod.dit_bq, "require_pinned_source", side_effect=lambda fqn, **kw: fqn,
+        ) as require,
     ):
-        fqns = mod._snapshot_source(args)
+        pinned = mod._pin_sources(_pin_args(), _PINNED_AT, reuse=True)
 
-    assert fqns.sat_positions_stem is not None
-    # The stem must end with the PROD_SAT_POS_STEM (trailing underscore).
-    assert fqns.sat_positions_stem.endswith(f"_{mod.PROD_SAT_POS_STEM}")
-    # Sanity: the shard-suffix helper still produces what we expect.
-    assert mod._shard_suffix(date(2020, 1, 1)) == "20200101"
-    # Load-bearing: re-appending each shard's date to the stem reproduces a
-    # dest FQN that was actually created. This is what pipe-segment will do
-    # at read time, so the stem MUST round-trip through this construction.
-    for d in (date(2020, 1, 1), date(2020, 1, 2), date(2020, 1, 3)):
-        reconstructed_shard = f"{fqns.sat_positions_stem}{mod._shard_suffix(d)}"
-        assert reconstructed_shard in produced, (
-            f"shard reconstruction failed for {d}: "
-            f"{reconstructed_shard!r} not in produced dests {produced!r}"
-        )
+    pin.assert_not_called()
+    require.assert_called_once()
+    assert pinned.normalized_messages == (
+        f"{_GE}.dit_exp_test01_pipe_segment_normalized_messages_20200101_20200102_{_STAMP}"
+    )
 
 
-def test_snapshot_source_threads_snapshot_dest_project() -> None:
-    """When --snapshot-dest-project is overridden (the cross-org dodge path),
-    every snapshot_into_experiment call must receive that project."""
-    args = _snapshot_args(snapshot_dest_project="gfw-int-pipe-v3")
-    with patch.object(
-        mod.dit_bq, "snapshot_into_experiment", return_value="stub",
-    ) as mock_helper:
-        mod._snapshot_source(args)
+def test_reuse_fails_before_any_binding_when_the_copy_is_missing() -> None:
+    with (
+        patch.object(
+            mod.dit_bq, "require_pinned_source",
+            side_effect=ValueError("pinned copy x does not exist"),
+        ),
+        pytest.raises(ValueError, match="does not exist"),
+    ):
+        mod._pin_sources(_pin_args(), _PINNED_AT, reuse=True)
 
-    for call in mock_helper.call_args_list:
-        assert call.kwargs["project"] == "gfw-int-pipe-v3"
+
+def test_pin_takes_the_stamp_from_reuse_pin_or_from_now(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    pinned = mod._PinnedSources(normalized_messages="p.d.copy")
+    with patch.object(mod, "_pin_sources", return_value=pinned) as pin_sources:
+        assert mod._pin(_pin_args(reuse_pin=_STAMP)) == pinned
+        assert mod._pin(_pin_args()) == pinned
+
+    reused, fresh = pin_sources.call_args_list
+    assert reused.args[1] == _PINNED_AT
+    assert reused.kwargs["reuse"] is True
+    assert fresh.kwargs["reuse"] is False
+    # A fresh stamp is now, in whole seconds: the stamp's precision.
+    assert fresh.args[1].tzinfo is not None
+    assert fresh.args[1].microsecond == 0
+    assert abs(datetime.now(timezone.utc) - fresh.args[1]) < timedelta(minutes=1)
+    # Only a run that made a new copy tells how to reuse it.
+    assert [m for m in caplog.messages if "pass --reuse-pin" in m] == [
+        f"to rerun on this copy, pass --reuse-pin {dit_bq.format_pin_stamp(fresh.args[1])}"
+    ]
+
+
+def _main(*extra: str) -> dict[str, Any]:
+    """Run ``main`` for two bindings with every cloud, git and docker call
+    patched. Returns the copy helper's mock, the pinned sources each binding
+    got, and the exit code."""
+    seen: list[mod._PinnedSources] = []
+    with (
+        patch.object(mod, "_verify_refs"),
+        patch.object(mod, "_verify_distinct_gpsdio_pins"),
+        patch.object(mod.dit_bq, "pin_source_into_experiment",
+                     return_value=f"{_GE}.copy") as pin,
+        patch.object(mod.dit_bq, "require_pinned_source",
+                     side_effect=lambda fqn, **kw: fqn) as require,
+        patch.object(mod, "_run_binding",
+                     side_effect=lambda **kw: seen.append(kw["pinned"]) or 0),
+        patch.object(mod, "_run_diffs", return_value={}) as diffs,
+    ):
+        rc = mod.main([
+            "--experiment-id", "test01",
+            "--binding", "before=v5.0.3", "--binding", "after=exp-branch",
+            "--date-range", "2020-01-01,2020-01-01",
+            *extra,
+        ])
+    return dict(rc=rc, pin=pin, require=require, seen=seen, diffs=diffs)
+
+
+def test_main_pins_once_and_every_binding_reads_the_same_copy() -> None:
+    result = _main()
+
+    assert result["rc"] == 0
+    result["pin"].assert_called_once()
+    assert result["pin"].call_args.kwargs["dry_run"] is False
+    assert result["seen"] == [mod._PinnedSources(normalized_messages=f"{_GE}.copy")] * 2
+
+
+def test_main_reuse_pin_copies_nothing_and_reads_the_earlier_copy() -> None:
+    result = _main("--reuse-pin", _STAMP)
+
+    result["pin"].assert_not_called()
+    result["require"].assert_called_once()
+    earlier = f"{_GE}.dit_exp_test01_pipe_segment_normalized_messages_20200101_20200102_{_STAMP}"
+    assert result["seen"] == [mod._PinnedSources(normalized_messages=earlier)] * 2
+
+
+def test_main_dry_run_only_dry_runs_the_copy_and_skips_the_diffs() -> None:
+    result = _main("--dry-run", "--pin-max-gb", "5")
+
+    assert result["rc"] == 0
+    assert result["pin"].call_args.kwargs["dry_run"] is True
+    assert result["pin"].call_args.kwargs["max_bytes"] == 5 * 10**9
+    result["diffs"].assert_not_called()
 
 
 # -- The six steps: what one binding runs ----------------------------------
@@ -318,7 +489,6 @@ def _expected(runner: str, *, setup_file: bool = False) -> dict[str, list[str]]:
 def _run_args(runner: str = "dataflow", *extra: str) -> argparse.Namespace:
     return mod.parse_args([
         "--experiment-id", "exp",
-        "--pin-source-at", "2026-06-03T10:00:00Z",
         "--binding", "before=v5.0.3",
         "--date-range", "2020-01-01,2020-01-02",
         "--dest-dataset", "ds",
@@ -333,7 +503,7 @@ def _argvs(runner: str = "dataflow", *extra: str) -> dict[str, list[str]]:
         _run_args(runner, *extra),
         binding_name="before",
         suffix=SFX,
-        snapshot_fqns=mod._PipeSegmentSnapshotFQNs(normalized_messages="p.d.normalized"),
+        pinned=mod._PinnedSources(normalized_messages="p.d.normalized"),
         worker_image="registry.example.invalid/pipe-segment:v0",
     )
 
@@ -462,22 +632,40 @@ def test_skip_downstream_runs_segment_only() -> None:
     assert _argvs("dataflow", "--skip-downstream")["segment"] == _expected("dataflow")["segment"]
 
 
-def test_satellite_offsets_stay_off_by_default_and_keep_their_flags_when_asked() -> None:
-    satellite = {"--in_normalized_sat_offset_messages_table", "--in_norad_to_receiver_table",
-                 "--in_sat_positions_table", "--out_sat_offsets_table"}
-    assert _run_args().include_satellite_offsets is False
-    assert not _flag_names(_argvs()["segment"]) & satellite
+# -- No satellite timing offsets in DIT --------------------------------------
 
-    asked = mod._step_argvs(
-        _run_args("dataflow", "--include-satellite-offsets"),
-        binding_name="before", suffix=SFX, worker_image=None,
-        snapshot_fqns=mod._PipeSegmentSnapshotFQNs(
-            normalized_messages="p.d.normalized", sat_positions_stem="p.d.sat_", norad="p.d.norad",
-        ),
-    )
-    assert satellite <= _flag_names(asked["segment"])
-    # The option reaches no other step.
-    assert not any(_flag_names(asked[step]) & satellite for step in mod.STEPS[1:])
+@pytest.mark.parametrize("runner", RUNNERS)
+@pytest.mark.parametrize("extra", [
+    (), ("--build-from-source",), ("--skip-downstream",),
+    ("--ssvid-filter-query", '"1","2"'), ("--max-num-workers", "7", "--disk-size-gb", "100"),
+])
+def test_no_emitted_argv_contains_a_satellite_flag(runner: str, extra: tuple[str, ...]) -> None:
+    """``segment`` runs its offsets branch only when it gets all three
+    satellite inputs. DIT passes none of them, and no offsets output table, on
+    any runner and with any option."""
+    for step, argv in _argvs(runner, *extra).items():
+        assert not _flag_names(argv) & SATELLITE_FLAGS, step
+        assert not [token for token in argv if "sat_" in token or "norad" in token], step
+
+
+def test_the_workflow_has_no_way_to_ask_for_satellite_offsets() -> None:
+    """No namespace attribute, no builder argument and no pinned input left
+    that could switch the branch on."""
+    import inspect
+
+    assert "include_satellite_offsets" not in vars(_run_args())
+    assert "include_satellite_offsets" not in inspect.signature(mod._segment_args).parameters
+    assert not [name for name in vars(mod) if name.startswith(("PROD_", "SAT_OFFSET"))]
+
+
+def test_the_offsets_table_is_not_written_compared_or_keyed() -> None:
+    tables = [*mod.SEGMENT_OUTPUT_TABLES, *mod.DOWNSTREAM_OUTPUT_TABLES]
+
+    assert "satellite_timing_offsets" not in mod.COMPARE_KEYS
+    assert "satellite_timing_offsets" not in tables
+    # Every compare key belongs to a table a binding writes, and back.
+    assert set(mod.COMPARE_KEYS) == set(tables)
+    assert not [table for table, *_ in _diffed() if "satellite" in table]
 
 
 # -- Dataflow job names ------------------------------------------------------
@@ -524,7 +712,7 @@ def _run_binding(args: argparse.Namespace, *, rc_by_step: dict[str, int] | None 
     ):
         rc = mod._run_binding(
             name="before", ref="v5.0.3", args=args, suffix=SFX,
-            snapshot_fqns=mod._PipeSegmentSnapshotFQNs(normalized_messages="p.d.normalized"),
+            pinned=mod._PinnedSources(normalized_messages="p.d.normalized"),
         )
     return rc, calls
 

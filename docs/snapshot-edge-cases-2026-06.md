@@ -11,7 +11,13 @@ Empirical audit of `dit.bq.snapshot_table` / `snapshot_dataset` against two edge
 **Update 2026-11-19 (PIPELINE-4705).** `pipe_events/cross_version_fishing.py` now pins by copying too, so the statement above no longer applies to it. Its sources show the view case of this audit in practice: three of its seven sources are views on the staging cohort (`identity_core`, `identity_authorization`, `event_regions`), so a snapshot run would have failed on them even with the permission.
 - A view cannot be copied with `LIKE` either: BigQuery answers `Cannot CREATE TABLE LIKE ..., which is VIEW` (dry run, 2026-11-19).
 - `dit.bq.pin_source_into_experiment` reads the source's type and copies a view with a plain `CREATE TABLE … AS SELECT`. The copy is a table of the rows the view returned at copy time, which is the pin a snapshot of a view could never give.
-- Still on snapshots, and still blocked: `pipe_segment/identity_match_key.py` and `pipe_gaps/outage_recovery.py` without `--no-snapshot`.
+
+**Update 2026-11-19 (PIPELINE-4705).** `pipe_gaps/outage_recovery.py` and `pipe_segment/identity_match_key.py` now pin by copying too. What this changes in the sections below:
+- **§ 4, `outage_recovery.py`.** `--snapshot-dest-project` is removed. A production VMS source is read across organisations by the copy, and the copy lands in `world-fishing-827`. `--pin-at` is removed as well: the copy is taken at run start.
+- **§ 4, `identity_match_key.py`.** The latent bug is closed by removing `--include-satellite-offsets` and the code behind it: dit runs no satellite timing offsets (owner decision, 2026-11-20). The main reason is not the cross-org snapshot this audit found. The offsets must be computed from the full message feed, which is too large to read on every test run, and pipe-segment cannot read precomputed offsets. See `workflows/pipe_segment/RUN_INSTRUCTIONS.md` § "No satellite timing offsets in DIT". `--snapshot-dest-project` is removed here too.
+- **§ 5, "Tactical: add `--snapshot-dest-project` to pipe-segment"** (done in June) is undone by the above.
+
+With these two changes no workflow pins with snapshots any more, and view sources are pinned by a plain copy.
 
 ## TL;DR
 

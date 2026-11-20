@@ -6,6 +6,71 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-20: no satellite timing offsets in DIT
+
+**DIT's segmenter workflows do not run pipe-segment's satellite timing offsets** (owner decision, 2026-11-20). Production's `segment` task works out, per receiver and hour, how far a satellite's clock is off, and drops the messages of the hours above the threshold. A DIT `segment` run does neither.
+
+#### Removed
+- **`workflows/pipe_segment/identity_match_key.py --include-satellite-offsets`, and everything behind it.** This breaks old invocations that pass the flag.
+  - The flag is rejected at argument parsing, bare or with a value, before any cloud call. The message gives the reasons below.
+  - Gone from the workflow: the code that passed the three satellite inputs and `--out_sat_offsets_table` to `segment`, the `satellite_timing_offsets` output table and its compare key. No step's argv carries a satellite flag, on any runner.
+  - Runs without the flag are unchanged: the option was off by default, and it never worked.
+- **Why** (measured or read on 2026-11-20):
+  - **The offsets must be computed from the full message feed, not from a test cohort.** The staging cohort's own offsets table (`pipe_ais_test_202408290000_published.satellite_timing_offsets`) was computed from the full satellite feed when the cohort was built; its table description names that feed as the source. Computed from the cohort's 142 vessels, the offsets come out different and noisy: for January 2020, 990 receiver-hours above the segmenter's 30 s threshold against 183 in the cohort's offsets table, with 39 in common. A run on such offsets would drop the wrong messages.
+  - **The full feed is too large to read on every test run:** the 2020 messages are about 4.1 TB.
+  - **pipe-segment has no option to read precomputed offsets.** `segment` computes them from three inputs and uses them in the same run.
+  - Also true, and secondary: the satellite positions are date-sharded tables in another organisation (366 tables and 139 GB for 2020), and the offsets query reads its message source through a table wildcard that does not match a partitioned table.
+- **What it means for comparisons:**
+  - On the 2020 staging cohort, DIT's `messages_segmented` keeps the messages that the correction would drop. The cohort's offsets table lists 1,361 such receiver-hours in 2020, on 27 receivers and 173 days. For those hours, DIT's staging output is not comparable with production's historical output.
+  - Comparisons between two DIT runs (modes, or base against head) are not affected: both sides run without the correction.
+  - The correction only ever applied to data that carries satellite receiver IDs. The current feed has none (since 2026-04-22), so production computes no offsets for current data either.
+- **What would change this:** an option in pipe-segment to read an offsets table instead of computing one. DIT could then pass the cohort's existing offsets table. That is the path, not planned work.
+
+#### Changed
+- **pipe-segment drift spec: production's four satellite flags are accepted differences of the `segment` step, with the reason above** (`workflows/pipe_segment/composer_drift.py`). `--out_sat_offsets_table` was listed as a DIT-owned flag and is now accepted with the other three, since DIT sets no value for it. pipe-segment still reports in sync.
+- **Docs: "DIT's `messages_segmented` keeps messages production drops when a satellite's clock is off" is now qualified.** It holds for data that carries satellite receiver IDs, so for the 2020 staging cohort against production's historical output, and not for the current feed.
+
+### 2026-11-19: source pinning by copy for pipe-gaps outage recovery and pipe-segment
+
+`workflows/pipe_gaps/outage_recovery.py` and `workflows/pipe_segment/identity_match_key.py` now pin their sources by copying them at run start, as `port_visits/cross_version_ais.py` has since 2026-10-22 ([PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705)). Both failed at their first step before: they pinned with BigQuery snapshots, which BigQuery refuses across organisations and which no DIT identity may create with an expiration in `tech_great_expectations`. **Nothing was run.** The copy statements were checked with BigQuery dry runs on the staging sources.
+
+#### Removed
+- **`outage_recovery.py`: the snapshot flags.** This breaks old invocations. Each flag stops the run at argument parsing, with a message that names what replaces it.
+  - `--pin-at`: drop it. The sources are pinned at run start; a copy cannot be taken at a past time, and no workflow needs a pin in the past (owner decision, 2026-10-22).
+  - `--snapshot-dest-project`: drop it. Copies always land in `world-fishing-827.tech_great_expectations`. A copy only reads its source, so a source in another organisation (production VMS) needs no flag.
+  - `--snapshot-expiration-days`: use `--pin-expiration-days`.
+  - `--skip-snapshots`: use `--reuse-pin <stamp>`.
+  - `--no-snapshot`: use `--no-pin`. Same meaning: every job reads the live sources.
+- **`identity_match_key.py`: `--pin-source-at` (was required), `--snapshot-dest-project` and `--snapshot-expiration-days`.** Same handling: each is rejected with its replacement (drop the first two; `--pin-expiration-days` for the third).
+- **`identity_match_key.py`: the code that snapshotted the satellite-offset inputs.** The option it served, `--include-satellite-offsets`, is removed altogether; see 2026-11-20 above.
+
+#### Changed
+- **`outage_recovery.py` copies both sources at run start** (`dit.bq.pin_source_into_experiment`).
+  - **Messages:** `[--start minus the lookback, --end]`. pipe-gaps filters messages on `DATE(timestamp)` and starts `ceil(--n-hours-before / 24)` days before a run's start date, one day with the default 12 hours. The window covers all three stages and the oracle. Default run: 2019-12-31 to 2020-12-31, 4.41 GB.
+  - **Segments:** the whole table. pipe-gaps reads it without a date filter. Default run: 4.1 MB.
+  - Both read from pipe-gaps v0.10.0, the default worker image.
+  - **New flags:** `--reuse-pin <stamp>` (reuse an earlier run's copies; fails if one is missing), `--no-pin`, `--pin-max-gb` (default 1000, per copy) and `--pin-expiration-days` (default 7).
+  - **New `--dry-run`:** dry-runs the copies, reports each one's bytes against the cap and stops. It creates nothing, runs no pipeline and no comparison, and leaves the pipe-gaps checkout alone (no auto-snapshot, no image build).
+  - **`--synthetic-outage`** works as before, on top of the copy: the filtered view is derived over the pinned messages; stages 1 and 2 read the view, stage 3 and the oracle the unfiltered copy. The view's name now also holds the copy's name, so a new pin gets a new view.
+  - **`--skip-pipelines` pins nothing.** A compare-only run reads no source. Before, it pinned anyway; a copy costs a query, so it no longer does.
+  - **Sources must be tables.** A view cannot be copied with `CREATE TABLE ... LIKE`.
+- **`outage_recovery.py` run cache: the key holds the copies' names instead of `pin_at` and `no_snapshot`.** The names (`pinned_messages`, `pinned_segments`) identify the tables the jobs read: each holds the experiment id, the source's table name, the window and the pin stamp.
+  - A `--reuse-pin` rerun recomputes the same names and hits the cache. A new pin has a new stamp and misses.
+  - With `--no-pin` both are empty, so live reads of the same sources now share rows across days. Before, the unused `pin_at` default changed daily and split them. The flag is for sources that do not change; pass `--no-cache` when unsure.
+  - The oracle's key is still independent of the outage dates, the recovery buffer and `--synthetic-outage`.
+  - **Every earlier row of this workflow misses once**, whatever the key holds: the key also contains the workflow file's sha1, which this change moved.
+- **`identity_match_key.py` copies `normalized_messages` at run start**, over the run's `--date-range` (inclusive). pipe-segment v5.0.3's `segment` step reads the source by date between the two ends, with no lookback, and no other step reads it. One day of the staging table is 10.7 MB, January 2020 is 363 MB, all of 2020 is 3.78 GB.
+  - **New flags:** `--reuse-pin <stamp>`, `--pin-max-gb` (default 1000) and `--pin-expiration-days` (default 7). `--dry-run` now dry-runs the copy and creates nothing; it still sets up the worktrees.
+  - `--date-range` with an end before its start is now rejected at argument parsing.
+  - The source must be one table partitioned on `timestamp`. The workflow does not check the partition column.
+  - The six steps and every emitted argv are unchanged, and the drift check still reports pipe-segment in sync.
+
+#### Not verified
+- **No copy was created and no pipeline ran.** The workflows' own copy statements were accepted by BigQuery dry runs against the default staging sources (byte figures above), as the operator's account. The service account `dq-monitoring@` is denied `bigquery.tables.create` on `tech_great_expectations`, at the dry run already. `automated-testing@`, which Cloud Build runs as, has that permission (see the working agreement on `tech_great_expectations` in `CLAUDE.md`); these two workflows have not been tried under it.
+- **That pipe-gaps and pipe-segment read the copies as they read the sources** is inferred from their SQL and from `LIKE` keeping partitioning and clustering. The staging messages table requires a partition filter, and so will its copy. A dry run showed that BigQuery accepts the `--synthetic-outage` view on such a table and that a read through its filter still prunes partitions.
+- **`outage_recovery.py` cannot run in-process from a laptop venv that holds a newer pipe-gaps** than the v0.10.0 the workflow builds its config for. Use Cloud Build, or a venv installed at v0.10.0.
+- **pipe-segment on Dataflow as the test service account** is still expected to fail when Beam creates its temp dataset: pipe-segment has no option for it and DIT has no overlay image. Pinning no longer stands in the way.
+
 ### 2026-11-19
 
 Port visits now runs what production runs: pipe-anchorages v5.0.1 and its CLI. Production's `core.ais.v5` DAG has run v5.0.1 since 2026-11-04 (v5.0.0 from 2026-10-26); DIT's default was still v4.6.4.
@@ -61,7 +126,7 @@ Port visits now runs what production runs: pipe-anchorages v5.0.1 and its CLI. P
   - **`--max-num-workers`, `--worker-machine-type`, `--disk-size-gb`** apply to the two Beam steps. `segment_info` no longer has a cap of its own (was 20, never used by the command).
   - **No `--setup_file` on published-image runs**, as in production: the image has no source tree. It is still passed with `--build-from-source` on Dataflow, where the worktree is mounted. **No `--experiments`** on any step: production passes none.
   - **`segment_identity` gets a Dataflow job name**, `dit-pipe-segment-segment-identity-<experiment>-<binding>`, like `segment`. On Dataflow a `--binding` name may now be at most 27 characters; a longer one is rejected when the arguments are parsed.
-  - **`--skip-downstream`** now skips five steps instead of two. **`--include-satellite-offsets`** is unchanged and still off by default.
+  - **`--skip-downstream`** now skips five steps instead of two. **`--include-satellite-offsets`** was left unchanged by this entry; the 2026-11-20 block removes it.
   - **Not production's state:** a binding starts from empty tables, so `segment` has no fragment history and `segment_vessel_daily` sees only the run's days in its 30-day window. Fair for an A/B between bindings; not comparable with production's tables.
 - **The pipe-segment drift spec covers all six tasks and is marked in sync** (`workflows/pipe_segment/composer_drift.py`). Drift in pipe-segment now fails the check (exit 1), as for port visits. Accepted differences, each with a reason in the report: `--project`, the staging source table, and production's three satellite-offset inputs, which DIT leaves out by default because they are date-sharded.
 - **Beam pin for pipe-segment: 2.56.0 → 2.71.0** (`PIPE_SEGMENT_BEAM_VERSION` in the `Makefile`), the version v5.0.3 pins. 2.56.0 was v5.0.2's. It applies to `make install-pipe-segment*` and to `make dit-cloud PIPELINE=pipe-segment`. The old constraint contradicts v5.0.3's `apache-beam[gcp]~=2.71`, so those installs are expected to have failed to resolve.
@@ -87,7 +152,7 @@ Port visits now runs what production runs: pipe-anchorages v5.0.1 and its CLI. P
 - No production-baseline run has been made since production moved to v5.0.1. The output pin's handling of the table's new partition-filter requirement is fixed separately, in #89.
 - No Dataflow job has run on the v5.0.1 overlay image yet. The image was self-checked when built (Beam 2.76.0, patch applied to all three reads, console script). The last staging run on the v5 CLI was on 2026-10-22, at pipe-anchorages b36aed6; the CLI, the SQL and the schemas did not change between that commit and v5.0.1.
 - **pipe-segment: no step has run with the new command lines.** They were checked against pipe-segment's argument definitions and queries at v5.0.3 and against composer's snapshot, by reading. Not checked: the published image itself, the three new steps on real tables, and that the new compare keys are unique in practice.
-- **pipe-segment still cannot run end to end as it is.** Its source pinning uses snapshots, which no DIT identity can create in `tech_great_expectations` (PIPELINE-4705). On Dataflow as the test service account, Beam's temp dataset is expected to be denied; pipe-segment has no option for it and DIT has no overlay image for it yet.
+- **pipe-segment still cannot run end to end as it is.** Its source pinning used snapshots, which no DIT identity can create in `tech_great_expectations`; it pins by copy since the same day (PIPELINE-4705, see the block above). On Dataflow as the test service account, Beam's temp dataset is expected to be denied; pipe-segment has no option for it and DIT has no overlay image for it yet.
 - **`make install-pipe-segment` with the corrected Beam pin** was not run.
 - **`cross_version_fishing.py` on pinned copies: no copy was created and no binding was run.** Checked with BigQuery dry runs only: BigQuery accepts all seven copy statements on the staging sources, the statement of a windowed view copy, and refuses a copy above the cap. Not checked: that the copies get created with the expected options, that pipe-events reads them (a copy of `research_messages` requires a partition filter like its source; the copies of the three views are plain tables), that `automated-testing@` can create them (the dry runs ran as the operator), and the output of a run. The windows come from reading pipe-events' SQL, not from a query log.
 
