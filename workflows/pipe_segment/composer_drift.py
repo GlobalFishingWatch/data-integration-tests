@@ -1,8 +1,10 @@
-"""Drift spec of the pipe-segment workflow (PIPELINE-4700).
+"""Drift specs of the pipe-segment workflows (PIPELINE-4700).
 
-Read-only: the spec ``workflows/composer_drift.py`` runs for
-``pipe_segment/identity_match_key.py`` against the segment tasks of the AIS v3
-DAG. See :mod:`dit.drift` for the check itself.
+Read-only: the specs ``workflows/composer_drift.py`` runs for
+``pipe_segment/identity_match_key.py`` and ``pipe_segment/ais.py`` against the
+segment tasks of the AIS v3 DAG. See :mod:`dit.drift` for the check itself.
+Most of this docstring is about the first; the second, the mode-equivalence
+workflow of the ``segment`` step, has its own section at the end of the file.
 
 **Why the v3 DAG.** Production's AIS v5 DAG has no segmenter: it waits for the
 v3 DAG's segment group and reads that group's tables. So the AIS segmenter
@@ -40,6 +42,7 @@ from collections.abc import Mapping
 from datetime import date
 
 from dit import drift
+from workflows.pipe_segment import ais
 from workflows.pipe_segment import identity_match_key as imk
 
 #: Binding name used for the offline tokens (it only reaches DIT-owned flags).
@@ -174,5 +177,93 @@ SPEC = drift.WorkflowSpec(
     note=_NOTE,
 )
 
+
+# --------------------------------------------------------------------------
+# pipe_segment/ais.py: mode equivalence of the segment step
+# --------------------------------------------------------------------------
+#
+# The workflow runs one production task, ``segment.segment``, in several
+# shapes. Its argv comes from the same builder as identity_match_key's
+# ``segment`` step, so the two specs drift together. Two steps mirror the one
+# task: a full-history job, which is what production runs, and an incremental
+# job, whose three extra flags are DIT's alone today.
+
+#: Why the incremental segmenter's flags are in DIT's argv and not in
+#: production's. Production's task passes none of them (rendered snapshot
+#: core_ais_v3, read 2026-11-20).
+_INCREMENTAL_REASON = (
+    "DIT only: production does not run pipe-segment's incremental segmenter "
+    "(opt-in since v5.1.0); DIT runs it to compare it with full history"
+)
+_INCREMENTAL_TABLE_REASON = (
+    "DIT only, with --incremental: the variant's own table, where the state of "
+    "the day before the date range is read"
+)
+
+#: Accepted for the incremental job only, on top of the ``segment`` step's.
+INCREMENTAL_ACCEPTED_DIFFERENCES = {
+    **SEGMENT_ACCEPTED_DIFFERENCES,
+    "--incremental": _INCREMENTAL_REASON,
+    "--in_segments_table": _INCREMENTAL_TABLE_REASON,
+    "--in_fragments_table": _INCREMENTAL_TABLE_REASON,
+}
+
+#: The mode-equivalence steps: name, the workflow's ``--modes`` entry that
+#: yields one job over the snapshot run's dates, and what may differ.
+_MODE_EQUIVALENCE_STEPS = (
+    ("segment", f"{ais.MODE_BF}:{ais.SEGMENTER_FULL_HISTORY}", SEGMENT_ACCEPTED_DIFFERENCES, ""),
+    (
+        f"segment[{ais.SEGMENTER_INCREMENTAL}]",
+        f"{ais.MODE_BF}:{ais.SEGMENTER_INCREMENTAL}",
+        INCREMENTAL_ACCEPTED_DIFFERENCES,
+        "needs an image of pipe-segment v5.1.0 or later, passed by flag; the "
+        "version compared here is the default image's",
+    ),
+)
+
+
+def mode_equivalence_tokens(variant: str, placeholders: Mapping[str, date]) -> list[str]:
+    """What ``ais.py`` runs for one job of ``variant`` over the snapshot run's
+    inclusive dates, on a default Dataflow run. The pin, the run id and the
+    commit only reach DIT-owned flags."""
+    start, end = placeholders["start_date"], placeholders["end_date"]
+    args = ais.parse_args([
+        "--experiment-id", "composer-drift",
+        "--start", start.isoformat(), "--end", end.isoformat(),
+        "--tail-days", "0", "--modes", variant,
+    ])
+    args.run_id = args.commit_sha = _BINDING
+    (job,) = ais.plan_jobs(args.variants[0], start, end, args.tail_days)
+    argv = ais.segment_argv(
+        args, job, suffix=f"{args.experiment_id}_{_BINDING}",
+        pinned=imk._PinnedSources(normalized_messages=args.source_normalized_table),
+    )
+    return [imk.CLI_ENTRYPOINT, *argv]
+
+
+def _mode_equivalence_tokens(variant: str) -> drift.TokenBuilder:
+    return lambda placeholders: mode_equivalence_tokens(variant, placeholders)
+
+
+MODE_EQUIVALENCE_SPEC = drift.WorkflowSpec(
+    name="pipe_segment/ais",
+    workflow="workflows/pipe_segment/ais.py",
+    snapshot="core_ais_v3",
+    steps=tuple(
+        drift.StepSpec(
+            step=step, task_id=TASK_IDS["segment"],
+            # The default image is a DIT overlay build; its tag names the
+            # version first, but the spec states it rather than parse it.
+            image=ais.DEFAULT_IMAGE_TAG, version=ais.DEFAULT_PIPELINE_VERSION,
+            tokens=_mode_equivalence_tokens(variant), accepted=accepted, note=note,
+        )
+        for step, variant, accepted, note in _MODE_EQUIVALENCE_STEPS
+    ),
+    dit_owned=DIT_OWNED_FLAGS,
+    multi_value=drift.LABELS_MULTI_VALUE,
+    in_sync=True,
+    note=_NOTE + "; --incremental and its two table flags are DIT's alone",
+)
+
 #: The specs ``workflows/composer_drift.py`` runs for this package.
-SPECS = (SPEC,)
+SPECS = (SPEC, MODE_EQUIVALENCE_SPEC)
