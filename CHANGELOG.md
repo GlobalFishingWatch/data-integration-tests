@@ -6,6 +6,37 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-20: mode equivalence for the segmenter; pipe-segment temp-dataset overlay
+
+A new workflow runs pipe-segment's `segment` step in several shapes and compares the outputs. Its first use is pipe-segment PR #227 (`--incremental`, v5.1.0), which claims that incremental day-by-day runs equal full history. **Nothing has run yet**, and the overlay images are not built.
+
+#### Added
+- **`workflows/pipe_segment/ais.py`: mode equivalence of the `segment` step** on the AIS staging cohort.
+  - **Modes** (`--modes`): `1_bf` (one job over the window), `2_bfd` (a backfill up to `--tail-days` before the end, then one job per day), `3_bftruncate` (a full backfill, then the last `--tail-days` days rerun in order), and `4_daily` (every day as its own job). The default is the first three; `4_daily` is 31 jobs on the default window.
+  - **Segmenters** (`--segmenter`, default `full-history`): `full-history`, which production's DAG runs, and `incremental`, which passes pipe-segment's `--incremental`.
+  - **The unit is a (mode, segmenter) variant.** A `--modes` entry is a mode, run with every segmenter of `--segmenter`, or `mode:segmenter` for exactly that pair, e.g. `--modes 1_bf,2_bfd:incremental,4_daily:incremental`.
+  - **Comparison:** `segments`, `messages_segmented` and `fragments`, pairwise across the selected variants, on the keys `identity_match_key.py` uses. The log says which is discriminating: `segments`. Any difference exits 1.
+  - **Defaults:** January 2020 (363 MB to pin), `--tail-days 3`, 4 workers per job, production's machine type with the usual cost hint.
+  - **Guards, all before any cloud call or before the first job:**
+    - `incremental` is refused unless every image the run executes names pipe-segment v5.1.0 or later in its tag. On older code the flag would be ignored silently. `--assume-incremental-support` vouches for an image whose tag names no version.
+    - Output tables that already hold rows are refused: a variant's tables are its history and must start empty.
+    - Every plan is checked to be consecutive days with no gap, ending on the window's last day.
+    - Unreviewed pipe-segment code is refused on a default image, as for port visits. Nothing is auto-built.
+  - **Source:** `normalized_messages`, pinned by copy over the window (`--reuse-pin`, `--pin-max-gb`, `--pin-expiration-days`). No satellite timing offsets.
+  - **`--dry-run`** reports the pin estimate, every planned job with its dates and what it reads, and the comparisons. It creates nothing.
+  - **No run cache.** A variant writes three comparison tables and the cache hands back one.
+  - Every job carries the `dit_run_id` label, so `make dit-cancel` and a cancelled `dit run` stop its Dataflow jobs. The tables are not recorded in `dit_runs` and are not dropped.
+- **`docker/overlays/pipe-segment-temp-dataset/`: a temp-dataset overlay for pipe-segment.** pipe-segment cannot be told which dataset Beam stages query results in, and DIT's service account may not create one.
+  - Two patches, because the read sites differ between versions: `temp_dataset.patch` for v5.1.0 (five BigQuery reads) and `temp_dataset_v5.0.3.patch` for v5.0.3 (four). Each applies to its own tag only.
+  - `build.sh <repo> <commit> <label> [--push]` applies the first patch that fits and builds `gcr.io/world-fishing-827/dit/pipe-segment:<label>-<commit7>-temp-dataset-<patch8>`.
+  - `verify_overlay.py` counts the BigQuery reads per module inside the image and fails the build if one is added upstream or left unpatched.
+  - **No image is built or pushed yet.** Until `dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` exists, a default run of the new workflow fails at the image pull.
+- **Drift spec `pipe_segment/ais`** (`workflows/pipe_segment/composer_drift.py`), in sync. Two steps mirror production's one `segment` task: a full-history job and an incremental job. `--incremental`, `--in_segments_table` and `--in_fragments_table` are accepted differences of the incremental step only, each with its reason.
+- **`dit.workflow.add_modes_arg(default=...)`**: a workflow can keep an expensive mode out of its default `--modes`. Without it the default stays every mode, and the help text of existing workflows is unchanged.
+
+#### Changed
+- **`identity_match_key.py`: the `segment` argv builder takes `labels`, `job_name` and `extra_flags`**, so `ais.py` shares it. Left at their defaults, the argv is unchanged, and the workflow's own tests still pin it.
+
 ### 2026-11-20: no satellite timing offsets in DIT
 
 **DIT's segmenter workflows do not run pipe-segment's satellite timing offsets** (owner decision, 2026-11-20). Production's `segment` task works out, per receiver and hour, how far a satellite's clock is off, and drops the messages of the hours above the threshold. A DIT `segment` run does neither.
