@@ -14,7 +14,7 @@ The workflow drives all six tasks of the group: ``segment`` and
 ``segment_info``, ``vessel_info`` and ``segment_vessel`` (BigQuery SQL).
 
 DIT's tokens are those of one binding of a default run (Dataflow runner,
-published image, satellite offsets off) over the snapshot run's inclusive
+published image) over the snapshot run's inclusive
 ``[start_date, end_date]``, as ``--date-range`` takes it. They come from
 ``identity_match_key._step_argvs``, the function a binding's run loops over.
 The workflow reads a pinned copy of its source; offline, the spec names the
@@ -22,6 +22,11 @@ source table itself.
 
 **Expected in sync** since 2026-11-19. What still differs is DIT-owned or
 accepted below, each with its reason.
+
+**No satellite timing offsets in DIT.** Production's ``segment`` task passes
+four satellite flags; DIT passes none and never will without a pipe-segment
+change (owner decision, 2026-11-20). All four are accepted differences of the
+``segment`` step. The reasons are in the workflow's module docstring.
 
 **What the check cannot see.** The tables one step hands to the next are
 DIT-owned flags, so their values are left out of the comparison. That the
@@ -57,7 +62,6 @@ DIT_OWNED_FLAGS = drift.DATAFLOW_OWNED_FLAGS | frozenset({
     "--out_segmented_messages_table",
     "--out_segments_table",
     "--fragments_table",
-    "--out_sat_offsets_table",
     "--source_segments",
     "--source_fragments",
     "--dest_segment_identity",
@@ -72,27 +76,35 @@ BEAM_ACCEPTED_DIFFERENCES = {
     "--project": "DIT's jobs run in its own project, never in production's",
 }
 
-#: Why production's satellite-offset inputs are left out. The satellite
-#: positions are date-sharded, which DIT does not support by policy. The
-#: offsets query also reads its message source as ``<table>*`` filtered on
-#: ``_TABLE_SUFFIX`` (``assets/satellite_offsets.sql.j2`` at v5.0.3), so it
-#: cannot read DIT's source, one partitioned table. The workflow refuses
-#: ``--include-satellite-offsets``, which asked for the branch
-#: (PIPELINE-4705); whether to delete that option is the owner's decision.
+#: Why production's satellite flags are left out: DIT runs no satellite timing
+#: offsets (owner decision, 2026-11-20). The offsets must come from the full
+#: message feed, which is too large to read on every test run; computed from
+#: a test cohort they are different and noisy. pipe-segment has no option to
+#: read precomputed offsets. Secondary: the satellite positions are
+#: date-sharded tables in another organisation, and the offsets query reads
+#: its message source through a table wildcard that a partitioned table does
+#: not match. The figures are in the workflow's module docstring.
 _SATELLITE_OFFSETS_REASON = (
-    "the satellite-offset branch is off in DIT: its inputs are "
-    "date-sharded, which DIT does not support"
+    "DIT runs no satellite timing offsets: they must be computed from the full "
+    "message feed, not a test cohort, the full feed is too large to read on "
+    "every test run, and pipe-segment cannot read precomputed offsets"
 )
 
-#: Accepted for the ``segment`` step only. ``--out_sat_offsets_table``, the
-#: fourth satellite-offset flag, is DIT-owned.
+#: The four satellite flags of production's ``segment`` task: three inputs and
+#: the offsets output table. DIT passes none of them.
+SATELLITE_FLAGS = (
+    "--in_normalized_sat_offset_messages_table",
+    "--in_norad_to_receiver_table",
+    "--in_sat_positions_table",
+    "--out_sat_offsets_table",
+)
+
+#: Accepted for the ``segment`` step only.
 SEGMENT_ACCEPTED_DIFFERENCES = {
     **BEAM_ACCEPTED_DIFFERENCES,
     "--in_normalized_messages_table": "DIT reads a pinned copy of its AIS staging "
                                       "cohort by design",
-    "--in_normalized_sat_offset_messages_table": _SATELLITE_OFFSETS_REASON,
-    "--in_norad_to_receiver_table": _SATELLITE_OFFSETS_REASON,
-    "--in_sat_positions_table": _SATELLITE_OFFSETS_REASON,
+    **dict.fromkeys(SATELLITE_FLAGS, _SATELLITE_OFFSETS_REASON),
 }
 
 #: Accepted for the four SQL steps.
@@ -102,8 +114,8 @@ SQL_ACCEPTED_DIFFERENCES = {
 }
 
 _NOTE = (
-    "production's three satellite-offset inputs are an accepted difference: "
-    "DIT leaves that branch off"
+    "production's four satellite flags are an accepted difference: DIT runs no "
+    "satellite timing offsets"
 )
 
 

@@ -7,6 +7,52 @@ lives in the gpsdio-segment library, not pipe-segment itself; we expose it
 via two short-lived pipe-segment branches that pin different gpsdio-segment
 SHAs (in ``pyproject.toml`` from v5.0.3 on; ``requirements/prod.in`` before).
 
+No satellite timing offsets in DIT
+----------------------------------
+**DIT's segmenter workflows do not run pipe-segment's satellite timing
+offsets** (owner decision, 2026-11-20). Production's ``segment`` task works
+out, per receiver and hour, how far a satellite's clock is off, and drops the
+messages of the hours above the threshold. A DIT ``segment`` run does neither:
+it passes none of the four satellite flags and writes no offsets table. The
+``--include-satellite-offsets`` flag is removed and rejected.
+
+Why (measured or read on 2026-11-20):
+
+* **The offsets must be computed from the full message feed, not from a test
+  cohort.** The staging cohort's own offsets table
+  (``pipe_ais_test_202408290000_published.satellite_timing_offsets``) was
+  computed from the full satellite feed when the cohort was built; its table
+  description names that feed as the source. Computed from the cohort's 142
+  vessels, the offsets come out different and noisy: for January 2020, 990
+  receiver-hours above the segmenter's 30 s threshold against 183 in the
+  cohort's offsets table, with 39 in common. A run on such offsets would drop
+  the wrong messages.
+* **The full feed is too large to read on every test run:** the 2020 messages
+  are about 4.1 TB.
+* **pipe-segment has no option to read precomputed offsets.** ``segment``
+  computes them from three inputs and uses them in the same run
+  (``pipeline.py`` lines 195 to 222 at v5.0.3).
+* Also true, and secondary: the satellite positions are date-sharded tables in
+  another organisation (366 tables and 139 GB for 2020), and the offsets query
+  reads its message source through a table wildcard that does not match a
+  partitioned table.
+
+What follows from it:
+
+* On the 2020 staging cohort, DIT's ``messages_segmented`` keeps the messages
+  that the correction would drop. The cohort's offsets table lists 1,361 such
+  receiver-hours in 2020, on 27 receivers and 173 days. For those hours DIT's
+  staging output is not comparable with production's historical output.
+* Comparisons between two DIT runs (modes, or base against head) are not
+  affected: both sides run without the correction.
+* The correction only ever applied to data that carries satellite receiver
+  IDs. The current feed has none (since 2026-04-22), so production computes no
+  offsets for current data either.
+
+What would change this: an option in pipe-segment to read an offsets table
+instead of computing one. DIT could then pass the cohort's existing offsets
+table. That is the path, not planned work.
+
 Pattern follows ``workflows/port_visits/cross_version_ais.py`` (git-worktree
 each binding's ref) but the per-binding execution mirrors
 ``workflows/pipe_events/fishing.py`` (a docker-runner consumer that goes
@@ -97,8 +143,8 @@ Production runs the last three in parallel; here they run one after the other.
 tables, so ``segment`` has no fragment history to stitch onto and
 ``segment_vessel_daily`` sees only the run's own days in its 30-day window.
 Both hold for every binding alike, so an A/B is fair; the outputs are not
-comparable with production's own tables. The satellite-offset branch is off,
-and ``--include-satellite-offsets`` is refused (see the constants below).
+comparable with production's own tables. Nor does a run apply the satellite
+timing offsets (see "No satellite timing offsets in DIT" above).
 
 ``--dry-run`` skips the pipe-segment invocations and the diff phase, and only
 dry-runs the copy (reporting its bytes against the ``--pin-max-gb`` cap). It
@@ -235,35 +281,30 @@ DEFAULT_SRC_NORMALIZED_TABLE = (
 PIN_ROLE = "pipe_segment"
 NORMALIZED_WINDOW_COLUMN = "timestamp"
 
-# Satellite offsets: production's `segment` task always passes three
-# satellite-offset inputs. This workflow leaves them out, and that is an
-# accepted difference in its drift spec (composer_drift.py).
+# No satellite timing offsets in DIT (owner decision, 2026-11-20; the module
+# docstring has the full statement and the figures).
 #
-# `--include-satellite-offsets` asked for that branch. It cannot work, so the
-# flag is refused at argument parsing (PIPELINE-4705). Read from pipe-segment
-# v5.0.3, not run:
-#   * the satellite positions are date-sharded tables in another organisation
-#     (`gfw-int-pipe-v3`), and dit does not support date-sharded inputs;
-#   * the offsets query reads its message source as `<table>*` filtered on
-#     `_TABLE_SUFFIX` (assets/satellite_offsets.sql.j2), which matches a
-#     date-sharded source only. dit's source is one partitioned table, so the
-#     query would read no rows.
-# The code that snapshotted those inputs went with snapshot pinning. What is
-# left of the option is the refused flag, the branch of `_segment_args` that
-# emits the four flags, `SAT_OFFSET_OUTPUT_TABLES` and its compare key. None
-# of it is reachable from the command line. Whether to delete the option is
-# the owner's decision.
-# With the branch off, `messages_segmented` keeps messages that production
-# drops when a satellite's clock is off.
-SATELLITE_OFFSETS_REFUSED = (
-    "--include-satellite-offsets cannot run and is refused (PIPELINE-4705). Its "
-    "inputs, the satellite positions, are date-sharded tables in another "
-    "organisation, and DIT does not support date-sharded inputs. pipe-segment's "
-    "offsets query also reads its message source through a table wildcard "
-    "(`<table>*` filtered on _TABLE_SUFFIX), which does not match a partitioned "
-    "table such as DIT's source. Drop the flag: the run then leaves the "
-    "satellite-offset branch off, as every run of this workflow has."
+# Production's `segment` task passes three satellite-offset inputs and an
+# offsets output table. This workflow passes none of the four, has no code
+# path that could, and compares no offsets table. That is an accepted
+# difference in its drift spec (composer_drift.py).
+#
+# `--include-satellite-offsets` once asked for that branch. It is still
+# parsed, hidden, so an old invocation fails with the message below instead
+# of argparse's "unrecognized arguments".
+SATELLITE_OFFSETS_REMOVED = (
+    "--include-satellite-offsets was removed: DIT's segmenter workflows do not run "
+    "satellite timing offsets (owner decision, 2026-11-20; PIPELINE-4705). The offsets "
+    "must be computed from the full message feed, not from a test cohort: computed "
+    "from the staging cohort's 142 vessels they come out different and noisy, and a "
+    "run on them would drop the wrong messages. The full feed is too large to read on "
+    "every test run (about 4.1 TB for 2020), and pipe-segment has no option to read "
+    "precomputed offsets. Its inputs are also date-sharded tables in another "
+    "organisation, which DIT does not support. Drop the flag. Every run leaves the "
+    "correction off, so comparisons between two DIT runs are unaffected. See \"No "
+    "satellite timing offsets in DIT\" in workflows/pipe_segment/RUN_INSTRUCTIONS.md."
 )
+_SATELLITE_OFFSETS_DEST = "removed_include_satellite_offsets"
 
 # Output tables produced by `segment`. Single date-partitioned tables since
 # pipe-segment v5.0.0 (PIPELINE-2074: sharded date tables to partitioned
@@ -273,12 +314,6 @@ SEGMENT_OUTPUT_TABLES = (
     "messages_segmented",
     "segments",
     "fragments",
-)
-
-# Produced and diffed only with the satellite-offset branch, which no run can
-# ask for while --include-satellite-offsets is refused (see above).
-SAT_OFFSET_OUTPUT_TABLES = (
-    "satellite_timing_offsets",
 )
 
 # The six pipe-segment commands one binding runs, in the order production's
@@ -371,7 +406,6 @@ COMPARE_KEYS = {
     "messages_segmented":       ["msgid"],
     "segments":                 ["seg_id", "frag_id"],   # one row per (seg, frag, day)
     "fragments":                ["frag_id"],             # frag_id is globally unique
-    "satellite_timing_offsets": ["timestamp", "receiver"],
     "segment_identity_daily":   ["seg_id", "first_timestamp"],
     "segment_vessel_daily":     ["seg_id", "ssvid", "day"],
     "segment_info":             ["seg_id"],              # clustered_by seg_id
@@ -481,13 +515,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         f"single date-partitioned table). Must be one table (not a view, not "
                         f"date-sharded tables) partitioned on `timestamp`, e.g. the prod cohort "
                         f"or a custom-filtered subset.")
-    p.add_argument("--include-satellite-offsets", action="store_true",
-                   help="REFUSED: this option cannot run (PIPELINE-4705). The satellite-offset "
-                        "branch of `segment` reads date-sharded satellite positions in another "
-                        "organisation, which DIT does not support, and its query reads the "
-                        "message source through a table wildcard that a partitioned table does "
-                        "not match. Passing the flag fails at argument parsing. Whether the "
-                        "option is deleted is an open decision.")
+    # Removed 2026-11-20: DIT does not run satellite timing offsets. Hidden, and
+    # rejected below with or without a value (nargs="?").
+    p.add_argument("--include-satellite-offsets", nargs="?", const="", default=None,
+                   dest=_SATELLITE_OFFSETS_DEST, help=argparse.SUPPRESS)
     p.add_argument("--service-account",
                    default="automated-testing@world-fishing-827.iam.gserviceaccount.com",
                    help="Service account for Dataflow runs.")
@@ -505,14 +536,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     args = p.parse_args(argv)
 
+    if getattr(args, _SATELLITE_OFFSETS_DEST) is not None:
+        raise SystemExit(SATELLITE_OFFSETS_REMOVED)
+    delattr(args, _SATELLITE_OFFSETS_DEST)
     for removed, instead in REMOVED_FLAGS.items():
         if getattr(args, _removed_flag_dest(removed)) is not None:
             raise SystemExit(
                 f"{removed} was removed with snapshot pinning (PIPELINE-4705): {instead}"
             )
         delattr(args, _removed_flag_dest(removed))
-    if args.include_satellite_offsets:
-        raise SystemExit(SATELLITE_OFFSETS_REFUSED)
 
     args.bindings = [_parse_binding(b) for b in args.bindings]
     args.date_range = _parse_daterange(args.date_range)
@@ -724,14 +756,10 @@ class _PinnedSources:
     (``dit.bq.pinned_source_fqn``). Frozen so nothing changes the pin between
     pinning and the bindings' runs.
 
-    ``sat_positions_stem`` and ``norad`` are the two satellite-offset inputs
-    ``_segment_args`` would pass. Nothing sets them: the workflow refuses
-    ``--include-satellite-offsets`` (see ``SATELLITE_OFFSETS_REFUSED``). They
-    stay until the owner decides whether to delete the option.
+    It is the only source: DIT runs no satellite timing offsets, so there is
+    no satellite input to pin.
     """
     normalized_messages: str
-    sat_positions_stem: Optional[str] = None
-    norad: Optional[str] = None
 
 
 def _normalized_window(date_range: tuple[date, date]) -> dit_bq.SourceWindow:
@@ -890,7 +918,6 @@ def _segment_args(
     worker_image: Optional[str],
     ssvid_filter_query: Optional[str],
     service_account: str,
-    include_satellite_offsets: bool,
     max_num_workers: Optional[int] = None,
     worker_sizing: WorkerSizing | None = None,
     build_from_source: bool = False,
@@ -902,12 +929,11 @@ def _segment_args(
     BigQuerySource finds it partitioned, as the source is, and filters by
     DATE(timestamp).
 
-    Satellite-offset args only appear when ``include_satellite_offsets`` is
-    set, with ``pinned.sat_positions_stem`` (the FQN prefix pipe-segment
-    appends per-shard date suffixes to) and ``pinned.norad``. No run gets
-    there: the workflow refuses ``--include-satellite-offsets`` at argument
-    parsing and nothing sets the two fields. The branch is kept until the
-    owner decides whether to delete the option (PIPELINE-4705).
+    No satellite flag is ever passed (``--in_normalized_sat_offset_messages_table``,
+    ``--in_norad_to_receiver_table``, ``--in_sat_positions_table``,
+    ``--out_sat_offsets_table``). ``segment`` runs its offsets branch only
+    when it gets all three inputs, so a DIT run computes no satellite timing
+    offsets and drops no message for them. See the module docstring.
 
     The Dataflow options, the job name among them, come from
     :func:`_dataflow_options`.
@@ -934,21 +960,6 @@ def _segment_args(
         f"--temp_location={dataflow_temp_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
         f"--staging_location={dataflow_staging_location(DEFAULT_DATAFLOW_TEMP_BUCKET)}",
     ]
-    if include_satellite_offsets:
-        # Pre-condition: the caller set both satellite fields; assert for the
-        # type narrower. Nothing in the workflow does (see the docstring).
-        assert pinned.sat_positions_stem is not None, (
-            "include_satellite_offsets=True but sat_positions_stem is None."
-        )
-        assert pinned.norad is not None, (
-            "include_satellite_offsets=True but norad is None."
-        )
-        args.extend([
-            f"--in_normalized_sat_offset_messages_table={pinned.normalized_messages}",
-            f"--out_sat_offsets_table={_output_prefix('satellite_timing_offsets', dest_dataset=dest_dataset, suffix=suffix)}",
-            f"--in_norad_to_receiver_table={pinned.norad}",
-            f"--in_sat_positions_table={pinned.sat_positions_stem}",
-        ])
     if ssvid_filter_query is not None:
         args.append(f"--ssvid_filter_query={ssvid_filter_query}")
     if runner == "dataflow":
@@ -1157,7 +1168,6 @@ def _step_argvs(
             pinned=pinned,
             date_range=args.date_range,
             ssvid_filter_query=args.ssvid_filter_query,
-            include_satellite_offsets=args.include_satellite_offsets,
             **tables, **identity, **beam("segment"),
         ),
         "segment_identity": lambda: _segment_identity_args(
@@ -1373,8 +1383,6 @@ def _run_diffs(
     """
     results: dict[DiffKey, int] = {}
     tables: list[str] = list(SEGMENT_OUTPUT_TABLES)
-    if args.include_satellite_offsets:
-        tables.extend(SAT_OFFSET_OUTPUT_TABLES)
     if not args.skip_downstream:
         tables.extend(DOWNSTREAM_OUTPUT_TABLES)
 

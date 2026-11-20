@@ -338,7 +338,7 @@ def _segment_step_argvs(runner="dataflow", caps=None):
         "segment": pipe_segment._segment_args(
             pinned=pipe_segment._PinnedSources(normalized_messages="p.d.n"),
             date_range=one_day,
-            ssvid_filter_query=None, include_satellite_offsets=False,
+            ssvid_filter_query=None,
             max_num_workers=caps.get("segment"), **common,
         ),
         "segment_identity": pipe_segment._segment_identity_args(

@@ -1,10 +1,12 @@
 """Tests for ``workflows/pipe_segment/identity_match_key.py``.
 
-Two parts:
+Three parts:
 
 * Source pinning by copy (PIPELINE-4705): the window of the pinned source,
-  new and reused pins, the dry run, the removed snapshot flags, and the
-  refusal of ``--include-satellite-offsets``.
+  new and reused pins, the dry run, and the removed snapshot flags.
+* No satellite timing offsets in DIT (2026-11-20): the removed
+  ``--include-satellite-offsets`` is rejected, no step's argv carries a
+  satellite flag, and no offsets table is written, compared or keyed.
 * The six-step chain a binding runs, shaped like production's segment group
   (2026-11-19): every step's argv on both runners, the labels on every step,
   no Dataflow option on the four BigQuery SQL steps, which table each step
@@ -84,31 +86,59 @@ def test_removed_flags_leave_no_trace_on_the_namespace() -> None:
         vars(args))
 
 
-def test_include_satellite_offsets_is_refused_at_parse_time_with_the_reasons() -> None:
-    """The option cannot run. It is refused before any cloud call, with a
-    message that says why and names the ticket."""
+#: The four satellite flags of pipe-segment's ``segment`` command. DIT passes none.
+SATELLITE_FLAGS = {
+    "--in_normalized_sat_offset_messages_table", "--in_norad_to_receiver_table",
+    "--in_sat_positions_table", "--out_sat_offsets_table",
+}
+
+
+@pytest.mark.parametrize("flag", [
+    ["--include-satellite-offsets"],            # bare, as the flag was used
+    ["--include-satellite-offsets", "true"],    # with a value
+    ["--include-satellite-offsets=1"],
+])
+def test_include_satellite_offsets_is_rejected_before_any_cloud_call(flag: list[str]) -> None:
+    """DIT runs no satellite timing offsets. The removed flag is rejected at
+    argument parsing, bare or with a value, with the real reasons."""
     with (
         patch.object(mod.dit_bq, "pin_source_into_experiment") as pin,
         patch.object(mod.subprocess, "run") as run,
-        pytest.raises(SystemExit) as refused,
+        pytest.raises(SystemExit) as rejected,
     ):
-        mod.main(_base_args(["--include-satellite-offsets"]))
+        mod.main(_base_args(flag))
 
-    message = str(refused.value)
-    assert message == mod.SATELLITE_OFFSETS_REFUSED
-    assert "PIPELINE-4705" in message
-    assert "date-sharded" in message and "another organisation" in message
-    assert "table wildcard" in message and "partitioned" in message
+    message = str(rejected.value)
+    assert message == mod.SATELLITE_OFFSETS_REMOVED
+    assert message.startswith("--include-satellite-offsets was removed: DIT's segmenter "
+                              "workflows do not run satellite timing offsets")
+    # The real reasons, not only the shard argument.
+    assert "full message feed, not from a test cohort" in message
+    assert "too large to read on every test run" in message
+    assert "no option to read precomputed offsets" in message
+    assert "date-sharded" in message
+    assert "RUN_INSTRUCTIONS.md" in message
     # Nothing ran: no ref check, no copy.
     pin.assert_not_called()
     run.assert_not_called()
 
 
-def test_the_refusal_comes_before_every_other_argument_check() -> None:
+def test_the_satellite_rejection_comes_before_every_other_argument_check() -> None:
     """Even with an otherwise invalid invocation, the user learns first that
     the option is gone."""
-    with pytest.raises(SystemExit, match="--include-satellite-offsets cannot run"):
+    with pytest.raises(SystemExit, match="--include-satellite-offsets was removed"):
         mod.parse_args(_base_args(["--include-satellite-offsets", "--reuse-pin", "nonsense"]))
+
+
+def test_the_removed_satellite_flag_is_hidden_and_leaves_no_trace() -> None:
+    args = mod.parse_args(_base_args())
+
+    assert not [name for name in vars(args) if "satellite" in name]
+    with pytest.raises(SystemExit), patch("sys.stdout") as stdout:
+        mod.parse_args(["--help"])
+    shown = "".join(call.args[0] for call in stdout.write.call_args_list)
+    assert "--date-range" in shown
+    assert "satellite" not in shown
 
 
 def test_invalid_reuse_pin_is_rejected() -> None:
@@ -138,12 +168,11 @@ def test_a_date_range_that_ends_before_it_starts_is_rejected() -> None:
 # -- _PinnedSources dataclass -----------------------------------------------
 
 def test_pinned_sources_hold_the_copy_and_no_satellite_input() -> None:
-    """Nothing sets the two satellite-offset fields: the option that used
-    them is refused."""
+    """The normalized messages are the only source: DIT runs no satellite
+    timing offsets, so there is no satellite input to pin."""
     pinned = mod._PinnedSources(normalized_messages=f"{_GE}.copy")
     assert pinned.normalized_messages == f"{_GE}.copy"
-    assert pinned.sat_positions_stem is None
-    assert pinned.norad is None
+    assert [field.name for field in dataclasses.fields(pinned)] == ["normalized_messages"]
 
 
 def test_pinned_sources_is_frozen() -> None:
@@ -603,29 +632,40 @@ def test_skip_downstream_runs_segment_only() -> None:
     assert _argvs("dataflow", "--skip-downstream")["segment"] == _expected("dataflow")["segment"]
 
 
-def test_satellite_offsets_stay_off_and_the_kept_branch_still_emits_their_flags() -> None:
-    """Every run leaves the branch off. The code that emits its four flags is
-    kept until the owner decides on the option, though no run reaches it: the
-    command line refuses the flag, so the namespace is set by hand here."""
-    satellite = {"--in_normalized_sat_offset_messages_table", "--in_norad_to_receiver_table",
-                 "--in_sat_positions_table", "--out_sat_offsets_table"}
-    assert _run_args().include_satellite_offsets is False
-    assert not _flag_names(_argvs()["segment"]) & satellite
-    with pytest.raises(SystemExit, match="cannot run and is refused"):
-        _run_args("dataflow", "--include-satellite-offsets")
+# -- No satellite timing offsets in DIT --------------------------------------
 
-    asked_args = _run_args("dataflow")
-    asked_args.include_satellite_offsets = True
-    asked = mod._step_argvs(
-        asked_args,
-        binding_name="before", suffix=SFX, worker_image=None,
-        pinned=mod._PinnedSources(
-            normalized_messages="p.d.normalized", sat_positions_stem="p.d.sat_", norad="p.d.norad",
-        ),
-    )
-    assert satellite <= _flag_names(asked["segment"])
-    # The option reaches no other step.
-    assert not any(_flag_names(asked[step]) & satellite for step in mod.STEPS[1:])
+@pytest.mark.parametrize("runner", RUNNERS)
+@pytest.mark.parametrize("extra", [
+    (), ("--build-from-source",), ("--skip-downstream",),
+    ("--ssvid-filter-query", '"1","2"'), ("--max-num-workers", "7", "--disk-size-gb", "100"),
+])
+def test_no_emitted_argv_contains_a_satellite_flag(runner: str, extra: tuple[str, ...]) -> None:
+    """``segment`` runs its offsets branch only when it gets all three
+    satellite inputs. DIT passes none of them, and no offsets output table, on
+    any runner and with any option."""
+    for step, argv in _argvs(runner, *extra).items():
+        assert not _flag_names(argv) & SATELLITE_FLAGS, step
+        assert not [token for token in argv if "sat_" in token or "norad" in token], step
+
+
+def test_the_workflow_has_no_way_to_ask_for_satellite_offsets() -> None:
+    """No namespace attribute, no builder argument and no pinned input left
+    that could switch the branch on."""
+    import inspect
+
+    assert "include_satellite_offsets" not in vars(_run_args())
+    assert "include_satellite_offsets" not in inspect.signature(mod._segment_args).parameters
+    assert not [name for name in vars(mod) if name.startswith(("PROD_", "SAT_OFFSET"))]
+
+
+def test_the_offsets_table_is_not_written_compared_or_keyed() -> None:
+    tables = [*mod.SEGMENT_OUTPUT_TABLES, *mod.DOWNSTREAM_OUTPUT_TABLES]
+
+    assert "satellite_timing_offsets" not in mod.COMPARE_KEYS
+    assert "satellite_timing_offsets" not in tables
+    # Every compare key belongs to a table a binding writes, and back.
+    assert set(mod.COMPARE_KEYS) == set(tables)
+    assert not [table for table, *_ in _diffed() if "satellite" in table]
 
 
 # -- Dataflow job names ------------------------------------------------------
