@@ -41,13 +41,20 @@ GE = "world-fishing-827.tech_great_expectations"
 PIN = f"{GE}.dit_exp_exp_pipe_segment_normalized_messages_20200101_20200111_20261120t101500z"
 PINNED = imk._PinnedSources(normalized_messages=PIN)
 SUFFIX = "exp_abc1234_f00d00"
-V510 = "gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54"
+#: An overlay image of a later commit, given by flag: it knows --incremental.
+NEWER = "gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-pr230-abc1234-temp-dataset-04b40b54"
+#: The overlay of the version the VMS DAG pins: older than --incremental.
+V503 = "gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8"
 UNVERSIONED = "gcr.io/world-fishing-827/dit/pipe-segment:pr-230-abc1234-temp-dataset-04b40b54"
-V510_IMAGES = ("--image-tag", V510, "--worker-image", V510)
+NEWER_IMAGES = ("--image-tag", NEWER, "--worker-image", NEWER)
+V503_IMAGES = ("--image-tag", V503, "--worker-image", V503)
 
 #: The pipe-segment PR #227 test: full history in one job (the reference) and
 #: backfill-then-daily; incremental backfill-then-daily, rerun and every-day.
-PR227_MODES = "1_bf,2_bfd,2_bfd:incremental,3_bftruncate:incremental,4_daily:incremental"
+PR227_MODES = (
+    "1_bf:full-history,2_bfd:full-history,"
+    "2_bfd:incremental,3_bftruncate:incremental,4_daily:incremental"
+)
 
 FULL, INC = mod.SEGMENTER_FULL_HISTORY, mod.SEGMENTER_INCREMENTAL
 D = date.fromisoformat
@@ -103,15 +110,34 @@ def _argvs(args, variant: mod.Variant) -> list[list[str]]:
 # variants: --modes and --segmenter
 # --------------------------------------------------------------------------
 
-def test_default_is_three_modes_of_the_full_history_segmenter() -> None:
+def test_default_is_full_history_in_one_job_against_three_incremental_shapes() -> None:
     args = mod.parse_args([])
+
+    # The reference first: full history in one job carries no state between
+    # jobs. Then the segmenter the AIS DAG passes, in the three cheap shapes.
+    assert [v.label for v in args.variants] == [
+        "1_bf:full-history", "1_bf:incremental", "2_bfd:incremental",
+        "3_bftruncate:incremental",
+    ]
+    assert mod.DEFAULT_SEGMENTER == INC and args.segmenter == INC
+    assert mod.DEFAULT_MODES == ("1_bf:full-history", "1_bf", "2_bfd", "3_bftruncate")
+    # The every-day mode stays opt-in.
+    assert mod.SELECTABLE_MODES == ("1_bf", "2_bfd", "3_bftruncate", "4_daily")
+
+
+def test_the_default_modes_with_full_history_are_the_three_full_history_shapes() -> None:
+    """What the version the VMS DAG pins can run: no incremental variant left."""
+    args = mod.parse_args(["--segmenter", FULL])
 
     assert [v.label for v in args.variants] == [
         "1_bf:full-history", "2_bfd:full-history", "3_bftruncate:full-history",
     ]
-    # Production's segmenter, and the every-day mode stays opt-in.
-    assert mod.DEFAULT_MODES == ("1_bf", "2_bfd", "3_bftruncate")
-    assert mod.SELECTABLE_MODES == (*mod.DEFAULT_MODES, "4_daily")
+
+
+def test_bare_modes_take_the_default_segmenter() -> None:
+    assert [v.label for v in mod.parse_args(["--modes", "1_bf,4_daily"]).variants] == [
+        "1_bf:incremental", "4_daily:incremental",
+    ]
 
 
 @pytest.mark.parametrize(("modes", "segmenter", "expected"), [
@@ -266,9 +292,9 @@ def test_jobs_carry_their_place_in_the_variants_run_order() -> None:
 
 
 @pytest.mark.parametrize(("cli", "jobs"), [
-    ((), 9),                                             # the default: 1 + 4 + 4
+    ((), 10),                                            # the default: 1 + 1 + 4 + 4
     (("--modes", "1_bf"), 1),
-    (("--modes", PR227_MODES, *V510_IMAGES), 44),        # 1 + 4 + 4 + 4 + 31
+    (("--modes", PR227_MODES), 44),                      # 1 + 4 + 4 + 4 + 31
     (("--modes", ",".join(mod.SELECTABLE_MODES), "--segmenter", f"{FULL},{INC}"), 80),
 ])
 def test_job_counts_on_the_default_window(cli, jobs) -> None:
@@ -309,7 +335,7 @@ def test_the_default_window_is_one_month_of_the_cohorts_data_year() -> None:
 @pytest.mark.parametrize("variant", mod.ALL_VARIANTS, ids=lambda v: v.label)
 @pytest.mark.parametrize("runner", ["dataflow", "docker"])
 def test_every_job_of_every_variant(variant, runner) -> None:
-    args = _args("--runner", runner, *V510_IMAGES)
+    args = _args("--runner", runner, *NEWER_IMAGES)
     start, end = args.date_range
     jobs = mod.plan_jobs(variant, start, end, args.tail_days)
     tables = {
@@ -406,7 +432,7 @@ def test_a_full_history_dataflow_job_argv_is_pinned() -> None:
 
 
 def test_an_incremental_job_adds_exactly_three_flags_after_the_tables() -> None:
-    args = _args("--modes", "2_bfd", "--segmenter", f"{FULL},{INC}", *V510_IMAGES)
+    args = _args("--modes", "2_bfd", "--segmenter", f"{FULL},{INC}", *NEWER_IMAGES)
     full = _argvs(args, _variant("2_bfd:full-history"))[1]
     incremental = _argvs(args, _variant("2_bfd:incremental"))[1]
 
@@ -451,7 +477,7 @@ def test_cap_sizing_filter_and_worker_image_reach_the_job() -> None:
     args = _args(
         "--modes", "1_bf", "--max-num-workers", "9", "--worker-machine-type", "e2-small",
         "--disk-size-gb", "20", "--ssvid-filter-query", '"123","456"',
-        "--worker-image", V510, "--service-account", "sa@p.iam.gserviceaccount.com",
+        "--worker-image", NEWER, "--service-account", "sa@p.iam.gserviceaccount.com",
         "--dest-dataset", "scratch",
     )
     argv = _argvs(args, _variant("1_bf:full-history"))[0]
@@ -460,7 +486,7 @@ def test_cap_sizing_filter_and_worker_image_reach_the_job() -> None:
     assert _one(argv, "--worker_machine_type") == "e2-small"
     assert _one(argv, "--disk_size_gb") == "20"
     assert _one(argv, "--ssvid_filter_query") == '"123","456"'
-    assert _one(argv, "--sdk_container_image") == V510
+    assert _one(argv, "--sdk_container_image") == NEWER
     assert _one(argv, "--service_account_email") == "sa@p.iam.gserviceaccount.com"
     assert _one(argv, "--out_segments_table") == (
         f"world-fishing-827.scratch.segments_{SUFFIX}_1_bf_full")
@@ -478,7 +504,7 @@ def test_setup_file_only_with_build_from_source() -> None:
 def test_every_label_is_one_that_pipe_segment_and_bigquery_accept() -> None:
     """pipe-segment splits each entry on ``=``; BigQuery and Dataflow take
     lowercase letters, digits, ``_`` and ``-``, 63 characters at most."""
-    args = _args("--modes", PR227_MODES, *V510_IMAGES)
+    args = _args("--modes", PR227_MODES, *NEWER_IMAGES)
     args.run_id, args.commit_sha = "Run=1", "ABC.def"
 
     for variant in args.variants:
@@ -494,7 +520,7 @@ def test_every_label_is_one_that_pipe_segment_and_bigquery_accept() -> None:
 
 def test_job_names_are_distinct_and_fit() -> None:
     args = _args("--modes", ",".join(mod.SELECTABLE_MODES), "--segmenter", f"{FULL},{INC}",
-                 *V510_IMAGES)
+                 *NEWER_IMAGES)
     names = [_one(argv, "--job_name") for v in args.variants for argv in _argvs(args, v)]
 
     assert len(set(names)) == len(names)
@@ -505,7 +531,7 @@ def test_job_names_are_distinct_and_fit() -> None:
 def test_a_long_experiment_id_is_shortened_not_the_variant_or_the_counter() -> None:
     args = mod.parse_args([
         "--experiment-id", "a" * 32, "--start", "2020-01-01", "--end", "2020-12-31",
-        "--modes", "4_daily:incremental", *V510_IMAGES,
+        "--modes", "4_daily:incremental", *NEWER_IMAGES,
     ])
     job = mod._plans(args)[_variant("4_daily:incremental")][-1]
 
@@ -535,9 +561,10 @@ def test_the_parser_has_no_satellite_option() -> None:
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize(("image", "version"), [
-    (V510, (5, 1, 0)),
-    (mod.DEFAULT_OVERLAY_IMAGE, (5, 0, 3)),
-    (imk.DEFAULT_IMAGE_TAG, (5, 0, 3)),                       # a published tag
+    (NEWER, (5, 1, 0)),
+    (mod.DEFAULT_OVERLAY_IMAGE, (5, 1, 0)),
+    (V503, (5, 0, 3)),
+    ("registry.example.invalid/core/pipe-segment:v5.0.3", (5, 0, 3)),  # a published tag
     ("registry/pipe-segment:v5.10.2", (5, 10, 2)),
     ("registry/pipe-segment:5.1.0-rc1", (5, 1, 0)),
     ("localhost:5000/pipe-segment:v6.0.0@sha256:abc", (6, 0, 0)),
@@ -556,44 +583,50 @@ def _support(*cli: str, repo_dir: str = ".") -> None:
 
 
 @pytest.mark.parametrize("cli", [
-    # The default image is production's version, which is older than the flag.
-    ("--segmenter", INC),
-    ("--modes", "1_bf,2_bfd:incremental"),
-    # Either image alone is not enough on Dataflow: both run the job's code.
-    ("--segmenter", INC, "--image-tag", V510),
-    ("--segmenter", INC, "--worker-image", V510),
-    ("--segmenter", INC, "--runner", "docker"),
+    # The default run selects incremental variants; an older image by flag
+    # does not know the flag.
+    V503_IMAGES,
+    (*V503_IMAGES, "--modes", "1_bf:full-history,2_bfd:incremental"),
+    # Either image alone is enough to refuse on Dataflow: both run the job's code.
+    ("--image-tag", V503),
+    ("--worker-image", V503),
+    ("--runner", "docker", "--image-tag", V503),
 ])
 def test_incremental_is_refused_on_an_image_older_than_the_flag(cli) -> None:
     with pytest.raises(SystemExit) as refused:
         _support(*cli)
 
     message = str(refused.value)
+    assert "the incremental segmenter (" in message
     assert "needs pipe-segment v5.1.0 or later" in message
-    assert "holds pipe-segment v5.0.3" in message
-    assert mod.DEFAULT_OVERLAY_IMAGE in message
+    assert f"{V503} holds pipe-segment v5.0.3" in message
     # Why it is a refusal and not a warning: the flag would be ignored silently.
     assert "would not fail" in message and "without testing anything" in message
+    # The two ways out: full history only on this image, or a newer image.
+    assert "--segmenter full-history" in message
     assert f"{mod.OVERLAY_DIR}/build.sh" in message
 
 
 def test_the_refusal_names_the_flag_whose_image_is_too_old() -> None:
     with pytest.raises(SystemExit, match=r"and --worker-image \S+ holds pipe-segment v5.0.3"):
-        _support("--segmenter", INC, "--image-tag", V510)
+        _support("--worker-image", V503)
     with pytest.raises(SystemExit, match=r"and --image-tag \S+ holds pipe-segment v5.0.3"):
-        _support("--segmenter", INC, "--worker-image", V510)
+        _support("--image-tag", V503)
 
 
 @pytest.mark.parametrize("cli", [
-    ("--segmenter", INC, *V510_IMAGES),
-    ("--modes", PR227_MODES, *V510_IMAGES),
-    # The docker runner has no workers: only the submitter image runs.
-    ("--segmenter", INC, "--runner", "docker", "--image-tag", V510),
-    # Nothing incremental selected: any image will do.
+    # The default: the default image knows the flag.
     (),
-    ("--modes", "4_daily"),
+    ("--modes", PR227_MODES),
+    ("--segmenter", INC, *NEWER_IMAGES),
+    # The docker runner has no workers: only the submitter image runs.
+    ("--runner", "docker", "--image-tag", NEWER, "--worker-image", V503),
+    # Nothing incremental selected: any image will do. The run for the
+    # version the VMS DAG pins.
+    ("--segmenter", FULL, *V503_IMAGES),
+    ("--modes", "1_bf:full-history,4_daily:full-history", *V503_IMAGES),
     # A compare-only run executes no image.
-    ("--segmenter", INC, "--skip-pipelines", "--suffix", "s"),
+    (*V503_IMAGES, "--skip-pipelines", "--suffix", "s"),
 ])
 def test_incremental_runs_when_every_executed_image_knows_the_flag(cli) -> None:
     _support(*cli)
@@ -602,20 +635,20 @@ def test_incremental_runs_when_every_executed_image_knows_the_flag(cli) -> None:
 def test_an_image_whose_tag_names_no_version_is_refused_unless_vouched_for(caplog) -> None:
     images = ("--image-tag", UNVERSIONED, "--worker-image", UNVERSIONED)
     with pytest.raises(SystemExit) as refused:
-        _support("--segmenter", INC, *images)
+        _support(*images)
 
     message = str(refused.value)
     assert "does not start with a pipe-segment version" in message
     assert "--assume-incremental-support" in message
 
     with caplog.at_level("WARNING", logger=mod.logger.name):
-        _support("--segmenter", INC, *images, "--assume-incremental-support")
+        _support(*images, "--assume-incremental-support")
     assert sum("on your word" in r.getMessage() for r in caplog.records) == 2
 
 
 def test_vouching_does_not_override_a_tag_that_names_an_older_version() -> None:
     with pytest.raises(SystemExit, match="holds pipe-segment v5.0.3"):
-        _support("--segmenter", INC, "--assume-incremental-support")
+        _support(*V503_IMAGES, "--assume-incremental-support")
 
 
 def _checkout(tmp_path: Path, *, with_flag: bool) -> str:
@@ -626,7 +659,7 @@ def _checkout(tmp_path: Path, *, with_flag: bool) -> str:
 
 
 def test_build_from_source_reads_the_flag_from_the_working_tree(tmp_path) -> None:
-    cli = ("--segmenter", INC, "--runner", "docker", "--build-from-source")
+    cli = ("--runner", "docker", "--build-from-source")
 
     _support(*cli, repo_dir=_checkout(tmp_path / "new", with_flag=True))
     with pytest.raises(SystemExit, match="declares no --incremental flag"):
@@ -639,27 +672,31 @@ def test_build_from_source_on_dataflow_still_checks_the_worker_image(tmp_path) -
     repo = _checkout(tmp_path, with_flag=True)
 
     with pytest.raises(SystemExit, match=r"--worker-image \S+ holds pipe-segment v5.0.3"):
-        _support("--segmenter", INC, "--build-from-source", repo_dir=repo)
-    _support("--segmenter", INC, "--build-from-source", "--worker-image", V510, repo_dir=repo)
+        _support("--build-from-source", "--worker-image", V503, repo_dir=repo)
+    _support("--build-from-source", repo_dir=repo)
+    _support("--build-from-source", "--worker-image", NEWER, repo_dir=repo)
 
 
 # --------------------------------------------------------------------------
 # the image guard: no auto-build, unreviewed code refused on a default image
 # --------------------------------------------------------------------------
 
-def test_the_default_image_is_the_overlay_of_productions_version() -> None:
+def test_the_default_image_is_the_overlay_of_the_version_the_ais_dag_pins() -> None:
     assert mod.DEFAULT_IMAGE_TAG == mod.DEFAULT_WORKER_IMAGE == mod.DEFAULT_OVERLAY_IMAGE
     assert mod.DEFAULT_OVERLAY_IMAGE.startswith("gcr.io/world-fishing-827/dit/pipe-segment:")
-    # The same version as the cross-version workflow's published default.
-    assert imk.DEFAULT_IMAGE_TAG.endswith(f":{mod.DEFAULT_PIPELINE_VERSION}")
-    assert mod.image_pipeline_version(mod.DEFAULT_OVERLAY_IMAGE) == (5, 0, 3)
+    # One definition for both pipe-segment workflows.
+    assert imk.DEFAULT_IMAGE_TAG == mod.DEFAULT_OVERLAY_IMAGE
+    assert imk.DEFAULT_PIPELINE_VERSION == mod.DEFAULT_PIPELINE_VERSION == "v5.1.0"
+    # It knows --incremental, the default segmenter.
+    assert mod.image_pipeline_version(mod.DEFAULT_OVERLAY_IMAGE) == (5, 1, 0)
+    assert mod.image_pipeline_version(mod.DEFAULT_OVERLAY_IMAGE) >= mod.INCREMENTAL_SINCE
 
 
 @pytest.mark.parametrize(("cli", "expected"), [
     ((), ("--image-tag", "--worker-image")),
-    (("--image-tag", V510), ("--worker-image",)),
-    (("--worker-image", V510), ("--image-tag",)),
-    (V510_IMAGES, ()),
+    (("--image-tag", NEWER), ("--worker-image",)),
+    (("--worker-image", NEWER), ("--image-tag",)),
+    (NEWER_IMAGES, ()),
     (("--build-from-source",), ("--worker-image",)),
     (("--runner", "docker"), ("--image-tag",)),
     (("--runner", "docker", "--build-from-source"), ()),
@@ -669,7 +706,7 @@ def test_default_images_executed(cli, expected) -> None:
     assert mod._default_images_executed(mod.parse_args(list(cli))) == expected
 
 
-@pytest.mark.parametrize("cli", [(), ("--runner", "docker"), ("--image-tag", V510)])
+@pytest.mark.parametrize("cli", [(), ("--runner", "docker"), ("--image-tag", NEWER)])
 def test_unreviewed_code_on_a_default_image_is_refused(cli) -> None:
     with pytest.raises(SystemExit) as refusal:
         mod.check_images(mod.parse_args(list(cli)), "abc1234", True)
@@ -681,7 +718,7 @@ def test_unreviewed_code_on_a_default_image_is_refused(cli) -> None:
 
 
 @pytest.mark.parametrize(("cli", "unreviewed"), [
-    (V510_IMAGES, True),
+    (NEWER_IMAGES, True),
     (("--runner", "docker", "--build-from-source"), True),
     (("--skip-pipelines", "--suffix", "s"), True),
     ((), False),
@@ -789,7 +826,7 @@ def test_main_pins_the_window_once_and_every_job_reads_the_copy() -> None:
 
 
 def test_main_runs_each_variants_jobs_in_order_with_the_overlays_variables() -> None:
-    rc, b = _main("--modes", "2_bfd:incremental,3_bftruncate:incremental", *V510_IMAGES)
+    rc, b = _main("--modes", "2_bfd:incremental,3_bftruncate:incremental", *NEWER_IMAGES)
 
     assert rc == 0
     ranges = [(_labels(argv)["dit_mode"], _one(argv, "--date_range")) for _, argv, _ in b.docker]
@@ -804,7 +841,7 @@ def test_main_runs_each_variants_jobs_in_order_with_the_overlays_variables() -> 
         ("3_bftruncate", "2020-01-10,2020-01-10"),
     ]
     for image, argv, kwargs in b.docker:
-        assert image == V510 and _one(argv, "--sdk_container_image") == V510
+        assert image == NEWER and _one(argv, "--sdk_container_image") == NEWER
         assert kwargs["entrypoint"] == "pipe-segment"
         assert kwargs["volumes"] == ["gcp:/root/.config"]
         assert kwargs["build_from_source"] is False
@@ -833,8 +870,32 @@ def test_main_checks_then_pins_then_runs_then_compares() -> None:
     assert b.context["default_worker_image"] == mod.DEFAULT_WORKER_IMAGE
 
 
-def test_main_refuses_incremental_on_the_default_image_before_any_cloud_call() -> None:
-    rc, b = _main("--modes", "1_bf,2_bfd:incremental")
+def test_the_default_run_compares_three_incremental_shapes_with_full_history() -> None:
+    """No flag beyond the window: ten jobs on the default overlay image, one
+    of them full history, and every pair compared on the three tables."""
+    rc, b = _main()
+
+    assert rc == 0
+    jobs = [
+        (_labels(argv)["dit_mode"], _labels(argv)["dit_segmenter"], "--incremental" in argv)
+        for _, argv, _ in b.docker
+    ]
+    assert jobs == [
+        ("1_bf", FULL, False),
+        ("1_bf", INC, True),
+        *[("2_bfd", INC, True)] * 4,
+        *[("3_bftruncate", INC, True)] * 4,
+    ]
+    assert {image for image, _, _ in b.docker} == {mod.DEFAULT_OVERLAY_IMAGE}
+    assert {_one(argv, "--sdk_container_image") for _, argv, _ in b.docker} == {
+        mod.DEFAULT_OVERLAY_IMAGE}
+    # Six pairs on three tables; the reference's three pairs lead each table.
+    assert len(b.compared) == 18
+    assert [a for a, _, _ in b.compared[:3]] == [f"{GE}.segments_exp_abc1234_f00d00_1_bf_full"] * 3
+
+
+def test_main_refuses_incremental_on_an_older_image_before_any_cloud_call() -> None:
+    rc, b = _main(*V503_IMAGES)
 
     assert isinstance(rc, SystemExit)
     assert "needs pipe-segment v5.1.0 or later" in str(rc)
@@ -851,7 +912,7 @@ def test_main_refuses_unreviewed_code_on_the_default_image_before_pinning() -> N
 def test_main_refuses_tables_that_already_hold_rows_before_pinning() -> None:
     """Rows left by another run would be read as this run's history: the
     doubled counts of the pipe-segment PR's own test."""
-    held = f"{GE}.fragments_old_2_bfd_full"
+    held = f"{GE}.fragments_old_2_bfd_inc"
     rc, b = _main("--modes", "1_bf,2_bfd", "--suffix", "old", nonempty=[held])
 
     assert isinstance(rc, SystemExit)
@@ -860,7 +921,7 @@ def test_main_refuses_tables_that_already_hold_rows_before_pinning() -> None:
     # Every table of every selected variant was looked at.
     assert sorted(b.checked) == sorted(
         f"{GE}.{table}_old_{tag}"
-        for table in imk.SEGMENT_OUTPUT_TABLES for tag in ("1_bf_full", "2_bfd_full")
+        for table in imk.SEGMENT_OUTPUT_TABLES for tag in ("1_bf_inc", "2_bfd_inc")
     )
 
 
@@ -871,13 +932,13 @@ def test_a_failed_job_ends_the_variant_and_the_run() -> None:
     )
 
     assert isinstance(rc, SystemExit)
-    assert "2_bfd:full-history job 3/4" in str(rc) and "later jobs were not run" in str(rc)
+    assert "2_bfd:incremental job 3/4" in str(rc) and "later jobs were not run" in str(rc)
     # Jobs 1 to 3 of the first variant; nothing after, and no comparison.
     assert b.calls.count("docker") == 3 and "compare" not in b.calls
 
 
 def test_main_compares_every_pair_on_the_three_tables_discriminating_first() -> None:
-    rc, b = _main("--modes", "1_bf,2_bfd:incremental,4_daily:incremental", *V510_IMAGES,
+    rc, b = _main("--modes", "1_bf:full-history,2_bfd,4_daily",
                   "--suffix", "s", "--skip-pipelines")
 
     assert rc == 0 and "docker" not in b.calls and "pin" not in b.calls
@@ -899,7 +960,7 @@ def test_main_compares_every_pair_on_the_three_tables_discriminating_first() -> 
 
 
 def test_the_pr227_run_compares_ten_pairs_with_the_reference_first() -> None:
-    args = mod.parse_args(["--modes", PR227_MODES, *V510_IMAGES])
+    args = mod.parse_args(["--modes", PR227_MODES, *NEWER_IMAGES])
     pairs = mod.comparison_pairs(args.variants)
 
     assert len(pairs) == 10
@@ -912,14 +973,14 @@ def test_the_pr227_run_compares_ten_pairs_with_the_reference_first() -> None:
 
 def test_any_difference_fails_the_run_and_the_summary_names_it(capsys) -> None:
     rc, b = _main(
-        "--modes", "1_bf,2_bfd", "--suffix", "s", "--skip-pipelines",
+        "--modes", "1_bf:full-history,2_bfd", "--suffix", "s", "--skip-pipelines",
         compare_rc=lambda a, _b: 1 if ".segments_" in a else 0,
     )
 
     assert rc == 1
     summary = capsys.readouterr().err
-    assert "segments            1_bf:full-history vs 2_bfd:full-history  -> DIFFERENT" in summary
-    assert "fragments           1_bf:full-history vs 2_bfd:full-history  -> IDENTICAL" in summary
+    assert "segments            1_bf:full-history vs 2_bfd:incremental  -> DIFFERENT" in summary
+    assert "fragments           1_bf:full-history vs 2_bfd:incremental  -> IDENTICAL" in summary
 
 
 def test_one_variant_is_run_and_not_compared(caplog) -> None:
@@ -961,7 +1022,7 @@ def test_reuse_pin_reads_an_earlier_copy_and_creates_none() -> None:
 
 def test_dry_run_reports_the_plan_and_creates_nothing(caplog) -> None:
     with caplog.at_level("INFO"):
-        rc, b = _main("--modes", PR227_MODES, *V510_IMAGES, "--dry-run")
+        rc, b = _main("--modes", PR227_MODES, *NEWER_IMAGES, "--dry-run")
 
     assert rc == 0
     # The commit is read without snapshotting, the tables are only looked at,
@@ -984,7 +1045,7 @@ def test_dry_run_still_refuses_what_a_run_would_refuse() -> None:
     assert isinstance(rc, SystemExit) and "unreviewed" in str(rc)
     assert b.calls == ["resolve_pipeline_commit"]
 
-    rc, b = _main("--dry-run", "--segmenter", INC)
+    rc, b = _main("--dry-run", *V503_IMAGES)
     assert isinstance(rc, SystemExit) and "needs pipe-segment v5.1.0" in str(rc)
     assert b.calls == []
 

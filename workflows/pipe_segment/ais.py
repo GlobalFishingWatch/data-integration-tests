@@ -33,23 +33,36 @@ Modes (``--modes``):
   "every day" also needs "backfill, then three days" in the same run. It is
   not in the default ``--modes``: on the default window it is 31 jobs.
 
-Segmenters (``--segmenter``, default ``full-history``):
+Segmenters (``--segmenter``, default ``incremental``):
 
-* ``full-history``: what production runs. Each job reads every fragment in
-  its fragments table and matches them all again
-  (``transform/full_history_segments.py`` lines 62 to 69 at v5.1.0;
-  ``pipeline.py`` at v5.0.3).
 * ``incremental``: pipe-segment's ``--incremental`` (v5.1.0, pipe-segment PR
   #227). Each job starts from the segments of the day before its date range
-  (``pipeline.py`` lines 159 to 171 at v5.1.0). Production does not pass it.
+  (``pipeline.py`` lines 159 to 171 at v5.1.0). The AIS v3 DAG passes it since
+  2026-11-20 (composer-dags-production PR #3145), which is why it is the
+  default here. That is what the DAG is configured for; no production run was
+  looked at.
+* ``full-history``: pipe-segment's own default, what the AIS DAG passed until
+  then and what the VMS v5 DAG, on v5.0.3, still does. Each job reads every
+  fragment in its fragments table and matches them all again
+  (``transform/full_history_segments.py`` lines 62 to 69 at v5.1.0;
+  ``pipeline.py`` at v5.0.3).
 
 ``--modes`` entries are variants. A bare mode (``2_bfd``) takes every
-segmenter of ``--segmenter``; a qualified one (``2_bfd:incremental``) names
+segmenter of ``--segmenter``; a qualified one (``1_bf:full-history``) names
 its own. So ``--segmenter full-history,incremental`` runs the cross product,
 and a list of qualified entries runs exactly the pairs named. One flag holds
 the unit, because the cross product is not always what a test needs: the
 pipe-segment PR #227 test is five of the eight pairs (44 jobs on the default
 window, where the cross product is 80).
+
+The default ``--modes`` is ``1_bf:full-history,1_bf,2_bfd,3_bftruncate``:
+with the default segmenter, the three incremental shapes and full history in
+one job. Full history in one job is the reference because it carries no state
+between jobs at all: every segment is matched from the window's fragments in
+one pass. A run of incremental shapes alone would only show that incremental
+agrees with itself. ``1_bf:incremental`` separates "the incremental matching
+differs" from "the hand-over between jobs differs". Ten jobs on the default
+window.
 
 What the workflow guarantees about the chain
 --------------------------------------------
@@ -92,6 +105,10 @@ too; ``--assume-incremental-support`` overrides that for an image known to
 hold the flag. With ``--build-from-source`` the submitter is the working
 tree, and the check reads its ``segment`` command for the flag.
 
+The default image knows the flag. The refusal is for an explicit older image,
+e.g. the overlay of v5.0.3 to test the version the VMS DAG pins: such a run
+must name full history for every entry (``--segmenter full-history``).
+
 Comparison
 ----------
 The three tables are compared pairwise across the selected variants
@@ -131,8 +148,9 @@ Sources, images, cache
 * **Images.** pipe-segment has no option to name the dataset Beam stages
   query results in, and DIT's service account may not create one. The default
   ``--image-tag`` and ``--worker-image`` are therefore a DIT overlay of
-  v5.0.3, the version production runs
-  (``docker/overlays/pipe-segment-temp-dataset/``). The workflow hands the
+  v5.1.0, the version the AIS v3 DAG is configured for
+  (``docker/overlays/pipe-segment-temp-dataset/``; shared with
+  ``identity_match_key.py``). The workflow hands the
   overlay its dataset through the ``DIT_BQ_TEMP_DATASET`` container variable.
   As for port visits, DIT never auto-builds an image for this workflow (a
   plain build has no overlay), and a run that would execute the default image
@@ -146,15 +164,21 @@ and creates nothing.
 Dates: ``--start`` and ``--end`` are inclusive, like pipe-segment's
 ``--date_range``.
 
-Example (the default: three modes, full history, January 2020, 9 jobs)::
+Example (the default: full history in one job against three incremental
+shapes, January 2020, 10 jobs)::
 
     dit run workflows/pipe_segment/ais.py --experiment-id segment-modes
 
 Example (the pipe-segment PR #227 test, 44 jobs; see RUN_INSTRUCTIONS.md)::
 
     dit run workflows/pipe_segment/ais.py --experiment-id pr227 \\
-        --image-tag <v5.1.0 overlay> --worker-image <v5.1.0 overlay> \\
-        --modes 1_bf,2_bfd,2_bfd:incremental,3_bftruncate:incremental,4_daily:incremental
+        --modes 1_bf:full-history,2_bfd:full-history,2_bfd,3_bftruncate,4_daily
+
+Example (the version the VMS DAG pins, which has no incremental segmenter)::
+
+    dit run workflows/pipe_segment/ais.py --experiment-id segment-v503 \\
+        --segmenter full-history --modes 1_bf,2_bfd,3_bftruncate \\
+        --image-tag <v5.0.3 overlay> --worker-image <v5.0.3 overlay>
 """
 from __future__ import annotations
 
@@ -222,18 +246,28 @@ MODE_DAILY = "4_daily"
 #: Modes selectable via --modes, in canonical order.
 SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE, MODE_DAILY)
 
-#: What a run without --modes executes. ``4_daily`` is one job per day of the
-#: window (31 on the default window), so it is opt-in.
-DEFAULT_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
-
 SEGMENTER_FULL_HISTORY = "full-history"
 SEGMENTER_INCREMENTAL = "incremental"
 
-#: Segmenters selectable via --segmenter, in canonical order. Production runs
-#: the first: its ``segment`` task passes no ``--incremental`` (rendered
-#: snapshot core_ais_v3 of composer-dags-production at cb0c9a3b7, read
-#: 2026-11-20).
+#: Segmenters selectable via --segmenter, in canonical order: full history
+#: first, so that the reference variant sorts first.
 SEGMENTERS = (SEGMENTER_FULL_HISTORY, SEGMENTER_INCREMENTAL)
+
+#: The segmenter of a ``--modes`` entry that names none: the one the AIS v3
+#: DAG's ``segment`` task passes. Its rendered snapshot (core_ais_v3 of
+#: composer-dags-production at e4cb29361, read 2026-11-20) has
+#: ``--incremental`` since that repository's PR #3145, merged the same day.
+#: The VMS v5 DAG's task passes none. This is the DAGs' configuration, not a
+#: record of what a production run did.
+DEFAULT_SEGMENTER = SEGMENTER_INCREMENTAL
+
+#: What a run without --modes executes: full history in one job, the
+#: reference, and the three cheap shapes with the default segmenter. With the
+#: default segmenter that is four variants and ten jobs on the default window.
+#: ``4_daily`` is one job per day (31 there), so it is opt-in.
+DEFAULT_MODES = (
+    f"{MODE_BF}:{SEGMENTER_FULL_HISTORY}", MODE_BF, MODE_BFD, MODE_BFTRUNCATE,
+)
 
 #: Each segmenter's short form in table names, job names and compose project
 #: names, where ``-`` and ``:`` are not safe everywhere.
@@ -251,8 +285,8 @@ DEFAULT_END = "2020-01-31"     # inclusive
 DEFAULT_TAIL_DAYS = 3
 
 #: Dataflow autoscaling ceiling per job, sized for the staging cohort (142
-#: vessels, about 75,000 messages a day). Production runs its segment task
-#: with 50 (``identity_match_key.STEP_MAX_NUM_WORKERS``); with ``--parallel``
+#: vessels, about 75,000 messages a day). The AIS DAG caps its segment task
+#: at 50 (``identity_match_key.STEP_MAX_NUM_WORKERS``); with ``--parallel``
 #: several variants submit at once, each up to this cap.
 DEFAULT_MAX_NUM_WORKERS = 4
 
@@ -260,27 +294,14 @@ DEFAULT_MAX_NUM_WORKERS = 4
 #: 2026-10-23); shared with ``identity_match_key.py``.
 STEP_WORKER_SIZING = {STEP: imk.STEP_WORKER_SIZING[STEP]}
 
-#: The pipe-segment version production runs (``identity_match_key.py`` holds
-#: the citation) and the default image holds. ``composer_drift.py`` compares
-#: it with the image tag of production's task.
-DEFAULT_PIPELINE_VERSION = "v5.0.3"
-
-#: Where the overlay images are built; named in the refusals below.
-OVERLAY_DIR = "docker/overlays/pipe-segment-temp-dataset"
-
-#: The default image: pipe-segment DEFAULT_PIPELINE_VERSION (commit f4d39fe)
-#: with DIT's temp-dataset overlay (patch ``temp_dataset_v5.0.3.patch``,
-#: sha256 82b7f0a8...), as ``build.sh`` in OVERLAY_DIR names it. Production's
-#: own image cannot be the default: upstream has no way to name Beam's
-#: BigQuery staging dataset, and DIT's service account may not create one.
-#: NOT BUILT YET (2026-11-20): the tag follows from the commit and the patch,
-#: and the image exists once ``build.sh <repo> v5.0.3 v5.0.3 --push`` has run.
-#: When production bumps its version: build the overlay image of the new tag,
-#: then bump both constants here.
-DEFAULT_OVERLAY_IMAGE = (
-    f"gcr.io/world-fishing-827/dit/pipe-segment:"
-    f"{DEFAULT_PIPELINE_VERSION}-f4d39fe-temp-dataset-82b7f0a8"
-)
+#: The pipe-segment version the default image holds, the overlay directory and
+#: the default overlay image (not built yet): one definition for both
+#: pipe-segment workflows, in ``identity_match_key.py``, which holds the
+#: citations. ``composer_drift.py`` compares the version with the image tag of
+#: the DAG's task.
+DEFAULT_PIPELINE_VERSION = imk.DEFAULT_PIPELINE_VERSION
+OVERLAY_DIR = imk.OVERLAY_DIR
+DEFAULT_OVERLAY_IMAGE = imk.DEFAULT_OVERLAY_IMAGE
 
 #: Submitter image: ``docker run`` builds and submits the Beam graph in it. The
 #: overlay sets the staging dataset at pipeline construction, so the submitter
@@ -291,14 +312,10 @@ DEFAULT_IMAGE_TAG = DEFAULT_OVERLAY_IMAGE
 #: transforms the submitter pickled, so it must hold the same code.
 DEFAULT_WORKER_IMAGE = DEFAULT_OVERLAY_IMAGE
 
-#: Container variable the overlay patch reads to pass ``temp_dataset`` to
-#: Beam's ReadFromBigQuery (see OVERLAY_DIR).
-TEMP_DATASET_ENV = "DIT_BQ_TEMP_DATASET"
-
-#: Pre-existing dataset Beam stages query results in.
-DEFAULT_BQ_TEMP_DATASET = os.environ.get(
-    TEMP_DATASET_ENV, f"{PROJECT}.{dit_workflow.DEFAULT_DEST_DATASET}"
-)
+#: Container variable the overlay patch reads, and the default dataset it
+#: names (see OVERLAY_DIR); shared with ``identity_match_key.py``.
+TEMP_DATASET_ENV = imk.TEMP_DATASET_ENV
+DEFAULT_BQ_TEMP_DATASET = imk.DEFAULT_BQ_TEMP_DATASET
 
 #: pipe-segment's ``--runner`` value for each of this workflow's runners.
 _BEAM_RUNNER = {"dataflow": "dataflow", "docker": "DirectRunner"}
@@ -847,6 +864,10 @@ def check_incremental_support(args: argparse.Namespace, repo_dir: str) -> None:
       ``--assume-incremental-support`` is given.
     * With ``--build-from-source`` the submitter is the working tree at
       ``repo_dir``; its ``segment`` command must declare the flag.
+
+    ``incremental`` is the default segmenter and the default image knows the
+    flag, so a default run passes. What is refused is an older or unversioned
+    image given by flag while an incremental variant is still selected.
     """
     incremental = [v.label for v in args.variants if v.segmenter == SEGMENTER_INCREMENTAL]
     if not incremental or args.skip_pipelines:
@@ -880,11 +901,14 @@ def check_incremental_support(args: argparse.Namespace, repo_dir: str) -> None:
                  "cannot tell what it holds"
         )
         way_out = (
-            f"Pass an overlay image of {since} or later as --image-tag and --worker-image "
-            f"({OVERLAY_DIR}/build.sh <pipe-segment dir> <commit> <label> --push, with a "
-            f"label that starts with the version, e.g. {since})"
+            f"Choose one: run this image with full history only (--segmenter "
+            f"{SEGMENTER_FULL_HISTORY}, and no ':{SEGMENTER_INCREMENTAL}' entry in --modes); "
+            f"or pass an overlay image of {since} or later as --image-tag and "
+            f"--worker-image ({OVERLAY_DIR}/build.sh <pipe-segment dir> <commit> <label> "
+            f"--push, with a label that starts with the version, e.g. {since}; the default "
+            f"image is one)"
             + ("." if version is not None
-               else ", or pass --assume-incremental-support if the image is known to "
+               else "; or pass --assume-incremental-support if the image is known to "
                     "hold the flag.")
         )
         raise SystemExit(
@@ -916,18 +940,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         p, choices=SELECTABLE_MODES, default=DEFAULT_MODES, cached=False,
         help_suffix=(
             f"An entry is a mode, run with every segmenter of --segmenter, or "
-            f"mode:segmenter (e.g. {MODE_BFD}:{SEGMENTER_INCREMENTAL}) for exactly that "
-            f"pair. {MODE_DAILY} runs every day of the window as its own job and is not "
-            f"in the default. The three tables are compared across every pair of the "
-            f"selected (mode, segmenter) variants."
+            f"mode:segmenter (e.g. {MODE_BF}:{SEGMENTER_FULL_HISTORY}) for exactly that "
+            f"pair. The default is full history in one job, the reference, and three "
+            f"shapes of the default segmenter. {MODE_DAILY} runs every day of the window "
+            f"as its own job and is not in the default. The three tables are compared "
+            f"across every pair of the selected (mode, segmenter) variants."
         ),
     )
-    p.add_argument("--segmenter", default=SEGMENTER_FULL_HISTORY,
+    p.add_argument("--segmenter", default=DEFAULT_SEGMENTER,
                    help=f"Comma-separated segmenters for the --modes entries that name "
-                        f"none: {', '.join(SEGMENTERS)}. Default: {SEGMENTER_FULL_HISTORY}, "
-                        f"what production runs. {SEGMENTER_INCREMENTAL} passes pipe-segment's "
-                        f"--incremental and needs an image of "
-                        f"{_version_text(INCREMENTAL_SINCE)} or later.")
+                        f"none: {', '.join(SEGMENTERS)}. Default: {DEFAULT_SEGMENTER}, which "
+                        f"the AIS DAG's segment task passes: pipe-segment's --incremental, "
+                        f"which needs an image of {_version_text(INCREMENTAL_SINCE)} or later "
+                        f"(the default image is one). {SEGMENTER_FULL_HISTORY} passes no flag; "
+                        f"it is pipe-segment's own default and what the VMS DAG runs with.")
     p.add_argument("--assume-incremental-support", action="store_true",
                    help="Accept an image whose tag names no pipe-segment version for an "
                         "incremental variant. Without it such an image is refused: on code "
@@ -961,7 +987,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--image-tag", default=DEFAULT_IMAGE_TAG,
                    help=f"Submitter image: builds and submits the Beam graph. Default: DIT's "
                         f"overlay of pipe-segment {DEFAULT_PIPELINE_VERSION}, the version "
-                        f"production runs ({DEFAULT_IMAGE_TAG}). For other code, pass an "
+                        f"the AIS DAG is configured for ({DEFAULT_IMAGE_TAG}). For other code, "
+                        f"pass an "
                         f"overlay image of that commit, built with {OVERLAY_DIR}/build.sh, "
                         f"here and as --worker-image.")
     p.add_argument("--worker-image", default=DEFAULT_WORKER_IMAGE,
@@ -984,8 +1011,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_dataset_args(p)
     add_max_num_workers_arg(
         p, default=DEFAULT_MAX_NUM_WORKERS,
-        help_detail="The default is sized for the staging cohort; production runs its "
-                    "segment task with 50.",
+        help_detail="The default is sized for the staging cohort; the AIS DAG caps its "
+                    "segment task at 50.",
     )
     add_worker_sizing_args(p, defaults=STEP_WORKER_SIZING)
     p.add_argument("--suffix", default=None,

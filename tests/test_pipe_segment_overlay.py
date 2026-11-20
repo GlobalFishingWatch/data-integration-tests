@@ -183,20 +183,33 @@ def test_the_helper_reads_the_variable_the_workflow_sets() -> None:
 
 def test_the_default_image_tag_names_the_patch_that_builds_it() -> None:
     """``build.sh`` tags an image ``<label>-<commit7>-temp-dataset-<patch8>``.
-    Editing the v5.0.3 patch changes the tag, so the constant must follow."""
-    patch8 = hashlib.sha256((OVERLAY / PATCH_V503).read_bytes()).hexdigest()[:8]
+    Editing the default version's patch changes the tag, so the constant must
+    follow. Both pipe-segment workflows share the default image."""
+    default_patch = next(p for p, tag in PATCH_TAGS.items() if tag == ais.DEFAULT_PIPELINE_VERSION)
+    patch8 = hashlib.sha256((OVERLAY / default_patch).read_bytes()).hexdigest()[:8]
     tag = ais.DEFAULT_OVERLAY_IMAGE.rsplit(":", 1)[1]
 
+    assert default_patch == PATCH_V510
     assert re.fullmatch(rf"{re.escape(ais.DEFAULT_PIPELINE_VERSION)}-[0-9a-f]{{7}}"
                         rf"-temp-dataset-{patch8}", tag)
-    assert ais.DEFAULT_PIPELINE_VERSION == PATCH_TAGS[PATCH_V503]
+    assert imk.DEFAULT_IMAGE_TAG == ais.DEFAULT_IMAGE_TAG == ais.DEFAULT_OVERLAY_IMAGE
 
 
-def test_the_readme_lists_the_default_image_and_both_patches() -> None:
+def _image_of(patch: str) -> str:
+    """The image ``build.sh`` names for the tag ``patch`` is written against,
+    with the commits of the two tags (f4d39fe, 4ddde03)."""
+    commit7 = {"v5.0.3": "f4d39fe", "v5.1.0": "4ddde03"}[PATCH_TAGS[patch]]
+    patch8 = hashlib.sha256((OVERLAY / patch).read_bytes()).hexdigest()[:8]
+    return f"dit/pipe-segment:{PATCH_TAGS[patch]}-{commit7}-temp-dataset-{patch8}"
+
+
+def test_the_readme_lists_the_image_of_each_patch() -> None:
     readme = (OVERLAY / "README.md").read_text()
 
-    assert "dit/" + ais.DEFAULT_OVERLAY_IMAGE.rsplit("/", 1)[1] in readme
-    assert PATCH_V510 in readme and PATCH_V503 in readme
+    assert "dit/" + ais.DEFAULT_OVERLAY_IMAGE.rsplit("/", 1)[1] == _image_of(PATCH_V510)
+    # The default (the version the AIS DAG pins) and the older one the VMS DAG pins.
+    for patch in PATCH_TAGS:
+        assert _image_of(patch) in readme and patch in readme
 
 
 # --------------------------------------------------------------------------
