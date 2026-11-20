@@ -24,6 +24,58 @@ with a BigQuery snapshot, which no DIT identity can create in
 see section 5. The copy statement was accepted by BigQuery dry runs. No copy
 has been created yet.
 
+## No satellite timing offsets in DIT
+
+**DIT's segmenter workflows do not run pipe-segment's satellite timing
+offsets** (owner decision, 2026-11-20). Production's `segment` task works
+out, per receiver and hour, how far a satellite's clock is off, and drops the
+messages of the hours above the threshold. A DIT run does neither. It passes
+none of the four satellite flags and writes no offsets table. The
+`--include-satellite-offsets` flag is removed; passing it stops the run at
+argument parsing.
+
+**Why** (measured or read on 2026-11-20):
+
+- **The offsets must be computed from the full message feed, not from a test
+  cohort.** The staging cohort's own offsets table
+  (`pipe_ais_test_202408290000_published.satellite_timing_offsets`) was
+  computed from the full satellite feed when the cohort was built; its table
+  description names that feed as the source. Computed from the cohort's 142
+  vessels, the offsets come out different and noisy. For January 2020: 990
+  receiver-hours above the segmenter's 30 s threshold, against 183 in the
+  cohort's offsets table, with 39 in common. A run on such offsets would drop
+  the wrong messages.
+- **The full feed is too large to read on every test run.** The 2020 messages
+  are about 4.1 TB.
+- **pipe-segment has no option to read precomputed offsets.** `segment`
+  computes them from three inputs and uses them in the same run (`pipeline.py`
+  lines 195 to 222 at v5.0.3).
+- Also true, and secondary: the satellite positions are date-sharded tables in
+  another organisation (366 tables and 139 GB for 2020), and the offsets query
+  reads its message source through a table wildcard that does not match a
+  partitioned table.
+
+**What follows from it:**
+
+- On the 2020 staging cohort, DIT's `messages_segmented` keeps the messages
+  that the correction would drop. The cohort's offsets table lists 1,361 such
+  receiver-hours in 2020, on 27 receivers and 173 days.
+- For those hours, DIT's staging output is **not comparable with production's
+  historical output**.
+- Comparisons **between two DIT runs** (modes, or base against head) are not
+  affected. Both sides run without the correction.
+- The correction only ever applied to data that carries satellite receiver
+  IDs. The current feed has none (since 2026-04-22), so production computes no
+  offsets for current data either.
+
+**What would change this:** an option in pipe-segment to read an offsets table
+instead of computing one. DIT could then pass the cohort's existing offsets
+table. That is the path, not planned work.
+
+Production's task still passes the four flags. The drift check accepts that
+difference for the `segment` step, with this reason
+([`composer_drift.py`](composer_drift.py)).
+
 ## 1. Install dit
 
 ```bash
@@ -199,14 +251,9 @@ no fragment history to stitch onto, and `segment_vessel_daily` sees only the
 run's own days in its 30-day window. Both are the same for every binding, so
 the A/B is fair; the tables are not comparable with production's.
 
-**Satellite offsets.** Production's `segment` also reads satellite positions
-and writes clock offsets. No run here does. `--include-satellite-offsets`
-asked for it and is refused at argument parsing, before any cloud call
-(PIPELINE-4705). It could not work: the satellite positions are date-sharded
-tables in another organisation, which DIT does not support, and the offsets
-query reads its message source through a table wildcard, which DIT's
-partitioned source does not match. Whether the option is deleted is an open
-decision.
+**No satellite timing offsets.** `segment` here passes none of production's
+four satellite flags, so it computes no offsets and drops no message for
+them. See "No satellite timing offsets in DIT" at the top.
 
 ## 6. DirectRunner smoke (laptop, fast)
 
@@ -329,5 +376,6 @@ label, so `make dit-cancel` finds nothing for it.
 | `pinned copy … does not exist` with `--reuse-pin` | The copy expired, or the stamp, `--experiment-id`, `--date-range` or source table differ from the run that made it. |
 | The copy is denied `bigquery.tables.create` | The identity may not create tables in `tech_great_expectations`. With gcloud impersonating `dq-monitoring@`, that is the case. |
 | A Dataflow job fails creating `beam_temp_dataset_…` | The test service account may not create datasets, and pipe-segment cannot be told which dataset to use (status note at the top). |
-| `--include-satellite-offsets cannot run and is refused` | The option is refused at argument parsing (section 5). Drop the flag. |
+| `--include-satellite-offsets was removed` | DIT runs no satellite timing offsets ("No satellite timing offsets in DIT" at the top). Drop the flag. |
+| DIT's `messages_segmented` has more rows than production's for some hours of 2020 | Expected: production dropped those hours' messages for satellite clock offsets, and DIT does not. Same section. |
 | `… was removed with snapshot pinning` | `--pin-source-at`, `--snapshot-dest-project` or `--snapshot-expiration-days` was passed. The message names what to use instead. |

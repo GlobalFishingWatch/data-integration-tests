@@ -6,6 +6,30 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-20: no satellite timing offsets in DIT
+
+**DIT's segmenter workflows do not run pipe-segment's satellite timing offsets** (owner decision, 2026-11-20). Production's `segment` task works out, per receiver and hour, how far a satellite's clock is off, and drops the messages of the hours above the threshold. A DIT `segment` run does neither.
+
+#### Removed
+- **`workflows/pipe_segment/identity_match_key.py --include-satellite-offsets`, and everything behind it.** This breaks old invocations that pass the flag.
+  - The flag is rejected at argument parsing, bare or with a value, before any cloud call. The message gives the reasons below.
+  - Gone from the workflow: the code that passed the three satellite inputs and `--out_sat_offsets_table` to `segment`, the `satellite_timing_offsets` output table and its compare key. No step's argv carries a satellite flag, on any runner.
+  - Runs without the flag are unchanged: the option was off by default, and it never worked.
+- **Why** (measured or read on 2026-11-20):
+  - **The offsets must be computed from the full message feed, not from a test cohort.** The staging cohort's own offsets table (`pipe_ais_test_202408290000_published.satellite_timing_offsets`) was computed from the full satellite feed when the cohort was built; its table description names that feed as the source. Computed from the cohort's 142 vessels, the offsets come out different and noisy: for January 2020, 990 receiver-hours above the segmenter's 30 s threshold against 183 in the cohort's offsets table, with 39 in common. A run on such offsets would drop the wrong messages.
+  - **The full feed is too large to read on every test run:** the 2020 messages are about 4.1 TB.
+  - **pipe-segment has no option to read precomputed offsets.** `segment` computes them from three inputs and uses them in the same run.
+  - Also true, and secondary: the satellite positions are date-sharded tables in another organisation (366 tables and 139 GB for 2020), and the offsets query reads its message source through a table wildcard that does not match a partitioned table.
+- **What it means for comparisons:**
+  - On the 2020 staging cohort, DIT's `messages_segmented` keeps the messages that the correction would drop. The cohort's offsets table lists 1,361 such receiver-hours in 2020, on 27 receivers and 173 days. For those hours, DIT's staging output is not comparable with production's historical output.
+  - Comparisons between two DIT runs (modes, or base against head) are not affected: both sides run without the correction.
+  - The correction only ever applied to data that carries satellite receiver IDs. The current feed has none (since 2026-04-22), so production computes no offsets for current data either.
+- **What would change this:** an option in pipe-segment to read an offsets table instead of computing one. DIT could then pass the cohort's existing offsets table. That is the path, not planned work.
+
+#### Changed
+- **pipe-segment drift spec: production's four satellite flags are accepted differences of the `segment` step, with the reason above** (`workflows/pipe_segment/composer_drift.py`). `--out_sat_offsets_table` was listed as a DIT-owned flag and is now accepted with the other three, since DIT sets no value for it. pipe-segment still reports in sync.
+- **Docs: "DIT's `messages_segmented` keeps messages production drops when a satellite's clock is off" is now qualified.** It holds for data that carries satellite receiver IDs, so for the 2020 staging cohort against production's historical output, and not for the current feed.
+
 ### 2026-11-19: source pinning by copy for pipe-gaps outage recovery and pipe-segment
 
 `workflows/pipe_gaps/outage_recovery.py` and `workflows/pipe_segment/identity_match_key.py` now pin their sources by copying them at run start, as `port_visits/cross_version_ais.py` has since 2026-10-22 ([PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705)). Both failed at their first step before: they pinned with BigQuery snapshots, which BigQuery refuses across organisations and which no DIT identity may create with an expiration in `tech_great_expectations`. **Nothing was run.** The copy statements were checked with BigQuery dry runs on the staging sources.
@@ -18,7 +42,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   - `--skip-snapshots`: use `--reuse-pin <stamp>`.
   - `--no-snapshot`: use `--no-pin`. Same meaning: every job reads the live sources.
 - **`identity_match_key.py`: `--pin-source-at` (was required), `--snapshot-dest-project` and `--snapshot-expiration-days`.** Same handling: each is rejected with its replacement (drop the first two; `--pin-expiration-days` for the third).
-- **`identity_match_key.py --include-satellite-offsets` is refused.** Passing it stops the run at argument parsing, before any cloud call. The option could not work: its inputs, the satellite positions, are date-sharded tables in another organisation, which DIT does not support, and pipe-segment's offsets query reads its message source through a table wildcard that a partitioned table such as DIT's source does not match. The code that snapshotted those inputs is removed. The flag itself, the compare key of `satellite_timing_offsets` and the drift spec's accepted difference stay until the owner decides whether to delete the option.
+- **`identity_match_key.py`: the code that snapshotted the satellite-offset inputs.** The option it served, `--include-satellite-offsets`, is removed altogether; see 2026-11-20 above.
 
 #### Changed
 - **`outage_recovery.py` copies both sources at run start** (`dit.bq.pin_source_into_experiment`).
@@ -88,7 +112,7 @@ Port visits now runs what production runs: pipe-anchorages v5.0.1 and its CLI. P
   - **`--max-num-workers`, `--worker-machine-type`, `--disk-size-gb`** apply to the two Beam steps. `segment_info` no longer has a cap of its own (was 20, never used by the command).
   - **No `--setup_file` on published-image runs**, as in production: the image has no source tree. It is still passed with `--build-from-source` on Dataflow, where the worktree is mounted. **No `--experiments`** on any step: production passes none.
   - **`segment_identity` gets a Dataflow job name**, `dit-pipe-segment-segment-identity-<experiment>-<binding>`, like `segment`. On Dataflow a `--binding` name may now be at most 27 characters; a longer one is rejected when the arguments are parsed.
-  - **`--skip-downstream`** now skips five steps instead of two. **`--include-satellite-offsets`** was left unchanged by this entry; the block above refuses it.
+  - **`--skip-downstream`** now skips five steps instead of two. **`--include-satellite-offsets`** was left unchanged by this entry; the 2026-11-20 block removes it.
   - **Not production's state:** a binding starts from empty tables, so `segment` has no fragment history and `segment_vessel_daily` sees only the run's days in its 30-day window. Fair for an A/B between bindings; not comparable with production's tables.
 - **The pipe-segment drift spec covers all six tasks and is marked in sync** (`workflows/pipe_segment/composer_drift.py`). Drift in pipe-segment now fails the check (exit 1), as for port visits. Accepted differences, each with a reason in the report: `--project`, the staging source table, and production's three satellite-offset inputs, which DIT leaves out by default because they are date-sharded.
 - **Beam pin for pipe-segment: 2.56.0 → 2.71.0** (`PIPE_SEGMENT_BEAM_VERSION` in the `Makefile`), the version v5.0.3 pins. 2.56.0 was v5.0.2's. It applies to `make install-pipe-segment*` and to `make dit-cloud PIPELINE=pipe-segment`. The old constraint contradicts v5.0.3's `apache-beam[gcp]~=2.71`, so those installs are expected to have failed to resolve.
