@@ -58,7 +58,7 @@ All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-wi
 
 The default overlay image must be rebuilt, and the workflow's constants bumped, whenever production bumps the pipeline version. The overlay README lists the steps.
 
-**Second instance, with one patch per pipeline generation** (2026-11-20, pipe-segment, [`docker/overlays/pipe-segment-temp-dataset/`](../docker/overlays/pipe-segment-temp-dataset/README.md)). `workflows/pipe_segment/ais.py` defaults to the source-built overlay of pipe-segment v5.0.3 under the same two rules. What is new:
+**Second instance, with one patch per pipeline generation** (2026-11-20, pipe-segment, [`docker/overlays/pipe-segment-temp-dataset/`](../docker/overlays/pipe-segment-temp-dataset/README.md)). Both pipe-segment workflows default to the source-built overlay of pipe-segment v5.1.0, the version the AIS DAG is configured for; `workflows/pipe_segment/ais.py` follows the same two rules, and `identity_match_key.py` still auto-builds a plain image for an unreviewed binding. What is new:
 - **The read sites differ between the two versions dit drives**, so the directory holds one patch for each, and `build.sh` applies the first that passes `git apply --check`. The self-check is told which patch was applied.
 - **The self-check counts every BigQuery read in the whole package**, not only in the patched modules, so a read added upstream in a new module also fails the build.
 - **Start the image label with the pipeline version** (`v5.1.0`, `v5.1.0-pr230`). The workflow reads it from the tag to decide whether the image knows a flag that older code would ignore silently.
@@ -72,7 +72,8 @@ Examples:
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:v5.0.1-767770f-temp-dataset-905dc761` (source-built overlay; the port-visits default)
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` (source-built overlay of a PR head; cross-version, per-binding)
 - `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (auto-built for unreviewed docker-runner code)
-- `gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` (source-built overlay; the default of pipe-segment's mode-equivalence workflow; not built yet on 2026-11-20)
+- `gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` (source-built overlay; the default of both pipe-segment workflows; not built yet on 2026-11-20)
+- `gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` (source-built overlay of the version the VMS DAG pins; not built yet)
 
 Canonical upstream defaults the workflows pin (read-only to dit):
 
