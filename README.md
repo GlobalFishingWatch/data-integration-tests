@@ -445,9 +445,10 @@ Each phase below is a short summary of what's planned and where we are. This sec
 7e. **Mode equivalence for the segmenter.** `workflows/pipe_segment/ais.py` and the pipe-segment temp-dataset overlay landed 2026-11-20 (Features, "Mode equivalence for the segmenter"). First use: pipe-segment PR #227 (`--incremental`, released as v5.1.0), whose claim is that incremental day-by-day runs equal full history.
    - **Nothing has run.** The argv, the plan and the refusals are covered by tests with every cloud call mocked; the two patches apply to their tags and pass the static self-check.
    - **Next, each waiting for the owner's go-ahead:**
-     1. build and push the two overlay images (v5.0.3, the default; v5.1.0, for `incremental`);
-     2. a three-day Dataflow smoke (`RUN_INSTRUCTIONS.md`, 4 jobs);
-     3. the PR #227 test on January 2020 (44 jobs).
+     1. a three-day laptop smoke on DirectRunner, which needs no image (`RUN_INSTRUCTIONS.md` § M5, 4 local runs);
+     2. build and push the two overlay images (v5.0.3, the default; v5.1.0, for `incremental`);
+     3. the same three days on Dataflow (4 jobs);
+     4. the PR #227 test on January 2020 (44 jobs, § M6).
    - **Open:** `identity_match_key.py` is not wired to the overlay; the workflow has no run cache and its output tables have no expiration; a cross-version wrapper for the segmenter (base against head, per mode) does not exist.
 
 8. **Docs reorganisation.** This README has outgrown its shape — it now carries source-target inventories, per-workflow interpretation notes, and operational findings that belong in `docs/` or alongside the workflow they describe (`workflows/<pipeline>/README.md`, as `workflows/encounters/README.md` now does). Near-term: move content out and leave the README as an index. Longer-term this needs a **concept for storing dit outputs and analyses in a structured way** — run results, comparison summaries and their interpretation currently have no home at all, which is why they keep landing in prose. Recorded 2026-07-31.
