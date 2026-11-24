@@ -43,17 +43,19 @@ def compare_tables(
     compare_all) keep working with correct semantics.
 
     Counts come from ``table-check``'s ``--output-json`` summary, not the
-    subprocess exit code -- ``table-check summary`` always exits 0 regardless
-    of whether differences were found (it's informational, not assertional).
-    The earlier shim returned that exit code and so reported "IDENTICAL" for
+    subprocess exit code. Before v0.3.0, ``table-check summary`` exited 0
+    whatever it found; since v0.3.0 it exits 0 on PASS, 1 on FAIL and 2 on
+    error, but its PASS/FAIL verdict also honours ``--expect-diff`` and
+    schema drift, so the row counts stay the source of truth here. The
+    earlier shim returned the exit code and so reported "IDENTICAL" for
     every successful comparison; this implementation reads the real count
     from the JSON output then clamps as described above.
 
     Falls back to the subprocess exit code only when the JSON output is
     missing or unparseable -- which signals a real subprocess failure
-    (auth, malformed query, etc.) rather than the informational success
-    case. In that path the return value is the non-zero subprocess rc,
-    preserving the "non-zero means something went wrong" contract.
+    (auth, malformed query, etc.; exit 2 since v0.3.0). In that path the
+    return value is the non-zero subprocess rc, preserving the "non-zero
+    means something went wrong" contract.
 
     ``view_suffix`` is appended to both fully-qualified table names before
     the call. SCD-2 consumers (pipe-gaps) pass ``"_last_versions"``;
