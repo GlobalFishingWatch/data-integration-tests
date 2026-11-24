@@ -492,6 +492,63 @@ def log_production_sizing_hint(
 
 
 # --------------------------------------------------------------------------
+# (a4) DirectRunner for short jobs of a Dataflow run (owner request, 2026-11-24)
+# --------------------------------------------------------------------------
+#
+# A Dataflow job spends about two minutes starting workers and two stopping
+# them, whatever its size. On a small cohort a one-day job does about a
+# minute of work inside a six-minute job. ``--direct-runner-max-days N`` runs
+# every job covering N days or fewer on Beam's DirectRunner, inside the same
+# container that would otherwise submit it, and leaves longer jobs on
+# Dataflow. Chosen by hand: DIT does not judge when the two runners agree.
+# The run's own comparison checks it, whenever a short job's output is
+# compared with a longer job's on Dataflow.
+
+RUNNER_DATAFLOW = "dataflow"
+RUNNER_DOCKER = "docker"
+
+
+def _positive_days(value: str) -> int:
+    return _int_at_least(value, name="--direct-runner-max-days", minimum=1)
+
+
+def add_direct_runner_max_days_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--direct-runner-max-days`` (default ``None``: every job on the
+    run's ``--runner``)."""
+    parser.add_argument(
+        "--direct-runner-max-days", type=_positive_days, default=None, metavar="N",
+        help="With --runner dataflow: run every job that covers N days or fewer on "
+             "DirectRunner inside the container instead of submitting it to Dataflow; "
+             "longer jobs stay on Dataflow. Meant for small inputs, such as the staging "
+             "cohort's daily jobs, where Dataflow's start-up and shutdown (about four "
+             "minutes a job) dwarf the work. DirectRunner runs the same code in one "
+             "process; DIT does not check that both runners give the same output, but "
+             "the run's comparison does whenever such a job is compared with a longer "
+             "one on Dataflow. Default: off.",
+    )
+
+
+def runner_for_days(runner: str, days: int, direct_runner_max_days: int | None) -> str:
+    """The runner one job runs on: ``runner``, except a Dataflow run's job of
+    at most ``direct_runner_max_days`` days, which runs on DirectRunner
+    (``RUNNER_DOCKER``). Pure."""
+    if runner == RUNNER_DATAFLOW and direct_runner_max_days is not None \
+            and days <= direct_runner_max_days:
+        return RUNNER_DOCKER
+    return runner
+
+
+def check_direct_runner_max_days(runner: str, direct_runner_max_days: int | None) -> None:
+    """Refuse ``--direct-runner-max-days`` on a run that is not on Dataflow,
+    where it would change nothing and so read as if it had."""
+    if direct_runner_max_days is not None and runner != RUNNER_DATAFLOW:
+        raise SystemExit(
+            f"error: --direct-runner-max-days moves short jobs of a Dataflow run to "
+            f"DirectRunner; with --runner {runner} every job already runs there."
+        )
+
+
+# --------------------------------------------------------------------------
 # (b) Experiment-id helpers
 # --------------------------------------------------------------------------
 # BQ-table-name-safe slug; max 32 chars. Compiled once.
