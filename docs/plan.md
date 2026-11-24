@@ -342,7 +342,13 @@ A cross-version workflow gives every binding the same command line, the same inp
 
 **Drift check of older layers.** `drift.WorkflowSpec.composer_ref` freezes a spec at one composer commit, whatever ref the run reads. Each declared adjustment for an older version names the composer commit at which production last ran that version (`adjustments.FROZEN_AT`); base plus adjustment must be in sync there. Production cannot move a fixed commit, so this is a regression test of DIT: it runs in the opt-in `tests/test_composer_drift_live.py` and with the runner's `--frozen`, not in the default output.
 
-**Removal rule for old layers.** A declared adjustment, and its frozen spec, is deleted when no run needs that version as a base. Proposed: keep production's current and previous version.
+**Removal rule for old layers** (owner decision, 2026-11-24). A declared adjustment, and its frozen spec, is kept only while its version is production's current or previous one, and deleted after that.
+
+**Where the rules live: two stages** (owner decision, 2026-11-24).
+1. **Now:** in DIT, one file per pipeline (`workflows/<pkg>/adjustments.py`), keyed by version range and always edited at its newest state. Adding a rule for an old version never means checking that version out or committing on top of it.
+2. **Later ([PIPELINE-4819](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4819)):** each pipeline repo carries a file describing its own DIT interface, so a repo maintains exactly one, for its own version. DIT reads it at each binding's ref (`git show <ref>:<path>`), as it already reads a ref's CLI source for the preflight. Layer 0 then comes from each side's ref instead of DIT's checkout. Refs older than the file fall back to DIT's version-range table, which from then on only shrinks; the removal rule above applies to that fallback alone.
+
+Set aside: a separate rules repository tracking each pipeline repo's versions (a third repository to keep in sync, nothing gained over a file in DIT), and git notes on pipeline commits (not fetched or pushed by default, poor tooling).
 
 **First consumer:** `workflows/pipe_segment/identity_match_key.py`. Its base passes `--incremental` and its two tables to `segment`, as the AIS v3 DAG does since composer PR #3145 (2026-11-20). One declared adjustment removes the three for a binding whose `segment` does not declare `--incremental` (below v5.1.0). Its frozen spec checks v5.0.3 at composer `cb0c9a3b7930`, the first parent of PR #3145's merge. The other cross-version workflows (`port_visits/cross_version_ais.py`, `pipe_events/cross_version_fishing.py`, `pipe_gaps/outage_recovery.py`) keep their own pin specs until they are ported; the hard-form users (encounters v4.4 to v5, pipe-events v4 to v9) come with their ports.
 

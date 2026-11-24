@@ -80,6 +80,17 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-24 — Owner decisions on per-side adjustments: removal rule, two stages for where rules live, default of a v5.0.3 against v5.1.0 run
+
+Decided on PR #97, the same day as the entry below.
+- **Removal rule:** a declared adjustment and its frozen spec are kept only while their version is production's current or previous one.
+- **Where the rules live, two stages.** Now: in DIT, one file per pipeline, keyed by version range, always edited at its newest state. Later ([PIPELINE-4819](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4819)): each pipeline repo carries its own DIT interface for its own version, read at each binding's ref; DIT's table becomes the fallback for older refs. The owner's aim is that a pipeline repo maintains one interface at a time. Set aside: a separate rules repository, git notes.
+- **Frozen specs** appear only with the drift runner's `--frozen` and in the opt-in live test. Confirmed.
+- **`--in_segments_table` and `--in_fragments_table`** stay accepted differences in the pipe-segment drift spec; `--incremental` is compared. Confirmed.
+- **Default of a v5.0.3 against v5.1.0 run** in `identity_match_key.py`: the base runs full history (its only segmenter), the head incremental, as production's DAG does since composer PR #3145. That is the comparison the owner wants: the PR against the release production ran before it. Holding the segmenter fixed stays possible with `--binding-adjust`; the code-only comparison is `ais.py`'s full-history base-against-head pair. No extra warning: the run log already prints the flag difference.
+
+**Sections moved.** `docs/plan.md` § "Per-side adjustments" (removal rule, "Where the rules live: two stages").
+
 ### 2026-11-24 — Per-side adjustments in cross-version runs (`dit.adjust`); `identity_match_key.py` mirrors production's `--incremental`; frozen drift spec for pipe-segment v5.0.3
 
 **Trigger.** The entry below agreed per-side adjustments with the owner and left them for their own PR. This is that PR. Owner decisions fixed beforehand: by default both sides get the same parameters; adjusting either side must be easy; tables are in scope from the start; an older layer is checked against the composer commit where production last ran it; every emitted flag is checked against the ref's own CLI source before a run.
