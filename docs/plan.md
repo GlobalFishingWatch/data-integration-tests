@@ -309,6 +309,43 @@ A capability not in the original Phase 1-7 numbering, emerged from the PIPELINE-
 - **Pipe-gaps cross-version workflow.** None exists. Job names and the cleanup label are at parity (see Open items); a cross-version workflow for pipe-gaps would mirror `cross_version_ais.py` for the detect-gaps shape.
 - **`--temp_dataset` for pipe-anchorages: no upstream PR (decision 2026-10-22, PIPELINE-4699).** The v4.6.4 CLI's `--temp_dataset` only ever existed on the local `anchorages_pipeline@dit-temp-dataset-support` branch, which the PIPELINE-1465 synthetic branches cherry-picked. For the v5 CLI, dit builds a test-only overlay image instead ([`docker/overlays/pipe-anchorages-temp-dataset/`](../docker/overlays/pipe-anchorages-temp-dataset/README.md)); it is never proposed upstream. Confirmed on 2026-11-19, when the v4 CLI was dropped and the overlay of v5.0.1 became the workflows' default image.
 
+## Per-side adjustments: bindings that differ in their interface (2026-11-24)
+
+A cross-version workflow gives every binding the same command line, the same inputs and the same outputs. That holds only while the refs share an interface. pipe-segment PR #227 (v5.1.0) is the first case in hand: v5.1.0's `segment` declares `--incremental`, `--in_segments_table` and `--in_fragments_table`; v5.0.3's does not (compare `src/pipe_segment/cli/commands/segment.py` at the two tags). Port visits v4 to v5 was the hard form (other commands, flags, date convention) and was solved by dropping v4.
+
+**Owner direction (2026-11-24).** By default every parameter is the same on both sides. Adjusting a parameter on one side (remove, add, rename) must be easy. Table interfaces may change too (two inputs become one), so the design cannot stop at flags. Checking only the newest interface against production is a risk.
+
+**What stays shared in a run, and is not adjustable:** the DIT checkout, the experiment id, the date window, the pin stamp, the destination dataset, and the comparison tool. Everything that faces the pipeline may differ per side.
+
+**Layers over one base** (`src/dit/adjust.py`, pure, stdlib plus `dit.composer`):
+
+| Layer | What | Where | Selected by |
+|---|---|---|---|
+| 0. Base | The workflow's builders. Mirrors production today. | `workflows/<pkg>/*.py` | always |
+| 1. Declared | Edits that hold for a range of pipeline versions. | `workflows/<pkg>/adjustments.py` | the binding's ref: its CLI source first, its version second |
+| 2. Ad hoc | Edits for one run, for a ref whose change is not released. | `--binding-adjust NAME=<step>:<op>:<flag>[=<value>]` | the operator |
+
+- **Interface** (`adjust.Interface`, frozen): per step the command tokens; `inputs` as `Input(role, source, window)`; `outputs` as `Output(name, table, keys, meaning)`.
+- **An adjustment is a pure `Interface -> Interface`**, built from edits: flag edits `remove`, `add`, `rename`, `set`, `command` (placed on a step with `on_step`); table edits `add_input`, `remove_input`, `replace_inputs`, `rename_output`, `add_output`, `remove_output`, `set_keys`. `Adjustment(edits, applies, reason)`; layers apply in order and a later one wins.
+- **No adjustment means byte-identical tokens**: the same tokens in the same order and spelling. An edit rewrites only the tokens of the flag it names.
+- **A stale rule is loud.** An edit that finds nothing to change raises: remove, rename or set of an absent flag, add of a present one, a table edit naming an unknown input or output.
+- **Placeholders**: `{out.<name>}` is the binding's own table of output `<name>`, `{in.<role>}` the pinned copy of input `<role>`.
+- **Ad hoc edits are flag edits only.** Table edits are declared in code.
+
+**Table rules.**
+- **Pinning.** The union of all sides' inputs is pinned once, at the one pin stamp. Each side reads its own inputs' copies through `{in.<role>}`.
+- **Comparison by output name.** A rename is an edit. An output only one side writes is listed as not compared, never dropped. A compared pair must have equal keys on both sides after edits, or the run refuses before pinning.
+- **Lineage is the operator's claim.** When the sides read different source tables, DIT cannot show they hold the same data; the run log says so, naming the tables.
+- **No real case yet.** No pipeline DIT covers changes its tables between two versions today. The table edits are tested with synthetic interfaces only.
+
+**Preflight**, per binding, before anything is pinned: every pipeline flag of the adjusted argv must be declared in that ref's CLI source, read with `git show`. Beam's options are exempt on Beam steps only (pipe-segment: `adjustments.BEAM_OPTIONS`, `drift.DATAFLOW_OWNED_FLAGS` plus eight more, worked out by reading both command modules at v5.0.3 and v5.1.0). This targets the dangerous failure: pipe-segment parses with `parse_known_args` and hands unknown flags to Beam, which ignores them, so a wrong flag runs silently without effect. A static read of source, not a run of the CLI.
+
+**Drift check of older layers.** `drift.WorkflowSpec.composer_ref` freezes a spec at one composer commit, whatever ref the run reads. Each declared adjustment for an older version names the composer commit at which production last ran that version (`adjustments.FROZEN_AT`); base plus adjustment must be in sync there. Production cannot move a fixed commit, so this is a regression test of DIT: it runs in the opt-in `tests/test_composer_drift_live.py` and with the runner's `--frozen`, not in the default output.
+
+**Removal rule for old layers.** A declared adjustment, and its frozen spec, is deleted when no run needs that version as a base. Proposed: keep production's current and previous version.
+
+**First consumer:** `workflows/pipe_segment/identity_match_key.py`. Its base passes `--incremental` and its two tables to `segment`, as the AIS v3 DAG does since composer PR #3145 (2026-11-20). One declared adjustment removes the three for a binding whose `segment` does not declare `--incremental` (below v5.1.0). Its frozen spec checks v5.0.3 at composer `cb0c9a3b7930`, the first parent of PR #3145's merge. The other cross-version workflows (`port_visits/cross_version_ais.py`, `pipe_events/cross_version_fishing.py`, `pipe_gaps/outage_recovery.py`) keep their own pin specs until they are ported; the hard-form users (encounters v4.4 to v5, pipe-events v4 to v9) come with their ports.
+
 ## Runtime & CI
 
 Originally the orchestrator ran on the user's laptop. Babysitting a 12-hour cross-version run is impractical (suspending the laptop kills the run). Design settled on **Cloud Build** for both ad-hoc and PR-triggered runs. The ad-hoc path (items 1-3 below) landed 2026-05-15; items 4-6 are still open (status: README § Roadmap).
