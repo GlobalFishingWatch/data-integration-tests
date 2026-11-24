@@ -80,6 +80,48 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-24 — Per-side adjustments in cross-version runs (`dit.adjust`); `identity_match_key.py` mirrors production's `--incremental`; frozen drift spec for pipe-segment v5.0.3
+
+**Trigger.** The entry below agreed per-side adjustments with the owner and left them for their own PR. This is that PR. Owner decisions fixed beforehand: by default both sides get the same parameters; adjusting either side must be easy; tables are in scope from the start; an older layer is checked against the composer commit where production last ran it; every emitted flag is checked against the ref's own CLI source before a run.
+
+**What was decided, and why.**
+- **One base, layers on top** (`src/dit/adjust.py`): the workflow's base `Interface` (steps' tokens, inputs, outputs with keys), then declared adjustments chosen per binding, then the run's ad hoc `--binding-adjust`. An adjustment is a pure `Interface -> Interface`; a later layer wins. Design in `docs/plan.md` § "Per-side adjustments".
+- **No adjustment means byte-identical tokens.** Edits splice only the tokens of the flag they name and keep its spelling. So the existing argv tests of `identity_match_key.py` pass unedited: their binding is `before=v5.0.3`, which the declared adjustment takes back to the old argv. Edited there: one test renamed and inverted (no `--incremental` below v5.1.0) and two preflight reads patched out of the `main()` harness.
+- **A stale rule is an error.** Remove, rename or set of an absent flag, add of a present one, a table edit naming an unknown input or output: all raise. A no-op rule would hide that the base moved under it.
+- **The base mirrors production, so it passes `--incremental`.** Since composer PR #3145 (2026-11-20) the AIS v3 DAG's `segment` passes it. The base also names the binding's own tables as `--in_segments_table` / `--in_fragments_table`. `CROSS_VERSION_SEGMENT_ACCEPTED_DIFFERENCES` is gone: `--incremental` is now compared. The two table flags are accepted differences (DIT names its own tables; the DAG leaves pipe-segment's defaults, which are its own outputs too).
+- **The rule is written as a removal** ("below v5.1.0: no `--incremental` and its two tables"), where the plan worded it as an addition ("5.1.0 and later: add"). Same rule. Written from the base's side because the base is production, and the rule is what gets deleted when v5.0.3 is no longer needed.
+- **The rule asks the ref's source first, its version second.** An unreleased head carries the previous release's version number; a head with the flag and `version = "5.0.3"` must keep it.
+- **Preflight against the ref's CLI source**, before pinning. pipe-segment parses with `parse_known_args` and hands unknown flags to Beam, which ignores them: a wrong flag would run silently with no effect. Beam options are exempt on the two Beam steps only (`adjustments.BEAM_OPTIONS`: `drift.DATAFLOW_OWNED_FLAGS` plus project, runner, region, setup file, machine type, disk size, private IPs, network). The four SQL steps get no exemption.
+- **Ad hoc edits are flag edits only.** Table edits are declared in code.
+- **Placeholders** `{out.<name>}` and `{in.<role>}`: the operator cannot know a binding's table names.
+- **Frozen spec at `composer_ref`.** `WorkflowSpec.composer_ref` reads a spec at its own commit whatever ref the run asks for. The pipe-segment v5.0.3 layer is frozen at `cb0c9a3b7930`, the first parent of PR #3145's merge `24afaa8b1`. Not in the runner's default output, which answers "what does DIT differ in from production today"; added with `--frozen` and checked in the opt-in `tests/test_composer_drift_live.py`.
+- **`--binding-image NAME=IMAGE`** (submitter and worker image for one binding; wins over `--image-tag`), modelled on `cross_version_ais.py`. A warning when the image's tag names another version than the ref states.
+- **`--allow-same-gpsdio-pin`**: v5.0.3 and v5.1.0 both pin gpsdio-segment v3.0.0, which `_verify_distinct_gpsdio_pins` refused. Default unchanged.
+- **The run log** prints, per binding, the edits with their reasons; per pair, each step's flag difference (`composer.diff_flags` via `adjust.diff_steps`); and, when the sides read different inputs, that lineage is the operator's claim, naming the tables.
+- **pipe-segment's pin spec moved to the library** (`adjust.Input`). The other three cross-version workflows keep their own `_PinSpec` until they are ported.
+- **`ais.py` shares the static read.** Its `--build-from-source` check of `--incremental` now uses `adjust.declared_flags` instead of a substring test for `"--incremental"`. The one difference: a single-quoted declaration now counts too. Its version helpers moved to `workflows/pipe_segment/adjustments.py` and are re-exported under the old names.
+
+**Verified, and how.**
+- The three flags are the only change of `src/pipe_segment/cli/commands/segment.py` between tags v5.0.3 and v5.1.0 (`git show` in the local pipe-segment checkout).
+- The preflight passes on the real command modules at both tags (opt-in test; a read of source, not a run of the CLI).
+- `cb0c9a3b7930` is the first parent of `24afaa8b1` (`git log --first-parent` on the AIS v3 snapshot in the local composer checkout), and the frozen spec is in sync there.
+- Drift check against composer `origin/main` `d8968f59cb98`: exit 0, both pipe-segment specs in sync; with `--frozen`, the v5.0.3 spec in sync too.
+- Suite 1,535 → 1,726.
+
+**Not verified.**
+- No binding has run with adjustments. Nothing ran on Dataflow, docker or BigQuery; the v5.0.3 overlay image is not built.
+- The table edits have no real case: no pipeline changes its tables between versions today. Tested with synthetic interfaces only.
+- `BEAM_OPTIONS` is hand-written and not checked against Beam.
+- That the output schemas of v5.0.3 and v5.1.0 match (the schema files are unchanged between the tags; read, not run).
+
+**Sections moved.**
+- New: `src/dit/adjust.py`, `workflows/pipe_segment/adjustments.py`, `tests/test_adjust.py`, `tests/test_pipe_segment_adjustments.py`.
+- `src/dit/composer.py` (`ArgvSpan`, `argv_spans`); `src/dit/drift.py` (`WorkflowSpec.composer_ref`, `frozen`, per-spec ref in `run_specs`, report line); `src/dit/git_info.py` (`show_file`, `first_file`).
+- `workflows/pipe_segment/identity_match_key.py`: docstring section "Bindings that differ in their interface" (replaces "No `--incremental` here"); `_base_interface`, `_incremental_flags`, `_adjusted`, `_sides`, `_preflight`, `_check_flags`, `_log_sides`, `_not_compared`, pin functions on `adjust.Input`; `--binding-adjust`, `--binding-image`, `--allow-same-gpsdio-pin`.
+- `workflows/pipe_segment/composer_drift.py` (`INCREMENTAL_ACCEPTED_DIFFERENCES`, `FROZEN_SPECS`); `workflows/composer_drift.py` (`FROZEN_SPECS`, `--frozen`, `select`); `workflows/pipe_segment/ais.py` (shared helpers).
+- Tests: `tests/test_composer_drift.py`, `tests/test_drift.py`, `tests/test_pipe_segment_identity_match_key.py`, `tests/test_composer_drift_live.py` (frozen specs).
+- Docs: `docs/plan.md` § "Per-side adjustments" (new); `docs/conventions.md` § "Bindings that differ in their interface" (new); README Features; `workflows/pipe_segment/RUN_INSTRUCTIONS.md` (status, `--incremental`, image resolution, gpsdio pin); CHANGELOG § 2026-11-24.
+
 ### 2026-11-24 — A base version next to the head in `workflows/pipe_segment/ais.py` (`@base`, `--base-image`); per-side adjustments agreed, not built
 
 **Trigger.** The owner pointed out that the pipe-segment PR #227 test needs the head in its new mode against the base in its only mode. Neither pipe-segment workflow did that:
