@@ -45,7 +45,8 @@ In a cross-version workflow every binding gets the base interface by default: th
 - **An edit that finds nothing to change is an error.** Do not catch it to make a rule optional; a stale rule must be loud.
 - **Every declared adjustment for an older version names a composer commit** at which production last ran that version, and gets a frozen drift spec (`WorkflowSpec.composer_ref`) checked in `tests/test_composer_drift_live.py`.
 - **Preflight against the ref's CLI source** before anything is pinned: a pipeline that hands unknown flags to Beam ignores a wrong flag silently. Beam's options are exempt on Beam steps only, from a hand-written list next to the workflow that says how it was worked out.
-- **Removal:** delete an adjustment and its frozen spec when no run needs that version as a base (proposed: keep production's current and previous version).
+- **Removal:** keep an adjustment and its frozen spec only while their version is production's current or previous one (owner decision, 2026-11-24).
+- **Later, the pipeline repos define their own interface** ([PIPELINE-4819](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4819)); DIT's version-range table becomes the fallback for older refs. See `docs/plan.md` § "Per-side adjustments".
 
 ## Image namespace
 
