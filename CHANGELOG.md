@@ -9,6 +9,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 ### 2026-11-24: a base version next to the head in the segmenter's mode-equivalence workflow
 
 #### Added
+- **`--direct-runner-max-days N` on `workflows/pipe_segment/ais.py`** (default off): with `--runner dataflow`, every job covering N days or fewer runs on DirectRunner inside the container, and longer jobs stay on Dataflow. For small inputs such as the staging cohort's daily jobs, where Dataflow's start-up and shutdown take about four minutes of a six-minute job (measured on build `4bb84ec0`). Chosen by hand; refused with `--runner docker`. `--dry-run` reports which runner each job uses. Shared helpers in `dit.workflow` (`add_direct_runner_max_days_arg`, `runner_for_days`, `check_direct_runner_max_days`) for other workflows. Not yet run inside Cloud Build.
 - **`workflows/pipe_segment/ais.py`: `--modes` entries ending in `@base`, and `--base-image`.** Such an entry runs on the base image, an overlay image of an earlier pipe-segment version, as submitter and worker image. Every other entry runs on the run's own images.
   - **Why:** without a base, "full history equals incremental" is tested on the new version alone. A change to code both segmenters share would go unseen.
   - **The three-sided test of pipe-segment PR #227:** `--modes 1_bf:full-history@base,1_bf:full-history,1_bf:incremental --base-image <v5.0.3 overlay>`.

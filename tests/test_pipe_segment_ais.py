@@ -1054,7 +1054,7 @@ def test_dry_run_reports_the_plan_and_creates_nothing(caplog) -> None:
     log = "\n".join(r.getMessage() for r in caplog.records)
     assert "dry run: nothing is created" in log
     assert "plan: 5 variant(s), 23 segment job(s), 12 comparison(s)" in log
-    assert ("4_daily:incremental job 10/10: 2020-01-10 (1d); reads the pinned messages of "
+    assert ("4_daily:incremental job 10/10: 2020-01-10 (1d) on Dataflow; reads the pinned messages of "
             "that range and the segments and fragments of 2020-01-09 in its own tables") in log
     assert "1_bf:full-history job 1/1: 2020-01-01..2020-01-10 (10d)" in log
     assert "no fragment history (its tables are empty)" in log
@@ -1209,6 +1209,82 @@ def test_base_job_names_are_distinct_and_fit() -> None:
 def test_compare_must_name_a_known_choice() -> None:
     with pytest.raises(SystemExit):
         mod.parse_args(["--compare", "pairs"])
+
+
+# --------------------------------------------------------------------------
+# --direct-runner-max-days: short jobs on DirectRunner, long ones on Dataflow
+# --------------------------------------------------------------------------
+
+def test_by_default_every_job_of_a_dataflow_run_is_on_dataflow() -> None:
+    args = _args("--modes", "2_bfd")
+    argvs = _argvs(args, _variant("2_bfd:incremental"))
+    assert [_one(argv, "--runner") for argv in argvs] == ["dataflow"] * 4
+
+
+def test_jobs_of_at_most_n_days_run_on_direct_runner() -> None:
+    args = _args("--modes", "2_bfd,4_daily", "--direct-runner-max-days", "1")
+    bfd = _argvs(args, _variant("2_bfd:incremental"))
+    daily = _argvs(args, _variant("4_daily:incremental"))
+
+    # The 7-day backfill stays on Dataflow; each one-day job runs locally.
+    assert [_one(argv, "--runner") for argv in bfd] == ["dataflow"] + ["DirectRunner"] * 3
+    assert {_one(argv, "--runner") for argv in daily} == {"DirectRunner"}
+
+
+def test_a_direct_runner_job_gets_no_dataflow_option() -> None:
+    args = _args("--modes", "4_daily", "--direct-runner-max-days", "1")
+    argv = _argvs(args, _variant("4_daily:incremental"))[0]
+    flags = _flags(argv)
+
+    assert not {"--job_name", "--sdk_container_image", "--region", "--max_num_workers",
+                "--worker_machine_type", "--service_account_email"} & set(flags)
+    # Still what the BigQuery reads and writes need, and the labels.
+    assert {"--temp_location", "--project", "--labels"} <= set(flags)
+
+
+def test_the_threshold_counts_days_with_both_ends_included() -> None:
+    args = _args("--modes", "2_bfd", "--direct-runner-max-days", "7")
+    argvs = _argvs(args, _variant("2_bfd:incremental"))
+    # The backfill is 2020-01-01..07: seven days, so it runs locally too.
+    assert {_one(argv, "--runner") for argv in argvs} == {"DirectRunner"}
+
+
+@pytest.mark.parametrize("cli", [
+    ("--runner", "docker", "--direct-runner-max-days", "1"),
+    ("--direct-runner-max-days", "0"),
+    ("--direct-runner-max-days", "one"),
+])
+def test_a_meaningless_threshold_is_refused(cli) -> None:
+    with pytest.raises(SystemExit):
+        mod.parse_args(list(cli))
+
+
+def test_the_worker_image_is_not_executed_when_no_head_job_is_on_dataflow() -> None:
+    only_daily = mod.parse_args(["--modes", "4_daily", "--direct-runner-max-days", "1",
+                                 "--worker-image", V503, "--image-tag", NEWER])
+    assert mod._images_executed(only_daily) == (("--image-tag", NEWER),)
+    # So an older worker image no job uses does not trip the incremental check.
+    _support("--modes", "4_daily", "--direct-runner-max-days", "1",
+             "--worker-image", V503, "--image-tag", NEWER)
+
+
+def test_the_plan_says_where_each_job_runs(caplog) -> None:
+    with caplog.at_level("INFO"):
+        rc, _ = _main("--modes", "1_bf:full-history,2_bfd", "--direct-runner-max-days", "1",
+                      "--dry-run")
+
+    assert rc == 0
+    log = "\n".join(r.getMessage() for r in caplog.records)
+    assert "--direct-runner-max-days 1: 3 job(s) on DirectRunner, 2 on Dataflow" in log
+    assert "1_bf:full-history job 1/1: 2020-01-01..2020-01-10 (10d) on Dataflow" in log
+    assert "2_bfd:incremental job 2/4: 2020-01-08 (1d) on DirectRunner" in log
+
+
+def test_runner_for_days_is_pure_and_only_moves_dataflow_jobs() -> None:
+    assert dit_workflow.runner_for_days("dataflow", 1, 1) == "docker"
+    assert dit_workflow.runner_for_days("dataflow", 2, 1) == "dataflow"
+    assert dit_workflow.runner_for_days("dataflow", 1, None) == "dataflow"
+    assert dit_workflow.runner_for_days("docker", 30, 1) == "docker"
 
 
 def test_dry_run_still_refuses_what_a_run_would_refuse() -> None:
