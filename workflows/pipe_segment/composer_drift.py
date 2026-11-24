@@ -30,10 +30,24 @@ production PR #3145 (merged 17:26 UTC) set the segment group to pipe-segment
 v5.1.0 and added ``--incremental`` to the ``segment`` task. Both specs then
 reported the version on every step and the flag on ``segment``, and the runner
 exited 1. DIT followed the same day: both workflows default to the overlay
-image of v5.1.0, ``ais.py`` defaults to the incremental segmenter, and
-``identity_match_key.py`` keeps full history, with ``--incremental`` an
-accepted difference (reason below). The default image is a DIT overlay build,
-so each step states its version instead of leaving it to the image tag.
+image of v5.1.0 and ``ais.py`` defaults to the incremental segmenter. The
+default image is a DIT overlay build, so each step states its version instead
+of leaving it to the image tag.
+
+**``--incremental`` is compared in the cross-version workflow too** (since
+2026-11-24). Its base interface passes the flag, as the DAG's task does, so
+dropping it on either side is drift. Until then the flag was an accepted
+difference: every binding ran full history, because a binding may be older
+than the flag. That is now a declared adjustment
+(``workflows/pipe_segment/adjustments.py``), applied to such a binding only.
+
+**The older layer is checked too** (``FROZEN_SPECS``). The base plus the
+adjustment for v5.0.3 is what DIT runs for a v5.0.3 binding. It is compared
+with the DAG at the last composer commit at which the segment group ran
+v5.0.3 (``adjustments.FROZEN_AT``), and must be in sync there. That spec is
+frozen: production cannot move it, so it is a regression test of DIT. It runs
+in ``tests/test_composer_drift_live.py`` and with the runner's ``--frozen``,
+not in the runner's default output.
 
 **No satellite timing offsets in DIT.** Production's ``segment`` task passes
 four satellite flags; DIT passes none and never will without a pipe-segment
@@ -51,8 +65,8 @@ import argparse
 from collections.abc import Mapping
 from datetime import date
 
-from dit import drift
-from workflows.pipe_segment import ais
+from dit import adjust, drift
+from workflows.pipe_segment import adjustments, ais
 from workflows.pipe_segment import identity_match_key as imk
 
 #: Binding name used for the offline tokens (it only reaches DIT-owned flags).
@@ -120,19 +134,20 @@ SEGMENT_ACCEPTED_DIFFERENCES = {
     **dict.fromkeys(SATELLITE_FLAGS, _SATELLITE_OFFSETS_REASON),
 }
 
-#: Why the cross-version workflow leaves out the DAG's ``--incremental``
-#: (identity_match_key.py, "No ``--incremental`` here", has the full reasons).
-_CROSS_VERSION_FULL_HISTORY_REASON = (
-    "the cross-version A/B runs full history for every binding: a binding may be a "
-    "ref older than v5.1.0, which would ignore the flag silently; a binding is one "
-    "job from empty tables, so the state the flag reads is empty either way; and "
-    "whether the two segmenters agree is what pipe_segment/ais.py tests"
+#: The two table flags an incremental job passes and the DAG's task does not.
+_INCREMENTAL_TABLE_REASON = (
+    "DIT names where an incremental job reads the state of the day before its "
+    "range: the run's own tables. The DAG's task leaves both to pipe-segment's "
+    "defaults, which are its own output tables too"
 )
 
-#: Accepted for the ``segment`` step of ``identity_match_key.py``.
-CROSS_VERSION_SEGMENT_ACCEPTED_DIFFERENCES = {
+#: Accepted for a ``segment`` job that passes ``--incremental``, on top of the
+#: step's: the cross-version workflow's base, and the default job of
+#: ``ais.py``. ``--incremental`` itself is not here: it is compared.
+INCREMENTAL_ACCEPTED_DIFFERENCES = {
     **SEGMENT_ACCEPTED_DIFFERENCES,
-    "--incremental": _CROSS_VERSION_FULL_HISTORY_REASON,
+    "--in_segments_table": _INCREMENTAL_TABLE_REASON,
+    "--in_fragments_table": _INCREMENTAL_TABLE_REASON,
 }
 
 #: Accepted for the four SQL steps.
@@ -158,9 +173,21 @@ def _dit_args(placeholders: Mapping[str, date]) -> argparse.Namespace:
     ])
 
 
-def dit_step_tokens(step: str, placeholders: Mapping[str, date]) -> list[str]:
+def dit_step_tokens(
+    step: str,
+    placeholders: Mapping[str, date],
+    *,
+    version: tuple[int, int, int] | None = None,
+) -> list[str]:
     """What one binding runs for ``step``. For reviewed code at the default
-    tag, the worker image is the default image."""
+    tag, the worker image is the default image.
+
+    Without ``version`` the binding gets the base interface, which is what a
+    binding at the default pipe-segment version runs. With it, the binding
+    gets the declared adjustments for that version on top
+    (``workflows/pipe_segment/adjustments.py``), chosen by the version alone:
+    offline, no ref's source is read.
+    """
     args = _dit_args(placeholders)
     argvs = imk._step_argvs(
         args,
@@ -170,18 +197,22 @@ def dit_step_tokens(step: str, placeholders: Mapping[str, date]) -> list[str]:
             normalized_messages=args.source_normalized_table,
         ),
         worker_image=args.image_tag,
+        binding=adjust.BindingInfo(name=_BINDING, version=version),
     )
     return [imk.CLI_ENTRYPOINT, *argvs[step]]
 
 
-def _tokens(step: str) -> drift.TokenBuilder:
-    """The token builder of ``step``."""
-    return lambda placeholders: dit_step_tokens(step, placeholders)
+def _tokens(step: str, version: tuple[int, int, int] | None = None) -> drift.TokenBuilder:
+    """The token builder of ``step``, for a binding at ``version`` (the
+    default version when ``None``)."""
+    return lambda placeholders: dit_step_tokens(step, placeholders, version=version)
 
 
-def _accepted(step: str) -> Mapping[str, str]:
+def _accepted(step: str, *, incremental: bool = True) -> Mapping[str, str]:
+    """The accepted differences of ``step``. ``incremental`` says whether the
+    ``segment`` job passes ``--incremental`` and its two table flags."""
     if step == "segment":
-        return CROSS_VERSION_SEGMENT_ACCEPTED_DIFFERENCES
+        return INCREMENTAL_ACCEPTED_DIFFERENCES if incremental else SEGMENT_ACCEPTED_DIFFERENCES
     return BEAM_ACCEPTED_DIFFERENCES if step in imk.BEAM_STEPS else SQL_ACCEPTED_DIFFERENCES
 
 
@@ -202,7 +233,56 @@ SPEC = drift.WorkflowSpec(
     dit_owned=DIT_OWNED_FLAGS,
     multi_value=drift.LABELS_MULTI_VALUE,
     in_sync=True,
-    note=_NOTE + "; the DAG's --incremental is another: every binding runs full history",
+    note=_NOTE + "; the base interface passes --incremental as the DAG's task does",
+)
+
+
+# --------------------------------------------------------------------------
+# Older layers of identity_match_key.py, frozen at their composer commit
+# --------------------------------------------------------------------------
+#
+# For each pipe-segment version an adjustment is declared for
+# (``adjustments.FROZEN_AT``): the base plus that version's adjustments,
+# against the DAG at the last commit at which production ran the version.
+#
+# The image of a frozen spec is only read for its name and tag. DIT has no
+# default image of an older version (a binding at one brings its own with
+# ``--binding-image``), so the reference below need not exist.
+
+def _frozen_image(version: tuple[int, int, int]) -> str:
+    repository = imk.DEFAULT_IMAGE_TAG.rsplit(":", 1)[0]
+    return f"{repository}:{adjustments.version_text(version)}"
+
+
+def _frozen_spec(version: tuple[int, int, int], commit: str) -> drift.WorkflowSpec:
+    name = adjustments.version_text(version)
+    incremental = version >= adjustments.INCREMENTAL_SINCE
+    return drift.WorkflowSpec(
+        name=f"pipe_segment/identity_match_key@{name}",
+        workflow="workflows/pipe_segment/identity_match_key.py",
+        snapshot="core_ais_v3",
+        steps=tuple(
+            drift.StepSpec(
+                step=step, task_id=TASK_IDS[step],
+                image=_frozen_image(version), version=name,
+                tokens=_tokens(step, version),
+                accepted=_accepted(step, incremental=incremental),
+            )
+            for step in imk.STEPS
+        ),
+        dit_owned=DIT_OWNED_FLAGS,
+        multi_value=drift.LABELS_MULTI_VALUE,
+        in_sync=True,
+        composer_ref=commit,
+        note=_NOTE + f"; what DIT runs for a binding at pipe-segment {name}: the base "
+                     f"interface with the adjustments declared for that version",
+    )
+
+
+#: The frozen specs: not in the runner's default output (``--frozen`` adds
+#: them); checked in ``tests/test_composer_drift_live.py``.
+FROZEN_SPECS = tuple(
+    _frozen_spec(version, commit) for version, commit in adjustments.FROZEN_AT.items()
 )
 
 
@@ -221,21 +301,8 @@ SPEC = drift.WorkflowSpec(
 # * ``segment[full-history]``: a job of the reference variant, which leaves
 #   the flag out on purpose.
 
-#: The two table flags an incremental job passes and the DAG's task does not.
-_INCREMENTAL_TABLE_REASON = (
-    "DIT names where an incremental job reads the state of the day before its "
-    "range: the variant's own tables. The DAG's task leaves both to pipe-segment's "
-    "defaults, which are its own output tables too"
-)
-
-#: Accepted for the default, incremental job, on top of the ``segment`` step's.
-INCREMENTAL_ACCEPTED_DIFFERENCES = {
-    **SEGMENT_ACCEPTED_DIFFERENCES,
-    "--in_segments_table": _INCREMENTAL_TABLE_REASON,
-    "--in_fragments_table": _INCREMENTAL_TABLE_REASON,
-}
-
-#: Accepted for the full-history job, on top of the ``segment`` step's.
+#: Accepted for the full-history job, on top of the ``segment`` step's. (The
+#: default, incremental job accepts INCREMENTAL_ACCEPTED_DIFFERENCES, above.)
 FULL_HISTORY_ACCEPTED_DIFFERENCES = {
     **SEGMENT_ACCEPTED_DIFFERENCES,
     "--incremental": "DIT's reference variant runs full history on purpose: it is "

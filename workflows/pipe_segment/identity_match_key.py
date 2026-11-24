@@ -60,7 +60,11 @@ through ``dit.runners.docker.run`` + ``dit.workflow.resolve_run_context``).
 
 Steps:
 
-1. Verify every binding's git ref exists in ``--pipeline-dir``.
+1. Verify every binding's git ref exists in ``--pipeline-dir``. Then work out
+   each binding's interface (its command lines, inputs and outputs after its
+   adjustments), log it, and check it against the ref's own CLI source; see
+   "Bindings that differ in their interface" below. Nothing is pinned or run
+   before this passes.
 2. Pin the source by copying it at run start
    (``dit.bq.pin_source_into_experiment``, PIPELINE-4705) into
    ``world-fishing-827.tech_great_expectations`` (default 7-day TTL). The one
@@ -84,12 +88,14 @@ Steps:
 
    a. ``git worktree add`` a temp dir at the ref.
    b. ``resolve_run_context(repo_dir=worktree, pipeline_name="pipe-segment",
-      runner="docker", suffix=<per-binding>, worker_image=args.image_tag,
+      runner="docker", suffix=<per-binding>, worker_image=<the binding's
+      --binding-image, else --image-tag>,
       default_worker_image=DEFAULT_IMAGE_TAG, ...)``. The harness classifies
       the ref as reviewed/unreviewed and stamps ``ctx.worker_image`` --
       canonical published for reviewed code at the default tag; auto-built
       ``gcr.io/world-fishing-827/dit/pipe-segment:dit-<commit>`` (kaniko) for
-      unreviewed code; an explicit ``--image-tag`` always wins.
+      unreviewed code; an explicit ``--image-tag`` or ``--binding-image``
+      always wins.
    c. Sanity check: log the worktree's ``gpsdio-segment`` pin (catches a
       kaniko cache-hit silently reusing the wrong image -- a false
       "IDENTICAL" verdict is worse than a noisy diff).
@@ -104,6 +110,7 @@ Steps:
       the per-binding outputs (see "The six steps" below).
 
 4. Diff: for each (output table, binding-pair) run ``dit.compare.compare_tables``.
+   Two bindings are compared by output name, each on its own table.
    Output tables are date-partitioned single tables (since pipe-segment v5.0.0
    PIPELINE-2074), so no per-shard iteration. Diffs are informational (exit
    0 even when non-empty); the overall exit code is non-zero only if a
@@ -146,29 +153,71 @@ Both hold for every binding alike, so an A/B is fair; the outputs are not
 comparable with production's own tables. Nor does a run apply the satellite
 timing offsets (see "No satellite timing offsets in DIT" above).
 
-**No ``--incremental`` here.** Since 2026-11-20 the AIS v3 DAG passes
-``--incremental`` to ``segment`` (pipe-segment v5.1.0; composer-dags-production
-PR #3145). This workflow does not, and its drift spec accepts that difference.
-Why:
+Bindings that differ in their interface
+---------------------------------------
+By default every binding gets the same command line, reads the same pinned
+source and writes the same tables. That is the *base* interface
+(:func:`_base_interface`), and it mirrors what production's segment group runs
+today. Where a binding's pipe-segment differs from that, the binding gets
+adjustments (``dit.adjust``), in layers, a later one winning:
 
-* **Bindings are arbitrary refs.** A ref older than v5.1.0 does not know the
-  flag, and pipe-segment hands unknown flags to Beam instead of rejecting them
-  (``cli/main.py`` line 47, ``parse_known_args``). Inferred, not run: such a
-  binding would run full history while the other ran incremental, and the A/B
-  would compare two segmenters instead of two refs.
-* **Nothing here exercises what the flag changes.** It changes where a job
-  takes the state of the day before its range from. A binding runs one
-  ``segment`` job from empty tables, so that state is empty either way.
-* **Whether the two segmenters agree is the subject of ``ais.py``**, the
-  mode-equivalence workflow, and no run has confirmed it yet. Until one has,
-  the cross-version A/B stays on the segmenter that needs no stored state.
+1. the base;
+2. the adjustments declared in ``workflows/pipe_segment/adjustments.py`` that
+   apply to the binding, chosen by what the binding's own ref declares;
+3. the run's ``--binding-adjust NAME=<step>:<op>:<flag>[=<value>]`` edits, for
+   a ref whose change is not released yet. ``<op>`` is ``remove``, ``add``,
+   ``rename`` or ``set``.
 
-Passing it later is one entry in ``_segment_args``'s ``extra_flags`` plus a
-check that every binding's ref declares the flag.
+**``--incremental`` follows the binding's pipe-segment.** Since 2026-11-20 the
+AIS v3 DAG passes ``--incremental`` to ``segment`` (pipe-segment v5.1.0;
+composer-dags-production PR #3145), so the base passes it too, with
+``--in_segments_table`` and ``--in_fragments_table`` naming the binding's own
+tables. A binding whose ``segment`` command does not declare the flag (below
+v5.1.0) has the three removed by the one declared adjustment, and runs the
+full-history segmenter, the only one it has. What this means for an A/B:
+
+* Two bindings at v5.1.0 or later both run incremental. A binding runs one
+  ``segment`` job from empty tables, so the state of the day before its range
+  is empty (read from ``--incremental``'s help text at v5.1.0; not run).
+* A binding below v5.1.0 against one at or above it compares full history
+  with incremental, as well as two refs. The run log says so: it prints the
+  flag difference between the two. To hold the segmenter fixed, take the
+  three flags from the newer binding with ``--binding-adjust``.
+* Whether the two segmenters agree is what ``ais.py``, the mode-equivalence
+  workflow, tests. No run has confirmed it yet.
+
+**Checked before anything is pinned** (:func:`_preflight`), with git reads of
+``--pipeline-dir`` only:
+
+* Every flag of every step must be declared by that step's command module at
+  the binding's ref. pipe-segment hands a flag it does not know to Beam, which
+  ignores it (``cli/main.py``, ``parse_known_args``), so a wrong flag would
+  not fail: the job would run without it. Beam's own options on the two Beam
+  steps are exempt (``adjustments.BEAM_OPTIONS`` lists them and says why).
+* An adjustment that finds nothing to change is an error, not a no-op.
+* Two bindings must be compared on the same keys.
+
+The run log prints, per binding, the edits applied with their reasons, then
+per pair of bindings the flag differences of each step.
+
+**Images.** ``--binding-image NAME=IMAGE`` gives one binding its own image,
+as submitter and as Dataflow worker. Two bindings of different pipe-segment
+versions need it: a ref merged into ``origin/main`` otherwise runs
+``--image-tag``, whatever version the ref is. The flag check reads the ref,
+and the image is what runs; a warning says when the image's tag names another
+version than the ref states.
+
+**Tables.** An adjustment may also change a binding's inputs and outputs
+(``dit.adjust``: two inputs become one, an output is renamed). The union of
+the bindings' inputs is pinned once; outputs are compared by name, and an
+output only one binding writes is listed as not compared. No pipe-segment
+version changes its tables today, so no such adjustment is declared and this
+path has run on synthetic interfaces only.
 
 ``--dry-run`` skips the pipe-segment invocations and the diff phase, and only
 dry-runs the copy (reporting its bytes against the ``--pin-max-gb`` cap). It
-still sets up and tears down the worktrees.
+still runs the checks above, logs each binding's interface, and sets up and
+tears down the worktrees.
 
 Example (DirectRunner smoke, 1 day, single binding to validate plumbing)::
 
@@ -188,6 +237,24 @@ Example (Dataflow A/B, 1 day, after the experiment branches are pushed)::
         --binding after=experiment/identity-match-key-transponder-only \\
         --date-range 2020-01-01,2020-01-01 \\
         --runner dataflow
+
+Example (two pipe-segment versions, each on its own overlay image; the older
+binding loses ``--incremental`` by the declared adjustment)::
+
+    dit run workflows/pipe_segment/identity_match_key.py \\
+        --experiment-id segment-503-510 \\
+        --binding before=v5.0.3 --binding-image before=<v5.0.3 overlay> \\
+        --binding after=v5.1.0 \\
+        --allow-same-gpsdio-pin \\
+        --date-range 2020-01-01,2020-01-01 \\
+        --runner dataflow
+
+Example (the same, with both bindings on the full-history segmenter)::
+
+        ... \\
+        --binding-adjust after=segment:remove:--incremental \\
+        --binding-adjust after=segment:remove:--in_segments_table \\
+        --binding-adjust after=segment:remove:--in_fragments_table
 """
 from __future__ import annotations
 
@@ -203,10 +270,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
+from dit import adjust
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
@@ -230,6 +300,7 @@ from dit.workflow import (
     worker_sizing_from_args,
     worker_sizing_options,
 )
+from workflows.pipe_segment import adjustments
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +404,11 @@ DEFAULT_SRC_NORMALIZED_TABLE = (
 # workflow does not check this.
 PIN_ROLE = "pipe_segment"
 NORMALIZED_WINDOW_COLUMN = "timestamp"
+
+#: The role of the one input of the base interface (``{in.normalized_messages}``
+#: in a step's tokens). Its pinned copy keeps PIN_ROLE in its name; an input a
+#: declared adjustment adds is pinned as ``<PIN_ROLE>_<role>``.
+INPUT_ROLE = "normalized_messages"
 
 # No satellite timing offsets in DIT (owner decision, 2026-11-20; the module
 # docstring has the full statement and the figures).
@@ -466,6 +542,40 @@ COMPARE_KEYS = {
     "segment_vessel":           ["seg_id", "ssvid", "vessel_id"],
 }
 
+#: What a row of each output table is, as its keys above say it.
+OUTPUT_MEANINGS = {
+    "messages_segmented":       "one row per message",
+    "segments":                 "one row per segment, fragment and day",
+    "fragments":                "one row per fragment",
+    "segment_identity_daily":   "one row per segment and day",
+    "segment_vessel_daily":     "one row per segment, ssvid and processed day",
+    "segment_info":             "one row per segment",
+    "vessel_info":              "one row per vessel id and ssvid",
+    "segment_vessel":           "one row per segment, ssvid and vessel id",
+}
+
+#: Flags whose values are a binding's own by construction: the tables it
+#: writes and hands from step to step, its labels, its job name and its image.
+#: The flag diff between two bindings compares these by presence only;
+#: otherwise every one of them would show as a difference on every run.
+BINDING_OWN_FLAGS = frozenset({
+    "--out_segmented_messages_table",
+    "--out_segments_table",
+    "--fragments_table",
+    "--in_segments_table",
+    "--in_fragments_table",
+    "--source_segments",
+    "--source_fragments",
+    "--dest_segment_identity",
+    "--source_segment_identity",
+    "--source_segment_vessel",
+    "--source_segment_vessel_daily",
+    "--destination",
+    "--labels",
+    "--job_name",
+    "--sdk_container_image",
+})
+
 
 # --------------------------------------------------------------------------
 # Argparse
@@ -508,6 +618,35 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "regex (lowercase / digits / _ / -, max 32 chars) since it is embedded "
                         "into BQ table names and the docker compose project name. Each ref "
                         "must resolve in --pipeline-dir.")
+    p.add_argument("--binding-image", action="append", default=[], dest="binding_images",
+                   metavar="NAME=IMAGE",
+                   help="Image for one binding, repeatable: that binding's submitter image "
+                        "and, on Dataflow, its worker image, in place of --image-tag. Needed "
+                        "when the bindings are different pipe-segment versions: without it a "
+                        "binding whose ref is merged into origin/main runs --image-tag, "
+                        f"whatever version the ref is. Pass a DIT overlay image of the "
+                        f"binding's commit ({OVERLAY_DIR}/build.sh).")
+    p.add_argument("--binding-adjust", action="append", default=[], dest="binding_adjustments",
+                   metavar="NAME=EDIT",
+                   help="Change one binding's command line for this run, as "
+                        f"{adjust.AD_HOC_FORM}. Repeatable and "
+                        "applied in the order given, after the adjustments declared in "
+                        "workflows/pipe_segment/adjustments.py. <op> is one of "
+                        f"{', '.join(adjust.AD_HOC_OPS)}; <step> is one of {', '.join(STEPS)}. "
+                        "Examples: after=segment:remove:--incremental, "
+                        "after=segment:add:--bins_per_day=8, "
+                        "after=segment:set:--bins_per_day=8, "
+                        "after=segment:rename:--fragments_table=--out_fragments_table. A "
+                        "value may name the binding's own tables: {out.<table>} (e.g. "
+                        "{out.segments}) and {in.normalized_messages}, the pinned source. "
+                        "An edit that finds nothing to change is an error. Every binding "
+                        "runs the same command line unless an adjustment says otherwise.")
+    p.add_argument("--allow-same-gpsdio-pin", action="store_true",
+                   help="Let the run start when every binding pins the same gpsdio-segment. "
+                        "By default that is refused, since this workflow was written to "
+                        "compare two gpsdio-segment pins. Pass it when the bindings differ "
+                        "in pipe-segment itself (e.g. v5.0.3 against v5.1.0, which pin the "
+                        "same gpsdio-segment).")
     p.add_argument("--date-range", required=True,
                    help="YYYY-MM-DD,YYYY-MM-DD, inclusive on both ends. Forwarded to the "
                         "steps and used to window the pinned copy of the source.")
@@ -610,6 +749,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         delattr(args, _removed_flag_dest(removed))
 
     args.bindings = [_parse_binding(b) for b in args.bindings]
+    args.binding_images = _parse_binding_images(args.binding_images, args.bindings)
+    args.binding_adjustments = _parse_binding_adjustments(
+        args.binding_adjustments, args.bindings,
+    )
     args.date_range = _parse_daterange(args.date_range)
     if args.reuse_pin is not None:
         try:
@@ -654,6 +797,55 @@ def _parse_binding(spec: str) -> tuple[str, str]:
             f"Got: {spec!r}."
         )
     return name, value
+
+
+def _require_binding(flag: str, name: str, bindings: Sequence[tuple[str, str]]) -> None:
+    names = [binding for binding, _ in bindings]
+    if name not in names:
+        raise SystemExit(
+            f"{flag} names the binding {name!r}, and the bindings are {', '.join(names)}."
+        )
+
+
+def _parse_binding_images(
+    specs: Sequence[str], bindings: Sequence[tuple[str, str]],
+) -> dict[str, str]:
+    """``--binding-image NAME=IMAGE`` as binding name to image. A name that is
+    no binding, or given twice, is refused: the image would run nowhere, or
+    one of the two would be dropped silently."""
+    images: dict[str, str] = {}
+    for spec in specs:
+        name, separator, image = spec.partition("=")
+        if not (name and separator and image):
+            raise SystemExit(f"--binding-image must be NAME=IMAGE; got {spec!r}")
+        _require_binding("--binding-image", name, bindings)
+        if name in images:
+            raise SystemExit(f"--binding-image is given twice for the binding {name!r}.")
+        images[name] = image
+    return images
+
+
+def _parse_binding_adjustments(
+    specs: Sequence[str], bindings: Sequence[tuple[str, str]],
+) -> list[adjust.Adjustment]:
+    """``--binding-adjust`` entries as adjustments, in the order given. The
+    binding and the step must exist, so a mistyped name cannot read as an
+    edit that was applied."""
+    def parse(spec: str) -> adjust.Adjustment:
+        try:
+            name, adjustment = adjust.parse_ad_hoc(spec)
+        except adjust.AdjustmentError as exc:
+            raise SystemExit(f"--binding-adjust {exc}") from exc
+        _require_binding("--binding-adjust", name, bindings)
+        unknown = [edit.step for edit in adjustment.edits if edit.step not in STEPS]
+        if unknown:
+            raise SystemExit(
+                f"--binding-adjust {spec!r}: no step {unknown[0]!r}; the steps are "
+                f"{', '.join(STEPS)}."
+            )
+        return adjustment
+
+    return [parse(spec) for spec in specs]
 
 
 def _job_name(step: str, *, experiment_id: str, binding_name: str) -> str:
@@ -765,6 +957,8 @@ def _read_gpsdio_pin_at_ref(pipeline_dir: str, ref: str) -> str:
 def _verify_distinct_gpsdio_pins(
     pipeline_dir: str,
     bindings: list[tuple[str, str]],
+    *,
+    allow_same: bool = False,
 ) -> dict[str, str]:
     """Fail fast if every binding pins the same gpsdio-segment line.
 
@@ -774,17 +968,29 @@ def _verify_distinct_gpsdio_pins(
     each ref's ``requirements/prod.in`` via ``git show`` (no worktree needed)
     and aborts before pinning if all values collapse to one. Single-
     binding runs are exempt (nothing to compare). (Copilot PR #44 round 2.)
+
+    ``allow_same`` (``--allow-same-gpsdio-pin``) turns the refusal into a log
+    line, for a run whose bindings differ in pipe-segment itself: v5.0.3 and
+    v5.1.0 pin the same gpsdio-segment.
     """
     pins = {name: _read_gpsdio_pin_at_ref(pipeline_dir, ref) for name, ref in bindings}
     for name, pin in pins.items():
         logger.info("binding %s: gpsdio-segment pin -> %s", name, pin)
     if len(bindings) > 1 and len(set(pins.values())) == 1:
         single = next(iter(set(pins.values())))
+        if allow_same:
+            logger.info(
+                "all %d bindings pin the same gpsdio-segment (%s); allowed by "
+                "--allow-same-gpsdio-pin: the bindings are taken to differ in pipe-segment "
+                "itself.", len(bindings), single,
+            )
+            return pins
         raise SystemExit(
             f"All {len(bindings)} bindings pin the same gpsdio-segment "
             f"({single!r}). The A/B is misconfigured -- there is no actual "
             f"code difference under test. Did you forget to push the "
-            f"experiment branch with the repinned requirements/prod.in?"
+            f"experiment branch with the repinned requirements/prod.in? If the "
+            f"bindings differ in pipe-segment itself, pass --allow-same-gpsdio-pin."
         )
     return pins
 
@@ -821,6 +1027,10 @@ class _PinnedSources:
 
     It is the only source: DIT runs no satellite timing offsets, so there is
     no satellite input to pin.
+
+    This is the base interface's one input (``INPUT_ROLE``). A binding whose
+    inputs a table adjustment changed gets the copies of all of them by role
+    instead (``pinned_inputs`` of :func:`_step_argvs`); none is declared today.
     """
     normalized_messages: str
 
@@ -839,49 +1049,95 @@ def _normalized_window(date_range: tuple[date, date]) -> dit_bq.SourceWindow:
     )
 
 
-def _pin_sources(
-    args: argparse.Namespace, pinned_at: datetime, *, reuse: bool,
-) -> _PinnedSources:
-    """Pin the normalized messages under the stamp of ``pinned_at``, or with
-    ``reuse``, check that an earlier run's copy under that stamp exists.
+def _base_input(args: argparse.Namespace) -> adjust.Input:
+    """The one input of the base interface: the normalized messages over the
+    run's date range."""
+    return adjust.Input(
+        role=INPUT_ROLE,
+        source=args.source_normalized_table,
+        window=_normalized_window(args.date_range),
+    )
 
-    A reused copy must match this run's experiment id, date range and source
+
+def _pin_role(role: str) -> str:
+    """The role in a pinned copy's name. The base input keeps PIN_ROLE, so its
+    copies are named as before and ``--reuse-pin`` finds earlier ones."""
+    return PIN_ROLE if role == INPUT_ROLE else f"{PIN_ROLE}_{role}"
+
+
+def _pin_inputs(
+    args: argparse.Namespace,
+    inputs: Sequence[adjust.Input],
+    pinned_at: datetime,
+    *,
+    reuse: bool,
+) -> dict[adjust.Input, str]:
+    """Pin each of ``inputs`` under the stamp of ``pinned_at``, or with
+    ``reuse``, check that an earlier run's copy under that stamp exists.
+    Returns each input's pinned copy.
+
+    A reused copy must match this run's experiment id, window and source
     table name, since all of them are in the name. With ``args.dry_run`` the
     copy is only dry-run: its bytes are checked against the cap and nothing
     is created.
+
+    Two inputs whose copies would get the same name are refused: the name
+    holds the role and the source's table name, not its dataset.
     """
-    window = _normalized_window(args.date_range)
-    if reuse:
-        normalized = dit_bq.require_pinned_source(
-            dit_bq.pinned_source_fqn(
-                args.source_normalized_table,
-                experiment_id=args.experiment_id,
-                role=PIN_ROLE,
-                pinned_at=pinned_at,
-                window=window,
-                project=PROJECT,
-            ),
+    names = {
+        source: dit_bq.pinned_source_fqn(
+            source.source,
+            experiment_id=args.experiment_id,
+            role=_pin_role(source.role),
+            pinned_at=pinned_at,
+            window=source.window,
             project=PROJECT,
         )
-    else:
-        normalized = dit_bq.pin_source_into_experiment(
-            args.source_normalized_table,
+        for source in inputs
+    }
+    clashing = [name for name, count in Counter(names.values()).items() if count > 1]
+    if clashing:
+        raise SystemExit(
+            f"error: two inputs would be pinned under one name ({', '.join(clashing)}): "
+            + "; ".join(f"{s.role}={s.source}" for s in inputs if names[s] in clashing)
+            + ". Give the inputs different roles."
+        )
+
+    def pin(source: adjust.Input) -> str:
+        if reuse:
+            return dit_bq.require_pinned_source(names[source], project=PROJECT)
+        return dit_bq.pin_source_into_experiment(
+            source.source,
             experiment_id=args.experiment_id,
-            role=PIN_ROLE,
+            role=_pin_role(source.role),
             pinned_at=pinned_at,
-            window=window,
+            window=source.window,
             expiration_days=args.pin_expiration_days,
             max_bytes=int(args.pin_max_gb * 1e9),
             dry_run=args.dry_run,
             project=PROJECT,
         )
-    logger.info("pinned normalized messages: %s", normalized)
-    return _PinnedSources(normalized_messages=normalized)
+
+    pinned = {source: pin(source) for source in inputs}
+    for source, copy in pinned.items():
+        logger.info("pinned %s: %s", source.role, copy)
+    return pinned
 
 
-def _pin(args: argparse.Namespace) -> _PinnedSources:
-    """Copy the source at run start, or with ``--reuse-pin`` reuse an earlier
-    run's copy."""
+def _pin_sources(
+    args: argparse.Namespace, pinned_at: datetime, *, reuse: bool,
+) -> _PinnedSources:
+    """Pin the base interface's one input, the normalized messages
+    (:func:`_pin_inputs`). What a run without table adjustments reads."""
+    source = _base_input(args)
+    return _PinnedSources(
+        normalized_messages=_pin_inputs(args, (source,), pinned_at, reuse=reuse)[source],
+    )
+
+
+def _pin_stamp(args: argparse.Namespace) -> tuple[datetime, bool]:
+    """``(pin stamp, reuse)``: the stamp of ``--reuse-pin``, else now in whole
+    seconds."""
     reuse = args.reuse_pin is not None
     pinned_at = (
         dit_bq.parse_pin_stamp(args.reuse_pin) if reuse
@@ -889,12 +1145,38 @@ def _pin(args: argparse.Namespace) -> _PinnedSources:
     )
     logger.info("pin stamp: %s (%s)", dit_bq.format_pin_stamp(pinned_at),
                 "reusing an earlier run's copy" if reuse else "a new copy")
-    logger.info("pinning: %s (copy in %s.%s)",
-                args.source_normalized_table, PROJECT, dit_bq.CANONICAL_DATASET)
-    pinned = _pin_sources(args, pinned_at, reuse=reuse)
+    return pinned_at, reuse
+
+
+def _log_reuse_hint(args: argparse.Namespace, pinned_at: datetime, *, reuse: bool) -> None:
     if not reuse and not args.dry_run:
         logger.info("to rerun on this copy, pass --reuse-pin %s",
                     dit_bq.format_pin_stamp(pinned_at))
+
+
+def _pin(args: argparse.Namespace) -> _PinnedSources:
+    """Copy the source at run start, or with ``--reuse-pin`` reuse an earlier
+    run's copy."""
+    pinned_at, reuse = _pin_stamp(args)
+    logger.info("pinning: %s (copy in %s.%s)",
+                args.source_normalized_table, PROJECT, dit_bq.CANONICAL_DATASET)
+    pinned = _pin_sources(args, pinned_at, reuse=reuse)
+    _log_reuse_hint(args, pinned_at, reuse=reuse)
+    return pinned
+
+
+def _pin_union(
+    args: argparse.Namespace, inputs: Sequence[adjust.Input],
+) -> dict[adjust.Input, str]:
+    """Pin every distinct input of every binding once, at one pin stamp
+    (``dit.adjust.union_inputs``). With no table adjustment that is the one
+    base input, and this does what :func:`_pin` does."""
+    pinned_at, reuse = _pin_stamp(args)
+    for source in inputs:
+        logger.info("pinning: %s (copy in %s.%s)",
+                    source.source, PROJECT, dit_bq.CANONICAL_DATASET)
+    pinned = _pin_inputs(args, inputs, pinned_at, reuse=reuse)
+    _log_reuse_hint(args, pinned_at, reuse=reuse)
     return pinned
 
 
@@ -1219,21 +1501,52 @@ def _segment_vessel_args(
     )
 
 
-def _step_argvs(
+def _incremental_flags(*, dest_dataset: str, suffix: str) -> list[str]:
+    """The flags that select pipe-segment's incremental segmenter, as
+    production's ``segment`` task does since 2026-11-20 (pipe-segment v5.1.0).
+
+    ``--in_segments_table`` and ``--in_fragments_table`` name the run's own
+    output tables. Those are pipe-segment's defaults too (``pipeline.py``,
+    ``prior_segments_table`` and ``prior_fragments_table`` at v5.1.0); they
+    are passed so the argv says where the state of the day before comes from,
+    and so a change of default upstream cannot move it.
+    """
+    table = functools.partial(_output_prefix, dest_dataset=dest_dataset, suffix=suffix)
+    return [
+        "--incremental",
+        f"--in_segments_table={table('segments')}",
+        f"--in_fragments_table={table('fragments')}",
+    ]
+
+
+def _base_interface(
     args: argparse.Namespace,
     *,
     binding_name: str,
     suffix: str,
-    pinned: _PinnedSources,
     worker_image: str | None,
-) -> dict[str, list[str]]:
-    """The argv of every step one binding runs, by step, in run order.
+) -> adjust.Interface:
+    """What a binding hands to pipe-segment and takes back when no adjustment
+    applies to it: the layer every binding starts from.
 
-    Pure: no docker and no cloud call, so the drift spec builds the same
-    tokens offline. ``--skip-downstream`` keeps ``segment`` only.
+    It mirrors production's segment group today (the AIS v3 DAG, pipe-segment
+    v5.1.0), so ``segment`` passes ``--incremental``. A binding whose
+    pipe-segment differs gets the adjustments of
+    ``workflows/pipe_segment/adjustments.py`` and of ``--binding-adjust``
+    (:func:`_adjusted`).
+
+    * ``steps``: each step's argv, from the builders above, in run order.
+      ``--skip-downstream`` keeps ``segment`` only. The pinned source is the
+      placeholder ``{in.normalized_messages}``, filled once it is pinned.
+    * ``inputs``: the normalized messages over the run's date range.
+    * ``outputs``: the binding's own table for every table the steps write,
+      with its compare keys.
+
+    Pure: no docker and no cloud call.
     """
     tables = dict(dest_dataset=args.dest_dataset, suffix=suffix)
     identity = dict(experiment_id=args.experiment_id, binding_name=binding_name)
+    source = _base_input(args)
 
     def beam(step: str) -> dict:
         return dict(
@@ -1247,9 +1560,10 @@ def _step_argvs(
 
     builders = {
         "segment": lambda: _segment_args(
-            pinned=pinned,
+            pinned=_PinnedSources(normalized_messages=f"{{in.{source.role}}}"),
             date_range=args.date_range,
             ssvid_filter_query=args.ssvid_filter_query,
+            extra_flags=_incremental_flags(**tables),
             **tables, **identity, **beam("segment"),
         ),
         "segment_identity": lambda: _segment_identity_args(
@@ -1263,7 +1577,100 @@ def _step_argvs(
         "segment_vessel": lambda: _segment_vessel_args(**tables, **identity),
     }
     steps = STEPS[:1] if args.skip_downstream else STEPS
-    return {step: builders[step]() for step in steps}
+    return adjust.Interface(
+        steps={step: builders[step]() for step in steps},
+        inputs=(source,),
+        outputs=tuple(
+            adjust.Output(
+                name=table,
+                table=_output_prefix(table, **tables),
+                keys=tuple(COMPARE_KEYS[table]),
+                meaning=OUTPUT_MEANINGS[table],
+            )
+            for table in _output_tables(args)
+        ),
+    )
+
+
+def _output_tables(args: argparse.Namespace) -> tuple[str, ...]:
+    """The tables a base binding writes: ``segment``'s three, and the five
+    downstream ones unless ``--skip-downstream``."""
+    return (
+        SEGMENT_OUTPUT_TABLES if args.skip_downstream
+        else (*SEGMENT_OUTPUT_TABLES, *DOWNSTREAM_OUTPUT_TABLES)
+    )
+
+
+def _binding_info(args: argparse.Namespace, name: str) -> adjust.BindingInfo:
+    """The binding ``name`` as far as it is known without a git call: its
+    version when its ref is written as a version tag (``v5.0.3``). ``main``
+    reads each ref's own source instead (:func:`_binding_infos`) and hands
+    the result on."""
+    return adjustments.offline_binding_info(name, dict(args.bindings).get(name))
+
+
+def _adjusted(
+    args: argparse.Namespace,
+    *,
+    binding_name: str,
+    suffix: str,
+    worker_image: str | None,
+    binding: adjust.BindingInfo | None = None,
+) -> adjust.Adjusted:
+    """The interface of one binding after its layers: the base, the declared
+    adjustments that apply to the binding, then its ``--binding-adjust``
+    edits. ``binding`` is what the rules know about it; left out, it is what
+    :func:`_binding_info` knows offline.
+
+    ``dit.adjust.AdjustmentError`` when an adjustment does not fit the base:
+    a stale declared rule, or an ad hoc edit that finds nothing to change.
+    """
+    try:
+        return adjust.apply(
+            _base_interface(
+                args, binding_name=binding_name, suffix=suffix, worker_image=worker_image,
+            ),
+            binding or _binding_info(args, binding_name),
+            declared=adjustments.DECLARED,
+            ad_hoc=args.binding_adjustments,
+        )
+    except adjust.AdjustmentError as exc:
+        raise adjust.AdjustmentError(f"binding {binding_name}: {exc}") from exc
+
+
+def _step_argvs(
+    args: argparse.Namespace,
+    *,
+    binding_name: str,
+    suffix: str,
+    pinned: _PinnedSources,
+    worker_image: str | None,
+    binding: adjust.BindingInfo | None = None,
+    pinned_inputs: Mapping[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """The argv of every step one binding runs, by step, in run order.
+
+    Derived from the binding's adjusted interface (:func:`_adjusted`), with
+    its placeholders filled: ``{in.<role>}`` from the pinned copies and
+    ``{out.<table>}`` from the binding's own tables. With no adjustment
+    applying, each argv is the base builder's, token for token.
+
+    ``pinned`` is the copy of the base input. ``pinned_inputs`` maps every
+    input role of the binding to its copy; it is needed only when a table
+    adjustment gave the binding other inputs, and defaults to the base input.
+
+    Pure: no docker and no cloud call, so the drift spec builds the same
+    tokens offline.
+    """
+    interface = _adjusted(
+        args, binding_name=binding_name, suffix=suffix,
+        worker_image=worker_image, binding=binding,
+    ).interface
+    roles = (
+        {INPUT_ROLE: pinned.normalized_messages} if pinned_inputs is None else pinned_inputs
+    )
+    filled = adjust.fill(interface, adjust.placeholder_values(interface, roles))
+    return {step: list(tokens) for step, tokens in filled.steps.items()}
 
 
 @contextlib.contextmanager
@@ -1359,6 +1766,34 @@ def _verify_gpsdio_segment(worktree_dir: str, *, binding_name: str) -> str:
     )
 
 
+def _warn_on_version_mismatch(
+    name: str, binding: adjust.BindingInfo, image: str, args: argparse.Namespace,
+) -> None:
+    """Warn when the image a binding runs is tagged another pipe-segment
+    version than the binding's ref states.
+
+    The binding's flags are chosen and checked for its ref. The image is what
+    runs. They can differ: a ref merged into ``origin/main`` runs
+    ``--image-tag`` whatever its version, unless the binding has its own
+    ``--binding-image``. On the docker runner with ``--build-from-source`` no
+    image runs, so there is nothing to compare.
+    """
+    if args.build_from_source and args.runner != "dataflow":
+        return
+    in_image = adjustments.image_pipeline_version(image)
+    if in_image is None or binding.version is None or in_image == binding.version:
+        return
+    logger.warning(
+        "[%s] the image %s is tagged pipe-segment %s, and the binding's ref %s states %s. "
+        "The binding's flags were chosen and checked for the ref, and the image is what "
+        "runs. If the image holds other code than the ref, give the binding its own: "
+        "--binding-image %s=<image of the ref>. For an unreleased head, which still states "
+        "the version of the release before it, this is expected.",
+        name, image, adjustments.version_text(in_image), binding.ref,
+        adjustments.version_text(binding.version), name,
+    )
+
+
 def _run_binding(
     *,
     name: str,
@@ -1366,7 +1801,18 @@ def _run_binding(
     args: argparse.Namespace,
     pinned: _PinnedSources,
     suffix: str,
+    binding: adjust.BindingInfo | None = None,
+    pinned_inputs: Mapping[str, str] | None = None,
 ) -> int:
+    """Run one binding's steps in a worktree of its ref.
+
+    ``binding`` is what the adjustment rules know about the binding (``main``
+    reads it from the ref's own source); ``pinned_inputs`` the pinned copy of
+    each of its inputs by role. Both default to what a run without
+    adjustments needs: see :func:`_step_argvs`.
+    """
+    binding = binding or _binding_info(args, name)
+    requested_image = args.binding_images.get(name, args.image_tag)
     worktree_dir = tempfile.mkdtemp(prefix=f"dit-pipe-segment-{name}-")
     try:
         subprocess.run(
@@ -1380,17 +1826,17 @@ def _run_binding(
 
         # Resolve the per-binding image: canonical for reviewed code at the
         # default tag, kaniko auto-build for unreviewed code, or the explicit
-        # --image-tag passthrough. Passing suffix=<per-binding> takes the
-        # "manual / cross-version escape hatch" path in resolve_run_context
-        # (record git state as-is, no auto-snapshot -- our worktrees ARE
-        # committed refs).
+        # --binding-image / --image-tag passthrough. Passing
+        # suffix=<per-binding> takes the "manual / cross-version escape hatch"
+        # path in resolve_run_context (record git state as-is, no
+        # auto-snapshot -- our worktrees ARE committed refs).
         ctx = resolve_run_context(
             repo_dir=worktree_dir,
             pipeline_name=PIPELINE_NAME,
             runner="docker",
             require_clean=False,
             suffix=suffix,
-            worker_image=args.image_tag,
+            worker_image=requested_image,
             default_worker_image=DEFAULT_IMAGE_TAG,
             resolve_digest=False,  # no run cache for pipe-segment yet
             build_from_source=args.build_from_source,
@@ -1400,16 +1846,18 @@ def _run_binding(
                     name, ctx.pipeline_commit,
                     " (UNREVIEWED)" if ctx.unreviewed else "",
                     image_tag)
+        _warn_on_version_mismatch(name, binding, image_tag, args)
 
-        if image_tag != args.image_tag and args.runner == "dataflow":
+        if image_tag != requested_image and args.runner == "dataflow":
             # The harness replaced the image with a build of the binding's
             # commit. That build is plain source: no temp-dataset overlay.
             logger.warning(
                 "[%s] %s was auto-built from plain source, without DIT's temp-dataset "
                 "overlay. On Dataflow, Beam will try to create its own BigQuery staging "
                 "dataset as %s, which DIT's default service account may not. Build an "
-                "overlay image of the commit (%s/build.sh) and pass it as --image-tag.",
-                name, image_tag, args.service_account, OVERLAY_DIR,
+                "overlay image of the commit (%s/build.sh) and pass it as --image-tag, or "
+                "for this binding only as --binding-image %s=<image>.",
+                name, image_tag, args.service_account, OVERLAY_DIR, name,
             )
 
         if args.dry_run:
@@ -1421,6 +1869,7 @@ def _run_binding(
         argvs = _step_argvs(
             args, binding_name=name, suffix=suffix,
             pinned=pinned, worker_image=image_tag,
+            binding=binding, pinned_inputs=pinned_inputs,
         )
         for step, cli_args in argvs.items():
             rc = _run_pipe_subcommand(
@@ -1454,21 +1903,47 @@ _SKIPPED = -1  # sentinel for diff pairs we couldn't run
 DiffKey = tuple[str, str, str]
 
 
-def _diff_table_pair(
-    *,
-    table: str,
-    dest_dataset: str,
-    suffix_a: str,
-    suffix_b: str,
-) -> int:
-    """Diff a single table between two bindings. Returns 0/1."""
-    a = _output_prefix(table, dest_dataset=dest_dataset, suffix=suffix_a)
-    b = _output_prefix(table, dest_dataset=dest_dataset, suffix=suffix_b)
-    return dit_compare.compare_tables(
-        a, b,
-        keys=COMPARE_KEYS[table],
-        view_suffix="",
-    )
+def _sides(
+    args: argparse.Namespace,
+    suffix_by_binding: Mapping[str, str],
+    infos: Mapping[str, adjust.BindingInfo] | None = None,
+) -> dict[str, adjust.Adjusted]:
+    """Every binding's adjusted interface, by binding name. ``infos`` is what
+    the rules know about each binding (:func:`_binding_infos`); a binding
+    missing from it is known offline only (:func:`_binding_info`).
+
+    The image in a step's ``--sdk_container_image`` is the one asked for. The
+    harness may replace it per binding at run time; no rule and no check here
+    reads its value.
+    """
+    return {
+        name: _adjusted(
+            args, binding_name=name, suffix=suffix,
+            worker_image=args.binding_images.get(name, args.image_tag),
+            binding=(infos or {}).get(name),
+        )
+        for name, suffix in suffix_by_binding.items()
+    }
+
+
+#: An output only one binding of a pair writes: (output, the binding that
+#: writes it, the binding it is not compared with).
+NotCompared = tuple[str, str, str]
+
+
+def _not_compared(interfaces: Mapping[str, adjust.Interface]) -> list[NotCompared]:
+    """The outputs that one binding of a pair writes and the other does not.
+    They are listed in the verdict, never dropped silently."""
+    def one_sided(a: str, b: str) -> list[NotCompared]:
+        pairing = adjust.pair_outputs(interfaces[a], interfaces[b])
+        return [
+            *((o.name, a, b) for o in pairing.only_left),
+            *((o.name, b, a) for o in pairing.only_right),
+        ]
+
+    return [
+        entry for a, b in itertools.combinations(interfaces, 2) for entry in one_sided(a, b)
+    ]
 
 
 def _run_diffs(
@@ -1476,8 +1951,15 @@ def _run_diffs(
     args: argparse.Namespace,
     suffix_by_binding: dict[str, str],
     failed_bindings: set[str],
+    interfaces: Mapping[str, adjust.Interface] | None = None,
 ) -> dict[DiffKey, int]:
-    """Run diffs over all (table, binding-pair) combinations.
+    """Run diffs over all (output, binding-pair) combinations.
+
+    Two bindings are compared by output name (``dit.adjust.pair_outputs``),
+    each on its own table, with the keys of the pair. ``interfaces`` holds
+    each binding's adjusted interface; left out, they are rebuilt from
+    ``args``. An output only one binding of a pair writes is not compared
+    (:func:`_not_compared` lists those for the verdict).
 
     Output tables are single date-partitioned tables; pipe-segment's
     ``prepare_output_tables`` (pipeline.py:158) clears + writes the
@@ -1485,24 +1967,33 @@ def _run_diffs(
     suffix differs, each binding writes to its own table FQN, so the
     diff sees only the run's date range (no stale data to filter out).
     """
+    if interfaces is None:
+        interfaces = {
+            name: side.interface for name, side in _sides(args, suffix_by_binding).items()
+        }
+    pairs = {
+        (a, b): {
+            left.name: (left, right)
+            for left, right in adjust.pair_outputs(interfaces[a], interfaces[b]).compared
+        }
+        for a, b in itertools.combinations(suffix_by_binding.keys(), 2)
+    }
     results: dict[DiffKey, int] = {}
-    tables: list[str] = list(SEGMENT_OUTPUT_TABLES)
-    if not args.skip_downstream:
-        tables.extend(DOWNSTREAM_OUTPUT_TABLES)
+    tables = dict.fromkeys(o.name for interface in interfaces.values() for o in interface.outputs)
 
     for table in tables:
-        for a, b in itertools.combinations(suffix_by_binding.keys(), 2):
+        for (a, b), compared in pairs.items():
+            if table not in compared:
+                continue
             if a in failed_bindings or b in failed_bindings:
                 results[(table, a, b)] = _SKIPPED
                 bad = a if a in failed_bindings else b
                 logger.info("diff %s  %s vs %s -> SKIPPED (binding %s failed)",
                             table, a, b, bad)
                 continue
-            rc = _diff_table_pair(
-                table=table,
-                dest_dataset=args.dest_dataset,
-                suffix_a=suffix_by_binding[a],
-                suffix_b=suffix_by_binding[b],
+            left, right = compared[table]
+            rc = dit_compare.compare_tables(
+                left.table, right.table, keys=list(left.keys), view_suffix="",
             )
             results[(table, a, b)] = rc
             verdict = "IDENTICAL" if rc == 0 else f"DIFFERENT (table-check rc={rc})"
@@ -1510,7 +2001,9 @@ def _run_diffs(
     return results
 
 
-def _summarize(results: dict[DiffKey, int]) -> str:
+def _summarize(
+    results: dict[DiffKey, int], not_compared: Sequence[NotCompared] = (),
+) -> str:
     lines = ["", "pipe-segment cross-version diff summary:"]
     for (table, a, b), rc in results.items():
         if rc == _SKIPPED:
@@ -1520,7 +2013,134 @@ def _summarize(results: dict[DiffKey, int]) -> str:
         else:
             verdict = "DIFFERENT"
         lines.append(f"  {table}  {a} vs {b}  -> {verdict} (rc={rc})")
+    lines.extend(
+        f"  {table}  {a} vs {b}  -> NOT COMPARED (only {a} writes it)"
+        for table, a, b in not_compared
+    )
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Before anything is pinned: each binding's interface, checked
+# --------------------------------------------------------------------------
+
+def _binding_infos(args: argparse.Namespace) -> dict[str, adjust.BindingInfo]:
+    """What the adjustment rules may know about each binding, read from its
+    ref's own source in ``--pipeline-dir`` with ``git show``: the flags each
+    step's command declares, and the version the code states."""
+    return {
+        name: adjustments.binding_info(args.pipeline_dir, name, ref, STEPS)
+        for name, ref in args.bindings
+    }
+
+
+def _check_flags(sides: Mapping[str, adjust.Adjusted]) -> None:
+    """Refuse a run in which a binding would pass a flag its pipe-segment does
+    not declare.
+
+    pipe-segment hands flags it does not know to Beam, which ignores them
+    (``cli/main.py``, ``parse_known_args``; read at v5.0.3 and v5.1.0, not
+    run). So a wrong flag does not fail: the job runs without it, and a
+    comparison built on it tests something else than it says. Every flag of
+    every step is therefore looked up in the ref's own command module, except
+    Beam's options on the two Beam steps (``adjustments.BEAM_OPTIONS``).
+
+    The check reads the ref. It assumes the image a binding runs holds that
+    ref's code; :func:`_warn_on_version_mismatch` warns when the image's tag
+    says otherwise.
+    """
+    problems = [
+        f"  binding {name} (ref {side.binding.ref}): {problem}"
+        for name, side in sides.items()
+        for problem in adjustments.flag_problems(
+            side.interface, side.binding, beam_steps=BEAM_STEPS,
+        )
+    ]
+    if problems:
+        raise SystemExit(
+            "error: the command line of a binding does not fit its pipe-segment:\n"
+            + "\n".join(problems)
+            + "\nNothing was pinned or run. pipe-segment hands a flag it does not know to "
+              "Beam, which ignores it, so such a job would run without the flag and "
+              "nothing would fail. For a flag the ref does not declare: take it out for "
+              "that binding (--binding-adjust <binding>=<step>:remove:<flag>), or declare "
+              "the difference in workflows/pipe_segment/adjustments.py."
+        )
+
+
+def _log_sides(sides: Mapping[str, adjust.Adjusted]) -> None:
+    """Put on record what each binding runs and where two bindings differ:
+    the edits applied to each with their reasons, the flag differences per
+    step, the outputs only one of two writes, and the lineage note when they
+    do not read the same inputs."""
+    for name, side in sides.items():
+        version = side.binding.version
+        edits = adjust.describe(side)
+        logger.info(
+            "[%s] ref %s, pipe-segment %s: %s", name, side.binding.ref,
+            adjustments.version_text(version) if version else "of unknown version",
+            f"{len(edits)} edit(s) to the base interface" if edits
+            else "the base interface, no adjustment",
+        )
+        for edit in edits:
+            logger.info("[%s]   %s", name, edit)
+
+    interfaces = {name: side.interface for name, side in sides.items()}
+    for a, b in itertools.combinations(interfaces, 2):
+        for diff in adjust.diff_steps(
+            interfaces[a], interfaces[b], presence_only=BINDING_OWN_FLAGS,
+        ):
+            for line in adjust.format_step_diff(diff, a, b):
+                logger.info("flags  %s", line)
+    for table, writer, other in _not_compared(interfaces):
+        logger.warning("output %s: only %s writes it, so it is not compared with %s.",
+                       table, writer, other)
+    note = adjust.lineage_note(interfaces)
+    if note:
+        logger.warning("lineage: %s", note)
+
+
+def _preflight(
+    args: argparse.Namespace, suffix_by_binding: Mapping[str, str],
+) -> dict[str, adjust.Adjusted]:
+    """Each binding's adjusted interface, logged and checked. Runs before
+    anything is pinned and makes no cloud call: git reads of ``--pipeline-dir``
+    only.
+
+    Refused here:
+
+    * an adjustment that does not fit the base (a stale declared rule, an ad
+      hoc edit that finds nothing to change);
+    * a placeholder that names no output and no input of its binding;
+    * a flag a binding's pipe-segment does not declare (:func:`_check_flags`);
+    * two bindings that would be compared on different keys.
+    """
+    try:
+        sides = _sides(args, suffix_by_binding, _binding_infos(args))
+    except adjust.AdjustmentError as exc:
+        raise SystemExit(f"error: {exc}. Nothing was pinned or run.") from exc
+    _log_sides(sides)
+
+    for name, side in sides.items():
+        unknown = adjust.unknown_placeholders(side.interface)
+        if unknown:
+            known = adjust.placeholder_values(
+                side.interface, {i.role: "" for i in side.interface.inputs},
+            )
+            raise SystemExit(
+                f"error: binding {name}: {', '.join('{' + p + '}' for p in unknown)} names "
+                f"no output and no input of this binding. Known: "
+                f"{', '.join('{' + p + '}' for p in known)}. Nothing was pinned or run."
+            )
+    _check_flags(sides)
+    for a, b in itertools.combinations(sides, 2):
+        try:
+            adjust.check_keys(adjust.pair_outputs(sides[a].interface, sides[b].interface))
+        except adjust.AdjustmentError as exc:
+            raise SystemExit(
+                f"error: bindings {a} and {b}: {exc} Nothing was pinned or run."
+            ) from exc
+    return sides
 
 
 # --------------------------------------------------------------------------
@@ -1550,10 +2170,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Cheap preflight: fail before pinning if the A/B is misconfigured
     # with identical gpsdio-segment pins (an IDENTICAL diff would otherwise
     # look like "the change has no effect" when in fact nothing was tested).
-    _verify_distinct_gpsdio_pins(args.pipeline_dir, args.bindings)
-    pinned = _pin(args)
+    _verify_distinct_gpsdio_pins(
+        args.pipeline_dir, args.bindings, allow_same=args.allow_same_gpsdio_pin,
+    )
 
     suffix_by_binding = {name: f"{args.experiment_id}_{name}" for name, _ in args.bindings}
+
+    # Each binding's interface after its adjustments, logged and checked
+    # against its ref's own CLI source, before anything is pinned.
+    sides = _preflight(args, suffix_by_binding)
+    interfaces = {name: side.interface for name, side in sides.items()}
+
+    # The union of the bindings' inputs, each pinned once at one pin stamp.
+    # With no table adjustment that is the one base input.
+    copies = _pin_union(args, adjust.union_inputs(interfaces.values()))
 
     # Bindings run sequentially. dit_docker.run uses os.getcwd() to locate the
     # worktree's compose.yaml; process-wide chdir isn't thread-safe. With
@@ -1561,10 +2191,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rc_by_binding: dict[str, int] = {}
     logger.info("running %d binding(s) sequentially", len(args.bindings))
     for name, ref in args.bindings:
+        pinned_inputs = {i.role: copies[i] for i in interfaces[name].inputs}
         rc = _run_binding(
             name=name, ref=ref, args=args,
-            pinned=pinned,
+            # The copy of the base input; empty for a binding a table
+            # adjustment took that input from. The argvs are filled from
+            # pinned_inputs.
+            pinned=_PinnedSources(normalized_messages=pinned_inputs.get(INPUT_ROLE, "")),
             suffix=suffix_by_binding[name],
+            binding=sides[name].binding,
+            pinned_inputs=pinned_inputs,
         )
         rc_by_binding[name] = rc
 
@@ -1581,8 +2217,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args=args,
         suffix_by_binding=suffix_by_binding,
         failed_bindings=failed_bindings,
+        interfaces=interfaces,
     )
-    print(_summarize(results), file=sys.stderr)
+    print(_summarize(results, _not_compared(interfaces)), file=sys.stderr)
     return 1 if failed_bindings else 0
 
 

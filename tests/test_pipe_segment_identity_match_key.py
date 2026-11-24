@@ -327,6 +327,9 @@ def _main(*extra: str) -> dict[str, Any]:
     with (
         patch.object(mod, "_verify_refs"),
         patch.object(mod, "_verify_distinct_gpsdio_pins"),
+        # The two git reads of the preflight (tests/test_pipe_segment_adjustments.py).
+        patch.object(mod, "_binding_infos", return_value={}),
+        patch.object(mod, "_check_flags"),
         patch.object(mod.dit_bq, "pin_source_into_experiment",
                      return_value=f"{_GE}.copy") as pin,
         patch.object(mod.dit_bq, "require_pinned_source",
@@ -785,20 +788,23 @@ def test_an_auto_built_image_on_dataflow_gets_a_warning_about_the_overlay(caplog
     assert warnings("DirectRunner", built) == []
 
 
-# -- No --incremental: an accepted difference from the AIS DAG ---------------
+# -- --incremental follows the binding's pipe-segment ------------------------
 
 @pytest.mark.parametrize("runner", RUNNERS)
-def test_no_binding_passes_incremental(runner: str) -> None:
-    """The AIS DAG passes ``--incremental`` since 2026-11-20. A binding may be a
-    ref that does not know the flag and would ignore it silently, so the
-    cross-version A/B stays on full history for every binding."""
+def test_a_binding_below_v5_1_0_passes_no_incremental(runner: str) -> None:
+    """The AIS DAG passes ``--incremental`` since 2026-11-20, and so does the
+    base interface. This file's binding is ``before=v5.0.3``, which does not
+    know the flag and would ignore it silently: the declared adjustment takes
+    it out, with its two table flags. That is why every argv pinned above is
+    what it was before the base changed. Bindings at v5.1.0 or later are in
+    ``tests/test_pipe_segment_adjustments.py``."""
     _, calls = _run_binding(_run_args(runner))
     tokens = [token for _, argv, _ in calls for token in argv]
 
     assert not any(token.split("=")[0] in {
         "--incremental", "--in_segments_table", "--in_fragments_table",
     } for token in tokens)
-    assert "No ``--incremental`` here" in (mod.__doc__ or "")
+    assert "``--incremental`` follows the binding's pipe-segment" in (mod.__doc__ or "")
 
 
 def test_run_binding_stops_at_the_first_failing_step() -> None:
