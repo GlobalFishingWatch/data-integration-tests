@@ -80,6 +80,39 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-24 — Parallel slices (`dit.slices`, port visits' `6_parallel`); per-step orchestration declarations (`dit.orchestration`)
+
+**Trigger.** The owner: some steps can load several slices at once, others carry state from one run to the next. In the owner's view the segmenter, incremental fishing events and probably gaps must run sequentially; `research_messages`, raw encounters and `raw_port_events` can run slices in parallel. DIT should test this and move towards declaring the allowed orchestration per step, so it is written down what an Airflow backfill or daily DAG may do (`depends_on_past`, `max_active_runs`, `LatestOnlyOperator`). First test: N slices loaded in parallel equal one backfill over the same window, on `raw_port_events`.
+
+**What changed.**
+- **`dit.slices`** (pure): days, calendar weeks, calendar months, N-day chunks, an explicit list; one spec string selects one; `check_partition`. The segmenter's daily jobs (`4_daily`, daily tails) now come from `by_day`; port visits' daily tails from a new pure `mode_slices`. Both plans unchanged: the existing tests pass unedited.
+- **`dit.orchestration`**: frozen `StepOrchestration` / `PipelineOrchestration`, `judge`, `outcome_of`, `airflow_guidance`. One declaration file per onboarded pipeline, seeded `claimed` from the owner's statements; every other step `unknown` / `untested`.
+- **`workflows/port_visits/ais.py`**: mode `6_parallel`, `--slices`, `--max-concurrent-slices`, `--dry-run`.
+
+**Decisions.**
+- **The mode is `6_parallel`, not `5_parallel`.** `5_outage_recovery` / `5_outage_oracle` (pipe-gaps) and `4_mutate_recover` / `4_daily` already use 4 and 5; 6 is free in every workflow.
+- **Step 1 only.** Step 2 reads its input from the start date on and writes its whole table with WRITE_TRUNCATE (pipe-anchorages v5.0.1, `pipelines/port_visits/main.py`, read, not run). Slices would replace each other's output, so the mode is refused for it with that reason.
+- **Why step 1 is expected to pass** (read at v5.0.1, not run): `messages.sql.j2` reads `[start, end)` with no lookback; `smart_thin_records.py` processes each segment-day on its own ("start_date and end_date are only checked to be dates"); the pre-hook deletes only `[start, end)` and the sink appends. What a run may still show: concurrent DML on one monthly partition, and the create-table pre-hook racing. Nothing pre-creates the table to dodge that race.
+- **Compared with `1_bf` only**, and `1_bf` must be selected. The sequential modes stay pairwise among themselves.
+- **At least two slices, covering the window exactly once.** One slice is the same job as `1_bf`; a gap or overlap makes the comparison meaningless.
+- **`--slices` and `--max-concurrent-slices` without `6_parallel` are errors**, like `--base-image` without `@base`.
+- **Default `--slices month`**; no cap on concurrent slices by default. A cap makes later slices wait, which weakens the test; the help says so.
+- **A failed slice is an outcome, not a crash.** All slices are awaited; the failures are listed; the outcome `failed` is judged against the declaration (for an allowed step: exit 1). The comparison is skipped, since the table holds part of the window.
+- **The mode never reads the run cache.** Concurrency outcomes need not repeat, and a hit would report an older run's result as this run's. The row is still written (cleanup). The slices are in its cache key.
+- **The judgement lives in the library** (`judge`), so the next workflow reuses it. Forbidden steps are run, not refused, as negative tests: a difference or failed jobs is "as declared"; no difference warns that the declaration may be too strict (exit 0). Unknown: the workflow's normal rule.
+- **No `verified` without a human.** Nothing writes a declaration; a passed run's message says how to record it.
+- **`research_messages` has no file.** DIT has no pipe-research workflow; the claim is recorded in `docs/plan.md`.
+- **The cross-version wrapper refuses `6_parallel`.** Diffing it across bindings is not defined.
+- **`--dry-run` on port visits** returns before `resolve_run_context`: no commit read, no snapshot, no image check, no digest lookup.
+
+**Checked, and not.**
+- The dry run of `--steps thin_port_messages --modes 1_bf,6_parallel --slices month` lists 13 jobs (1 + 12) with distinct job names. It created nothing.
+- Concurrent submission is tested with a barrier that only opens when all 12 slices are inside `docker run` at once.
+- The drift check exits 0 (port visits in sync; the argv of a slice is the argv of a step-1 job).
+- Nothing ran on Dataflow. Proposed runs in README Roadmap 7f.
+
+**Sections moved.** New `src/dit/slices.py`, `src/dit/orchestration.py`, `workflows/{port_visits,encounters,pipe_events,pipe_gaps,pipe_segment}/orchestration.py`; `tests/test_slices.py`, `tests/test_orchestration.py`, `tests/test_port_visits_parallel.py`. `workflows/port_visits/ais.py` (docstring; `MODE_PARALLEL`, `DEFAULT_MODES`, `SEQUENTIAL_MODES`, `DEFAULT_SLICES`, `PARALLEL_STEP2_REFUSED`; `validate_parallel`, `mode_slices`, `_run_in_order`, `execute_parallel`, `ParallelSlicesFailed`, `judge_parallel`, `describe_plan`, `_dry_run`; cache key and `_run_with_cache`; `main`). `workflows/pipe_segment/ais.py` (`_days`, `plan_slices`). `workflows/port_visits/cross_version_ais.py` (refusal). Docs: `docs/plan.md` (§ `dit.slices`, § `dit.orchestration`, new § "Orchestration capabilities"); `workflows/README.md` (table row, new section, extraction note); README Features and Roadmap 7f; CHANGELOG § 2026-11-24. Suite 1,537 → 1,615.
+
 ### 2026-11-24 — A base version next to the head in `workflows/pipe_segment/ais.py` (`@base`, `--base-image`); per-side adjustments agreed, not built
 
 **Trigger.** The owner pointed out that the pipe-segment PR #227 test needs the head in its new mode against the base in its only mode. Neither pipe-segment workflow did that:

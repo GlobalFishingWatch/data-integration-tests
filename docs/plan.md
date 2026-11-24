@@ -203,6 +203,35 @@ def daterange_inclusive(start: date, end: date) -> Iterator[date]: ...
 
 Lifted from `mode_equivalence._daterange_inclusive`.
 
+### `dit.slices` (2026-11-24)
+
+```python
+Slice = tuple[date, date]  # first and last day of one job, both included
+def days(first: date, last: date) -> tuple[date, ...]: ...
+def by_day(start, end) / by_week(start, end) / by_month(start, end) -> tuple[Slice, ...]: ...
+def by_chunks(start, end, n: int) -> tuple[Slice, ...]: ...
+def explicit(pairs) -> tuple[Slice, ...]: ...
+def parse_spec(text: str) -> SliceSpec: ...   # "day" | "week" | "month" | "<N>d" | JSON [[first, last], ...]
+def plan(spec: SliceSpec, start: date, end: date) -> tuple[Slice, ...]: ...
+def check_partition(slices, *, start: date, end: date) -> None: ...  # covers the window exactly once
+```
+
+Pure; inclusive dates. Weeks are calendar weeks (Monday to Sunday), months calendar months, both cut at the window's ends. Consumers: pipe-segment's `4_daily` and daily tails, port visits' daily tails and its `--slices`.
+
+### `dit.orchestration` (2026-11-24)
+
+```python
+@dataclass(frozen=True)
+class StepOrchestration: step, command, parallel_slices, depends_on_previous_run, status, source, reason
+@dataclass(frozen=True)
+class PipelineOrchestration: pipeline, steps
+def judge(declaration: StepOrchestration, outcome: str) -> Judgement: ...  # verdict, exit_code, warning, message
+def outcome_of(*, slices_failed: bool, compare_rc: int | None) -> str: ...
+def airflow_guidance(declaration) -> str: ...
+```
+
+See § "Orchestration capabilities" below.
+
 ### Workflow entry-point convention
 
 A workflow file is a Python module with a `main(argv: Sequence[str] | None = None) -> int` entry point. `dit run <path>` discovers and invokes it; an in-repo workflow can call its own `main()` from a pytest fixture without going through the CLI.
@@ -308,6 +337,53 @@ A capability not in the original Phase 1-7 numbering, emerged from the PIPELINE-
 - **`--fail-on-diff` mode for PR gating.** Today's wrapper treats diff as information; PR-gating semantics flip this. One-flag addition when needed.
 - **Pipe-gaps cross-version workflow.** None exists. Job names and the cleanup label are at parity (see Open items); a cross-version workflow for pipe-gaps would mirror `cross_version_ais.py` for the detect-gaps shape.
 - **`--temp_dataset` for pipe-anchorages: no upstream PR (decision 2026-10-22, PIPELINE-4699).** The v4.6.4 CLI's `--temp_dataset` only ever existed on the local `anchorages_pipeline@dit-temp-dataset-support` branch, which the PIPELINE-1465 synthetic branches cherry-picked. For the v5 CLI, dit builds a test-only overlay image instead ([`docker/overlays/pipe-anchorages-temp-dataset/`](../docker/overlays/pipe-anchorages-temp-dataset/README.md)); it is never proposed upstream. Confirmed on 2026-11-19, when the v4 CLI was dropped and the overlay of v5.0.1 became the workflows' default image.
+
+## Orchestration capabilities (2026-11-24)
+
+**Question.** Which pipeline steps may load several date slices at the same time, and which carry state from one run to the next and must run one slice after the other? The answer decides how a step may be orchestrated, in an Airflow backfill and in a daily DAG. DIT records it per step and tests it.
+
+**Declarations.** One file per pipeline, `workflows/<pkg>/orchestration.py`, holding a `dit.orchestration.PipelineOrchestration` of frozen `StepOrchestration`s. Per step:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `parallel_slices` | `allowed` / `forbidden` / `unknown` | may slices of one window load concurrently into one table |
+| `depends_on_previous_run` | `True` / `False` / `None` | does a run read what the run before it wrote |
+| `status` | `verified` / `claimed` / `untested` | `verified` names the Cloud Build id of the run that showed it; `claimed` names who claimed it and when |
+| `reason` | text | why, with the code read and its tag where there is one |
+
+Seeded on 2026-11-24 from the owner's statements, all `claimed`, source "owner, 2026-11-24, not verified":
+
+| Pipeline | Step | Parallel slices | Depends on previous run |
+|---|---|---|---|
+| pipe-anchorages | `thin_port_messages` (`raw_port_events`) | allowed | no |
+| encounters | `create_raw_encounters` | allowed | no |
+| pipe-events | `incremental_events` | forbidden | yes |
+| pipe-gaps | `detect` | forbidden ("probably", in the owner's words) | yes |
+| pipe-segment | `segment` | forbidden | yes |
+
+Every other onboarded step is `unknown` and `untested`. `research_messages` (pipe-research) was also named as allowed; DIT has no pipe-research workflow, so there is no file for it.
+
+**Nothing records `verified` automatically.** A run's result reaches a declaration only by a human edit, naming the Cloud Build id.
+
+**Mapping to Airflow** (`dit.orchestration.airflow_guidance`):
+
+| Declaration | Airflow |
+|---|---|
+| `forbidden`, or depends on the previous run | `depends_on_past=True` on the task, `max_active_runs=1` on the DAG; a backfill runs its intervals one after the other, in date order |
+| `allowed` and no dependency | a backfill may run several intervals at once (`max_active_runs > 1`, no `depends_on_past`); each interval rewrites only its own dates |
+| `unknown` | treat as sequential until a test shows otherwise |
+
+A step that recomputes its whole history on every run (port visits' step 2 writes with WRITE_TRUNCATE) has a third shape: in a backfill only the last interval's run matters, which is where `LatestOnlyOperator` fits. Not a field yet; the step's `reason` says so.
+
+**The test: a parallel-slices mode.** The window is cut into slices by `dit.slices` (`--slices day|week|month|<N>d|<JSON list>`), every slice is its own job, all are submitted before any is awaited, and they write into one table. That table is compared with one job over the window (`1_bf`). The outcome (identical, different, or failed jobs) is judged against the declaration (`dit.orchestration.judge`):
+
+- allowed: identical passes; a difference or a failed slice fails (exit 1);
+- forbidden: the step is still run, as a negative test. A difference or failed jobs is "as declared" (exit 0); no difference is reported as "the declaration may be too strict" (exit 0, with a warning);
+- unknown: the outcome is reported and the workflow's normal rule applies (a difference fails).
+
+**First consumer:** `workflows/port_visits/ais.py`, mode `6_parallel`, step 1 only. Numbered 6 so it clashes with no mode of another workflow (4 and 5 are taken by pipe-gaps and pipe-segment). Step 2 is refused: it writes its whole table with WRITE_TRUNCATE (pipe-anchorages v5.0.1, `pipelines/port_visits/main.py`, read, not run), so slices would replace each other's output.
+
+**Candidate next consumers** (not decided): encounters' raw step (allowed), and the forbidden ones as negative tests (segmenter, incremental fishing events, gaps). Each takes the mode in its own workflow and reuses `dit.slices` and `judge`.
 
 ## Runtime & CI
 
