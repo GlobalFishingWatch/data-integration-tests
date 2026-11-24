@@ -581,6 +581,28 @@ the matching from a difference in the hand-over.
 - `--runner docker --build-from-source` runs the working tree locally with
   DirectRunner and needs no image.
 
+### Short jobs on DirectRunner
+
+A one-day job of the staging cohort spends about four of its six minutes on
+Dataflow starting and stopping workers (measured on build `4bb84ec0`,
+2026-11-24: about 2 min start-up, 1 min work, 2 min 10 s shutdown).
+`--direct-runner-max-days 1` runs every one-day job on DirectRunner inside
+the container and keeps longer jobs on Dataflow:
+
+```bash
+ARGS="--experiment-id pr227 --modes ...,4_daily:incremental --direct-runner-max-days 1 ..."
+```
+
+- Set by hand. Use it for small inputs (the staging cohort) where the
+  overhead dwarfs the work, not for production-sized days.
+- The comparison checks that DirectRunner gives what Dataflow gives: a
+  variant whose daily jobs ran locally is compared with a reference on
+  Dataflow.
+- `--dry-run` says which runner each job uses and how many run where.
+- Not verified yet: DirectRunner inside Cloud Build. It needs the BigQuery
+  export to GCS to work from the build step, and memory on the build machine
+  (E2_HIGHCPU_8) when `--parallel` runs several such jobs at once.
+
 ## M4. Dry run
 
 ```bash

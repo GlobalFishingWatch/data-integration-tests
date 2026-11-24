@@ -194,6 +194,16 @@ Sources, images, cache
   As for port visits, DIT never auto-builds an image for this workflow (a
   plain build has no overlay), and a run that would execute the default image
   on unreviewed code refuses to start (``check_images``).
+* **Short jobs on DirectRunner** (``--direct-runner-max-days N``, off by
+  default). A Dataflow job spends about two minutes starting workers and two
+  stopping them; a one-day job of the staging cohort does about a minute of
+  work (measured on build 4bb84ec0, 2026-11-24). With the flag, every job of
+  N days or fewer runs on DirectRunner inside the container, and longer jobs
+  stay on Dataflow. Set by hand: DIT does not judge when the runners agree.
+  The comparison checks it whenever a short job's variant is compared with a
+  reference on Dataflow. Not verified yet: DirectRunner inside Cloud Build
+  (its BigQuery export, and memory on the build machine when ``--parallel``
+  runs several such jobs at once).
 * **No run cache.** A variant writes three comparison tables and the cache
   hands back one, so every run recomputes what it selects.
 
@@ -254,6 +264,8 @@ from dit.runners import docker as dit_docker
 from dit.snapshot import resolve_pipeline_commit
 from dit.workflow import (
     add_dataset_args,
+    add_direct_runner_max_days_arg,
+    check_direct_runner_max_days,
     add_experiment_id_arg,
     add_max_num_workers_arg,
     add_modes_arg,
@@ -264,6 +276,7 @@ from dit.workflow import (
     parse_choice_list,
     resolve_run_context,
     resolve_worker_sizing,
+    runner_for_days,
     worker_cap,
     worker_sizing_from_args,
 )
@@ -563,6 +576,11 @@ class Job:
         """The variant's first job: its tables are empty."""
         return self.iteration == 1
 
+    @property
+    def days(self) -> int:
+        """Days the job covers, both ends included."""
+        return (self.end - self.start).days + 1
+
 
 def plan_jobs(variant: Variant, start: date, end: date, tail_days: int) -> tuple[Job, ...]:
     """The jobs of ``variant`` over ``[start, end]``, in run order. Pure.
@@ -671,6 +689,13 @@ def variant_images(args: argparse.Namespace, variant: Variant) -> tuple[str, str
     return args.image_tag, args.worker_image
 
 
+def job_runner(args: argparse.Namespace, job: Job) -> str:
+    """``dataflow`` or ``docker`` (DirectRunner in the container) for ``job``:
+    the run's ``--runner``, except a short job of a Dataflow run under
+    ``--direct-runner-max-days``."""
+    return runner_for_days(args.runner, job.days, args.direct_runner_max_days)
+
+
 def segment_argv(
     args: argparse.Namespace, job: Job, *, suffix: str, pinned: imk._PinnedSources,
 ) -> list[str]:
@@ -690,7 +715,7 @@ def segment_argv(
         experiment_id=args.experiment_id,
         binding_name=variant.tag,
         date_range=(job.start, job.end),
-        runner=_BEAM_RUNNER[args.runner],
+        runner=_BEAM_RUNNER[job_runner(args, job)],
         worker_image=worker_image,
         ssvid_filter_query=args.ssvid_filter_query,
         service_account=args.service_account,
@@ -720,8 +745,9 @@ def describe_job(args: argparse.Namespace, job: Job, *, suffix: str) -> str:
             "no fragment history (its tables are empty)" if job.first
             else f"every fragment in {tables['fragments']}"
         )
+    where = "on Dataflow" if job_runner(args, job) == "dataflow" else "on DirectRunner"
     return (
-        f"{variant.label} job {job.iteration}/{job.total}: {span}; reads the pinned "
+        f"{variant.label} job {job.iteration}/{job.total}: {span} {where}; reads the pinned "
         f"messages of that range and {state}; clears and writes that range"
     )
 
@@ -891,9 +917,14 @@ def _images_executed(
         return ()
     if side == SIDE_BASE:
         return (("--base-image", args.base_image),)
+    on_dataflow = any(
+        job_runner(args, job) == "dataflow"
+        for variant, jobs in _plans(args).items() if variant.side == SIDE_HEAD
+        for job in jobs
+    )
     candidates = (
         ("--image-tag", args.image_tag, not args.build_from_source),
-        ("--worker-image", args.worker_image, args.runner == "dataflow"),
+        ("--worker-image", args.worker_image, on_dataflow),
     )
     return tuple((flag, image) for flag, image, executed in candidates if executed)
 
@@ -1190,6 +1221,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                     "segment task at 50.",
     )
     add_worker_sizing_args(p, defaults=STEP_WORKER_SIZING)
+    add_direct_runner_max_days_arg(p)
     p.add_argument("--suffix", default=None,
                    help="Output-table suffix; generated from the experiment id, the "
                         "pipe-segment commit and a random part when omitted. A run refuses "
@@ -1212,6 +1244,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     args.variants = parse_variants(args.modes, args.segmenter)
     check_base_side(args)
+    check_direct_runner_max_days(args.runner, args.direct_runner_max_days)
     args.date_range = (_parse_date(args.start, "--start"), _parse_date(args.end, "--end"))
     start, end = args.date_range
     if end < start:
@@ -1270,6 +1303,12 @@ def log_plan(args: argparse.Namespace, suffix: str) -> None:
         len(plans), sum(map(len, plans.values())), len(pairs) * len(COMPARED_TABLES),
         len(pairs), len(COMPARED_TABLES),
     )
+    if args.direct_runner_max_days is not None:
+        local = sum(job_runner(args, job) == "docker" for jobs in plans.values() for job in jobs)
+        logger.info(
+            "--direct-runner-max-days %d: %d job(s) on DirectRunner, %d on Dataflow",
+            args.direct_runner_max_days, local, sum(map(len, plans.values())) - local,
+        )
     for variant, jobs in plans.items():
         logger.info("variant %s: %d job(s); image %s; tables %s",
                     variant.label, len(jobs), variant_images(args, variant)[0],
