@@ -6,6 +6,16 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-24: table-check pinned to v0.3.0
+
+#### Changed
+- **`table-identical-checks` is pinned to the `v0.3.0` tag instead of `master`** (`requirements.txt`). With `@master`, ditbox's kaniko layer cache (keyed on `requirements.txt`, 1-year TTL) kept the TIC commit from the first build (`c7b896e`), however often the image was rebuilt. A tag makes the image reproducible, and bumping the tag is what refreshes it.
+- **What v0.3.0 changes for DIT comparisons:**
+  - Duplicate keys no longer inflate the after-tolerance counts.
+  - Rows whose key columns contain NULLs are now matched; previously they could be reported as identical without being compared.
+  - STRUCT columns work on partition-filtered sources.
+  - `table-check summary` now exits 0 on PASS, 1 on FAIL and 2 on error. `dit.compare` keeps reading the row counts from the JSON (`check=False`), so its verdict logic is unchanged.
+
 ### 2026-11-20: no satellite timing offsets in DIT
 
 **DIT's segmenter workflows do not run pipe-segment's satellite timing offsets** (owner decision, 2026-11-20). Production's `segment` task works out, per receiver and hour, how far a satellite's clock is off, and drops the messages of the hours above the threshold. A DIT `segment` run does neither.
