@@ -670,8 +670,9 @@ job.
 - **44 Dataflow jobs**, each capped at 4 workers. With `--parallel` the five
   variants run side by side; D's 31 jobs run one after the other and set the
   duration.
-- **30 comparisons**: 10 pairs of variants on three tables. The four pairs
-  with A come first for each table.
+- **12 comparisons**: each of the four other variants with A, on three
+  tables (`--compare reference`, the default). `--compare all-pairs` gives
+  30: every pair of the five.
 - Rough cost: a few USD, estimated from startup-dominated jobs of a few
   worker-minutes each on e2-standard-4. Not measured: no pipe-segment job has
   run from DIT on Dataflow. `--worker-machine-type` lowers it.
@@ -698,8 +699,8 @@ make dit-cloud PIPELINE=pipe-segment REF=v5.1.0 \
           --parallel"
 ```
 
-- **45 Dataflow jobs** and **45 comparisons** (15 pairs on three tables). The
-  five pairs with Z come first for each table.
+- **45 Dataflow jobs** and **15 comparisons**: each of the five other
+  variants with Z, on three tables (45 with `--compare all-pairs`).
 - Z against A is the pair that tests the shared code: same mode, same flags,
   two versions.
 - It needs both overlay images built: v5.1.0 (the default) and v5.0.3. Neither

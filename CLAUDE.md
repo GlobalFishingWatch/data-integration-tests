@@ -167,6 +167,8 @@ So the planned test assumed that v5.1.0 in full history equals v5.0.3. PR #227 c
 - The schema definitions of the three compared tables are unchanged between the tags (`schemas/message_schema.py`, `schemas/segment_schema.py`, `transform/fragment.py` are not in `git diff v5.0.3 v5.1.0`). Read, not run.
 - Nothing ran on Dataflow, and neither overlay image is built.
 
+**Comparison: each variant with the reference by default** (owner decision, same day). `--compare reference|all-pairs`, default `reference`. A difference between two non-reference variants still shows: at least one of them then differs from the reference. Every pair stays available to tell which of two variants moved. For the #227 test with the base: 15 comparisons instead of 45. This settles the open question of the 2026-11-20 entry below ("pairwise is 30 comparisons ... reference only would be 12").
+
 **Sections moved.** `workflows/pipe_segment/ais.py` (docstring section "A third part of the unit"; `SIDE_*`, `SIDES`; `Variant`, `ALL_VARIANTS`, `_split_entry`, `parse_variants`; `_labels`; `variant_images`, `segment_argv`, `run_variant`; `_images_executed`, `check_base_side`, `check_incremental_support`, `_check_incremental_support`; `--base-image`; `log_plan`, `_log_configuration`); `tests/test_pipe_segment_ais.py` (three adapted, a new section on the base side; suite 1,500 → 1,535); `workflows/pipe_segment/RUN_INSTRUCTIONS.md` (M3, M6); README Features; CHANGELOG § 2026-11-24.
 
 ### 2026-11-20 — Mode equivalence for the segmenter (`workflows/pipe_segment/ais.py`); pipe-segment temp-dataset overlay
