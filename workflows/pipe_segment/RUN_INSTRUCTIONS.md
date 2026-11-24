@@ -10,11 +10,13 @@ End-to-end steps to A/B-test the gpsdio-segment identity-match-key change
 (reducing `match_key = (transponder_type, receiver_type, source)` to
 `(transponder_type,)`) via this workflow.
 
-**Status, 2026-11-20.** The workflow's command lines match what the AIS v3
+**Status, 2026-11-24.** The workflow's command lines match what the AIS v3
 DAG's segment group is configured for (pipe-segment v5.1.0, six tasks; see
-[`composer_drift.py`](composer_drift.py)), with one accepted difference: the
-DAG's `segment` task passes `--incremental` and this workflow does not (below).
-That was established by reading code and the DAG's rendered snapshot. The only
+[`composer_drift.py`](composer_drift.py)), `--incremental` included, with no
+accepted difference. A binding older than v5.1.0 drops that flag by a declared
+adjustment (below), and that older layer is checked against the DAG at the
+composer commit where production last ran v5.0.3. That was established by
+reading code and the DAG's rendered snapshots. The only
 recorded run is one laptop smoke of the `segment` step on 2026-06-03, on
 v5.0.3. Two things still stand between this file and a full run:
 
@@ -35,19 +37,40 @@ and passed no `--incremental`. composer-dags-production PR #3145 changed both,
 and DIT's drift check reported it the same evening. The VMS v5 DAG still pins
 v5.0.3. Examples below use `v5.1.0`; an experiment branch should fork from it.
 
-**No `--incremental` in this workflow.** Every binding runs the full-history
-segmenter:
+**`--incremental` follows the binding's pipe-segment (since 2026-11-24).**
+Until then no binding passed the flag, and the drift spec accepted the DAG's
+flag as a difference. Now the workflow mirrors production as its base, and a
+binding whose code differs gets *adjustments* (`dit.adjust`):
 
-- A binding may be a ref older than v5.1.0. Such code hands the unknown flag
-  to Beam instead of rejecting it (read, not tried), so the two sides of the
-  A/B would run different segmenters.
-- A binding is one `segment` job from empty tables, so the state the flag
-  reads is empty either way.
+- **The base** passes `--incremental`, `--in_segments_table` and
+  `--in_fragments_table` to `segment`, the two tables being the binding's own.
+- **The declared adjustment** in [`adjustments.py`](adjustments.py) removes
+  the three for a binding whose `segment` command does not declare
+  `--incremental` at its ref (read with `git show`), or, when that source
+  cannot be read, whose version is below v5.1.0. Such a binding runs full
+  history, the only segmenter it has. An unreleased head with the flag but an
+  old version number keeps the flags: the source decides first.
+- **Ad hoc edits** for one run: `--binding-adjust NAME=<step>:<op>:<flag>[=<value>]`,
+  `<op>` one of `remove`, `add`, `rename`, `set`, repeatable, applied after the
+  declared ones in the order given. Values may name the binding's own tables
+  (`{out.<name>}`) or the pinned source (`{in.<role>}`).
+- A v5.0.3 binding against a v5.1.0 binding compares full history with
+  incremental as well as two refs. The run log prints the flag difference per
+  step. To hold the segmenter fixed, remove the three flags from the newer
+  binding with `--binding-adjust` (example in the workflow's docstring).
 - Whether the two segmenters agree is what `ais.py` tests, and no run has
   confirmed it yet.
 
-The drift spec accepts the DAG's flag for the `segment` step, with this
-reason.
+**Preflight, before anything is pinned.** Every flag of every step must be
+declared by that step's command module at the binding's ref
+(`src/pipe_segment/cli/commands/<step>.py`, or `pipe_segment/...` before
+v5.0.3). pipe-segment hands unknown flags to Beam (`parse_known_args` in
+`cli/main.py`), which ignores them, so a wrong flag would otherwise run
+silently without effect. Beam's own options on the two Beam steps are exempt;
+the list is `adjustments.BEAM_OPTIONS`, worked out by reading both command
+modules at v5.0.3 and v5.1.0. The four SQL steps get no exemption. An edit
+that finds nothing to change is an error too, and two bindings must be
+compared on the same keys.
 
 Source pinning no longer stands in the way. The workflow pinned its source
 with a BigQuery snapshot, which no DIT identity can create in
@@ -209,7 +232,10 @@ git push -u origin experiment/identity-match-key-transponder-only
 
 The workflow reads each binding's pin from `pyproject.toml` (older tags:
 `requirements/prod.in`) and refuses a two-binding run whose bindings pin the
-same gpsdio-segment.
+same gpsdio-segment. That guard is for the identity-match-key experiment. A
+run of two pipe-segment versions that share the pin (v5.0.3 against v5.1.0)
+passes `--allow-same-gpsdio-pin`; the run then logs that the pins are equal
+and goes on.
 
 ## 4. Image resolution
 
@@ -226,8 +252,12 @@ The workflow resolves a per-binding image via `dit.workflow.resolve_run_context`
   On Dataflow as the test service account the job is expected to fail when
   Beam creates its staging dataset, and the workflow logs a warning.
 - **Explicit override**: `--image-tag <FQN>` is respected for all bindings.
-  There is no per-binding image flag, so an A/B of two overlay images on
-  Dataflow is not possible yet.
+- **Per binding**: `--binding-image NAME=IMAGE` (repeatable) gives one
+  binding its own image, as submitter and as Dataflow worker; it wins over
+  `--image-tag` for that binding. An A/B of two pipe-segment versions needs
+  it, since a reviewed ref otherwise runs the default image whatever version
+  the ref is. A warning says when the image's tag names another version than
+  the ref states. The v5.0.3 overlay image is not built yet.
 - **Laptop fast-iter**: `--build-from-source` bypasses both the default
   image and the kaniko build — compose builds the `dev` service from the
   worktree's working tree.
