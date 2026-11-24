@@ -64,6 +64,43 @@ agrees with itself. ``1_bf:incremental`` separates "the incremental matching
 differs" from "the hand-over between jobs differs". Ten jobs on the default
 window.
 
+A third part of the unit: the side (``@base``)
+----------------------------------------------
+A ``--modes`` entry may end in ``@base``. That variant runs on
+``--base-image``, an overlay image of an earlier pipe-segment version, as
+submitter and worker image; every other variant runs on the run's own images
+(the head). So one run can hold three sides of a change such as PR #227: the
+base version, the head in the base's mode, and the head in its new mode::
+
+    --modes 1_bf:full-history@base,1_bf:full-history,1_bf:incremental \\
+    --base-image <v5.0.3 overlay>
+
+Without the base, "full history equals incremental" is tested on the head
+alone, and a change to code both segmenters share would go unseen. PR #227
+touched such code (``pipeline.py``, ``transform/read_messages.py``,
+``transform/create_segments.py``; ``git diff --stat v5.0.3 v5.1.0``).
+
+* Both sides read the same pinned copy and get the same flags. Nothing is
+  added or removed for the older version: a base variant in full history
+  passes exactly what a head variant in full history passes. That is enough
+  for v5.0.3 against v5.1.0, whose command lines differ only in the three
+  flags ``incremental`` adds. A base whose command line differs in another
+  way needs per-side adjustments, which this workflow does not have yet.
+* A base variant has its own three tables (tag ``…_base``) and sorts first
+  within its mode, so ``1_bf:full-history@base`` is the reference when it is
+  selected.
+* There is no default base image: the base is whichever version the test is
+  about. ``@base`` without ``--base-image`` is refused, and so is
+  ``--base-image`` without an ``@base`` entry, which would read as a compared
+  base. ``--build-from-source`` is refused with ``@base``: the working tree is
+  the head.
+* ``incremental`` is checked per side (next section but one). A base older
+  than v5.1.0 runs full history only.
+* The schema definitions of the three tables are the same in both tags
+  (``schemas/message_schema.py``, ``schemas/segment_schema.py`` and
+  ``transform/fragment.py`` are not in ``git diff v5.0.3 v5.1.0``). Read from
+  the code; no table was written.
+
 What the workflow guarantees about the chain
 --------------------------------------------
 From the PR's notes and the code:
@@ -97,8 +134,9 @@ pipe-segment's command line hands every flag it does not know to Beam
 ``--incremental`` would not fail. Inferred, not run: the job would run the
 full-history segmenter, and "incremental against full history" would compare
 full history with itself and pass. The workflow therefore refuses
-``incremental`` before any cloud call unless every image the run executes
-says it is v5.1.0 or later. It reads that from the image tag, which must
+``incremental`` before any cloud call unless every image that runs an
+incremental variant says it is v5.1.0 or later (per side: the head's images
+for the head's variants, ``--base-image`` for the ``@base`` ones). It reads that from the image tag, which must
 start with the pipe-segment version (the overlay's ``build.sh`` label, e.g.
 ``v5.1.0-4ddde03-temp-dataset-…``). A tag that names no version is refused
 too; ``--assume-incremental-support`` overrides that for an image known to
@@ -173,6 +211,13 @@ Example (the pipe-segment PR #227 test, 44 jobs; see RUN_INSTRUCTIONS.md)::
 
     dit run workflows/pipe_segment/ais.py --experiment-id pr227 \\
         --modes 1_bf:full-history,2_bfd:full-history,2_bfd,3_bftruncate,4_daily
+
+Example (the same test with the base version as a sixth variant and the
+reference, 45 jobs)::
+
+    dit run workflows/pipe_segment/ais.py --experiment-id pr227 \\
+        --modes 1_bf:full-history@base,1_bf:full-history,2_bfd:full-history,2_bfd,3_bftruncate,4_daily \\
+        --base-image <v5.0.3 overlay>
 
 Example (the version the VMS DAG pins, which has no incremental segmenter)::
 
@@ -269,6 +314,19 @@ DEFAULT_MODES = (
     f"{MODE_BF}:{SEGMENTER_FULL_HISTORY}", MODE_BF, MODE_BFD, MODE_BFTRUNCATE,
 )
 
+#: Which code a variant runs on. ``head`` is the run's own images
+#: (``--image-tag``, ``--worker-image``); ``base`` is ``--base-image``, an
+#: earlier pipe-segment version to compare against. A ``--modes`` entry ends in
+#: ``@base`` to run on the base image.
+SIDE_HEAD = "head"
+SIDE_BASE = "base"
+
+#: Sides in canonical order: base first, so that a base variant, when one is
+#: selected, sorts first within its mode and can be the reference.
+SIDES = (SIDE_BASE, SIDE_HEAD)
+
+SIDE_SEPARATOR = "@"
+
 #: Each segmenter's short form in table names, job names and compose project
 #: names, where ``-`` and ``:`` are not safe everywhere.
 _SEGMENTER_TAGS = {SEGMENTER_FULL_HISTORY: "full", SEGMENTER_INCREMENTAL: "inc"}
@@ -337,65 +395,88 @@ COMPARE_VIEW_SUFFIX = ""
 
 
 # --------------------------------------------------------------------------
-# Variants: (mode, segmenter)
+# Variants: (mode, segmenter, side)
 # --------------------------------------------------------------------------
 
 @dataclasses.dataclass(frozen=True)
 class Variant:
-    """One way to run the window: how it is cut into jobs, and which
-    segmenter each job runs. The unit that is run and compared."""
+    """One way to run the window: how it is cut into jobs, which segmenter
+    each job runs, and on which code. The unit that is run and compared."""
 
     mode: str
     segmenter: str
+    side: str = SIDE_HEAD
 
     @property
     def label(self) -> str:
-        """As typed in ``--modes`` and shown in logs: ``2_bfd:incremental``."""
-        return f"{self.mode}:{self.segmenter}"
+        """As typed in ``--modes`` and shown in logs: ``2_bfd:incremental``,
+        ``1_bf:full-history@base``."""
+        own = f"{self.mode}:{self.segmenter}"
+        return own if self.side == SIDE_HEAD else f"{own}{SIDE_SEPARATOR}{self.side}"
 
     @property
     def tag(self) -> str:
-        """Safe for table names, job names and labels: ``2_bfd_inc``."""
-        return f"{self.mode}_{_SEGMENTER_TAGS[self.segmenter]}"
+        """Safe for table names, job names and labels: ``2_bfd_inc``,
+        ``1_bf_full_base``."""
+        own = f"{self.mode}_{_SEGMENTER_TAGS[self.segmenter]}"
+        return own if self.side == SIDE_HEAD else f"{own}_{self.side}"
 
 
-#: Every variant, in canonical order: by mode, then by segmenter. The first
-#: selected one (``1_bf:full-history`` when selected) is the reference.
+#: Every variant, in canonical order: by mode, then by side (base first), then
+#: by segmenter. The first selected one is the reference:
+#: ``1_bf:full-history@base`` when selected, else ``1_bf:full-history``.
 ALL_VARIANTS = tuple(
-    Variant(mode, segmenter) for mode in SELECTABLE_MODES for segmenter in SEGMENTERS
+    Variant(mode, segmenter, side)
+    for mode in SELECTABLE_MODES for side in SIDES for segmenter in SEGMENTERS
 )
+
+
+def _split_entry(entry: str) -> tuple[str, str | None, str]:
+    """One ``--modes`` entry, ``mode[:segmenter][@side]``, as
+    ``(mode, segmenter or None, side)``. Nothing is validated here."""
+    own, at, side = entry.partition(SIDE_SEPARATOR)
+    mode, colon, segmenter = own.partition(":")
+    return (
+        mode.strip(),
+        segmenter.strip() if colon else None,
+        side.strip() if at else SIDE_HEAD,
+    )
 
 
 def parse_variants(raw_modes: str, raw_segmenters: str) -> list[Variant]:
     """The variants ``--modes`` and ``--segmenter`` select, in canonical order.
 
     A bare mode takes every segmenter of ``raw_segmenters``; ``mode:segmenter``
-    names its own. Duplicates collapse. An unknown or empty selection raises
-    ``SystemExit`` naming the valid choices, before any cloud call: a typo
-    that ran nothing would read as a passing run.
+    names its own. Either form may end in ``@base`` to run on ``--base-image``.
+    Duplicates collapse. An unknown or empty selection raises ``SystemExit``
+    naming the valid choices, before any cloud call: a typo that ran nothing
+    would read as a passing run.
     """
     segmenters = parse_choice_list(
         raw_segmenters, choices=SEGMENTERS, flag="--segmenter", noun="segmenter",
     )
     entries = [entry.strip() for entry in raw_modes.split(",") if entry.strip()]
-    pairs = [tuple(part.strip() for part in entry.partition(":")) for entry in entries]
+    parts = [_split_entry(entry) for entry in entries]
     valid = (
         f"valid modes: {','.join(SELECTABLE_MODES)}, each optionally followed by "
-        f"':' and one of {','.join(SEGMENTERS)}"
+        f"':' and one of {','.join(SEGMENTERS)}, and then optionally by "
+        f"'{SIDE_SEPARATOR}{SIDE_BASE}' to run on --base-image"
     )
-    if not pairs:
+    if not parts:
         raise SystemExit(f"error: --modes must name at least one mode; {valid}")
     # Reported as typed, so the message echoes the command line.
     unknown = [
-        entry for entry, (mode, colon, own) in zip(entries, pairs, strict=True)
-        if mode not in SELECTABLE_MODES or (colon and own not in SEGMENTERS)
+        entry for entry, (mode, own, side) in zip(entries, parts, strict=True)
+        if mode not in SELECTABLE_MODES
+        or (own is not None and own not in SEGMENTERS)
+        or side not in SIDES
     ]
     if unknown:
         raise SystemExit(f"error: unknown mode(s) {','.join(unknown)}; {valid}")
     selected = {
-        Variant(mode, segmenter)
-        for mode, colon, own in pairs
-        for segmenter in ([own] if colon else segmenters)
+        Variant(mode, segmenter, side)
+        for mode, own, side in parts
+        for segmenter in (segmenters if own is None else [own])
     }
     return [variant for variant in ALL_VARIANTS if variant in selected]
 
@@ -549,6 +630,7 @@ def _labels(args: argparse.Namespace, job: Job) -> list[str]:
         "--labels=dit_workflow=pipe_segment_ais",
         f"--labels=dit_mode={variant.mode}",
         f"--labels=dit_segmenter={variant.segmenter}",
+        f"--labels=dit_side={variant.side}",
         f"--labels=dit_iteration={job.iteration}",
         f"--labels=dit_total_iterations={job.total}",
         f"--labels=dit_slice_start={job.start.isoformat()}",
@@ -581,6 +663,15 @@ def _segmenter_flags(args: argparse.Namespace, suffix: str, variant: Variant) ->
     ]
 
 
+def variant_images(args: argparse.Namespace, variant: Variant) -> tuple[str, str]:
+    """``(submitter image, worker image)`` of ``variant``. A base variant runs
+    ``--base-image`` as both: the two must hold the same code, and an overlay
+    image serves as either."""
+    if variant.side == SIDE_BASE:
+        return args.base_image, args.base_image
+    return args.image_tag, args.worker_image
+
+
 def segment_argv(
     args: argparse.Namespace, job: Job, *, suffix: str, pinned: imk._PinnedSources,
 ) -> list[str]:
@@ -592,6 +683,7 @@ def segment_argv(
     tables, the labels, the job name, and the date range of the job.
     """
     variant = job.variant
+    _, worker_image = variant_images(args, variant)
     return imk._segment_args(
         pinned=pinned,
         dest_dataset=args.dest_dataset,
@@ -600,7 +692,7 @@ def segment_argv(
         binding_name=variant.tag,
         date_range=(job.start, job.end),
         runner=_BEAM_RUNNER[args.runner],
-        worker_image=args.worker_image,
+        worker_image=worker_image,
         ssvid_filter_query=args.ssvid_filter_query,
         service_account=args.service_account,
         max_num_workers=args.max_num_workers,
@@ -667,10 +759,11 @@ def run_variant(
     jobs before it wrote, so the first failure ends the variant
     (``SystemExit``)."""
     start, end = args.date_range
+    image_tag, _ = variant_images(args, variant)
     for job in plan_jobs(variant, start, end, args.tail_days):
         logger.info("%s", describe_job(args, job, suffix=suffix))
         rc = dit_docker.run(
-            args.image_tag,
+            image_tag,
             segment_argv(args, job, suffix=suffix, pinned=pinned),
             **_docker_run_kwargs(args, variant),
         )
@@ -779,14 +872,20 @@ def image_pipeline_version(image: str) -> tuple[int, int, int] | None:
     return major, minor, patch
 
 
-def _images_executed(args: argparse.Namespace) -> tuple[tuple[str, str], ...]:
-    """``(flag, image)`` for each image this run executes.
+def _images_executed(
+    args: argparse.Namespace, side: str = SIDE_HEAD,
+) -> tuple[tuple[str, str], ...]:
+    """``(flag, image)`` for each image the variants of ``side`` execute.
 
-    The submitter image runs unless ``--build-from-source`` replaces it. The
-    worker image runs only on Dataflow. A compare-only run executes neither.
+    Head: the submitter image runs unless ``--build-from-source`` replaces it,
+    and the worker image runs only on Dataflow. Base: ``--base-image`` is both.
+    A compare-only run executes none, and neither does a side with no variant
+    selected.
     """
-    if args.skip_pipelines:
+    if args.skip_pipelines or not any(v.side == side for v in args.variants):
         return ()
+    if side == SIDE_BASE:
+        return (("--base-image", args.base_image),)
     candidates = (
         ("--image-tag", args.image_tag, not args.build_from_source),
         ("--worker-image", args.worker_image, args.runner == "dataflow"),
@@ -854,9 +953,46 @@ def _version_text(version: tuple[int, int, int]) -> str:
     return "v" + ".".join(map(str, version))
 
 
+def check_base_side(args: argparse.Namespace) -> None:
+    """Refuse a selection of ``@base`` variants that cannot run as asked. No
+    cloud call.
+
+    * ``@base`` needs ``--base-image``: there is no default, since the base is
+      whichever earlier version the test is about.
+    * ``--base-image`` without an ``@base`` entry would run nothing on it, and
+      the run would read as if the base had been compared.
+    * ``--build-from-source`` runs the working tree, which is the head.
+    """
+    base = [v.label for v in args.variants if v.side == SIDE_BASE]
+    if args.base_image and not base:
+        raise SystemExit(
+            f"error: --base-image is given, but no --modes entry ends in "
+            f"'{SIDE_SEPARATOR}{SIDE_BASE}', so nothing would run on it. Add one, e.g. "
+            f"{MODE_BF}:{SEGMENTER_FULL_HISTORY}{SIDE_SEPARATOR}{SIDE_BASE}."
+        )
+    if not base:
+        return
+    if args.build_from_source:
+        raise SystemExit(
+            f"error: --build-from-source runs the working tree, and {', '.join(base)} "
+            f"must run the base image. Run the head from an image too (--image-tag and "
+            f"--worker-image), or drop the '{SIDE_SEPARATOR}{SIDE_BASE}' entries."
+        )
+    if not args.base_image and not args.skip_pipelines:
+        raise SystemExit(
+            f"error: {', '.join(base)} run on --base-image, and none is given. Pass an "
+            f"overlay image of the base version, built with:\n"
+            f"  {OVERLAY_DIR}/build.sh <pipe-segment dir> <commit or tag> <label> --push\n"
+            f"with a label that starts with the version (e.g. v5.0.3), so that DIT can "
+            f"tell which flags the image knows."
+        )
+
+
 def check_incremental_support(args: argparse.Namespace, repo_dir: str) -> None:
-    """Refuse ``incremental`` unless every image the run executes is known to
-    know ``--incremental``. No cloud call: image tags and one local file.
+    """Refuse ``incremental`` unless every image that runs an incremental
+    variant is known to know ``--incremental``. No cloud call: image tags and
+    one local file. Checked per side: a base image older than the flag is fine
+    as long as every ``@base`` entry names full history.
 
     * An image whose tag starts with a version older than
       ``INCREMENTAL_SINCE`` is refused.
@@ -867,13 +1003,33 @@ def check_incremental_support(args: argparse.Namespace, repo_dir: str) -> None:
 
     ``incremental`` is the default segmenter and the default image knows the
     flag, so a default run passes. What is refused is an older or unversioned
-    image given by flag while an incremental variant is still selected.
+    image given by flag while an incremental variant is still selected for it.
     """
-    incremental = [v.label for v in args.variants if v.segmenter == SEGMENTER_INCREMENTAL]
-    if not incremental or args.skip_pipelines:
+    if args.skip_pipelines:
         return
+    for side in SIDES:
+        incremental = [
+            v.label for v in args.variants
+            if v.segmenter == SEGMENTER_INCREMENTAL and v.side == side
+        ]
+        if incremental:
+            _check_incremental_support(args, repo_dir, side, incremental)
+
+
+def _check_incremental_support(
+    args: argparse.Namespace, repo_dir: str, side: str, incremental: Sequence[str],
+) -> None:
+    """``check_incremental_support`` for the incremental variants of one side."""
     since = _version_text(INCREMENTAL_SINCE)
     selected = f"the {SEGMENTER_INCREMENTAL} segmenter ({', '.join(incremental)})"
+    image_flags = "--base-image" if side == SIDE_BASE else "--image-tag and --worker-image"
+    full_history_only = (
+        f"name full history in every '{SIDE_SEPARATOR}{SIDE_BASE}' entry (e.g. "
+        f"{MODE_BF}:{SEGMENTER_FULL_HISTORY}{SIDE_SEPARATOR}{SIDE_BASE})"
+        if side == SIDE_BASE else
+        f"run this image with full history only (--segmenter "
+        f"{SEGMENTER_FULL_HISTORY}, and no ':{SEGMENTER_INCREMENTAL}' entry in --modes)"
+    )
 
     if args.build_from_source:
         command_file = Path(repo_dir) / _SEGMENT_COMMAND_FILE
@@ -885,7 +1041,7 @@ def check_incremental_support(args: argparse.Namespace, repo_dir: str) -> None:
                 f"flag. {_INCREMENTAL_WHY}"
             )
 
-    for flag, image in _images_executed(args):
+    for flag, image in _images_executed(args, side):
         version = image_pipeline_version(image)
         if version is not None and version >= INCREMENTAL_SINCE:
             continue
@@ -901,10 +1057,9 @@ def check_incremental_support(args: argparse.Namespace, repo_dir: str) -> None:
                  "cannot tell what it holds"
         )
         way_out = (
-            f"Choose one: run this image with full history only (--segmenter "
-            f"{SEGMENTER_FULL_HISTORY}, and no ':{SEGMENTER_INCREMENTAL}' entry in --modes); "
-            f"or pass an overlay image of {since} or later as --image-tag and "
-            f"--worker-image ({OVERLAY_DIR}/build.sh <pipe-segment dir> <commit> <label> "
+            f"Choose one: {full_history_only}; "
+            f"or pass an overlay image of {since} or later as {image_flags} "
+            f"({OVERLAY_DIR}/build.sh <pipe-segment dir> <commit> <label> "
             f"--push, with a label that starts with the version, e.g. {since}; the default "
             f"image is one)"
             + ("." if version is not None
@@ -995,6 +1150,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="Dataflow worker image, passed to Beam as --sdk_container_image. "
                         "Default: the same overlay image as --image-tag. Must hold the same "
                         "code as the submitter.")
+    p.add_argument("--base-image", default=None, metavar="IMAGE",
+                   help=f"Image of an earlier pipe-segment version, run by the --modes "
+                        f"entries that end in '{SIDE_SEPARATOR}{SIDE_BASE}' as submitter and "
+                        f"worker image, e.g. --modes "
+                        f"{MODE_BF}:{SEGMENTER_FULL_HISTORY}{SIDE_SEPARATOR}{SIDE_BASE},"
+                        f"{MODE_BF}:{SEGMENTER_FULL_HISTORY},{MODE_BF}. An overlay image "
+                        f"built with {OVERLAY_DIR}/build.sh. No default. Both sides read the "
+                        f"same pinned copy and get the same flags; a base older than "
+                        f"{_version_text(INCREMENTAL_SINCE)} runs full history only.")
     p.add_argument("--build-from-source", action="store_true",
                    help="Run `docker compose run dev` on the working tree instead of "
                         "--image-tag. That build has no temp-dataset overlay: fine with "
@@ -1036,6 +1200,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = p.parse_args(argv)
 
     args.variants = parse_variants(args.modes, args.segmenter)
+    check_base_side(args)
     args.date_range = (_parse_date(args.start, "--start"), _parse_date(args.end, "--end"))
     start, end = args.date_range
     if end < start:
@@ -1095,8 +1260,9 @@ def log_plan(args: argparse.Namespace, suffix: str) -> None:
         len(pairs), len(COMPARED_TABLES),
     )
     for variant, jobs in plans.items():
-        logger.info("variant %s: %d job(s); tables %s",
-                    variant.label, len(jobs), ", ".join(_tables(args, suffix, variant).values()))
+        logger.info("variant %s: %d job(s); image %s; tables %s",
+                    variant.label, len(jobs), variant_images(args, variant)[0],
+                    ", ".join(_tables(args, suffix, variant).values()))
         for job in jobs:
             logger.info("  %s", describe_job(args, job, suffix=suffix))
     if not pairs:
@@ -1119,8 +1285,9 @@ def _log_configuration(args: argparse.Namespace) -> None:
                 start, end, (end - start).days + 1, args.tail_days)
     logger.info("source: %s", args.source_normalized_table)
     logger.info("runner: %s", args.runner)
-    for flag, image in _images_executed(args):
-        logger.info("%s: %s", flag, image)
+    for side in reversed(SIDES):
+        for flag, image in _images_executed(args, side):
+            logger.info("%s: %s", flag, image)
     log_worker_caps({"every job": args.worker_cap})
     log_worker_sizings(args.worker_sizings)
     if args.runner == "dataflow":

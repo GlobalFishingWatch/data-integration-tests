@@ -192,10 +192,12 @@ def test_a_bad_selection_fails_at_parse_time(modes, segmenter, message) -> None:
 def test_variant_tags_are_safe_in_table_names_and_distinct() -> None:
     tags = [v.tag for v in mod.ALL_VARIANTS]
 
-    assert len(set(tags)) == len(mod.ALL_VARIANTS) == 8
+    # 4 modes x 2 segmenters x 2 sides.
+    assert len(set(tags)) == len(mod.ALL_VARIANTS) == 16
     assert all(re.fullmatch(r"[a-z0-9_]+", tag) for tag in tags)
     assert mod.Variant("2_bfd", INC).tag == "2_bfd_inc"
     assert mod.Variant("1_bf", FULL).tag == "1_bf_full"
+    assert mod.Variant("1_bf", FULL, mod.SIDE_BASE).tag == "1_bf_full_base"
 
 
 # --------------------------------------------------------------------------
@@ -386,7 +388,7 @@ def test_no_table_is_shared_between_variants() -> None:
         for fqn in mod._tables(args, SUFFIX, variant).values()
     ]
 
-    assert len(set(tables)) == len(tables) == 24
+    assert len(set(tables)) == len(tables) == 48
 
 
 def test_a_full_history_dataflow_job_argv_is_pinned() -> None:
@@ -407,6 +409,7 @@ def test_a_full_history_dataflow_job_argv_is_pinned() -> None:
         "--labels=dit_workflow=pipe_segment_ais",
         "--labels=dit_mode=2_bfd",
         "--labels=dit_segmenter=full-history",
+        "--labels=dit_side=head",
         "--labels=dit_iteration=2",
         "--labels=dit_total_iterations=4",
         "--labels=dit_slice_start=2020-01-08",
@@ -1038,6 +1041,150 @@ def test_dry_run_reports_the_plan_and_creates_nothing(caplog) -> None:
     assert "no fragment history (its tables are empty)" in log
     assert "reference: 1_bf:full-history" in log
     assert "compare segments on seg_id,frag_id, 10 pair(s): DISCRIMINATING" in log
+
+
+# --------------------------------------------------------------------------
+# the base side: --modes entries ending in @base run on --base-image
+# --------------------------------------------------------------------------
+
+#: The three-sided test of a pipe-segment change: the base version, the head
+#: in the base's mode, and the head in its new mode.
+THREE_SIDED = "1_bf:full-history@base,1_bf:full-history,1_bf:incremental"
+
+
+@pytest.mark.parametrize(("modes", "segmenter", "expected"), [
+    (THREE_SIDED, "incremental",
+     ["1_bf:full-history@base", "1_bf:full-history", "1_bf:incremental"]),
+    # Within a mode the base sorts first, whatever the order typed.
+    ("2_bfd,1_bf:full-history,1_bf:full-history@base", "incremental",
+     ["1_bf:full-history@base", "1_bf:full-history", "2_bfd:incremental"]),
+    # A bare mode at base takes every segmenter of --segmenter, as at head.
+    ("1_bf@base", "full-history", ["1_bf:full-history@base"]),
+    ("1_bf @ base", "full-history,incremental",
+     ["1_bf:full-history@base", "1_bf:incremental@base"]),
+])
+def test_an_entry_ending_in_base_is_a_variant_of_its_own(modes, segmenter, expected) -> None:
+    assert [v.label for v in mod.parse_variants(modes, segmenter)] == expected
+
+
+@pytest.mark.parametrize("modes", ["1_bf@", "1_bf@bse", "1_bf:full-history@head@base", "@base"])
+def test_an_unknown_side_fails_at_parse_time(modes) -> None:
+    with pytest.raises(SystemExit, match="unknown mode"):
+        mod.parse_variants(modes, "full-history")
+
+
+def test_a_base_variant_runs_the_base_image_and_the_head_its_own() -> None:
+    rc, b = _main("--modes", THREE_SIDED, "--base-image", V503)
+
+    assert rc == 0
+    ran = [
+        (image, _labels(argv)["dit_side"], _labels(argv)["dit_segmenter"],
+         _one(argv, "--sdk_container_image"), "--incremental" in argv)
+        for image, argv, _ in b.docker
+    ]
+    assert ran == [
+        (V503, "base", "full-history", V503, False),
+        (mod.DEFAULT_IMAGE_TAG, "head", "full-history", mod.DEFAULT_WORKER_IMAGE, False),
+        (mod.DEFAULT_IMAGE_TAG, "head", "incremental", mod.DEFAULT_WORKER_IMAGE, True),
+    ]
+    # One pin; every side reads the same copy.
+    assert len(b.pins) == 1
+    assert {_one(argv, "--in_normalized_messages_table") for _, argv, _ in b.docker} == {PIN}
+
+
+def test_base_and_head_full_history_differ_only_in_what_dit_owns() -> None:
+    """The base gets the flags the head gets in the same mode: no flag is
+    added or removed for the older version."""
+    args = _args("--modes", THREE_SIDED, "--base-image", V503)
+    base, head, _ = args.variants
+    (base_argv,), (head_argv,) = _argvs(args, base), _argvs(args, head)
+
+    differing = {
+        name for name in _flags(base_argv) | _flags(head_argv)
+        if _flags(base_argv).get(name) != _flags(head_argv).get(name)
+    }
+    assert differing == {
+        "--out_segmented_messages_table", "--out_segments_table", "--fragments_table",
+        "--labels", "--job_name", "--sdk_container_image",
+    }
+
+
+def test_the_base_has_its_own_tables_and_is_the_reference() -> None:
+    rc, b = _main("--modes", THREE_SIDED, "--base-image", V503,
+                  "--suffix", "s", "--skip-pipelines")
+
+    assert rc == 0
+    assert [(a, b_) for a, b_, _ in b.compared[:3]] == [
+        (f"{GE}.segments_s_1_bf_full_base", f"{GE}.segments_s_1_bf_full"),
+        (f"{GE}.segments_s_1_bf_full_base", f"{GE}.segments_s_1_bf_inc"),
+        (f"{GE}.segments_s_1_bf_full", f"{GE}.segments_s_1_bf_inc"),
+    ]
+    assert len(b.compared) == 9
+
+
+@pytest.mark.parametrize(("cli", "message"), [
+    # No default base: the base is whichever version the test is about.
+    (("--modes", THREE_SIDED), "run on --base-image, and none is given"),
+    # A base image nothing runs on would read as a compared base.
+    (("--base-image", V503), "no --modes entry ends in '@base'"),
+    # The working tree is the head.
+    (("--modes", THREE_SIDED, "--base-image", V503, "--build-from-source",
+      "--runner", "docker"), "--build-from-source runs the working tree"),
+])
+def test_a_base_selection_that_cannot_run_fails_at_parse_time(cli, message) -> None:
+    with pytest.raises(SystemExit, match=message):
+        mod.parse_args(list(cli))
+
+
+def test_comparing_tables_of_a_base_run_needs_no_base_image() -> None:
+    args = mod.parse_args(["--modes", THREE_SIDED, "--suffix", "s", "--skip-pipelines"])
+    assert mod._images_executed(args, mod.SIDE_BASE) == ()
+
+
+def test_incremental_is_checked_per_side() -> None:
+    # A base older than the flag is fine while every @base entry is full history.
+    _support("--modes", THREE_SIDED, "--base-image", V503)
+    _support("--modes", "1_bf@base,1_bf", "--base-image", NEWER)
+
+    with pytest.raises(SystemExit) as refused:
+        _support("--modes", "1_bf:incremental@base,1_bf", "--base-image", V503)
+    message = str(refused.value)
+    assert "the incremental segmenter (1_bf:incremental@base)" in message
+    assert f"--base-image {V503} holds pipe-segment v5.0.3" in message
+    assert "name full history in every '@base' entry" in message
+    assert "as --base-image" in message
+
+
+def test_the_head_image_guards_ignore_the_base_image() -> None:
+    args = mod.parse_args(["--modes", THREE_SIDED, "--base-image", V503])
+
+    assert mod._default_images_executed(args) == ("--image-tag", "--worker-image")
+    # Only base variants selected: no head image runs, so none is at its default.
+    only_base = mod.parse_args(["--modes", "1_bf:full-history@base", "--base-image", V503])
+    assert mod._default_images_executed(only_base) == ()
+    mod.check_images(only_base, "abc1234", unreviewed=True)
+
+
+def test_the_plan_names_each_variants_image(caplog) -> None:
+    with caplog.at_level("INFO"):
+        rc, _ = _main("--modes", THREE_SIDED, "--base-image", V503, "--dry-run")
+
+    assert rc == 0
+    log = "\n".join(r.getMessage() for r in caplog.records)
+    assert f"--base-image: {V503}" in log
+    assert f"variant 1_bf:full-history@base: 1 job(s); image {V503}; tables" in log
+    assert f"variant 1_bf:full-history: 1 job(s); image {mod.DEFAULT_IMAGE_TAG}; tables" in log
+    assert "reference: 1_bf:full-history@base" in log
+
+
+def test_base_job_names_are_distinct_and_fit() -> None:
+    args = _args("--modes", "3_bftruncate:full-history@base,3_bftruncate:full-history",
+                 "--base-image", V503)
+    names = [_one(argv, "--job_name") for v in args.variants for argv in _argvs(args, v)]
+
+    assert len(set(names)) == len(names) == 8
+    assert all(len(name) <= MAX_JOB_NAME for name in names)
+    assert names[0] == "dit-pipe-segment-segment-exp-3-bftruncate-full-base-1-4"
 
 
 def test_dry_run_still_refuses_what_a_run_would_refuse() -> None:

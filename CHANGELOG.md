@@ -6,6 +6,19 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-24: a base version next to the head in the segmenter's mode-equivalence workflow
+
+#### Added
+- **`workflows/pipe_segment/ais.py`: `--modes` entries ending in `@base`, and `--base-image`.** Such an entry runs on the base image, an overlay image of an earlier pipe-segment version, as submitter and worker image. Every other entry runs on the run's own images.
+  - **Why:** without a base, "full history equals incremental" is tested on the new version alone. A change to code both segmenters share would go unseen.
+  - **The three-sided test of pipe-segment PR #227:** `--modes 1_bf:full-history@base,1_bf:full-history,1_bf:incremental --base-image <v5.0.3 overlay>`.
+  - Both sides read the same pinned copy and get the same flags. Nothing is added or removed for the older version.
+  - A base variant has its own tables and is the reference when selected.
+  - Refused at parse time: `@base` without `--base-image` (there is no default), `--base-image` without an `@base` entry, and `@base` with `--build-from-source`.
+  - `incremental` is checked per side, so a base older than v5.1.0 runs full history only.
+  - Every job carries a new label, `dit_side` (`head` or `base`).
+  - **Not run**, like the rest of the workflow. The schema definitions of the three compared tables are unchanged between v5.0.3 and v5.1.0 (read from the code).
+
 ### 2026-11-20: mode equivalence for the segmenter; pipe-segment temp-dataset overlay
 
 A new workflow runs pipe-segment's `segment` step in several shapes and compares the outputs. Its first use is pipe-segment PR #227 (`--incremental`, v5.1.0), which claims that incremental day-by-day runs equal full history. **Nothing has run yet**, and the overlay images are not built.

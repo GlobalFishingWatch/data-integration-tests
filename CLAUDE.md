@@ -80,6 +80,42 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-24 — A base version next to the head in `workflows/pipe_segment/ais.py` (`@base`, `--base-image`); per-side adjustments agreed, not built
+
+**Trigger.** The owner pointed out that the pipe-segment PR #227 test needs the head in its new mode against the base in its only mode. Neither pipe-segment workflow did that:
+- `identity_match_key.py` gives every binding the same flags, and refuses v5.0.3 against v5.1.0 outright: it requires distinct gpsdio-segment pins, and both tags pin v3.0.0.
+- `ais.py` ran every variant on one image. Its full-history reference was the head's code in the old mode.
+
+So the planned test assumed that v5.1.0 in full history equals v5.0.3. PR #227 changed code both segmenters share (`git diff --stat v5.0.3 v5.1.0`: `pipeline.py`, `transform/read_messages.py`, `transform/create_segments.py`, `transform/satellite_offsets.py`), so that is not given.
+
+**What changed.** A variant is now (mode, segmenter, side). `side` is `head` (the run's images) or `base` (`--base-image`). A `--modes` entry ends in `@base` to select it.
+
+**Decisions.**
+- **No flag is edited for the base.** Between the two tags only `segment` changed, by three added flags, and full history passes none of them. So a base variant gets the head's full-history argv, and a test pins that the two differ only in tables, labels, job name and worker image.
+- **No default base image.** The base is whichever version a test is about; a constant for "the previous version" would go stale at every production bump.
+- **`--base-image` without an `@base` entry is an error**, not a no-op: the run would read as if a base had been compared.
+- **`@base` with `--build-from-source` is refused.** The working tree is the head.
+- **`incremental` is checked per side.** The old check looked at every executed image for any incremental variant, which would have refused a v5.0.3 base next to an incremental head.
+- **A base variant sorts first within its mode**, so it is the reference when selected.
+- **One image for the base**, as submitter and worker. An overlay image serves as both, and two flags would allow them to differ.
+- **`dit_side` label on every job**, head included, so the label set is the same for all jobs. It changes the head's `--labels`, which are DIT-owned in the drift spec; both specs stay in sync.
+- **The image guard (`check_images`) is about the head only.** With base variants alone selected no head image runs, so unreviewed code is not refused.
+
+**Per-side adjustments: agreed with the owner, not in this change.** This change covers the case where the base needs no other flags. The general case was planned the same day:
+- By default both sides get the same parameters. Declared rules per pipeline version and one-off edits on the command line remove, add or rename flags on either side.
+- Tables are in scope from the start (owner decision): each side can have its own inputs to pin and outputs to compare.
+- What stays shared: the DIT checkout, experiment id, window, pin stamp, destination dataset, comparison tool.
+- An older layer is checked against the composer commit at which production last ran that version, and every emitted flag against the ref's own CLI source before a run (owner decision).
+- It comes as its own PR after this one, with `identity_match_key.py` as the first consumer; `docs/plan.md` gets the section then.
+
+**Checked, and not.**
+- A dry run of the six-variant PR #227 plan from a clean pipe-segment clone at v5.1.0: 45 jobs, 45 comparisons, reference `1_bf:full-history@base`, each variant's image named. It created nothing.
+- The drift check exits 0 with both pipe-segment specs in sync (local composer checkout's `origin/main`).
+- The schema definitions of the three compared tables are unchanged between the tags (`schemas/message_schema.py`, `schemas/segment_schema.py`, `transform/fragment.py` are not in `git diff v5.0.3 v5.1.0`). Read, not run.
+- Nothing ran on Dataflow, and neither overlay image is built.
+
+**Sections moved.** `workflows/pipe_segment/ais.py` (docstring section "A third part of the unit"; `SIDE_*`, `SIDES`; `Variant`, `ALL_VARIANTS`, `_split_entry`, `parse_variants`; `_labels`; `variant_images`, `segment_argv`, `run_variant`; `_images_executed`, `check_base_side`, `check_incremental_support`, `_check_incremental_support`; `--base-image`; `log_plan`, `_log_configuration`); `tests/test_pipe_segment_ais.py` (three adapted, a new section on the base side; suite 1,500 → 1,535); `workflows/pipe_segment/RUN_INSTRUCTIONS.md` (M3, M6); README Features; CHANGELOG § 2026-11-24.
+
 ### 2026-11-20 — Mode equivalence for the segmenter (`workflows/pipe_segment/ais.py`); pipe-segment temp-dataset overlay
 
 **Trigger.** Every other onboarded pipeline has a mode-equivalence workflow; the segmenter had only the cross-version `identity_match_key.py`. pipe-segment PR #227 (merged 2026-11-20, v5.1.0, 4ddde03) adds an opt-in `--incremental` to `segment`, and its claim is a mode-equivalence claim: incremental day-by-day equals full history. The owner wants that PR run through DIT.

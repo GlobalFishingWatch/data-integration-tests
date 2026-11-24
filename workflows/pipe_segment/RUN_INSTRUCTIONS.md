@@ -526,7 +526,22 @@ the matching from a difference in the hand-over.
   workflow refuses before any cloud call. It reads the version from the start
   of the image tag (`v5.1.0-…`); an image whose tag names no version needs
   `--assume-incremental-support`.
-- **To run the version the VMS DAG pins**, pass the v5.0.3 overlay image as
+- **To run an earlier version next to the head**, end a `--modes` entry in
+  `@base` and pass that version's overlay image as `--base-image`. The entry
+  runs on that image as submitter and worker; the others run on the images
+  above. See M6 for the PR #227 command.
+  - Both sides read the same pinned copy and get the same flags. Nothing is
+    added or removed for the older version, so a base whose command line
+    differs in more than the three `incremental` flags cannot run this way
+    yet.
+  - There is no default base image. `@base` without `--base-image`,
+    `--base-image` without an `@base` entry, and `@base` with
+    `--build-from-source` are refused at parse time.
+  - `incremental` is checked per side: a base older than v5.1.0 must name full
+    history in every `@base` entry.
+  - A base variant sorts first within its mode, so `1_bf:full-history@base`
+    is the reference when selected.
+- **To run the version the VMS DAG pins on its own**, pass the v5.0.3 overlay image as
   both flags and select full history only:
   `--segmenter full-history --modes 1_bf,2_bfd,3_bftruncate`. With an
   incremental variant left in the selection the run is refused.
@@ -630,6 +645,42 @@ job.
 - Rough cost: a few USD, estimated from startup-dominated jobs of a few
   worker-minutes each on e2-standard-4. Not measured: no pipe-segment job has
   run from DIT on Dataflow. `--worker-machine-type` lowers it.
+
+### With the base version (v5.0.3) as a third side
+
+The command above runs v5.1.0 only. Its reference A is the head's code in the
+old mode, so it shows that the two segmenters of v5.1.0 agree, not that
+v5.1.0 agrees with the version before the PR. The PR also changed code both
+segmenters share (`pipeline.py`, `transform/read_messages.py`,
+`transform/create_segments.py`; `git diff --stat v5.0.3 v5.1.0`). Adding the
+base as a sixth variant closes that:
+
+| | Variant | Shape | Jobs |
+|---|---|---|---|
+| Z | `1_bf:full-history@base` | pipe-segment v5.0.3, one job over the window (the reference) | 1 |
+
+```bash
+make dit-cloud PIPELINE=pipe-segment REF=v5.1.0 \
+    WORKFLOW=workflows/pipe_segment/ais.py \
+    ARGS="--experiment-id pr227 \
+          --modes 1_bf:full-history@base,1_bf:full-history,2_bfd:full-history,2_bfd:incremental,3_bftruncate:incremental,4_daily:incremental \
+          --base-image gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8 \
+          --parallel"
+```
+
+- **45 Dataflow jobs** and **45 comparisons** (15 pairs on three tables). The
+  five pairs with Z come first for each table.
+- Z against A is the pair that tests the shared code: same mode, same flags,
+  two versions.
+- It needs both overlay images built: v5.1.0 (the default) and v5.0.3. Neither
+  is built yet.
+- Optional: `2_bfd:full-history@base` (4 more jobs) shows whether v5.0.3's own
+  day-by-day runs equal its one-job run. Without it, a difference in B cannot
+  be told apart as new or as there before the PR.
+- The schema definitions of the three tables are unchanged between the two
+  tags (`schemas/message_schema.py`, `schemas/segment_schema.py`,
+  `transform/fragment.py`; read from `git diff v5.0.3 v5.1.0`, no table
+  written).
 
 **Expected result (a hypothesis, not a finding):** all three tables IDENTICAL
 in every pair.
