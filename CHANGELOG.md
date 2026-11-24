@@ -6,6 +6,11 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-24: PR reviews by an independent Sonnet subagent
+
+#### Changed
+- **PRs are reviewed by an independent Sonnet subagent instead of Copilot**, which is no longer available. The reviewer gets only the PR and repo, not the author's conclusions. Its blocking and should-fix findings are addressed, or the reason for not doing so is recorded, before the squash-merge. See `CLAUDE.md` § Git workflow. Earlier notes that credit Copilot reviews are kept as history.
+
 ### 2026-11-24: table-check pinned to v0.3.0
 
 #### Changed
