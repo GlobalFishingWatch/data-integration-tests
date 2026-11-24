@@ -609,9 +609,16 @@ def add_modes_arg(
     on this invocation. Claiming the cache behaviour unconditionally would make
     the CLI help wrong for that consumer -- Copilot review on PR #71.
     """
-    is_all = default is None or tuple(default) == tuple(choices)
-    default = ",".join(choices if default is None else default)
-    default_note = "(all)" if is_all else f"(of {','.join(choices)})"
+    entries = tuple(choices if default is None else default)
+    # A default may hold entries that are not plain modes (pipe-segment's
+    # ``1_bf:full-history``). Then it is neither "all" nor a subset "of" the
+    # modes, and the note only lists them -- Copilot review on PR #96.
+    default_note = (
+        "(all)" if entries == tuple(choices)
+        else f"(of {','.join(choices)})" if set(entries) <= set(choices)
+        else f"(modes: {','.join(choices)})"
+    )
+    default = ",".join(entries)
     reuse_note = (
         "Modes are cached independently, so running a subset now and more "
         "later reuses the earlier modes' output."

@@ -129,6 +129,15 @@ def test_add_modes_arg_takes_a_default_subset() -> None:
     add_modes_arg(q, choices=_CHOICES, default=_CHOICES)
     assert "(all)" in (q._actions[-1].help or "")
 
+    # A default with an entry that is not a plain mode is neither "all" nor a
+    # subset "of" the modes: the note lists the modes instead.
+    r = argparse.ArgumentParser()
+    add_modes_arg(r, choices=_CHOICES, default=("1_bf:full-history", *_CHOICES))
+    help_text = r._actions[-1].help or ""
+    assert ("Default: 1_bf:full-history,1_bf,2_bfd,3_bftruncate "
+            "(modes: 1_bf,2_bfd,3_bftruncate)." in help_text)
+    assert "(all)" not in help_text and "(of " not in help_text
+
 
 # --------------------------------------------------------------------------
 # Per-workflow wiring: parse_args validates and canonicalises
