@@ -196,6 +196,18 @@ def judge(declaration: StepOrchestration, outcome: str) -> Judgement:
     ))
 
 
+def outcome_of(*, slices_failed: bool, compare_rc: int | None) -> str:
+    """The outcome of a parallel-slices test: ``failed`` if a slice failed,
+    else ``identical`` for comparison exit code 0 and ``different`` otherwise.
+    A comparison that errored (a missing table, say) also reads as
+    ``different``; the comparison's own log says which it was."""
+    if slices_failed:
+        return OUTCOME_FAILED
+    if compare_rc is None:
+        raise ValueError("no slice failed, so a comparison exit code is needed")
+    return OUTCOME_IDENTICAL if compare_rc == 0 else OUTCOME_DIFFERENT
+
+
 def airflow_guidance(declaration: StepOrchestration) -> str:
     """What the declaration means for the step's Airflow task, in one line."""
     if declaration.parallel_slices == PARALLEL_FORBIDDEN or declaration.depends_on_previous_run:

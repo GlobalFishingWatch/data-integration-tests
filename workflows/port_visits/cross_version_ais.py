@@ -159,6 +159,7 @@ from workflows.port_visits.ais import (
 )
 from workflows.port_visits.ais import DEFAULT_END as AIS_DEFAULT_END
 from workflows.port_visits.ais import DEFAULT_START as AIS_DEFAULT_START
+from workflows.port_visits.ais import MODE_PARALLEL as AIS_MODE_PARALLEL
 from workflows.port_visits.ais import SELECTABLE_MODES as AIS_SELECTABLE_MODES
 from workflows.port_visits.ais import SELECTABLE_STEPS as AIS_SELECTABLE_STEPS
 from workflows.port_visits.ais import STEP_WORKER_SIZING as AIS_STEP_WORKER_SIZING
@@ -410,6 +411,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> tuple[argparse.Namespace
     # was accepted, so a typo silently produced zero diff pairs (which
     # reads identically to "everything matched").
     args.modes = parse_modes(args.modes, choices=AIS_SELECTABLE_MODES)
+    if AIS_MODE_PARALLEL in args.modes:
+        # ais.py compares 6_parallel with 1_bf within one binding and judges it
+        # against the step's declaration; diffing it across bindings is not
+        # defined yet.
+        raise SystemExit(
+            f"--modes {AIS_MODE_PARALLEL} is not supported by the cross-version wrapper; "
+            f"run workflows/port_visits/ais.py with it directly"
+        )
     args.steps = parse_choice_list(
         args.steps, choices=AIS_SELECTABLE_STEPS, flag="--steps", noun="step",
     )

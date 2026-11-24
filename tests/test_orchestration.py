@@ -61,6 +61,14 @@ def test_a_pass_on_a_claim_says_how_to_record_it_and_a_verified_one_does_not() -
     assert "Cloud Build id" in claimed and "Cloud Build id" not in verified
 
 
+def test_outcome_of() -> None:
+    assert o.outcome_of(slices_failed=True, compare_rc=None) == o.OUTCOME_FAILED
+    assert o.outcome_of(slices_failed=False, compare_rc=0) == o.OUTCOME_IDENTICAL
+    assert o.outcome_of(slices_failed=False, compare_rc=2) == o.OUTCOME_DIFFERENT
+    with pytest.raises(ValueError):
+        o.outcome_of(slices_failed=False, compare_rc=None)
+
+
 def test_judge_rejects_unknown_outcome() -> None:
     with pytest.raises(ValueError):
         o.judge(_decl(o.PARALLEL_ALLOWED), "maybe")
