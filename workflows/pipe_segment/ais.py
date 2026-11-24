@@ -149,9 +149,10 @@ must name full history for every entry (``--segmenter full-history``).
 
 Comparison
 ----------
-The three tables are compared pairwise across the selected variants
-(``dit.compare``, keys as in ``identity_match_key.py``). They are not equally
-telling:
+The three tables are compared between each variant and the reference, the first
+selected (``--compare reference``, the default; ``--compare all-pairs`` compares
+every pair) with ``dit.compare``, on the keys ``identity_match_key.py`` uses.
+They are not equally telling:
 
 * ``segments`` is the **discriminating** one. A row holds the ``seg_id`` a
   fragment was matched to and the segment's cumulative count, identities and
@@ -818,16 +819,33 @@ def require_empty_outputs(args: argparse.Namespace, suffix: str) -> None:
 Verdicts = dict[tuple[str, Variant, Variant], int]
 
 
-def comparison_pairs(variants: Sequence[Variant]) -> list[tuple[Variant, Variant]]:
-    """Every pair of the selected variants, the reference's pairs first."""
-    return list(itertools.combinations(variants, 2))
+#: ``--compare``: each variant against the reference (the first selected), or
+#: every pair. Owner decision, 2026-11-24: the reference by default. A
+#: difference between two non-reference variants shows as a difference of at
+#: least one of them from the reference, so every pair adds jobs to read, not
+#: findings; it stays available to tell which of two variants moved.
+COMPARE_REFERENCE = "reference"
+COMPARE_ALL_PAIRS = "all-pairs"
+COMPARE_CHOICES = (COMPARE_REFERENCE, COMPARE_ALL_PAIRS)
+DEFAULT_COMPARE = COMPARE_REFERENCE
+
+
+def comparison_pairs(
+    variants: Sequence[Variant], compare: str = DEFAULT_COMPARE,
+) -> list[tuple[Variant, Variant]]:
+    """The pairs compared: each variant with the reference, or every pair
+    with the reference's pairs first."""
+    if compare == COMPARE_ALL_PAIRS:
+        return list(itertools.combinations(variants, 2))
+    reference, *others = variants
+    return [(reference, other) for other in others]
 
 
 def compare_all(args: argparse.Namespace, suffix: str) -> Verdicts:
-    """Compare the three tables pairwise across the selected variants."""
+    """Compare the three tables for each pair of ``--compare``."""
     verdicts: Verdicts = {}
     for table, meaning in COMPARED_TABLES:
-        for a, b in comparison_pairs(args.variants):
+        for a, b in comparison_pairs(args.variants, args.compare):
             rc = dit_compare.compare_tables(
                 _table(args, table, suffix, a),
                 _table(args, table, suffix, b),
@@ -1099,7 +1117,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             f"pair. The default is full history in one job, the reference, and three "
             f"shapes of the default segmenter. {MODE_DAILY} runs every day of the window "
             f"as its own job and is not in the default. The three tables are compared "
-            f"across every pair of the selected (mode, segmenter) variants."
+            f"with the reference variant, the first selected (see --compare)."
         ),
     )
     p.add_argument("--segmenter", default=DEFAULT_SEGMENTER,
@@ -1113,6 +1131,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="Accept an image whose tag names no pipe-segment version for an "
                         "incremental variant. Without it such an image is refused: on code "
                         "older than v5.1.0, --incremental is silently ignored.")
+    p.add_argument("--compare", choices=COMPARE_CHOICES, default=DEFAULT_COMPARE,
+                   help=f"{COMPARE_REFERENCE}: compare each variant with the reference, the "
+                        f"first selected (default). {COMPARE_ALL_PAIRS}: compare every pair of "
+                        f"variants, to tell which of two non-reference variants moved.")
     p.add_argument("--start", default=DEFAULT_START,
                    help=f"First day of the window, inclusive. Default {DEFAULT_START}.")
     p.add_argument("--end", default=DEFAULT_END,
@@ -1253,7 +1275,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def log_plan(args: argparse.Namespace, suffix: str) -> None:
     """Log every variant's tables and jobs, and the comparisons that follow."""
     plans = _plans(args)
-    pairs = comparison_pairs(args.variants)
+    pairs = comparison_pairs(args.variants, args.compare)
     logger.info(
         "plan: %d variant(s), %d segment job(s), %d comparison(s) (%d pair(s) x %d tables)",
         len(plans), sum(map(len, plans.values())), len(pairs) * len(COMPARED_TABLES),
@@ -1271,7 +1293,11 @@ def log_plan(args: argparse.Namespace, suffix: str) -> None:
             "--modes, or a second --segmenter, to get a comparison.", args.variants[0].label,
         )
         return
-    logger.info("reference: %s (its pairs are compared first)", args.variants[0].label)
+    logger.info(
+        "reference: %s (%s)", args.variants[0].label,
+        "every variant is compared with it" if args.compare == COMPARE_REFERENCE
+        else "its pairs are compared first; every pair is compared",
+    )
     for table, meaning in COMPARED_TABLES:
         logger.info("compare %s on %s, %d pair(s): %s",
                     table, ",".join(imk.COMPARE_KEYS[table]), len(pairs), meaning)

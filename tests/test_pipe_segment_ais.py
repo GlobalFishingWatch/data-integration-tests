@@ -875,7 +875,7 @@ def test_main_checks_then_pins_then_runs_then_compares() -> None:
 
 def test_the_default_run_compares_three_incremental_shapes_with_full_history() -> None:
     """No flag beyond the window: ten jobs on the default overlay image, one
-    of them full history, and every pair compared on the three tables."""
+    of them full history, and each variant compared with it on the three tables."""
     rc, b = _main()
 
     assert rc == 0
@@ -892,9 +892,11 @@ def test_the_default_run_compares_three_incremental_shapes_with_full_history() -
     assert {image for image, _, _ in b.docker} == {mod.DEFAULT_OVERLAY_IMAGE}
     assert {_one(argv, "--sdk_container_image") for _, argv, _ in b.docker} == {
         mod.DEFAULT_OVERLAY_IMAGE}
-    # Six pairs on three tables; the reference's three pairs lead each table.
-    assert len(b.compared) == 18
-    assert [a for a, _, _ in b.compared[:3]] == [f"{GE}.segments_exp_abc1234_f00d00_1_bf_full"] * 3
+    # Three pairs (each variant with the reference) on three tables.
+    assert len(b.compared) == 9
+    assert all(a.endswith("_1_bf_full") for a, _, _ in b.compared)
+    assert [b_.rsplit("f00d00_", 1)[1] for _, b_, _ in b.compared[:3]] == [
+        "1_bf_inc", "2_bfd_inc", "3_bftruncate_inc"]
 
 
 def test_main_refuses_incremental_on_an_older_image_before_any_cloud_call() -> None:
@@ -941,7 +943,7 @@ def test_a_failed_job_ends_the_variant_and_the_run() -> None:
 
 
 def test_main_compares_every_pair_on_the_three_tables_discriminating_first() -> None:
-    rc, b = _main("--modes", "1_bf:full-history,2_bfd,4_daily",
+    rc, b = _main("--modes", "1_bf:full-history,2_bfd,4_daily", "--compare", "all-pairs",
                   "--suffix", "s", "--skip-pipelines")
 
     assert rc == 0 and "docker" not in b.calls and "pin" not in b.calls
@@ -962,9 +964,26 @@ def test_main_compares_every_pair_on_the_three_tables_discriminating_first() -> 
     assert mod.COMPARED_TABLES[2][1].startswith("weak")
 
 
-def test_the_pr227_run_compares_ten_pairs_with_the_reference_first() -> None:
+def test_by_default_each_variant_is_compared_with_the_reference_only() -> None:
+    rc, b = _main("--modes", "1_bf:full-history,2_bfd,4_daily",
+                  "--suffix", "s", "--skip-pipelines")
+
+    assert rc == 0
+    assert [(a, b_) for a, b_, _ in b.compared] == [
+        (f"{GE}.{table}_s_1_bf_full", f"{GE}.{table}_s_{other}")
+        for table in ("segments", "messages_segmented", "fragments")
+        for other in ("2_bfd_inc", "4_daily_inc")
+    ]
+
+
+def test_the_pr227_run_compares_four_pairs_or_ten_with_all_pairs() -> None:
     args = mod.parse_args(["--modes", PR227_MODES, *NEWER_IMAGES])
-    pairs = mod.comparison_pairs(args.variants)
+    assert [(a.label, b.label) for a, b in mod.comparison_pairs(args.variants, args.compare)] == [
+        ("1_bf:full-history", other) for other in (
+            "2_bfd:full-history", "2_bfd:incremental",
+            "3_bftruncate:incremental", "4_daily:incremental")
+    ]
+    pairs = mod.comparison_pairs(args.variants, mod.COMPARE_ALL_PAIRS)
 
     assert len(pairs) == 10
     assert [(a.label, b.label) for a, b in pairs[:4]] == [
@@ -1034,13 +1053,13 @@ def test_dry_run_reports_the_plan_and_creates_nothing(caplog) -> None:
     assert b.pins[0]["dry_run"] is True
     log = "\n".join(r.getMessage() for r in caplog.records)
     assert "dry run: nothing is created" in log
-    assert "plan: 5 variant(s), 23 segment job(s), 30 comparison(s)" in log
+    assert "plan: 5 variant(s), 23 segment job(s), 12 comparison(s)" in log
     assert ("4_daily:incremental job 10/10: 2020-01-10 (1d); reads the pinned messages of "
             "that range and the segments and fragments of 2020-01-09 in its own tables") in log
     assert "1_bf:full-history job 1/1: 2020-01-01..2020-01-10 (10d)" in log
     assert "no fragment history (its tables are empty)" in log
-    assert "reference: 1_bf:full-history" in log
-    assert "compare segments on seg_id,frag_id, 10 pair(s): DISCRIMINATING" in log
+    assert "reference: 1_bf:full-history (every variant is compared with it)" in log
+    assert "compare segments on seg_id,frag_id, 4 pair(s): DISCRIMINATING" in log
 
 
 # --------------------------------------------------------------------------
@@ -1110,7 +1129,7 @@ def test_base_and_head_full_history_differ_only_in_what_dit_owns() -> None:
 
 
 def test_the_base_has_its_own_tables_and_is_the_reference() -> None:
-    rc, b = _main("--modes", THREE_SIDED, "--base-image", V503,
+    rc, b = _main("--modes", THREE_SIDED, "--base-image", V503, "--compare", "all-pairs",
                   "--suffix", "s", "--skip-pipelines")
 
     assert rc == 0
@@ -1185,6 +1204,11 @@ def test_base_job_names_are_distinct_and_fit() -> None:
     assert len(set(names)) == len(names) == 8
     assert all(len(name) <= MAX_JOB_NAME for name in names)
     assert names[0] == "dit-pipe-segment-segment-exp-3-bftruncate-full-base-1-4"
+
+
+def test_compare_must_name_a_known_choice() -> None:
+    with pytest.raises(SystemExit):
+        mod.parse_args(["--compare", "pairs"])
 
 
 def test_dry_run_still_refuses_what_a_run_would_refuse() -> None:

@@ -17,6 +17,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   - Refused at parse time: `@base` without `--base-image` (there is no default), `--base-image` without an `@base` entry, and `@base` with `--build-from-source`.
   - `incremental` is checked per side, so a base older than v5.1.0 runs full history only.
   - Every job carries a new label, `dit_side` (`head` or `base`).
+- **`--compare reference|all-pairs`** on the same workflow, default `reference` (owner decision, 2026-11-24): each variant is compared with the reference, the first selected variant, instead of every pair. A difference between two other variants shows as a difference of at least one of them from the reference; `all-pairs` stays available to tell which of two moved. The #227 test with the base is 15 comparisons instead of 45.
   - **Not run**, like the rest of the workflow. The schema definitions of the three compared tables are unchanged between v5.0.3 and v5.1.0 (read from the code).
 
 ### 2026-11-20: mode equivalence for the segmenter; pipe-segment temp-dataset overlay
