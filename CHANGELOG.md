@@ -6,6 +6,22 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: documentation rewrite
+
+Documentation only; no change to code, flags or workflow behaviour. Spans PRs #102 to #105.
+
+#### Added
+- **`docs/framework.md`**: the framework guide. Comparison shapes and their exit codes, source pinning, the run cache and cleanup (with which workflows `make dit-cancel` covers), run context and snapshots, images, Dataflow knobs (default worker caps and sizing per workflow, by constant), the cloud runtime, per-side adjustments, orchestration declarations, adding a pipeline, a module map.
+- **`docs/composer-drift.md`**: the drift check against production's DAGs in full, run as `dit run workflows/composer_drift.py`.
+- **`docs/usage.md`**: install modes, running a workflow, scenarios, snapshot safety and cleanup (formerly in the README).
+- **A page per pipeline next to its workflows**: `workflows/pipe_segment/README.md`, `workflows/port_visits/README.md`, `workflows/encounters/README.md` (rewritten), `workflows/pipe_gaps/README.md`, `workflows/pipe_events/README.md`. Each covers the versions DIT drives against production's, modes, commands, sources, run history and known limits.
+
+#### Changed
+- **`workflows/README.md`** is rewritten as the index of workflows; its version table is the source of truth for DIT's default version against production's.
+- **`docs/pipeline-contract.md`** says per column which version it was read at; pipe-gaps rows 4, 11 and 12 corrected.
+- **README** restructured as an index: the framework in one page, a documentation map, Features as one line per capability, Source data targets and the Roadmap kept.
+- **`docs/workflow-notes.md`**, a short-lived holding page for per-workflow notes, is folded into the pipeline pages and `docs/framework.md`, and removed.
+
 ### 2026-11-25: parallel slices, review fixes
 
 #### Changed
