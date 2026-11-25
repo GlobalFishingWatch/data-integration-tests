@@ -1,265 +1,420 @@
-# dit architecture
+# DIT architecture
 
-Visual reference for how the pieces fit together. Five diagrams (Mermaid + ASCII), each tackling a different angle. Designed to be read top-to-bottom for a new joiner; each section is self-contained for revisits.
+Diagrams of how the pieces fit together. Each section stands alone. The text that goes with them is in [`framework.md`](framework.md).
 
-Other reference material:
-- [`plan.md`](plan.md) — implementation plan + phase status
-- [`conventions.md`](conventions.md) — naming, image namespace, prod-infra boundary
-- [`pipeline-contract.md`](pipeline-contract.md) — what a pipeline must expose to be cleanly testable
-- [`framework-vision.md`](framework-vision.md) — long-term shape (don't optimise for it yet)
+1. [System context](#1-system-context)
+2. [The library](#2-the-library)
+3. [Ways to start a run](#3-ways-to-start-a-run)
+4. [Workflow flows](#4-workflow-flows)
+5. [Run context: commit and image](#5-run-context-commit-and-image)
+6. [Cloud Build runtime](#6-cloud-build-runtime)
+7. [The drift check](#7-the-drift-check)
+8. [Image namespace](#8-image-namespace)
+
+The diagrams are Mermaid and render on GitHub. Locally, most editors render them in a Markdown preview with a Mermaid extension.
 
 ---
 
-## 1. System context — repos, what each owns
+## 1. System context
 
-The work around GFW data pipelines is split across three categories of repo: **processing** (the pipeline source itself — one repo per pipeline), **orchestration** (prod params + DAGs, in `composer-dags-production`), and **testing** (integration tests in this repo, plus the BQ comparison engine in `table_identical_checks`). Each pipeline (`pipe-gaps`, `anchorages_pipeline`, `pipe-events`) is a single repo in the processing category; dit sits in the testing category and consumes `table_identical_checks` as a subprocess.
+Three kinds of repo, by owner. Pipeline repos hold the pipelines. `composer-dags-production` holds what production runs. This repo and `table_identical_checks` hold the tests.
 
 ```mermaid
 flowchart LR
-    subgraph PR["Processing repos (per-pipeline, public)"]
+    subgraph PR["Processing repos (one per pipeline)"]
         direction TB
-        pgaps[pipe-gaps<br/><i>gap detection</i>]
-        anchorages[anchorages_pipeline<br/><i>port visits + events</i>]
-        pevents[pipe-events<br/><i>fishing events</i>]
+        pgaps[pipe-gaps]
+        anchorages["pipe-anchorages<br/><i>port visits</i>"]
+        pevents["pipe-events<br/><i>fishing events</i>"]
+        psegment[pipe-segment]
+        encounters[encounters]
     end
 
     subgraph CD["Orchestration repo"]
-        composer["composer-dags-production<br/><i>prod DAGs + per-pipeline configs</i>"]
+        composer["composer-dags-production<br/><i>production DAGs</i>"]
     end
 
     subgraph TR["Testing repos"]
         direction TB
-        dit["<b>data-integration-tests (this repo)</b><br/><i>cross-pipeline integration tests</i>"]
-        tic[table_identical_checks<br/><i>BQ table comparison CLI</i>]
+        dit["<b>data-integration-tests</b><br/><i>dit library + workflows</i>"]
+        tic["table_identical_checks<br/><i>table-check</i>"]
     end
 
-    subgraph GCP["GCP runtime"]
+    subgraph GCP["GCP runtime (world-fishing-827)"]
         direction TB
-        cb["Cloud Build<br/><i>ad-hoc + PR CI</i>"]
-        df["Dataflow<br/><i>worker pool</i>"]
-        bq[(BigQuery<br/><i>source + output</i>)]
-        ar["Artifact Registry<br/><i>gcr.io/wf827/...</i>"]
+        cb[Cloud Build]
+        df[Dataflow]
+        bq[("BigQuery<br/>tech_great_expectations")]
+        ar["Artifact Registry<br/>gcr.io/world-fishing-827/dit/"]
     end
 
-    composer -->|deploys, owns prod params| pgaps
-    composer -->|deploys, owns prod params| anchorages
-    composer -->|deploys, owns prod params| pevents
+    composer -->|schedules and configures| PR
 
-    dit -.->|reads source as data,<br/>installs at any ref| pgaps
-    dit -.->|reads source as data,<br/>installs at any ref| anchorages
-    dit -.->|reads source as data,<br/>installs at any ref| pevents
-    dit -->|shells out for diffs| tic
+    dit -.->|runs at any git ref,<br/>never changes| PR
+    dit -.->|reads rendered DAG snapshots<br/>with git show, never imports| composer
+    dit -->|subprocess| tic
 
-    cb -->|runs workflows| dit
+    cb -->|runs dit run| dit
     dit -->|submits jobs| df
-    dit -->|reads/writes/snapshots| bq
-    dit -->|pushes per-binding images| ar
-    df -->|pulls worker image| ar
-    df -->|reads source, writes output| bq
-    tic -->|diff query| bq
+    dit -->|pins sources, writes outputs,<br/>run cache| bq
+    dit -->|pushes test images| ar
+    df -->|pulls image| ar
+    df -->|reads and writes| bq
+    tic -->|comparison query| bq
 
     style dit fill:#fff5cc,stroke:#c89,color:#000
     style tic fill:#fff5cc,stroke:#c89,color:#000
 ```
 
-**Ownership boundaries.**
-
 | Owns | Repo |
 |---|---|
-| Pipeline source code (Beam PTransforms, DoFns) | Processing repos |
-| Production params (DAG schedules, config values, IAM) | `composer-dags-production` |
-| Integration-test workflows + dit framework | `data-integration-tests` (this repo) |
-| BQ table comparison engine | `table_identical_checks` |
-| Production deployments | `composer-dags-production` operators |
+| Pipeline code, its command line, its published images | Processing repos |
+| Production DAGs and parameters | `composer-dags-production` |
+| The `dit` library, the workflows, the cloud runtime | `data-integration-tests` (this repo) |
+| The table comparison | `table_identical_checks` |
 
-**Rule**: dit treats `composer-dags-production` as **data**, not code (no `import gfw.…`); reads prod params via a planned `dit sync-params` step. dit treats pipeline repos as **packages**, installable at any ref via `make install-<pipeline>-ref`.
-
----
-
-## 2. Run modes — how dit gets invoked
-
-| Mode | Trigger | Use case | Wall clock | Status |
-|---|---|---|---|---|
-| **Ad-hoc, laptop** | `dit run workflows/<pipeline>/<workflow>.py` | Bugfix verification, dev iteration, small cohorts | 5 min – 2 h | ✅ Working |
-| **Ad-hoc, Cloud Build** | `make dit-cloud PIPELINE=... WORKFLOW=... ARGS="..."` | Long runs (12 h+); offloads from laptop; reproducible | 30 min – 24 h | 🟡 Image published; smoke run pending |
-| **PR-triggered** | GitHub PR opens → Cloud Build trigger in pipeline repo → references `cloudbuild-dit.yaml` | CI: prevent regressions on merge; status check posts to PR | depends on cohort | 📅 Planned |
-| **Scheduled** | Cloud Scheduler → Cloud Build (same yaml) | Nightly full-cohort against `main`; Slack on drift | depends on cohort | 📅 Planned |
-
-The same `cloudbuild-dit.yaml` serves the last three modes via substitutions — see § 4.
-
-Two workflow *shapes* (orthogonal to the run modes above):
-
-- **Mode-equivalence** (`workflows/<pipeline>/<name>.py`) — single pipeline version, multiple modes (bf / bfd / bftruncate / mutate_recover) running in parallel, pairwise byte-equivalence check. See § 3.
-- **Cross-version** (`workflows/<pipeline>/cross_version_<name>.py`) — multiple pipeline versions (git refs) at single mode, diff to detect intentional or accidental behaviour change. See § 3 (second sequence).
+Dotted arrows are read-only. DIT reads production data and production DAG configuration. It writes only to its own namespaces ([`conventions.md`](conventions.md) § Prod-infra boundary).
 
 ---
 
-## 3. Workflow flows — what actually runs
+## 2. The library
 
-### 3a. Mode-equivalence (Phase 1 / 2 — verified)
-
-Single pipeline version, exercises that bf / bfd / bftruncate produce equivalent output. The framework's foundational test.
+A workflow file holds what is specific to a pipeline: the steps' command lines, the output tables, the compare keys. Everything else comes from `src/dit/`.
 
 ```mermaid
-sequenceDiagram
-    actor U as User
-    participant W as workflows/[pipeline]/mode_equiv.py
-    participant DF as Dataflow workers
-    participant BQ as BigQuery
-    participant TIC as table-check (subprocess)
+flowchart TB
+    cli["dit.cli<br/><i>dit run, cache-cancel, composer-dag</i>"]
+    wf["workflows/&lt;pkg&gt;/&lt;name&gt;.py<br/><i>main(argv) returns an exit code</i>"]
+    cli --> wf
 
-    U->>W: dit run --runner dataflow --parallel
-    W->>W: compute restricted ssvids<br/>(input mutation for mutate_recover)
-    par parallel mode submissions
-        W->>DF: submit job mode=1_bf
-        W->>DF: submit job mode=2_bfd
-        W->>DF: submit job mode=3_bftruncate
-        W->>DF: submit job mode=4_mutate_recover [pipe-gaps only]
+    subgraph HARNESS["Run harness"]
+        direction TB
+        workflow["dit.workflow<br/><i>arguments, worker cap, sizing,<br/>run context, run_with_cache</i>"]
+        snapshot["dit.snapshot, dit.git_info<br/><i>commit, snapshot, reviewed?</i>"]
+        image["dit.worker_image<br/><i>auto-built image</i>"]
+        cache["dit.cache<br/><i>dit_runs: key, read, write, cancel</i>"]
+        workflow --> snapshot
+        workflow --> image
+        workflow --> cache
     end
-    DF-->>BQ: writes [suffix]_[mode] tables
-    DF-->>W: wait_for_job returns (all done)
-    loop pairwise diffs
-        W->>TIC: table-check summary table_a table_b --keys ...
-        TIC->>BQ: full-outer-join + per-column delta query
-        BQ-->>TIC: row counts + col deltas
-        TIC-->>W: rc=0 if identical
+
+    subgraph EXEC["Execution"]
+        direction TB
+        docker["dit.runners.docker"]
+        dataflow["dit.runners.dataflow"]
+        names["dit.job_names, dit.dataflow_paths"]
     end
-    W-->>U: IDENTICAL / DIFFERENT verdict per pair
+
+    subgraph DATA["Data"]
+        direction TB
+        bq["dit.bq<br/><i>pins: copies and views</i>"]
+        production["dit.production<br/><i>find a production job</i>"]
+        compare["dit.compare<br/><i>shim over table-check</i>"]
+    end
+
+    subgraph SYNC["In step with production"]
+        direction TB
+        composer["dit.composer<br/><i>read DAG snapshots</i>"]
+        drift["dit.drift<br/><i>version, command, flags</i>"]
+        adjust["dit.adjust<br/><i>per-side adjustments</i>"]
+        drift --> composer
+        adjust --> composer
+    end
+
+    subgraph ORCH["Orchestration"]
+        direction TB
+        orchestration["dit.orchestration<br/><i>declarations, judge</i>"]
+        slices["dit.slices<br/><i>date slices</i>"]
+    end
+
+    wf --> HARNESS
+    wf --> EXEC
+    wf --> DATA
+    wf --> SYNC
+    wf --> ORCH
 ```
 
-### 3b. Cross-version (PIPELINE-1465-shaped — landed today)
+Module by module: [`framework.md`](framework.md) § 14.
 
-Multiple pipeline versions against pinned source copies, diff to surface behaviour change. Bindings run in parallel; per-binding `--worker-image` lets each binding exercise different worker code.
+---
+
+## 3. Ways to start a run
+
+| How | Command | Use | State |
+|---|---|---|---|
+| By hand, locally | `dit run workflows/<pkg>/<name>.py` | Development, small cohorts, dry runs | Works |
+| By hand, in Cloud Build | `make dit-cloud PIPELINE=... WORKFLOW=... ARGS="..."` | Long runs; nothing depends on a laptop staying awake | Works |
+| From a pull request | A Cloud Build trigger in the pipeline repo that uses `cloudbuild-dit.yaml` | A check on the pull request | Planned |
+| On a schedule | Cloud Scheduler to Cloud Build, same yaml | Nightly runs against `main` | Planned |
+
+All four use the same `cloudbuild-dit.yaml` or the same `dit run`. Only what starts them differs.
+
+---
+
+## 4. Workflow flows
+
+### 4a. Mode equivalence
+
+One pipeline version, several ways of loading the same window. A difference fails the run.
 
 ```mermaid
 sequenceDiagram
     actor U as User
-    participant XV as cross_version_ais.py
-    participant Git as Git (worktrees)
+    participant W as workflow
+    participant C as dit_runs (run cache)
+    participant DF as Dataflow or container
     participant BQ as BigQuery
-    participant DF as Dataflow
-    participant AR as gcr.io/wf827/dit/[pipeline]
     participant TIC as table-check
 
-    U->>XV: dit run<br/>--binding before=[ref-A]<br/>--binding after=[ref-B]<br/>--binding-worker-image after=[built-img]
-    XV->>BQ: pin sources: CREATE TABLE ... LIKE ... AS SELECT (run start)
-    Note over BQ: tech_great_expectations.dit_exp_[exp-id]_cross_version_[table]_[window]_[pin]<br/>(7-day TTL)
-
-    par bindings run concurrently (ThreadPoolExecutor)
-        XV->>Git: worktree add at ref A
-        XV->>DF: ais.py with default worker-image
-        and
-        XV->>Git: worktree add at ref B
-        XV->>DF: ais.py with --worker-image=[built]
+    U->>W: dit run ... --modes 1_bf,2_bfd,3_bftruncate
+    W->>W: check arguments, resolve run context
+    par one branch per mode
+        W->>C: look up cache key
+        alt hit, tables still exist
+            C-->>W: cached table
+        else miss
+            W->>DF: run the mode's jobs
+            DF-->>BQ: write the mode's tables
+            W->>C: record the run
+        end
     end
-
-    AR-->>DF: workers pull per-binding image
-    DF-->>BQ: writes port_visits_[exp]-{before,after}_[mode]
-    DF-->>XV: jobs complete (both bindings)
-
-    loop pairwise diffs<br/>(skip pairs where binding failed)
-        XV->>TIC: table-check summary
-        TIC->>BQ: diff query
-        BQ-->>TIC: deltas
+    loop each pair of modes
+        W->>TIC: table-check summary a b --keys ...
+        TIC->>BQ: comparison query
+        TIC-->>W: differing rows
     end
-    XV-->>U: pairwise verdict (real code differences visible)
+    W-->>U: IDENTICAL or DIFFERENT per pair, exit 0 only if all identical
 ```
 
-**Critical detail**: without `--binding-worker-image`, Dataflow workers pull `ais.py`'s default `--worker-image` (a fixed published path). All bindings then run identical worker code — the test becomes a no-op for any change that lives in worker code (most pipeline changes). The override is what makes cross-version *actually* cross-version. See CLAUDE.md plan changelog 2026-05-15 "Cross-version worker-image gap".
+Not every workflow uses the run cache ([`framework.md`](framework.md) § 6).
 
----
+### 4b. Cross-version
 
-## 4. Cloud Build runtime
+Several git refs of one pipeline on the same pinned input. A difference is the result, not a failure.
 
-How `make dit-cloud` and the planned PR triggers actually execute. The same `cloudbuild-dit.yaml` is the single source of truth; ad-hoc and PR-triggered paths differ only in *what* invokes Cloud Build.
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant XV as cross-version wrapper
+    participant Git as pipeline checkout
+    participant BQ as BigQuery
+    participant R as single-version workflow
+    participant TIC as table-check
+
+    U->>XV: dit run ... --binding before=REF_A --binding after=REF_B
+    XV->>Git: check that every ref exists
+    opt bindings differ in their interface
+        XV->>Git: git show of each ref's CLI source (preflight)
+        XV->>XV: base interface + declared + ad hoc adjustments
+    end
+    XV->>BQ: pin sources once (copy at run start, dry-run against the cap)
+    Note over BQ: tech_great_expectations.dit_exp_[experiment]_[role]_[table]_[window]_[pin stamp]
+
+    par one branch per binding
+        XV->>Git: git worktree add at the ref
+        XV->>R: run on the pinned copies, with this binding's image
+        R-->>BQ: write this binding's tables
+    end
+
+    loop each pair of bindings (skip pairs with a failed binding)
+        XV->>TIC: table-check summary
+        TIC-->>XV: differing rows
+    end
+    XV-->>U: verdict per pair, exit non-zero only if a binding failed
+```
+
+Each binding needs an image that holds its own code. Otherwise all bindings run the same worker code and the comparison passes without testing anything ([`framework.md`](framework.md) § 7).
+
+### 4c. Production baseline
+
+One candidate against the table production wrote. Production is not re-run.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant XV as cross-version wrapper
+    participant DFP as production's Dataflow job (metadata)
+    participant BQ as BigQuery
+    participant R as single-version workflow
+    participant TIC as table-check
+
+    U->>XV: dit run ... --baseline-production TARGET --production-date D
+    XV->>DFP: find the job for D
+    DFP-->>XV: T0 = job created, T1 = job done
+    XV->>BQ: refuse if an input changed between T0 and T1
+    XV->>BQ: refuse if a pin would leave time travel during the run
+    XV->>BQ: views of the inputs FOR SYSTEM_TIME AS OF T0
+    XV->>BQ: view of production's output FOR SYSTEM_TIME AS OF T1
+    XV->>R: run the candidate on the input views, in production's run shape
+    R-->>BQ: write the candidate's table
+    XV->>TIC: candidate table against the output view
+    TIC-->>XV: differing rows
+    XV-->>U: verdict
+```
+
+### 4d. Parallel slices
 
 ```mermaid
 flowchart LR
-    subgraph LOCAL["Ad-hoc trigger (today)"]
-        laptop[laptop:<br/>make dit-cloud<br/>PIPELINE=...<br/>WORKFLOW=...<br/>ARGS=...]
-    end
-
-    subgraph PR_TRIG["PR-triggered (planned)"]
-        ghpr[pipeline-repo PR opens] --> ghhook[GitHub webhook]
-        ghhook --> trig[Cloud Build trigger<br/>in pipeline repo<br/>Terraform-owned]
-    end
-
-    laptop -->|"--source=$PROJECTS/[pipeline]"| cb
-    trig -.->|references| yaml
-    trig --> cb
-
-    subgraph DITREPO["data-integration-tests"]
-        yaml[cloudbuild-dit.yaml<br/>canonical]
-    end
-
-    subgraph CB["Cloud Build VM"]
-        cb[Build VM<br/>e.g. E2_HIGHCPU_8<br/>24h timeout<br/>SA=automated-testing@]
-        cb --> step1[1. pull ditbox image<br/>gcr.io/wf827/dit/ditbox:latest]
-        step1 --> step2[2. git clone dit @ _DIT_REF<br/>github.com/GFW/data-integration-tests]
-        step2 --> step3[3. pip install -e /workspace<br/>pipeline from --source]
-        step3 --> step4[4. dit run $_WORKFLOW $_ARGS]
-    end
-
-    step4 -->|submits jobs as<br/>automated-testing@| df[Dataflow]
-    df -->|pulls worker image| ar[gcr.io/wf827/...<br/>pipeline + dit images]
-    df -->|reads source, writes output| bq[(BigQuery)]
-    step4 -->|diffs| tic[table-check]
-    tic --> bq
+    window["window<br/>[start, end]"] --> plan["dit.slices.plan<br/>day, week, month, Nd, list"]
+    plan --> check["check_partition<br/><i>covers the window exactly once</i>"]
+    check --> jobs["one job per slice,<br/>all submitted before any is awaited"]
+    jobs --> table[("one table")]
+    window --> one["one job over the window (1_bf)"]
+    one --> ref[("reference table")]
+    table --> cmp["compare"]
+    ref --> cmp
+    cmp --> judge["dit.orchestration.judge<br/><i>outcome against the step's declaration</i>"]
+    decl["workflows/&lt;pkg&gt;/orchestration.py"] --> judge
+    judge --> verdict["verdict and exit code"]
 ```
-
-**Architecture choice** (see CLAUDE.md § Plan changelog 2026-05-15 "Cloud Build architecture decision"):
-
-- **`cloudbuild-dit.yaml` is the single source of truth.** Lives in dit. Every consumer (ad-hoc CLI, per-pipeline triggers, scheduler) routes through it.
-- **Per-pipeline triggers are owned by each pipeline repo.** Status checks land in the right repo's UI; teams customize their own triggers without touching dit.
-- **Ad-hoc path needs no per-pipeline trigger.** `gcloud builds submit --config=cloudbuild-dit.yaml --source=<pipeline-dir>` works from anywhere. ditbox + the yaml are all that's required.
 
 ---
 
-## 5. Image namespace
+## 5. Run context: commit and image
 
-Where dit-related container images live, vs prod-shaped namespaces in the same project. The boundary is enforced by IAM (the user has `uploadArtifacts` on wf827 only; no `repositories.create` anywhere).
+What `dit.workflow.resolve_run_context` decides before any job starts.
+
+```mermaid
+flowchart TB
+    start([run starts]) --> env{"DIT_PIPELINE_COMMIT set?<br/><i>cloud path</i>"}
+    env -->|yes| recorded["record that commit"]
+    env -->|no| dirty{"checkout dirty?<br/><i>tracked files only</i>"}
+    dirty -->|no| head["record HEAD"]
+    dirty -->|yes, docker runner| headU["record HEAD, unreviewed"]
+    dirty -->|yes, Dataflow runner| snap["scripts/snapshot.sh:<br/>orphan commit of tracked files,<br/>secret scan, push to<br/>refs/dit-snapshots/&lt;pipeline&gt;/&lt;sha&gt;"]
+    snap --> snapU["record snapshot commit, unreviewed"]
+
+    recorded --> reviewed
+    head --> reviewed{"ancestor of origin/main?"}
+    reviewed -->|yes| rev["reviewed"]
+    reviewed -->|no, or cannot tell| unrev["unreviewed"]
+    headU --> unrev
+    snapU --> unrev
+
+    rev --> img
+    unrev --> img{"image policy"}
+    img -->|workflow passes check_images| guard["workflow decides:<br/>refuse unreviewed code on a default image"]
+    img -->|build from source| compose["docker compose builds the working tree"]
+    img -->|explicit image given| explicit["use it"]
+    img -->|default image, reviewed| default["use the default"]
+    img -->|default image, unreviewed| build["kaniko build:<br/>dit/&lt;pipeline&gt;:dit-&lt;commit&gt;<br/><i>reused if the tag exists</i>"]
+```
+
+Two simplifications in this diagram:
+
+- In the cloud path the laptop has already answered "reviewed?" and passes it in as `DIT_UNREVIEWED`. The ancestry check runs in the build only when that variable is missing.
+- A run with an explicit `--suffix` (every binding of a cross-version run) never snapshots. It records the checkout's state as it is, and counts as unreviewed when the tree is dirty or the commit is not merged.
+
+Text: [`framework.md`](framework.md) § 7.
+
+---
+
+## 6. Cloud Build runtime
+
+How `make dit-cloud` runs a workflow. The same `cloudbuild-dit.yaml` would serve pull-request triggers.
+
+```mermaid
+flowchart LR
+    subgraph LAPTOP["Laptop: make dit-cloud"]
+        direction TB
+        l1["resolve the pipeline commit<br/><i>REF, snapshot of a dirty tree, or HEAD</i>"]
+        l2["resolve reviewed or not<br/><i>fetch origin/main, ancestry check</i>"]
+        l3["gcloud builds submit --async<br/><i>source: the pipeline checkout</i>"]
+        l1 --> l2 --> l3
+    end
+
+    subgraph BUILD["Cloud Build: one step in ditbox, as automated-testing@"]
+        direction TB
+        b1["git clone dit at DIT_REF"]
+        b2["uv pip install dit (no deps)"]
+        b3["uv pip install the pipeline<br/><i>at REF, or the uploaded tree; Beam pinned</i>"]
+        b4["dit run WORKFLOW ARGS<br/><i>DIT_PIPELINE_COMMIT, DIT_UNREVIEWED, DIT_CLOUD_MODE=1</i>"]
+        b1 --> b2 --> b3 --> b4
+    end
+
+    l3 --> b1
+
+    b4 -->|"docker run --network=cloudbuild"| inner["pipeline container<br/><i>identity from Cloud Build's metadata server</i>"]
+    b4 -->|in-process submit| df[Dataflow]
+    inner -->|submits| df
+    inner -->|SQL steps| bq[(BigQuery)]
+    df -->|pulls image| ar["gcr.io/world-fishing-827/dit/..."]
+    df --> bq
+    b4 -->|table-check| bq
+    b4 -.->|"SIGTERM: cancel_run"| df
+```
+
+- **`cloudbuild-dit.yaml` is the one definition of how DIT runs in the cloud.** It lives here. Triggers in pipeline repos would reference it.
+- **The laptop does what the builder cannot:** push a snapshot and fetch the pipeline's origin.
+- **ditbox holds tools only.** DIT and the pipeline are installed per run.
+
+Text: [`framework.md`](framework.md) § 9. Credentials: [`conventions.md`](conventions.md) § "Auth in the cloud path (ditbox)".
+
+---
+
+## 7. The drift check
+
+```mermaid
+flowchart LR
+    subgraph COMPOSER["composer-dags-production checkout (fetched by hand)"]
+        snap["tests/render_dags/snapshots/&lt;dag&gt;.py<br/><i>rendered_dag = {...}</i>"]
+    end
+
+    subgraph DIT["this repo"]
+        direction TB
+        spec["workflows/&lt;pkg&gt;/composer_drift.py<br/><i>WorkflowSpec, StepSpec</i>"]
+        builders["the workflow's own<br/>command-line builders"]
+        spec --> builders
+    end
+
+    snap -->|"git show, ast.literal_eval<br/>(dit.composer)"| prod["production's task:<br/>image, command, flags"]
+    builders -->|"same run dates"| mine["DIT's tokens:<br/>image, command, flags"]
+
+    prod --> cmp["dit.drift.check_step"]
+    mine --> cmp
+    cmp --> v["version"]
+    cmp --> c["command"]
+    cmp --> f["flags<br/><i>minus DIT-owned and accepted</i>"]
+    v --> out["summary, exit 0 / 1 / 2"]
+    c --> out
+    f --> out
+```
+
+Text: [`composer-drift.md`](composer-drift.md).
+
+---
+
+## 8. Image namespace
+
+Where DIT's images live, next to the namespaces of the canonical pipeline images in the same project.
 
 ```
-us-docker.pkg.dev/world-fishing-827/gcr.io/      (existing AR repo, location: us)
+gcr.io/world-fishing-827/
 │
-├── anchorages_pipeline/         ← prod canonical (read-only for dit)
-│   ├── scheduler:<tags>
-│   └── worker:<tags>
-├── encounters_pipeline/         ← prod canonical (read-only for dit)
-├── advanced_fishing_detection/  ← prod canonical (read-only for dit)
-├── 4wings/                      ← prod canonical (read-only for dit)
-├── ...
+├── anchorages_pipeline/, encounters_pipeline/, ...   canonical pipeline namespaces: read-only for DIT
 │
-└── dit/                         ← dit experimental namespace (read/write)
+└── dit/                                              DIT's namespace: read and write
     ├── ditbox:latest, :<short-sha>
-    │      └── tooling image: Python + git + gcloud + docker CLI
+    │       tooling image for Cloud Build runs
     │
-    ├── pipe-anchorages:<exp-id>-<binding>
-    │      └── e.g. pipeline-1465-after
-    │      └── per-binding worker image for cross_version_ais.py
+    ├── <pipeline>:dit-<pipeline_commit>
+    │       built automatically for unreviewed code
     │
-    ├── pipe-gaps:<exp-id>-<binding>           (when needed)
-    ├── pipe-events:<exp-id>-<binding>         (when needed)
+    ├── <pipeline>:<label>-<commit7>-<what>-<patch-sha>
+    │       overlay image built from a commit plus a test-only patch,
+    │       e.g. pipe-anchorages:v5.0.1-767770f-temp-dataset-905dc761
     │
-    └── pushtest:<anything>                    (smoke-test only)
+    ├── <pipeline>:<base-version>-<what>-<patch-sha>
+    │       overlay image built on a published image
+    │
+    ├── <pipeline>:<experiment-id>-<binding-name>
+    │       image built by hand for one binding of a cross-version run
+    │
+    └── pushtest:<anything>
+            smoke test of a push; delete after use
 ```
 
-| Subpath | Tag scheme | Lifecycle |
-|---|---|---|
-| `dit/ditbox` | `:latest` + `:<short-sha>` | Stable; rebuilt only when ditbox tooling changes |
-| `dit/<pipeline>` | `:<experiment-id>-<binding-name>` | Per cross-version experiment; cleanup manual until AR policy lands |
-| `dit/pushtest` | `:<anything>` | Smoke-only; delete immediately after use |
+Canonical upstream images that some workflows pull live in another project's registry. DIT reads them and never writes there.
 
-Push perms: project-level `uploadArtifacts` on wf827 (the user's group has it). No `repositories.create` needed because everything goes under the pre-existing `gcr.io` repo. See [`conventions.md`](conventions.md) § Image namespace for the build-and-push workflow.
-
----
-
-## Suggested viewers
-
-These files render best in:
-
-- **GitHub web** — Mermaid auto-renders on github.com/GlobalFishingWatch/data-integration-tests. Zero install. Recommended default.
-- **VS Code / Cursor** — install the `Markdown Preview Mermaid Support` extension (free, by Matt Bierner). Then any `.md` preview shows the diagrams.
-- **JetBrains IDEs** — Mermaid support is built-in for `.md` previews since 2023.
-
-For drafting new diagrams locally without a renderer, [mermaid.live](https://mermaid.live) is a free hosted editor — paste a fenced block, edit, copy back. No install.
+Naming rules, the overlay rules and the build commands: [`conventions.md`](conventions.md) § Image namespace.

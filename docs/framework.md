@@ -483,7 +483,7 @@ So when `DIT_CLOUD_MODE` is set, the docker runner adds `--network=cloudbuild` a
 
 To stop a run: cancel the build (the SIGTERM trap cleans up), or `make dit-cancel RUN_ID=<id>`.
 
-Diagram: [`architecture.md`](architecture.md) § 4. Day-to-day commands: [`usage.md`](usage.md).
+Diagram: [`architecture.md`](architecture.md) § 6. Day-to-day commands: [`usage.md`](usage.md).
 
 ---
 

@@ -1,12 +1,25 @@
-# dit conventions
+# DIT conventions
 
-Naming + path conventions used across dit. Referenced from `CLAUDE.md` § Working agreements and the cloudbuild yamls. Keep this short and operational.
+The rules a change to DIT must keep: where DIT may write, how images are named, how Dataflow settings are handled, how credentials reach a container. Referenced from `CLAUDE.md` § Working agreements and from the Cloud Build yamls.
+
+For what the pieces are, read [`framework.md`](framework.md) first. This page states the rules and their reasons.
+
+| Section | Rule in one line |
+|---|---|
+| [Prod-infra boundary](#prod-infra-boundary) | Read anything; write only to DIT's namespaces in `world-fishing-827`. |
+| [Runner-only Dataflow knobs](#runner-only-dataflow-knobs) | Worker cap and sizing never change output and never enter a cache key. |
+| [Bindings that differ in their interface](#bindings-that-differ-in-their-interface) | Same interface by default; differences are declared adjustments with a reason. |
+| [Image namespace](#image-namespace) | Every DIT image lives under `gcr.io/world-fishing-827/dit/`. |
+| [Auth in the cloud path (ditbox)](#auth-in-the-cloud-path-ditbox) | No credential files; `--network=cloudbuild` in Cloud Build. |
+| [Container env vars](#container-env-vars-workflow-driven-via-container_env) | `container_env` reaches the container; `env` does not. |
+| [Standard build-and-push workflow](#standard-build-and-push-workflow) | How to build an image for one binding. |
+| [Cleanup](#cleanup) | Images are deleted by hand. |
 
 ## Prod-infra boundary
 
 **Absolute rule.** ditbox / dit will **never** request, design toward, or write to resources in `gfw-int-infrastructure` — covering builds (image registries), data (BQ datasets, GCS buckets), Terraform, and IAM. All dit writes stay in `world-fishing-827` namespaces. If a proposed design seems to require writing to `gfw-int-infrastructure`, the design is wrong, not the IAM — re-route through a dit-namespaced path, or treat the gap as an upstream ask of whoever owns that infrastructure.
 
-dit is a **testing-shaped consumer** of GFW infrastructure. Reading from prod tables, snapshotting source data, and submitting Dataflow jobs as `automated-testing@world-fishing-827` are in scope. Modifying anything in production-shaped paths is not.
+dit is a **testing-shaped consumer** of GFW infrastructure. Reading from prod tables, pinning source data by copying it into DIT's dataset, and submitting Dataflow jobs as `automated-testing@world-fishing-827` are in scope. Modifying anything in production-shaped paths is not.
 
 **Prod-shaped, do not touch:**
 
@@ -18,6 +31,13 @@ dit is a **testing-shaped consumer** of GFW infrastructure. Reading from prod ta
 - Production's regional Dataflow quota in `world-fishing-827`, which also runs production jobs. Every Dataflow workflow takes `--max-num-workers` through `dit.workflow.add_max_num_workers_arg`, resolves it with `worker_cap` in `parse_args`, logs it once with `log_worker_caps`, and emits it only through `max_num_workers_options`. A new workflow picks its own default and never raises an existing one. Precedence, the more specific setting winning: the explicit flag, else `min(default, DIT_MAX_NUM_WORKERS_CEILING)`, else the default. The ceiling env var reaches only processes started from the operator's shell: `cloudbuild-dit.yaml` passes no such variable into the build step, so cloud runs need `--max-num-workers` in `ARGS` until that is wired (follow-up). Since 2026-10-23 (PIPELINE-4701).
 - Production's external-IP quota, likewise shared. Every Dataflow job runs with private worker IPs, as production does: a workflow emits `dit.workflow.NO_PUBLIC_IPS_OPTION` (`--no_use_public_ips`) in its Dataflow options. pipe-gaps adds nothing, because gfw-common's own default is already private and dit passes nothing that overrides it (a test pins both). Since 2026-10-23.
 
+**In scope (explicit exception):**
+
+- **Creating branches in pipeline repos** with potential fixes that may eventually merge to prod. The branch existing is normal dev workflow; only an actual merge is prod-touching, and that's owned by whoever holds the merge button, not by dit.
+- Reading anything anywhere — BQ tables, registry images, GCS objects.
+
+The boundary is enforced by IAM. DIT's identities may upload images to `world-fishing-827` only; a push to `gfw-int-infrastructure` fails with a permission error. If you find yourself wanting more permissions to make something work, the design is probably wrong — re-route through a dit-namespaced path first.
+
 ## Runner-only Dataflow knobs
 
 The worker cap (`--max-num-workers`), the worker machine type (`--worker-machine-type`) and the boot disk size (`--disk-size-gb`) change how fast a job runs and whether it runs out of memory. **Output must not depend on them.** So they are never part of a cache key, and a workflow whose output changes with them has a bug. Each goes through its `dit.workflow` helpers (`add_max_num_workers_arg` / `worker_cap`, `add_worker_sizing_args` / `resolve_worker_sizing` / `worker_sizing_options`), and each resolves the same way: the explicit flag wins, else the workflow's default. Since 2026-10-23.
@@ -28,16 +48,11 @@ The worker cap (`--max-num-workers`), the worker machine type (`--worker-machine
 - A new workflow follows the same rule. Worker caps do not: they keep their own defaults (above).
 - Production machine types cost more per worker-hour than a staging run needs. Pass a smaller `--worker-machine-type` / `--disk-size-gb` for non-production data: every flag's help says so, and a Dataflow run that keeps a production-mirrored field while reading the AIS staging cohort logs a `cost hint:` warning (`dit.workflow.log_production_sizing_hint`). The hint never prompts or blocks.
 
-**In scope (explicit exception):**
-
-- **Creating branches in pipeline repos** (`pipe-anchorages`, `pipe-gaps`, `pipe-events`) with potential fixes that may eventually merge to prod. The branch existing is normal dev workflow; only an actual merge is prod-touching, and that's owned by whoever holds the merge button, not by dit.
-- Reading anything anywhere — BQ tables, registry images, GCS objects.
-
-The boundary is mechanically enforced by IAM. `christian.homberg@globalfishingwatch.org` has `uploadArtifacts` on `world-fishing-827` only; trying to push to `gfw-int-infrastructure` fails with a permission error. If you find yourself wanting to elevate permissions to make something work, the design is probably wrong — re-route through a dit-namespaced path first.
+Resolution order and the defaults per workflow: [`framework.md`](framework.md) § 8.
 
 ## Bindings that differ in their interface
 
-In a cross-version workflow every binding gets the base interface by default: the same command line, inputs and outputs, mirroring production today. Where a binding's pipeline differs, it gets adjustments (`dit.adjust`); see `docs/plan.md` § "Per-side adjustments". Since 2026-11-24, first in `workflows/pipe_segment/identity_match_key.py`.
+In a cross-version workflow every binding gets the base interface by default: the same command line, inputs and outputs, mirroring production today. Where a binding's pipeline differs, it gets adjustments (`dit.adjust`). How they work: [`framework.md`](framework.md) § 10; design record: [`plan.md`](plan.md) § "Per-side adjustments". Since 2026-11-24, first in `workflows/pipe_segment/identity_match_key.py`.
 
 - **Shared in a run, never adjusted:** the DIT checkout, experiment id, date window, pin stamp, destination dataset, and the comparison tool.
 - **Declared adjustments live next to the workflow** (`workflows/<pkg>/adjustments.py`), each with a `reason` that says what differs in the pipeline. Its `applies` asks the ref's own CLI source first (an unreleased head carries the previous version number), its version second.
@@ -51,6 +66,8 @@ In a cross-version workflow every binding gets the base interface by default: th
 ## Image namespace
 
 All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-within-existing-repo, not a new repo. Only `uploadArtifacts` needed (project-level grant we already have).
+
+Which image a run uses, and when one is built automatically, is decided per run: [`framework.md`](framework.md) § 7. Tree view of the namespace: [`architecture.md`](architecture.md) § 8.
 
 | Purpose | Path | Tag scheme |
 |---|---|---|
@@ -71,7 +88,7 @@ All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-wi
 
 The default overlay image must be rebuilt, and the workflow's constants bumped, whenever production bumps the pipeline version. The overlay README lists the steps.
 
-**Second instance, with one patch per pipeline generation** (2026-11-20, pipe-segment, [`docker/overlays/pipe-segment-temp-dataset/`](../docker/overlays/pipe-segment-temp-dataset/README.md)). Both pipe-segment workflows default to the source-built overlay of pipe-segment v5.1.0, the version the AIS DAG is configured for; `workflows/pipe_segment/ais.py` follows the same two rules, and `identity_match_key.py` still auto-builds a plain image for an unreviewed binding. What is new:
+**Second instance, with one patch per pipeline generation** (2026-11-20, pipe-segment, [`docker/overlays/pipe-segment-temp-dataset/`](../docker/overlays/pipe-segment-temp-dataset/README.md)). Both pipe-segment workflows default to the source-built overlay of pipe-segment v5.1.0, the version the AIS DAG is configured for; Both follow the same two rules: `workflows/pipe_segment/ais.py` from the start, and `identity_match_key.py` since 2026-11-25 (its `check_images` refuses an unreviewed binding on the default image, before anything is pinned; until then it auto-built a plain image). What is new:
 - **The read sites differ between the two versions dit drives**, so the directory holds one patch for each, and `build.sh` applies the first that passes `git apply --check`. The self-check is told which patch was applied.
 - **The self-check counts every BigQuery read in the whole package**, not only in the patched modules, so a read added upstream in a new module also fails the build.
 - **Start the image label with the pipeline version** (`v5.1.0`, `v5.1.0-pr230`). The workflow reads it from the tag to decide whether the image knows a flag that older code would ignore silently.
@@ -132,7 +149,9 @@ Concrete case (pipe-segment v5.0.x smoke, 2026-06-03): Beam's `WriteToBigQuery` 
 
 ## Standard build-and-push workflow
 
-For per-binding pipeline images used by `--binding-worker-image`:
+For a workflow whose default image is an overlay (port visits, pipe-segment), build the binding's image with the `build.sh` of that overlay under [`docker/overlays/`](../docker/overlays/), not with the plain build below.
+
+For per-binding pipeline images of a pipeline without an overlay, used by `--binding-worker-image`:
 
 ```bash
 WORKTREE=$(mktemp -d)
@@ -164,4 +183,4 @@ gcloud artifacts docker images delete \
     --delete-tags --quiet
 ```
 
-Adding a policy keyed on the `dit/` prefix with a 30-day TTL is a TODO for when experiment volume warrants it (the same logic that lets snapshot datasets auto-clean — let TTL do the work).
+Adding a policy keyed on the `dit/` prefix with a 30-day TTL is a TODO for when experiment volume warrants it. Pinned source copies already clean themselves up this way, through their table expiration.
