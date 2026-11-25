@@ -492,6 +492,63 @@ def log_production_sizing_hint(
 
 
 # --------------------------------------------------------------------------
+# (a4) DirectRunner for short jobs of a Dataflow run (owner request, 2026-11-24)
+# --------------------------------------------------------------------------
+#
+# A Dataflow job spends about two minutes starting workers and two stopping
+# them, whatever its size. On a small cohort a one-day job does about a
+# minute of work inside a six-minute job. ``--direct-runner-max-days N`` runs
+# every job covering N days or fewer on Beam's DirectRunner, inside the same
+# container that would otherwise submit it, and leaves longer jobs on
+# Dataflow. Chosen by hand: DIT does not judge when the two runners agree.
+# The run's own comparison checks it, whenever a short job's output is
+# compared with a longer job's on Dataflow.
+
+RUNNER_DATAFLOW = "dataflow"
+RUNNER_DOCKER = "docker"
+
+
+def _positive_days(value: str) -> int:
+    return _int_at_least(value, name="--direct-runner-max-days", minimum=1)
+
+
+def add_direct_runner_max_days_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--direct-runner-max-days`` (default ``None``: every job on the
+    run's ``--runner``)."""
+    parser.add_argument(
+        "--direct-runner-max-days", type=_positive_days, default=None, metavar="N",
+        help="With --runner dataflow: run every job that covers N days or fewer on "
+             "DirectRunner inside the container instead of submitting it to Dataflow; "
+             "longer jobs stay on Dataflow. Meant for small inputs, such as the staging "
+             "cohort's daily jobs, where Dataflow's start-up and shutdown (about four "
+             "minutes a job) dwarf the work. DirectRunner runs the same code in one "
+             "process; DIT does not check that both runners give the same output, but "
+             "the run's comparison does whenever such a job is compared with a longer "
+             "one on Dataflow. Default: off.",
+    )
+
+
+def runner_for_days(runner: str, days: int, direct_runner_max_days: int | None) -> str:
+    """The runner one job runs on: ``runner``, except a Dataflow run's job of
+    at most ``direct_runner_max_days`` days, which runs on DirectRunner
+    (``RUNNER_DOCKER``). Pure."""
+    if runner == RUNNER_DATAFLOW and direct_runner_max_days is not None \
+            and days <= direct_runner_max_days:
+        return RUNNER_DOCKER
+    return runner
+
+
+def check_direct_runner_max_days(runner: str, direct_runner_max_days: int | None) -> None:
+    """Refuse ``--direct-runner-max-days`` on a run that is not on Dataflow,
+    where it would change nothing and so read as if it had."""
+    if direct_runner_max_days is not None and runner != RUNNER_DATAFLOW:
+        raise SystemExit(
+            f"error: --direct-runner-max-days moves short jobs of a Dataflow run to "
+            f"DirectRunner; with --runner {runner} every job already runs there."
+        )
+
+
+# --------------------------------------------------------------------------
 # (b) Experiment-id helpers
 # --------------------------------------------------------------------------
 # BQ-table-name-safe slug; max 32 chars. Compiled once.
@@ -590,8 +647,13 @@ def add_modes_arg(
     choices: Sequence[str],
     cached: bool = True,
     help_suffix: str = "",
+    default: Sequence[str] | None = None,
 ) -> None:
     """Add ``--modes`` (comma-separated subset; defaults to all of ``choices``).
+
+    ``default`` names the modes a run without the flag executes, when that is
+    not all of them: a workflow with an expensive opt-in mode (pipe-segment's
+    ``4_daily``, one job per day of the window) keeps it out of the default.
 
     The value stays a raw string on the namespace; call :func:`parse_modes`
     to validate it (workflows do this in their ``parse_args`` so a bad value
@@ -604,7 +666,16 @@ def add_modes_arg(
     on this invocation. Claiming the cache behaviour unconditionally would make
     the CLI help wrong for that consumer -- Copilot review on PR #71.
     """
-    default = ",".join(choices)
+    entries = tuple(choices if default is None else default)
+    # A default may hold entries that are not plain modes (pipe-segment's
+    # ``1_bf:full-history``). Then it is neither "all" nor a subset "of" the
+    # modes, and the note only lists them -- Copilot review on PR #96.
+    default_note = (
+        "(all)" if entries == tuple(choices)
+        else f"(of {','.join(choices)})" if set(entries) <= set(choices)
+        else f"(modes: {','.join(choices)})"
+    )
+    default = ",".join(entries)
     reuse_note = (
         "Modes are cached independently, so running a subset now and more "
         "later reuses the earlier modes' output."
@@ -615,7 +686,7 @@ def add_modes_arg(
     parser.add_argument(
         "--modes", default=default,
         help=(
-            f"Comma-separated subset of modes to run. Default: {default} (all). "
+            f"Comma-separated subset of modes to run. Default: {default} {default_note}. "
             f"Use a subset for a cheap smoke (e.g. --modes {choices[0]}); "
             f"comparisons run only for pairs where both modes ran, and a "
             f"single-mode run performs no comparison at all. {reuse_note}"

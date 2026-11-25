@@ -58,6 +58,11 @@ All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-wi
 
 The default overlay image must be rebuilt, and the workflow's constants bumped, whenever production bumps the pipeline version. The overlay README lists the steps.
 
+**Second instance, with one patch per pipeline generation** (2026-11-20, pipe-segment, [`docker/overlays/pipe-segment-temp-dataset/`](../docker/overlays/pipe-segment-temp-dataset/README.md)). Both pipe-segment workflows default to the source-built overlay of pipe-segment v5.1.0, the version the AIS DAG is configured for; `workflows/pipe_segment/ais.py` follows the same two rules, and `identity_match_key.py` still auto-builds a plain image for an unreviewed binding. What is new:
+- **The read sites differ between the two versions dit drives**, so the directory holds one patch for each, and `build.sh` applies the first that passes `git apply --check`. The self-check is told which patch was applied.
+- **The self-check counts every BigQuery read in the whole package**, not only in the patched modules, so a read added upstream in a new module also fails the build.
+- **Start the image label with the pipeline version** (`v5.1.0`, `v5.1.0-pr230`). The workflow reads it from the tag to decide whether the image knows a flag that older code would ignore silently.
+
 The auto-built pipeline image row covers both **Dataflow worker images** (Beam workers pull the image) and **docker-runner pipeline images** (dit's docker runner pulls and runs the image directly). Same namespace, same kaniko build machinery, same `:dit-<pipeline_commit>` tag scheme; what changes is the consumer. **Trigger is symmetric across both consumers**: `dit.worker_image.ensure_pipeline_image` builds when ALL of (a) `worker_image == default_worker_image` (no explicit override) and (b) the run is `unreviewed`. Reviewed code at the pinned default is pulled from the canonical upstream registry (`us-central1-docker.pkg.dev/gfw-int-infrastructure/<repo>/<package>:vX.Y.Z`); only unreviewed code triggers a fresh build under the dit namespace. Canonical upstream publications are read-only to dit — never a write target.
 
 Examples:
@@ -67,6 +72,8 @@ Examples:
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:v5.0.1-767770f-temp-dataset-905dc761` (source-built overlay; the port-visits default)
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` (source-built overlay of a PR head; cross-version, per-binding)
 - `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (auto-built for unreviewed docker-runner code)
+- `gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` (source-built overlay; the default of both pipe-segment workflows; built and pushed 2026-11-24, `sha256:f785658b99d8caea217be4575fb951336bfeab8c36d253d3b3309026ffadf8eb`)
+- `gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` (source-built overlay of the version the VMS DAG pins; built and pushed 2026-11-24, `sha256:96ac0dbc7103412e1017d0d27e78dc8630ee01ad2e0068abc93f2653bd13de9c`)
 
 Canonical upstream defaults the workflows pin (read-only to dit):
 

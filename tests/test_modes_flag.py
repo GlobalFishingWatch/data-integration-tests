@@ -108,6 +108,35 @@ def test_add_modes_arg_defaults_to_all_choices() -> None:
     add_modes_arg(p, choices=_CHOICES)
     assert p.parse_args([]).modes == "1_bf,2_bfd,3_bftruncate"
     assert p.parse_args(["--modes", "1_bf"]).modes == "1_bf"
+    assert "Default: 1_bf,2_bfd,3_bftruncate (all)." in (p._actions[-1].help or "")
+
+
+def test_add_modes_arg_takes_a_default_subset() -> None:
+    """A workflow with an expensive opt-in mode keeps it out of the default
+    (pipe-segment's ``4_daily``); the help then says what the choices are."""
+    import argparse
+
+    choices = (*_CHOICES, "4_daily")
+    p = argparse.ArgumentParser()
+    add_modes_arg(p, choices=choices, default=_CHOICES)
+
+    assert p.parse_args([]).modes == "1_bf,2_bfd,3_bftruncate"
+    assert p.parse_args(["--modes", "4_daily"]).modes == "4_daily"
+    assert ("Default: 1_bf,2_bfd,3_bftruncate (of 1_bf,2_bfd,3_bftruncate,4_daily)."
+            in (p._actions[-1].help or ""))
+    # A default naming every choice is still "all".
+    q = argparse.ArgumentParser()
+    add_modes_arg(q, choices=_CHOICES, default=_CHOICES)
+    assert "(all)" in (q._actions[-1].help or "")
+
+    # A default with an entry that is not a plain mode is neither "all" nor a
+    # subset "of" the modes: the note lists the modes instead.
+    r = argparse.ArgumentParser()
+    add_modes_arg(r, choices=_CHOICES, default=("1_bf:full-history", *_CHOICES))
+    help_text = r._actions[-1].help or ""
+    assert ("Default: 1_bf:full-history,1_bf,2_bfd,3_bftruncate "
+            "(modes: 1_bf,2_bfd,3_bftruncate)." in help_text)
+    assert "(all)" not in help_text and "(of " not in help_text
 
 
 # --------------------------------------------------------------------------

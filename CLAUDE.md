@@ -80,6 +80,115 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-25 — Review fixes on PR #96 (segmenter mode equivalence); overlay images and runs recorded
+
+**Images and runs.** Both pipe-segment overlay images were built and pushed on 2026-11-24 by the operator (digests in the overlay README), and `ais.py` ran in Cloud Build: default run `2e57a93b`, PR #227 with the v5.0.3 base `4bb84ec0`, DirectRunner check `967b1030`, ten days of production input `56af531e` with the compare-only rerun `de4e5831`, all IDENTICAL once table-check v0.3.1 fixed the duplicated-key pairing. The docs that said "not built" or "not run" now record this.
+
+**`identity_match_key.py` refuses instead of warning.** An unreviewed binding on the default image got a kaniko build of plain source (no overlay) and a warning; on Dataflow as the test service account its job was expected to fail. It now passes a `check_images` hook to `resolve_run_context`, which replaces the auto-build, and `_preflight_images` applies the same check to every binding before the copy, so a run that cannot start makes no BigQuery call. Consistent with `ais.py` and port visits. Trade-off: with one `--image-tag` for every binding, an A/B against an unmerged branch on Dataflow is refused until per-binding images exist (PR #97 adds `--binding-image`); DirectRunner with `--build-from-source` still works.
+
+**`ais.py`.** The compose project name holds the experiment id. Strictly, two runs never shared a compose project: `dit.runners.docker` appends a random suffix per call. The name now tells runs apart in `docker ps` and network names. `--parallel`'s help says how a failure ends.
+
+**Sections moved.** `workflows/pipe_segment/identity_match_key.py` (`check_images`, `_runs_default_image`, `_preflight_images`; `_run_binding`; comments and `--image-tag` help); `workflows/pipe_segment/ais.py` (`_compose_project_name`, `--parallel` help); tests; overlay README (status, image table, identity_match_key rules); `RUN_INSTRUCTIONS.md` (status table, §§ 4, 7, 8, M3, M5, M6, troubleshooting); README Features and Roadmap 7e; `docs/pipeline-contract.md` (row 5, pipe-segment note); `docs/conventions.md`; CHANGELOG § 2026-11-25.
+
+### 2026-11-24 — A base version next to the head in `workflows/pipe_segment/ais.py` (`@base`, `--base-image`); per-side adjustments agreed, not built
+
+**Trigger.** The owner pointed out that the pipe-segment PR #227 test needs the head in its new mode against the base in its only mode. Neither pipe-segment workflow did that:
+- `identity_match_key.py` gives every binding the same flags, and refuses v5.0.3 against v5.1.0 outright: it requires distinct gpsdio-segment pins, and both tags pin v3.0.0.
+- `ais.py` ran every variant on one image. Its full-history reference was the head's code in the old mode.
+
+So the planned test assumed that v5.1.0 in full history equals v5.0.3. PR #227 changed code both segmenters share (`git diff --stat v5.0.3 v5.1.0`: `pipeline.py`, `transform/read_messages.py`, `transform/create_segments.py`, `transform/satellite_offsets.py`), so that is not given.
+
+**What changed.** A variant is now (mode, segmenter, side). `side` is `head` (the run's images) or `base` (`--base-image`). A `--modes` entry ends in `@base` to select it.
+
+**Decisions.**
+- **No flag is edited for the base.** Between the two tags only `segment` changed, by three added flags, and full history passes none of them. So a base variant gets the head's full-history argv, and a test pins that the two differ only in tables, labels, job name and worker image.
+- **No default base image.** The base is whichever version a test is about; a constant for "the previous version" would go stale at every production bump.
+- **`--base-image` without an `@base` entry is an error**, not a no-op: the run would read as if a base had been compared.
+- **`@base` with `--build-from-source` is refused.** The working tree is the head.
+- **`incremental` is checked per side.** The old check looked at every executed image for any incremental variant, which would have refused a v5.0.3 base next to an incremental head.
+- **A base variant sorts first within its mode**, so it is the reference when selected.
+- **One image for the base**, as submitter and worker. An overlay image serves as both, and two flags would allow them to differ.
+- **`dit_side` label on every job**, head included, so the label set is the same for all jobs. It changes the head's `--labels`, which are DIT-owned in the drift spec; both specs stay in sync.
+- **The image guard (`check_images`) is about the head only.** With base variants alone selected no head image runs, so unreviewed code is not refused.
+
+**Per-side adjustments: agreed with the owner, not in this change.** This change covers the case where the base needs no other flags. The general case was planned the same day:
+- By default both sides get the same parameters. Declared rules per pipeline version and one-off edits on the command line remove, add or rename flags on either side.
+- Tables are in scope from the start (owner decision): each side can have its own inputs to pin and outputs to compare.
+- What stays shared: the DIT checkout, experiment id, window, pin stamp, destination dataset, comparison tool.
+- An older layer is checked against the composer commit at which production last ran that version, and every emitted flag against the ref's own CLI source before a run (owner decision).
+- It comes as its own PR after this one, with `identity_match_key.py` as the first consumer; `docs/plan.md` gets the section then.
+
+**Checked, and not.**
+- A dry run of the six-variant PR #227 plan from a clean pipe-segment clone at v5.1.0: 45 jobs, 45 comparisons, reference `1_bf:full-history@base`, each variant's image named. It created nothing.
+- The drift check exits 0 with both pipe-segment specs in sync (local composer checkout's `origin/main`).
+- The schema definitions of the three compared tables are unchanged between the tags (`schemas/message_schema.py`, `schemas/segment_schema.py`, `transform/fragment.py` are not in `git diff v5.0.3 v5.1.0`). Read, not run.
+- Nothing ran on Dataflow, and neither overlay image is built.
+
+**Short jobs on DirectRunner** (owner request, same day). A timing study of build `4bb84ec0` found a one-day staging job spends about 2 min starting Dataflow workers, 1 min working and 2 min 10 s stopping them; nothing was rebuilt or re-pulled per job. `--direct-runner-max-days N` (off by default) runs each job of N days or fewer on DirectRunner in the container, longer ones on Dataflow. Decisions: set by hand, as the owner asked (DIT does not judge when the runners agree); chosen per job by its length, which separates a backfill from daily runs without naming stages; refused with `--runner docker`, where it would change nothing; the worker image counts as executed only if a head job still runs on Dataflow, so the incremental check does not refuse an image no job uses. The equivalence of the two runners is checked by the run's own comparison against a Dataflow reference. Ran inside Cloud Build on 2026-11-24 (build `967b1030`): three one-day jobs on DirectRunner, about 1.5 min each, IDENTICAL to a Dataflow reference on all three tables. Not tested: build-machine memory with many parallel local jobs. Helpers in `dit.workflow` § (a4) for reuse.
+
+**Comparison: each variant with the reference by default** (owner decision, same day). `--compare reference|all-pairs`, default `reference`. A difference between two non-reference variants still shows: at least one of them then differs from the reference. Every pair stays available to tell which of two variants moved. For the #227 test with the base: 15 comparisons instead of 45. This settles the open question of the 2026-11-20 entry below ("pairwise is 30 comparisons ... reference only would be 12").
+
+**Sections moved.** `workflows/pipe_segment/ais.py` (docstring section "A third part of the unit"; `SIDE_*`, `SIDES`; `Variant`, `ALL_VARIANTS`, `_split_entry`, `parse_variants`; `_labels`; `variant_images`, `segment_argv`, `run_variant`; `_images_executed`, `check_base_side`, `check_incremental_support`, `_check_incremental_support`; `--base-image`; `log_plan`, `_log_configuration`); `tests/test_pipe_segment_ais.py` (three adapted, a new section on the base side; suite 1,500 → 1,535); `workflows/pipe_segment/RUN_INSTRUCTIONS.md` (M3, M6); README Features; CHANGELOG § 2026-11-24.
+
+### 2026-11-20 — Mode equivalence for the segmenter (`workflows/pipe_segment/ais.py`); pipe-segment temp-dataset overlay
+
+**Trigger.** Every other onboarded pipeline has a mode-equivalence workflow; the segmenter had only the cross-version `identity_match_key.py`. pipe-segment PR #227 (merged 2026-11-20, v5.1.0, 4ddde03) adds an opt-in `--incremental` to `segment`, and its claim is a mode-equivalence claim: incremental day-by-day equals full history. The owner wants that PR run through DIT.
+
+**Nothing has run.** No image was built, no Dataflow job submitted, no table written. Everything below about pipe-segment was read from its code at v5.0.3 (f4d39fe) and v5.1.0 (4ddde03). BigQuery was used for dry runs and free metadata reads only.
+
+**The DAG changed on the same day, and the drift check reported it within hours.** While this work was in review, composer-dags-production PR #3145 (merged 2026-11-20, 17:26 UTC) set the AIS v3 DAG's segment group to pipe-segment v5.1.0 and added `--incremental` to its `segment` task. The VMS v5 DAG still pins v5.0.3 and passes no such flag. That evening `workflows/composer_drift.py` exited 1 on this branch and on main: both pipe-segment specs reported `v5.0.3 -> v5.1.0` on every step and `--incremental` as production-only on `segment`. It is the first live change the general check caught, and it was caught because the check was run by hand. What followed, same day:
+- **Both workflows default to the overlay image of v5.1.0.** One definition, in `identity_match_key.py` (`DEFAULT_PIPELINE_VERSION`, `DEFAULT_OVERLAY_IMAGE`). The v5.0.3 patch stays for the version the VMS DAG pins.
+- **`ais.py` defaults to the incremental segmenter**, and its default `--modes` is `1_bf:full-history,1_bf,2_bfd,3_bftruncate`. Why that set:
+  - the reference stays full history in one job, because it hands no state from job to job; a run of incremental shapes alone would show only that incremental agrees with itself;
+  - `1_bf:incremental` separates a difference in the matching from a difference in the hand-over between jobs;
+  - ten jobs on the default window, one more than the first cut's nine.
+- **`identity_match_key.py` hands the overlay its dataset** (`--bq-temp-dataset`, as a container variable, so no argv changes) **and does not pass `--incremental`.** Passing it was considered and rejected:
+  - a binding may be a ref older than v5.1.0, which would ignore the flag silently (inferred), so the A/B would compare segmenters instead of refs;
+  - a binding is one job from empty tables, so the state the flag reads is empty either way and nothing in this workflow exercises it;
+  - whether the two segmenters agree is what `ais.py` tests, and no run has confirmed it.
+  The drift spec accepts the DAG's flag for that step with this reason. Matching the DAG later is one `extra_flags` entry plus a check that every binding's ref declares the flag.
+- **The drift specs.** `pipe_segment/ais`: the default job's `--incremental` is compared, not accepted, so the spec drifts if the DAG drops it; its two table flags are DIT's own; the full-history reference job accepts the DAG's flag. `pipe_segment/identity_match_key`: accepts it on `segment`, and now states its version, since an overlay tag is not a plain version. Both in sync at composer e4cb29361, runner exit 0.
+- **Still an unverified claim about production:** this is what composer's main configures. No production run was looked at, so the docs say "the DAG is configured for" and "passes", not "production runs".
+
+**Decisions.**
+- **The unit is a (mode, segmenter) variant, selected through `--modes` alone.** An entry is a mode, run with every segmenter of `--segmenter`, or `mode:segmenter`. Considered and rejected:
+  - the cross product only (`--modes` x `--segmenter`): the PR's test is five of the eight pairs, 44 jobs where the cross product is 80;
+  - a separate `--variants` flag: two flags for one selection.
+- **A fourth mode, `4_daily`, for "every day as its own job".** Not `--tail-days` set to the window: `--tail-days` applies to every mode of a run, and the PR's test needs "backfill, then three days" and "every day" in one run. It is opt-in (31 jobs on the default window), which needed `dit.workflow.add_modes_arg(default=...)`. **Open for the owner:** whether it belongs in the default, since it is the strictest test.
+- **Each variant has its own three tables, and they must be empty.** A full-history job reads its whole fragments table with no date bound (`transform/read_fragments.py`: no condition when `start_date` is `None`), and an incremental job starts from the stored segments. The PR's author got doubled message counts from a fragments table that already held the window. So `require_empty_outputs` refuses tables with rows, by a free metadata read, before the pin.
+- **Every plan is checked to chain** (`check_chain`, pure): the first job starts the window, each later job starts no later than the day after the last day written, and the last job ends the window. That covers the PR's rules (consecutive days, no gap, reruns in order through the end). It is checked for every mode at parse time, not only for incremental variants: a full-history job needs the fragments up to the day before it just as much.
+- **`incremental` is refused on an image that does not name v5.1.0 or later in its tag.** Why a refusal and not a warning: pipe-segment's command line hands unknown flags to Beam (`cli/main.py` line 47, `parse_known_args`). Inferred, not run: on v5.0.3 `--incremental` would be ignored, the job would run full history, and the comparison would pass without testing anything. Detection choices:
+  - the image tag, which must start with the version (the overlay label). No registry or docker call;
+  - a tag that names no version is refused too, with `--assume-incremental-support` as the way through;
+  - with `--build-from-source` the working tree's `segment` command is read for the flag.
+- **The comparison is pairwise, and the log says which table tells most.** `segments` is the discriminating one (segment id carried across days, cumulative values). `fragments` are built from one vessel's messages of one day (`pipeline.py` lines 326 to 336 at v5.1.0), so they detect chaining errors only weakly. Any difference exits 1, as in the other mode-equivalence workflows. **Open for the owner:** pairwise is 30 comparisons for the PR's five variants; comparing each variant with the reference only would be 12.
+- **The array columns.** `identities` and `destinations` in `fragments`, and the four `daily_*` / `cumulative_*` columns in `segments`, are `ARRAY<STRUCT<...>>` of scalars (`transform/fragment.py`, `schemas/segment_schema.py`). `table-check` documents multiset comparison for that shape. So the element-order differences the PR's author saw are expected not to show. A hypothesis until a run confirms it.
+- **Default image: a DIT overlay, with port visits' image policy.** First of v5.0.3, then of v5.1.0 when the DAG moved (above). pipe-segment has no staging-dataset option, so the published image cannot run on Dataflow as the test service account (inferred, as before). `check_images` is copied from `port_visits/ais.py`: no auto-build, unreviewed code refused on a default image. The default tag is fixed by the commit and the patch's hash, and a test pins both; the image itself does not exist yet.
+- **One patch per pipe-segment generation.** v5.1.0 rewrote three of v5.0.3's four read sites (job labels, PR #228) and added a fifth read, so neither patch applies to the other tag (`git apply --check`, both directions). `build.sh` applies the first that fits. `verify_overlay.py` counts the reads of the whole package, so a read in a new module fails the build too; its static half runs in DIT's tests, against the patches and, when a checkout with both tags is present, against the patched trees.
+- **`identity_match_key.py`'s `segment` builder is shared, not copied.** `_segment_args` and `_dataflow_options` gained `labels`, `job_name` and `extra_flags`, defaulting to what they emitted before. So a full-history job passes the flags the drift check already compares with production, and the new drift spec is in sync by construction.
+- **No run cache.** `run_with_cache` returns one comparison table per unit and a variant has three. Not straightforward, so left out; the help says so. The jobs carry `dit_run_id`, so cancellation still finds them.
+- **Dry run without side effects.** It reads the commit through `resolve_pipeline_commit(runner="docker")`, which never snapshots, and skips `resolve_run_context`. For a dirty tree it therefore reports HEAD, where a real Dataflow run would snapshot first.
+
+**Workflow-side workarounds for missing contract items.** One, already known: the temp dataset (contract row 5), by overlay. No new one.
+
+**Claims about production.** What the AIS and VMS DAGs pin and pass comes from composer's rendered snapshots, which is what the drift check reads: `core_ais_v3` at cb0c9a3b7 in the morning (v5.0.3, no `--incremental`) and at e4cb29361 in the evening (v5.1.0, `--incremental`), both 2026-11-20. These are statements about the DAGs, not about a job that ran.
+
+**Not done, and why.**
+- No image built and no run: outside this change's remit; each waits for the owner's go-ahead. Proposed order in README Roadmap 7e.
+- `identity_match_key.py` cannot take an overlay image per binding: it has one `--image-tag`, and an unreviewed binding still gets a plain auto-built image, which on Dataflow as the test service account is expected to fail. The workflow warns. A per-binding image flag, or the image guard of `ais.py`, is a follow-up.
+- No workflow for the VMS segment stage, which stays on v5.0.3 and full history.
+- No cross-version wrapper for the segmenter per mode, no `--steps` (the workflow runs `segment` only), no expiration on the output tables.
+- `check_images` and the bf / bfd / bftruncate slicing now exist in two and three workflows; noted in `workflows/README.md` as extraction candidates, not extracted.
+
+**Sections moved.**
+- New: `workflows/pipe_segment/ais.py`; `docker/overlays/pipe-segment-temp-dataset/` (two patches, `build.sh`, `verify_overlay.py`, README); `tests/test_pipe_segment_ais.py`, `tests/test_pipe_segment_overlay.py`.
+- `workflows/pipe_segment/identity_match_key.py`: `_dataflow_options`, `_segment_args` (optional `labels`, `job_name`, `extra_flags`; defaults unchanged); `DEFAULT_PIPELINE_VERSION`, `OVERLAY_DIR`, `DEFAULT_OVERLAY_IMAGE`, `DEFAULT_IMAGE_TAG`, `TEMP_DATASET_ENV`, `DEFAULT_BQ_TEMP_DATASET`; `--bq-temp-dataset`; `_run_pipe_subcommand` (container variable); `_run_binding` (warning for an auto-built image on Dataflow); module docstring ("No `--incremental` here").
+- `workflows/pipe_segment/composer_drift.py`: `MODE_EQUIVALENCE_SPEC`, `mode_equivalence_tokens`, `INCREMENTAL_ACCEPTED_DIFFERENCES`, `FULL_HISTORY_ACCEPTED_DIFFERENCES`, `CROSS_VERSION_SEGMENT_ACCEPTED_DIFFERENCES`; both specs state `version`; `SPECS` holds both.
+- `src/dit/workflow.py`: `add_modes_arg(default=...)`.
+- `Makefile`: comments on `PIPE_SEGMENT_BEAM_VERSION` (v5.1.0 pins Beam 2.71.0 too; the constant is unchanged).
+- Tests: `tests/test_composer_drift.py` (registry, fixture for tasks mirrored by several steps and for the DAG's `--incremental`, tests for both specs), `tests/test_pipe_segment_identity_match_key.py`, `tests/test_modes_flag.py`, `tests/test_max_num_workers.py`, `tests/test_worker_ips_and_sizing.py`. Suite 1,265 to 1,500.
+- Docs: README (Features, Source data targets, Roadmap 7b and 7e); `workflows/README.md` (both tables, a note on the extraction candidates); `workflows/pipe_segment/RUN_INSTRUCTIONS.md` (status, section 4, and the part "Mode equivalence of the segment step", with the PR #227 command); `docs/pipeline-contract.md` (pipe-segment row 5 and audit notes); `docs/composer-snapshots-2026-10.md` (§ 6 version table, § 8d); `docs/conventions.md` (overlay images); CHANGELOG § 2026-11-20.
+
 ### 2026-11-20 — No satellite timing offsets in DIT; the option is removed (PIPELINE-4705)
 
 **Owner decision (2026-11-20, on PR #94).** DIT's segmenter workflows do not run pipe-segment's satellite timing offsets, and this is to be stated very clearly. The entry below left `--include-satellite-offsets` refused but in place and asked whether to delete it. It is deleted.

@@ -33,6 +33,7 @@ from workflows.pipe_events import composer_drift as events_drift
 from workflows.pipe_events import fishing
 from workflows.pipe_gaps import composer_drift as gaps_drift
 from workflows.pipe_gaps import mode_equivalence as gaps_modes
+from workflows.pipe_segment import ais as segment_modes
 from workflows.pipe_segment import composer_drift as segment_drift
 from workflows.pipe_segment import identity_match_key as segment
 
@@ -74,10 +75,12 @@ COMMANDS = {
     ("pipe_segment/identity_match_key", "segment_info"): ("pipe-segment", "segment_info"),
     ("pipe_segment/identity_match_key", "vessel_info"): ("pipe-segment", "vessel_info"),
     ("pipe_segment/identity_match_key", "segment_vessel"): ("pipe-segment", "segment_vessel"),
+    ("pipe_segment/ais", "segment"): ("pipe-segment", "segment"),
+    ("pipe_segment/ais", "segment[full-history]"): ("pipe-segment", "segment"),
 }
 
 #: The workflows marked in sync with production: drift in one of them exits 1.
-IN_SYNC = ["port_visits/ais", "pipe_segment/identity_match_key"]
+IN_SYNC = ["port_visits/ais", "pipe_segment/identity_match_key", "pipe_segment/ais"]
 
 
 def _steps() -> list[tuple[str, str]]:
@@ -110,10 +113,10 @@ def offline(monkeypatch):
 # the registry
 # --------------------------------------------------------------------------
 
-def test_every_workflow_has_a_spec_and_two_are_marked_in_sync() -> None:
+def test_every_workflow_has_a_spec_and_three_are_marked_in_sync() -> None:
     assert [spec.name for spec in runner.SPECS] == [
         "port_visits/ais", "encounters/ais", "encounters/vms", "pipe_events/fishing",
-        "pipe_gaps/mode_equivalence", "pipe_segment/identity_match_key",
+        "pipe_gaps/mode_equivalence", "pipe_segment/identity_match_key", "pipe_segment/ais",
     ]
     assert [spec.name for spec in runner.SPECS if spec.in_sync] == IN_SYNC
     assert all((Path(__file__).parents[1] / spec.workflow).is_file() for spec in runner.SPECS)
@@ -129,6 +132,7 @@ def test_every_spec_names_its_snapshot_and_explains_what_it_accepts() -> None:
         "pipe_events/fishing": "core_ais_v5",
         "pipe_gaps/mode_equivalence": "core_ais_v5",
         "pipe_segment/identity_match_key": "core_ais_v3",
+        "pipe_segment/ais": "core_ais_v3",
     }
     assert set(_steps()) == set(COMMANDS)
     for spec in runner.SPECS:
@@ -384,6 +388,151 @@ def test_pipe_segment_accepts_the_satellite_flags_and_owns_the_handed_over_table
         assert set(by_step[step].accepted) == {"--project"}
 
 
+# -- pipe_segment/ais.py: mode equivalence of the segment step --------------
+
+INCREMENTAL_FLAGS = {"--incremental", "--in_segments_table", "--in_fragments_table"}
+
+
+def test_mode_equivalence_spec_mirrors_the_segment_task_once_per_segmenter() -> None:
+    spec = segment_drift.MODE_EQUIVALENCE_SPEC
+
+    # The default job first: the segmenter the DAG's task passes.
+    assert [(step.step, step.task_id) for step in spec.steps] == [
+        ("segment", "segment.segment"), ("segment[full-history]", "segment.segment"),
+    ]
+    # The default image is a DIT overlay; each step states the version inside it.
+    assert {step.image for step in spec.steps} == {segment_modes.DEFAULT_IMAGE_TAG}
+    assert {step.pipeline_version for step in spec.steps} == {"v5.1.0"}
+    assert spec.in_sync and spec.dit_owned == segment_drift.SPEC.dit_owned
+    assert "reference variant" in spec.steps[1].note and not spec.steps[0].note
+
+
+def test_both_pipe_segment_specs_state_the_version_of_the_shared_overlay_image() -> None:
+    steps = [*segment_drift.SPEC.steps, *segment_drift.MODE_EQUIVALENCE_SPEC.steps]
+
+    assert {step.image for step in steps} == {segment.DEFAULT_OVERLAY_IMAGE}
+    assert {step.pipeline_version for step in steps} == {segment.DEFAULT_PIPELINE_VERSION}
+    assert {step.image_name for step in steps} == {"pipe-segment"}
+
+
+def test_mode_equivalence_tokens_are_one_job_over_the_runs_dates() -> None:
+    incremental = _parsed("pipe_segment/ais", "segment")
+    full = _parsed("pipe_segment/ais", "segment[full-history]")
+
+    for parsed in (full, incremental):
+        assert parsed.value("--date_range") == "2026-03-01,2026-03-10"
+        assert parsed.value("--in_normalized_messages_table") == (
+            segment.DEFAULT_SRC_NORMALIZED_TABLE)
+        assert parsed.value("--runner") == "dataflow"
+        assert not set(segment_drift.SATELLITE_FLAGS) & set(parsed.names())
+    # Full history is pipe-segment's own default: no flag selects it.
+    assert not INCREMENTAL_FLAGS & set(full.names())
+    assert INCREMENTAL_FLAGS <= set(incremental.names())
+    # The state of the day before comes from the variant's own tables.
+    assert incremental.value("--in_segments_table") == incremental.value("--out_segments_table")
+    assert incremental.value("--in_fragments_table") == incremental.value("--fragments_table")
+    # Apart from the three flags, the two jobs pass the same flags as the
+    # cross-version workflow's segment step, whose builder they share.
+    cross_version = _parsed("pipe_segment/identity_match_key", "segment")
+    assert set(full.names()) == set(cross_version.names())
+    assert set(incremental.names()) - INCREMENTAL_FLAGS == set(cross_version.names())
+
+
+def test_mode_equivalence_tokens_are_what_the_workflow_hands_the_runner() -> None:
+    calls = []
+    args = segment_modes.parse_args([
+        "--experiment-id", "composer-drift", "--start", "2026-03-01", "--end", "2026-03-10",
+        "--tail-days", "0", "--modes", "1_bf", "--suffix", "composer-drift_drift",
+    ])
+    args.run_id = args.commit_sha = segment_drift._BINDING
+    with patch.object(segment_modes.dit_docker, "run",
+                      side_effect=lambda image, argv, **kw: calls.append((argv, kw)) or 0):
+        segment_modes.run_variant(
+            args, args.variants[0], suffix=args.suffix,
+            pinned=segment._PinnedSources(normalized_messages=args.source_normalized_table),
+        )
+
+    assert [[kw["entrypoint"], *argv] for argv, kw in calls] == [
+        _step("pipe_segment/ais", "segment").tokens(PLACEHOLDERS),
+    ]
+
+
+def test_who_accepts_which_incremental_flag() -> None:
+    """``--incremental`` is compared for the default mode-equivalence job and
+    accepted, with a reason, where DIT leaves it out on purpose."""
+    spec = segment_drift.MODE_EQUIVALENCE_SPEC
+    incremental, full = spec.steps
+    cross_version = _step("pipe_segment/identity_match_key", "segment")
+
+    # The default job passes it, as the DAG's task does: a difference is drift.
+    assert "--incremental" not in spec.expected(incremental)
+    # Its two table flags are DIT's own; the DAG's task passes neither.
+    assert {"--in_segments_table", "--in_fragments_table"} <= spec.expected(incremental)
+    assert "variant's own tables" in spec.reasons(incremental)["--in_segments_table"]
+    # The reference variant and the cross-version A/B run full history.
+    assert "reference variant" in spec.reasons(full)["--incremental"]
+    assert not {"--in_segments_table", "--in_fragments_table"} & spec.expected(full)
+    reason = segment_drift.SPEC.reasons(cross_version)["--incremental"]
+    assert "older than v5.1.0" in reason and "ignore the flag silently" in reason
+    assert "pipe_segment/ais.py tests" in reason
+    # No other step of the cross-version chain accepts it.
+    assert not any(
+        "--incremental" in step.accepted for step in segment_drift.SPEC.steps[1:])
+    # All three keep the segment step's other accepted differences.
+    for step in (incremental, full, cross_version):
+        assert set(segment_drift.SEGMENT_ACCEPTED_DIFFERENCES) <= set(step.accepted)
+
+
+def _segment_dag(tokens: list[str]) -> composer.RenderedDag:
+    raw = _port_visits_raw_dag(production_only=())
+    task = {"image": "registry.example.invalid/core/pipe-segment:v5.1.0",
+            "cmds": tokens[:1], "arguments": tokens[1:],
+            "upstream_task_ids": [], "downstream_task_ids": []}
+    return composer.dag_from_snapshot(
+        {**raw, "tasks": {"segment.segment": task}}, snapshot="synthetic")
+
+
+def test_the_segment_task_with_incremental_is_in_sync_and_without_it_is_drift() -> None:
+    """The DAG's task passes ``--incremental`` and no table flag for it. If it
+    drops the flag, the default mode-equivalence job no longer mirrors it."""
+    modes = segment_drift.MODE_EQUIVALENCE_SPEC
+    incremental, full = modes.steps
+    cross_version = _step("pipe_segment/identity_match_key", "segment")
+    # What the task passes is the cross-version step's flags plus the one flag.
+    without = list(cross_version.tokens(_RUN))
+    today = _segment_dag([*without, "--incremental"])
+
+    assert not drift.check_step(modes, incremental, today).drift
+    assert not drift.check_step(modes, full, today).drift
+    assert not drift.check_step(segment_drift.SPEC, cross_version, today).drift
+
+    dropped = _segment_dag(without)
+    report = drift.check_step(modes, incremental, dropped)
+    assert report.drift and report.argv.diff.only_left == ("--incremental",)
+    assert not drift.check_step(modes, full, dropped).drift
+    assert not drift.check_step(segment_drift.SPEC, cross_version, dropped).drift
+
+
+def test_a_version_bump_of_the_segment_task_is_drift_in_both_specs() -> None:
+    """What happened on 2026-11-20, with the roles of the versions swapped."""
+    tokens = [*_step("pipe_segment/identity_match_key", "segment").tokens(_RUN), "--incremental"]
+    raw = _port_visits_raw_dag(production_only=())
+    task = {"image": "registry.example.invalid/core/pipe-segment:v5.2.0",
+            "cmds": tokens[:1], "arguments": tokens[1:],
+            "upstream_task_ids": [], "downstream_task_ids": []}
+    dag = composer.dag_from_snapshot(
+        {**raw, "tasks": {"segment.segment": task}}, snapshot="synthetic")
+
+    for spec, step in (
+        (segment_drift.SPEC, _step("pipe_segment/identity_match_key", "segment")),
+        (segment_drift.MODE_EQUIVALENCE_SPEC, segment_drift.MODE_EQUIVALENCE_SPEC.steps[0]),
+    ):
+        report = drift.check_step(spec, step, dag)
+        assert report.drift and not report.version.matches and not report.argv.drift
+        assert (report.version.dit_version, report.version.production_version) == (
+            "v5.1.0", "v5.2.0")
+
+
 # --------------------------------------------------------------------------
 # the runner, against a synthetic composer checkout
 # --------------------------------------------------------------------------
@@ -402,6 +551,12 @@ def _mirror_task(step: drift.StepSpec, *, version: str | None = None) -> dict:
     extra = (
         [f"--worker_machine_type={sizing.machine_type}", f"--disk_size_gb={sizing.disk_size_gb}"]
         if step.task_id == gaps_drift.TASK_ID else []
+    ) + (
+        # The DAG's segment task passes --incremental; the cross-version
+        # workflow, whose step is the one mirrored, leaves it out on purpose.
+        ["--incremental"]
+        if step.task_id == segment_drift.TASK_IDS["segment"] and "--incremental" not in tokens
+        else []
     )
     return {
         "image": f"registry.example.invalid/core/{step.image_name}:"
@@ -418,11 +573,15 @@ def _snapshot(name: str, *, version: str | None = None, in_sync_version: str | N
     version for the workflows not yet in sync, ``in_sync_version`` for the
     mirrored ones marked in sync."""
     base = _port_visits_raw_dag(production_only=())
-    tasks = {
-        step.task_id: _mirror_task(step, version=in_sync_version if spec.in_sync else version)
+    mirrors = [
+        (step.task_id, _mirror_task(step, version=in_sync_version if spec.in_sync else version))
         for spec in runner.SPECS if spec.snapshot == name and spec.name != "port_visits/ais"
         for step in spec.steps
-    }
+    ]
+    # Several steps may mirror one task (pipe-segment's segment task is mirrored
+    # by both of its workflows, and twice by the mode-equivalence one). The
+    # first step named is the one production "runs": reversed, it is written last.
+    tasks = dict(reversed(mirrors))
     return {**base, "tasks": {**tasks, **(port_visits or {})}}
 
 
@@ -469,6 +628,7 @@ def test_no_drift_anywhere_when_production_runs_what_dit_runs(tmp_path, capsys) 
     out = capsys.readouterr().out
     assert "port_visits/ais: in sync; 12 field checks, 0 differ" in out
     assert "pipe_segment/identity_match_key: in sync" in out
+    assert "pipe_segment/ais: in sync" in out
     for name in SPECS:
         if name not in IN_SYNC:
             assert f"{name}: no drift (can be marked in sync)" in out
@@ -495,7 +655,8 @@ def test_drift_in_pipe_segment_exits_1(tmp_path, capsys) -> None:
     assert _main(repo) == 1
     out = capsys.readouterr().out
     assert "pipe_segment/identity_match_key: DRIFT (expected in sync)" in out
-    assert "DIFF v5.0.3 -> v99.0.0" in out
+    assert "pipe_segment/ais: DRIFT (expected in sync)" in out
+    assert "DIFF v5.1.0 -> v99.0.0" in out
     assert _main(repo, "--workflow", "encounters/ais") == 0
 
 
