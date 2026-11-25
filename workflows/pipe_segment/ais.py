@@ -368,7 +368,7 @@ DEFAULT_MAX_NUM_WORKERS = 4
 STEP_WORKER_SIZING = {STEP: imk.STEP_WORKER_SIZING[STEP]}
 
 #: The pipe-segment version the default image holds, the overlay directory and
-#: the default overlay image (not built yet): one definition for both
+#: the default overlay image (built 2026-11-24): one definition for both
 #: pipe-segment workflows, in ``identity_match_key.py``, which holds the
 #: citations. ``composer_drift.py`` compares the version with the image tag of
 #: the DAG's task.
@@ -776,8 +776,25 @@ def _docker_run_kwargs(args: argparse.Namespace, variant: Variant) -> dict:
         "volumes": [imk.GCP_VOLUME],
         "service": imk.COMPOSE_SERVICE,
         "build_from_source": args.build_from_source,
-        "project_name": f"dit-pipe-segment-{variant.tag}",
+        "project_name": _compose_project_name(args.experiment_id, variant),
     }
+
+
+def _compose_project_name(experiment_id: str, variant: Variant) -> str:
+    """``dit-pipe-segment-<experiment id>-<variant tag>``: names the run's
+    compose project and container, so two runs of the same variant from
+    different experiments are told apart in ``docker ps`` and in the network
+    names. The runner appends a random suffix per call on top, so concurrent
+    calls never share a project either way.
+
+    Compose project names take lowercase letters, digits, ``-`` and ``_``,
+    starting with a letter or digit. The prefix starts with a letter, an
+    experiment id matches ``EXPERIMENT_ID_RE`` (at most 32 such characters)
+    and a variant tag is built from the same set; anything else is replaced
+    by ``-`` all the same. Compose documents no length limit for a project
+    name."""
+    raw = f"dit-pipe-segment-{experiment_id}-{variant.tag}"
+    return re.sub(r"[^a-z0-9_-]", "-", raw.lower())
 
 
 def run_variant(
@@ -1247,7 +1264,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                    help="Skip the comparison phase; only run the jobs.")
     p.add_argument("--parallel", action="store_true",
                    help="Run the variants in parallel threads. The jobs of one variant "
-                        "always run one after the other.")
+                        "always run one after the other. When one variant fails, the "
+                        "others' jobs still run to completion before the error is raised, "
+                        "and nothing is compared.")
     p.add_argument("--dry-run", action="store_true",
                    help="Report the pin estimate (a BigQuery dry run, checked against "
                         "--pin-max-gb), the planned jobs and the comparisons, and stop. "

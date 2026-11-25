@@ -80,6 +80,16 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-25 — Review fixes on PR #96 (segmenter mode equivalence); overlay images and runs recorded
+
+**Images and runs.** Both pipe-segment overlay images were built and pushed on 2026-11-24 by the operator (digests in the overlay README), and `ais.py` ran in Cloud Build: default run `2e57a93b`, PR #227 with the v5.0.3 base `4bb84ec0`, DirectRunner check `967b1030`, ten days of production input `56af531e` with the compare-only rerun `de4e5831`, all IDENTICAL once table-check v0.3.1 fixed the duplicated-key pairing. The docs that said "not built" or "not run" now record this.
+
+**`identity_match_key.py` refuses instead of warning.** An unreviewed binding on the default image got a kaniko build of plain source (no overlay) and a warning; on Dataflow as the test service account its job was expected to fail. It now passes a `check_images` hook to `resolve_run_context`, which replaces the auto-build, and `_preflight_images` applies the same check to every binding before the copy, so a run that cannot start makes no BigQuery call. Consistent with `ais.py` and port visits. Trade-off: with one `--image-tag` for every binding, an A/B against an unmerged branch on Dataflow is refused until per-binding images exist (PR #97 adds `--binding-image`); DirectRunner with `--build-from-source` still works.
+
+**`ais.py`.** The compose project name holds the experiment id. Strictly, two runs never shared a compose project: `dit.runners.docker` appends a random suffix per call. The name now tells runs apart in `docker ps` and network names. `--parallel`'s help says how a failure ends.
+
+**Sections moved.** `workflows/pipe_segment/identity_match_key.py` (`check_images`, `_runs_default_image`, `_preflight_images`; `_run_binding`; comments and `--image-tag` help); `workflows/pipe_segment/ais.py` (`_compose_project_name`, `--parallel` help); tests; overlay README (status, image table, identity_match_key rules); `RUN_INSTRUCTIONS.md` (status table, §§ 4, 7, 8, M3, M5, M6, troubleshooting); README Features and Roadmap 7e; `docs/pipeline-contract.md` (row 5, pipe-segment note); `docs/conventions.md`; CHANGELOG § 2026-11-25.
+
 ### 2026-11-24 — Parallel slices (`dit.slices`, port visits' `6_parallel`); per-step orchestration declarations (`dit.orchestration`)
 
 **Trigger.** The owner: some steps can load several slices at once, others carry state from one run to the next. In the owner's view the segmenter, incremental fishing events and probably gaps must run sequentially; `research_messages`, raw encounters and `raw_port_events` can run slices in parallel. DIT should test this and move towards declaring the allowed orchestration per step, so it is written down what an Airflow backfill or daily DAG may do (`depends_on_past`, `max_active_runs`, `LatestOnlyOperator`). First test: N slices loaded in parallel equal one backfill over the same window, on `raw_port_events`.

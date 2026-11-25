@@ -2,7 +2,7 @@
 
 Test-only patches that let DIT run pipe-segment on Dataflow as `automated-testing@`. They are not proposed upstream, like the pipe-anchorages overlay next to this one (decision 2026-10-22, PIPELINE-4699).
 
-**Status, 2026-11-20: no image is built yet.** The patches apply to their tags and the patched sources pass the static self-check (below). Building and pushing the two images in the table is the next step, and it needs the owner's go-ahead. Until then a default run of either pipe-segment workflow fails when docker tries to pull its image.
+**Status, 2026-11-24: both images are built and pushed** (table below), each self-checked inside the image when built. Dataflow jobs of `workflows/pipe_segment/ais.py` have run on them as the test service account (Cloud Build runs `2e57a93b`, `4bb84ec0` and `56af531e`, 2026-11-24/25; results in `workflows/pipe_segment/RUN_INSTRUCTIONS.md`).
 
 **Which version is the default.** Both pipe-segment workflows default to the overlay of **v5.1.0**, the version the AIS v3 DAG's segment group is configured for since 2026-11-20 (composer-dags-production PR #3145). The v5.0.3 patch stays: the VMS v5 DAG still pins v5.0.3, and an overlay image of it is what a DIT run of that version needs.
 
@@ -15,7 +15,7 @@ Nothing outside the code can redirect this:
 - pipe-segment has no option for it. Its read sites call `beam.io.ReadFromBigQuery` directly, with no staging-dataset argument (v5.0.3 and v5.1.0, read 2026-11-20).
 - Beam has no pipeline option or environment variable for it; the only input is the transform argument. Checked in Beam 2.71.0, which pipe-segment pins at both tags (2026-11-20): `temp_dataset` appears only in `apache_beam/io/gcp/bigquery*.py`, as that argument, and nowhere under `options/` or the Dataflow runner. With it set, `_CustomBigQuerySource._setup_temporary_dataset` returns without creating anything, and the query result goes to a `beam_temp_table_<hex>` table in that dataset, deleted afterwards.
 
-That a pipe-segment Dataflow job fails without the overlay is inferred from this and from the pipe-anchorages smoke of 2026-10-22, which failed that way. It has not been tried with pipe-segment.
+That a pipe-segment Dataflow job fails without the overlay is inferred from this and from the pipe-anchorages smoke of 2026-10-22, which failed that way. It has not been tried with pipe-segment; the jobs on the overlay images ran without the failure.
 
 ## What the patches do
 
@@ -63,12 +63,12 @@ Image: `gcr.io/world-fishing-827/dit/pipe-segment:<label>-<commit7>-temp-dataset
 
 `--push` uses docker's gcloud credential helper. If gcloud is set to impersonate a service account without upload rights, the push fails with `uploadArtifacts` denied. Run it as your own account instead: `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT= ./build.sh ... --push`.
 
-To be built (the tags follow from the commits and the patches; fill in the digests when they exist):
+Built and pushed on 2026-11-24, as the operator's own account:
 
 | side | commit | image | digest | built |
 |---|---|---|---|---|
-| **default** of both workflows (the AIS DAG's version; knows `--incremental`) | pipe-segment v5.1.0, 4ddde03 | `dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` | not built yet | no |
-| the version the VMS DAG pins (full-history segmenter only) | pipe-segment v5.0.3, f4d39fe | `dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` | not built yet | no |
+| **default** of both workflows (the AIS DAG's version; knows `--incremental`) | pipe-segment v5.1.0, 4ddde03 | `gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` | `sha256:f785658b99d8caea217be4575fb951336bfeab8c36d253d3b3309026ffadf8eb` | 2026-11-24; self-check passed (5 BigQuery reads, all patched) |
+| the version the VMS DAG pins (full-history segmenter only) | pipe-segment v5.0.3, f4d39fe | `gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` | `sha256:96ac0dbc7103412e1017d0d27e78dc8630ee01ad2e0068abc93f2653bd13de9c` | 2026-11-24; self-check passed |
 
 ## Self-check
 
@@ -81,7 +81,7 @@ After building, `build.sh` runs `verify_overlay.py --patch <the patch it applied
 
 The first check needs neither pipe-segment nor Beam (`--static-only --package-dir <dir>`), so DIT's tests run it: `tests/test_pipe_segment_overlay.py` checks each patch against the expected counts, and, when a pipe-segment checkout with both tags is present, applies each patch to its tag and runs the static check on the result.
 
-Checked on 2026-11-20 without building an image: both patched trees pass the static check, the unpatched trees fail it, and the helper passes the Beam half of the runtime check under Beam 2.71.0 in DIT's own virtualenv. Not checked: the build itself, the runtime check inside an image, and a Dataflow job on an overlay image.
+Checked on 2026-11-20 without building an image: both patched trees pass the static check, the unpatched trees fail it, and the helper passes the Beam half of the runtime check under Beam 2.71.0 in DIT's own virtualenv. The build, the runtime check inside each image and Dataflow jobs on the images followed on 2026-11-24 (status at the top).
 
 ## Default image
 
@@ -95,9 +95,9 @@ Both pipe-segment workflows default to the row marked **default** above (`DEFAUL
 - **`--build-from-source` has no overlay either.** It runs `docker compose` on the working tree. That is fine for a local `--runner docker` check. On Dataflow the workflow logs a warning.
 - **The default segmenter is `incremental`**, which the default image knows. A run on the v5.0.3 image must select full history only (`--segmenter full-history`); otherwise it is refused before any cloud call.
 
-`workflows/pipe_segment/identity_match_key.py` differs in one point:
+`workflows/pipe_segment/identity_match_key.py` follows the same rules per binding (since 2026-11-25; it auto-built a plain image and only warned before):
 
-- **It still auto-builds an image for an unreviewed binding** (`dit-<commit>`, plain source). That is how an experiment branch gets an image at all, and the workflow has one `--image-tag` for every binding, so it cannot take an overlay image per binding. Such an image ignores the variable. On DirectRunner that does not matter; on Dataflow as the test service account the job is expected to fail, and the workflow logs a warning. Per-binding overlay images are a follow-up.
+- **An unreviewed binding on the default image is refused** before anything is pinned, with the same two ways out: an overlay image of the commit as `--image-tag`, or `--runner DirectRunner --build-from-source`. The workflow has one `--image-tag` for every binding, so an overlay image fits a run whose unreviewed bindings share one commit. Per-binding images are a follow-up.
 
 When the AIS DAG's pipe-segment version moves:
 

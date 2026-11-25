@@ -85,13 +85,13 @@ Steps:
    a. ``git worktree add`` a temp dir at the ref.
    b. ``resolve_run_context(repo_dir=worktree, pipeline_name="pipe-segment",
       runner="docker", suffix=<per-binding>, worker_image=args.image_tag,
-      default_worker_image=DEFAULT_IMAGE_TAG, ...)``. The harness classifies
-      the ref as reviewed/unreviewed and stamps ``ctx.worker_image`` --
-      canonical published for reviewed code at the default tag; auto-built
-      ``gcr.io/world-fishing-827/dit/pipe-segment:dit-<commit>`` (kaniko) for
-      unreviewed code; an explicit ``--image-tag`` always wins.
+      default_worker_image=DEFAULT_IMAGE_TAG, check_images=...)``. The
+      harness classifies the ref as reviewed/unreviewed; ``check_images``
+      replaces the auto-build and refuses unreviewed code on the default
+      image (already checked for every binding before pinning, by
+      ``_preflight_images``). An explicit ``--image-tag`` always wins.
    c. Sanity check: log the worktree's ``gpsdio-segment`` pin (catches a
-      kaniko cache-hit silently reusing the wrong image -- a false
+      cached image silently reusing the wrong code -- a false
       "IDENTICAL" verdict is worse than a noisy diff).
    d. Run ``segment`` via ``dit_docker.run(image_tag=ctx.worker_image,
       args=[...], entrypoint="pipe-segment", volumes=["gcp:/root/.config"],
@@ -212,6 +212,7 @@ from dit import compare as dit_compare
 from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
+from dit.snapshot import is_unreviewed
 from dit.workflow import (
     DEFAULT_DATAFLOW_TEMP_BUCKET,
     EXPERIMENT_ID_RE,
@@ -267,24 +268,21 @@ OVERLAY_DIR = "docker/overlays/pipe-segment-temp-dataset"
 #: OVERLAY_DIR names it. The published image cannot be the default: upstream
 #: has no way to name the dataset Beam stages query results in, and DIT's
 #: service account may not create one.
-#: NOT BUILT YET (2026-11-20): the tag follows from the commit and the patch,
-#: and the image exists once ``build.sh <repo> v5.1.0 v5.1.0 --push`` has run.
-#: When the DAG's version moves: build the overlay image of the new tag, then
+#: Built and pushed on 2026-11-24 (digest sha256:f785658b...; see the table in
+#: OVERLAY_DIR's README). When the DAG's version moves: build the overlay image of the new tag, then
 #: bump both constants.
 DEFAULT_OVERLAY_IMAGE = (
     f"gcr.io/world-fishing-827/dit/pipe-segment:"
     f"{DEFAULT_PIPELINE_VERSION}-4ddde03-temp-dataset-04b40b54"
 )
 
-# This workflow's default image, for reviewed code. For unreviewed code
-# (snapshot / unmerged experiment branch), ``resolve_run_context`` ->
-# ``ensure_pipeline_image`` auto-builds a content-addressable
-# ``gcr.io/world-fishing-827/dit/pipe-segment:dit-<commit>`` via the M-pivot-4
-# kaniko machinery, and the docker runner pulls THAT. Such a build is plain
-# source without the overlay: fine on DirectRunner, expected to fail on
-# Dataflow as the test service account (``_run_binding`` warns).
-# ``--build-from-source`` short-circuits both paths (compose builds the
-# ``dev`` service from the worktree's working tree).
+# This workflow's default image, for reviewed code. An unreviewed binding
+# (a commit not merged into ``origin/main``) that would run on it is refused
+# before anything is pinned (``check_images``): nothing is auto-built, because
+# the shared auto-build is plain source without the overlay. The way out is
+# an overlay image of the commit as ``--image-tag``, or ``--runner
+# DirectRunner --build-from-source`` (compose builds the ``dev`` service from
+# the worktree).
 DEFAULT_IMAGE_TAG = DEFAULT_OVERLAY_IMAGE
 
 #: Container variable the overlay patch reads to pass ``temp_dataset`` to
@@ -534,15 +532,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help=f"Pipeline image to run pipe-segment in. Default: {DEFAULT_IMAGE_TAG} "
                         f"(DIT's temp-dataset overlay of pipe-segment "
                         f"{DEFAULT_PIPELINE_VERSION}, the version the AIS DAG is configured "
-                        f"for; see {OVERLAY_DIR}). For reviewed code at this default, the "
-                        f"docker runner pulls it directly. For unreviewed code (snapshot / "
-                        f"unmerged experiment branch), resolve_run_context auto-builds a "
-                        f"content-addressable gcr.io/world-fishing-827/dit/pipe-segment:dit-"
-                        f"<commit> via M-pivot-4 kaniko and uses THAT instead; that build has "
-                        f"no overlay, so on Dataflow as the test service account it is "
-                        f"expected to fail. An explicit "
-                        f"override is respected per binding (applied to every binding's "
-                        f"resolve_run_context call -- use for manual prebuilt images).")
+                        f"for; see {OVERLAY_DIR}). Reviewed bindings run it. A binding whose "
+                        f"ref is not merged into origin/main is refused on it before anything "
+                        f"is pinned: nothing is auto-built, since a plain build has no overlay. "
+                        f"Pass an overlay image of the commit (built with {OVERLAY_DIR}/"
+                        f"build.sh), or use --runner DirectRunner --build-from-source. An "
+                        f"explicit value applies to every binding.")
     p.add_argument("--bq-temp-dataset", default=DEFAULT_BQ_TEMP_DATASET,
                    help="Existing BigQuery dataset Beam stages query results in; env-var "
                         "fallback DIT_BQ_TEMP_DATASET (default ${PROJECT}.${DIT_DEST_DATASET}). "
@@ -551,9 +546,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "image without the overlay ignores it.")
     p.add_argument("--build-from-source", action="store_true",
                    help="Build pipe-segment from each worktree via `docker compose build dev` "
-                        "instead of pulling/building an image. Compose mounts the worktree's "
-                        "source tree, so worker code reflects each binding's ref. Bypasses both "
-                        "the canonical-image pull and the kaniko auto-build -- the natural "
+                        "instead of pulling an image. Compose mounts the worktree's "
+                        "source tree, so worker code reflects each binding's ref. Bypasses the "
+                        "default-image pull -- the natural "
                         "laptop inner-loop pattern. Note: --runner=dataflow + --build-from-source "
                         "is rarely what you want: workers still pull --sdk_container_image, the "
                         "published image. Only this combination passes --setup_file=./setup.py, "
@@ -720,6 +715,67 @@ def _verify_refs(pipeline_dir: str, bindings: list[tuple[str, str]]) -> None:
                 f"Fetch it first: `git -C {pipeline_dir} fetch origin {ref}`."
             )
         logger.info("binding %s: ref %s -> %s", name, ref, result.stdout.strip())
+
+
+def _runs_default_image(args: argparse.Namespace) -> bool:
+    """Whether this run executes the default image: ``--image-tag`` is at its
+    default and is executed, as the submitter unless ``--build-from-source``,
+    or as the workers' image on Dataflow (passed as ``--sdk_container_image``
+    with or without ``--build-from-source``)."""
+    return args.image_tag == DEFAULT_IMAGE_TAG and (
+        not args.build_from_source or args.runner == "dataflow"
+    )
+
+
+def check_images(
+    args: argparse.Namespace, binding_name: str, pipeline_commit: str, unreviewed: bool,
+) -> None:
+    """Refuse a binding whose unreviewed code would run on the default image.
+
+    The same guard as ``ais.py``'s and port visits' ``check_images``. The
+    default image holds pipe-segment ``DEFAULT_PIPELINE_VERSION`` with DIT's
+    temp-dataset overlay, not the binding's code. The shared harness would
+    replace it with a kaniko build of plain source, which has no overlay, so
+    Beam would try to create its own BigQuery staging dataset and the Dataflow
+    job would fail. So nothing is auto-built for this workflow:
+    ``resolve_run_context`` calls this in place of the auto-build, and
+    ``_preflight_images`` calls it for every binding before anything is
+    pinned. An explicit ``--image-tag`` is always respected.
+    """
+    if not (unreviewed and _runs_default_image(args)):
+        return
+    raise SystemExit(
+        f"error: binding {binding_name!r} is unreviewed (commit {pipeline_commit} is not "
+        f"merged into pipe-segment's origin/main), and the run would execute DIT's default "
+        f"image:\n"
+        f"  {DEFAULT_OVERLAY_IMAGE}\n"
+        f"That image holds pipe-segment {DEFAULT_PIPELINE_VERSION} with DIT's temp-dataset "
+        f"overlay, not this code. DIT does not auto-build an image for this workflow: a "
+        f"plain build has no overlay, and its Dataflow job would fail creating a BigQuery "
+        f"staging dataset. Choose one:\n"
+        f"  - build an overlay image of the commit and pass it as --image-tag:\n"
+        f"      {OVERLAY_DIR}/build.sh <pipe-segment dir> {pipeline_commit} <label> --push\n"
+        f"    (--image-tag applies to every binding, so this fits a run whose unreviewed "
+        f"bindings share one commit)\n"
+        f"  - check the code locally, without Dataflow: --runner DirectRunner "
+        f"--build-from-source (the docker runner builds each binding's worktree; no "
+        f"overlay there either: Beam creates its own staging dataset, with your "
+        f"credentials)"
+    )
+
+
+def _preflight_images(args: argparse.Namespace) -> None:
+    """Apply ``check_images`` to every binding before any cloud call. Reads each
+    ref's commit and its ancestry of ``origin/main`` (``git fetch`` included),
+    as ``resolve_run_context`` does later for the binding's worktree."""
+    if not _runs_default_image(args):
+        return
+    for name, ref in args.bindings:
+        commit = subprocess.run(
+            ["git", "-C", args.pipeline_dir, "rev-parse", "--verify", ref + "^{commit}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        check_images(args, name, commit, is_unreviewed(commit, args.pipeline_dir))
 
 
 def _read_gpsdio_pin_at_ref(pipeline_dir: str, ref: str) -> str:
@@ -1379,7 +1435,7 @@ def _run_binding(
         logger.info("[%s] gpsdio-segment pin -> %s", name, gpsdio_pin)
 
         # Resolve the per-binding image: canonical for reviewed code at the
-        # default tag, kaniko auto-build for unreviewed code, or the explicit
+        # default tag (unreviewed code refused there by check_images), or the explicit
         # --image-tag passthrough. Passing suffix=<per-binding> takes the
         # "manual / cross-version escape hatch" path in resolve_run_context
         # (record git state as-is, no auto-snapshot -- our worktrees ARE
@@ -1394,23 +1450,13 @@ def _run_binding(
             default_worker_image=DEFAULT_IMAGE_TAG,
             resolve_digest=False,  # no run cache for pipe-segment yet
             build_from_source=args.build_from_source,
+            check_images=functools.partial(check_images, args, name),
         )
         image_tag = ctx.worker_image
         logger.info("[%s] commit=%s%s image=%s",
                     name, ctx.pipeline_commit,
                     " (UNREVIEWED)" if ctx.unreviewed else "",
                     image_tag)
-
-        if image_tag != args.image_tag and args.runner == "dataflow":
-            # The harness replaced the image with a build of the binding's
-            # commit. That build is plain source: no temp-dataset overlay.
-            logger.warning(
-                "[%s] %s was auto-built from plain source, without DIT's temp-dataset "
-                "overlay. On Dataflow, Beam will try to create its own BigQuery staging "
-                "dataset as %s, which DIT's default service account may not. Build an "
-                "overlay image of the commit (%s/build.sh) and pass it as --image-tag.",
-                name, image_tag, args.service_account, OVERLAY_DIR,
-            )
 
         if args.dry_run:
             logger.info("[%s] --dry-run set; skipping pipe-segment invocations.", name)
@@ -1551,6 +1597,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # with identical gpsdio-segment pins (an IDENTICAL diff would otherwise
     # look like "the change has no effect" when in fact nothing was tested).
     _verify_distinct_gpsdio_pins(args.pipeline_dir, args.bindings)
+    # Refuse an unreviewed binding on the default image before anything is
+    # pinned (check_images).
+    _preflight_images(args)
     pinned = _pin(args)
 
     suffix_by_binding = {name: f"{args.experiment_id}_{name}" for name, _ in args.bindings}

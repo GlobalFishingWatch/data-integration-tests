@@ -853,6 +853,9 @@ def test_main_runs_each_variants_jobs_in_order_with_the_overlays_variables() -> 
             "GOOGLE_CLOUD_PROJECT": "world-fishing-827",
             "DIT_BQ_TEMP_DATASET": GE,
         }
+    # The compose project names the experiment and the variant.
+    assert [kwargs["project_name"] for _, _, kwargs in b.docker] == (
+        ["dit-pipe-segment-exp-2_bfd_inc"] * 4 + ["dit-pipe-segment-exp-3_bftruncate_inc"] * 4)
     # The run's tables carry the generated suffix and the run id reaches the labels.
     assert _one(b.docker[0][1], "--out_segments_table") == (
         f"{GE}.segments_exp_abc1234_f00d00_2_bfd_inc")
