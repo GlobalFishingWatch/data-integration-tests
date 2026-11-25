@@ -1,5 +1,9 @@
 # dit/workflows/pipe_gaps — workflow-author notes
 
+The user-facing page (versions, modes, commands, run history) is
+[`README.md`](README.md). This file holds the rules for changing the
+workflows.
+
 ## Reprocess-to-end contract (load-bearing)
 
 `pipe-gaps detect` is NOT designed for arbitrary mid-range backfills. Any
@@ -8,9 +12,17 @@ from `start_date` to `+∞`; sub-range backfills leak (rows past your
 chosen `end_date` get deleted but never re-emitted until the next full
 reprocess). The implementation lives in
 `pipe-gaps/src/pipe_gaps/assets/queries/gaps_delete.sql.j2` — the
-pre-write delete is unbounded on the right (`WHERE end_timestamp >=
-start_date OR start_timestamp >= start_date`), which is the mechanism
-by which a reprocess takes ownership of the tail.
+pre-write delete is unbounded on the right, which is the mechanism
+by which a reprocess takes ownership of the tail:
+
+```sql
+DELETE FROM `<gaps table>`
+WHERE (is_closed = TRUE  AND DATE(end_timestamp)   >= '<start_date>')
+   OR (is_closed = FALSE AND DATE(start_timestamp) >= '<start_date>');
+```
+
+The query is the same at v0.10.0 (DIT's default worker image) and at
+v0.17.1 (production's AIS v5 DAG), read with `git show` on 2026-11-25.
 
 **This is by design.** Workflows here MUST respect it.
 
