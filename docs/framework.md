@@ -306,10 +306,12 @@ Every run records a committed git ref of the pipeline (`dit.snapshot.resolve_pip
 |---|---|
 | Clean | `HEAD` |
 | Dirty, runner is Dataflow | A snapshot commit, created and pushed automatically |
-| Dirty, runner is docker | `HEAD`, marked unreviewed. The container runs the working tree; there are no remote workers. |
+| Dirty, runner is docker | `HEAD`, marked unreviewed. No snapshot is made. See the note below. |
 | `DIT_PIPELINE_COMMIT` is set (cloud path) | That value. The laptop resolved it before submitting. |
 
 "Dirty" means changes to tracked files only (`dit.git_info.git_info`).
+
+**A dirty tree with the docker runner.** The uncommitted changes run only with `--build-from-source`, where `docker compose` builds the container from the working tree. Without that flag the container comes from an image, and the image rules below apply: an automatic build exports the recorded commit (`git archive`), which is `HEAD` here, so the uncommitted changes are not in it. Commit first, or pass `--build-from-source`.
 
 ### Snapshots of a dirty tree
 
