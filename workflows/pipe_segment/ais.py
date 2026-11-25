@@ -7,7 +7,11 @@ a day's fragments continue, and each segment's running counts), so "one job
 over the window equals one job per day" is the comparison most likely to find
 something.
 
-Nothing here is verified by a run yet. What the docstrings say about
+Run in Cloud Build on the overlay images, 2026-11-24/25, all IDENTICAL: the
+default run (2e57a93b), the PR #227 test with the v5.0.3 base (4bb84ec0),
+short jobs on DirectRunner (967b1030) and ten days of production input
+(56af531e, compared again as de4e5831). Results:
+``workflows/pipe_segment/README.md``. What the docstrings say about
 pipe-segment was read from its code at v5.0.3 (f4d39fe) and v5.1.0 (4ddde03),
 with file and line; what is inferred is labelled.
 

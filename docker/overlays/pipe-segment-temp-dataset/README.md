@@ -2,7 +2,7 @@
 
 Test-only patches that let DIT run pipe-segment on Dataflow as `automated-testing@`. They are not proposed upstream, like the pipe-anchorages overlay next to this one (decision 2026-10-22, PIPELINE-4699).
 
-**Status, 2026-11-24: both images are built and pushed** (table below), each self-checked inside the image when built. Dataflow jobs of `workflows/pipe_segment/ais.py` have run on them as the test service account (Cloud Build runs `2e57a93b`, `4bb84ec0` and `56af531e`, 2026-11-24/25; results in `workflows/pipe_segment/RUN_INSTRUCTIONS.md`).
+**Status, 2026-11-24: both images are built and pushed** (table below), each self-checked inside the image when built. Dataflow jobs of `workflows/pipe_segment/ais.py` have run on them as the test service account (Cloud Build runs `2e57a93b`, `4bb84ec0` and `56af531e`, 2026-11-24/25; results in the [run history](../../../workflows/pipe_segment/README.md#run-history)). `workflows/pipe_segment/identity_match_key.py` has not run on them yet.
 
 **Which version is the default.** Both pipe-segment workflows default to the overlay of **v5.1.0**, the version the AIS v3 DAG's segment group is configured for since 2026-11-20 (composer-dags-production PR #3145). The v5.0.3 patch stays: the VMS v5 DAG still pins v5.0.3, and an overlay image of it is what a DIT run of that version needs.
 
@@ -44,7 +44,7 @@ Both patches:
 Unset, the image behaves exactly like the commit it was built from. The argument is set when the pipeline is constructed and pickled into the source, which the workers split, so the overlay image must be **both** the submitter and the worker. Both workflows set the variable on every step, through the docker runner's `container_env`, from `--bq-temp-dataset`:
 
 - `workflows/pipe_segment/ais.py` takes the two images as `--image-tag` and `--worker-image`;
-- `workflows/pipe_segment/identity_match_key.py` takes one `--image-tag` and passes it as the workers' image too.
+- `workflows/pipe_segment/identity_match_key.py` takes `--image-tag` for every binding, or `--binding-image NAME=IMAGE` for one, and passes it as that binding's worker image too.
 
 ## Build
 
@@ -87,17 +87,7 @@ Checked on 2026-11-20 without building an image: both patched trees pass the sta
 
 Both pipe-segment workflows default to the row marked **default** above (`DEFAULT_OVERLAY_IMAGE` in `workflows/pipe_segment/identity_match_key.py`, shared with `ais.py`). The published image cannot be the default, because it has no staging-dataset option.
 
-`workflows/pipe_segment/ais.py` follows the rules of the port-visits overlay:
-
-- **A reviewed checkout runs v5.1.0.** With a clean checkout of a commit merged into pipe-segment `origin/main` and no image flags, the run executes the default image, whatever that commit is.
-- **Unreviewed code needs its own overlay image.** For a dirty tree, a DIT snapshot or a commit not merged into `origin/main`, a run that would execute the default image refuses to start, before any cloud call. Build an overlay image of the commit with `build.sh` and pass it as both `--image-tag` and `--worker-image`.
-- **DIT never auto-builds an image for this workflow.** The shared auto-build (`dit.worker_image`) builds plain source, without the overlay.
-- **`--build-from-source` has no overlay either.** It runs `docker compose` on the working tree. That is fine for a local `--runner docker` check. On Dataflow the workflow logs a warning.
-- **The default segmenter is `incremental`**, which the default image knows. A run on the v5.0.3 image must select full history only (`--segmenter full-history`); otherwise it is refused before any cloud call.
-
-`workflows/pipe_segment/identity_match_key.py` follows the same rules per binding (since 2026-11-25; it auto-built a plain image and only warned before):
-
-- **An unreviewed binding on the default image is refused** before anything is pinned, with the same two ways out: an overlay image of the commit for that binding (`--binding-image NAME=IMAGE`, or `--image-tag` for every binding), or `--runner DirectRunner --build-from-source`.
+Both workflows apply the same image rules, as for the port-visits overlay: reviewed code runs the default image; unreviewed code on it is refused before any cloud call; DIT never auto-builds an image (the shared auto-build, `dit.worker_image`, builds plain source without the overlay); `--build-from-source` has no overlay either. An incremental run needs an image tagged v5.1.0 or later, so a run on the v5.0.3 image must select full history only. Details: [`workflows/pipe_segment/README.md`](../../../workflows/pipe_segment/README.md#dits-default-image), and `RUN_INSTRUCTIONS.md` there (A3 for `ais.py`, B3 for `identity_match_key.py`).
 
 When the AIS DAG's pipe-segment version moves:
 
