@@ -19,7 +19,7 @@ Both date bounds are **inclusive** in v4.4.0: both queries filter with `BETWEEN`
 
 | | version | commands | source |
 |---|---|---|---|
-| Production, AIS v5 DAG (`core.ais.v5`) | **v5.0.0** | `partial-encounters`, `encounters` | drift check at composer `origin/main` 85700ebc3, 2026-11-25 |
+| Production, AIS v5 DAG (`core.ais.v5`) | **v5.0.0** | `partial-encounters`, `encounters` | drift check at composer `origin/main` 85700ebc3, run locally on 2026-11-25 (reads the checkout with `git show` only) |
 | Production, VMS v5 daily DAG | **v5.0.0** | same | same |
 | AIS v3 DAG configuration | v4.4.0 | `create_raw_encounters`, `merge_encounters` | `Versions.DETECT_ENCOUNTERS` in composer's `dags/core/ais/v3.py`, same commit |
 | **DIT** | **v4.4.0** CLI | `create_raw_encounters`, `merge_encounters` | `ais.DEFAULT_WORKER_IMAGE` |
@@ -37,7 +37,7 @@ sha256:5edc1f29b0197cacfd71eeb9ef87bf39a70d3b38b64f4ced4796be4c919ce964
 
 Built on 2026-07-30 `FROM` the published v4.4.0, with five patched files copied over the installed package so that both steps pass a named staging dataset to Beam. Same Beam (2.71.0) and entrypoint, so one image serves as submitter and worker. Without it, a Dataflow job whose workers run as `automated-testing@` fails creating `beam_temp_dataset_*`.
 
-**The build recipe is not in this repository.** It was built from a scratch directory, and the patch was never committed here (the same change sits on an unpushed local branch of `encounters_pipeline`, against v4.3.2). The image can be pulled, not rebuilt from DIT. Unlike pipe-anchorages, there is no `docker/overlays/` directory for encounters.
+**The build recipe is not in this repository.** It was built from a scratch directory, and the patch was never committed here (the same change sits on a local branch of `encounters_pipeline`, against v4.3.2). The image can be pulled, not rebuilt from DIT. Unlike pipe-anchorages, there is no `docker/overlays/` directory for encounters.
 
 ## Workflows
 
@@ -129,7 +129,7 @@ dit run "$DIT/workflows/encounters/ais.py" --runner docker \
 Always pass the image explicitly, as both flags:
 
 - The submitter (`--image-tag`) must accept `--temp_dataset` too, so the overlay is needed there, not only on the workers.
-- An explicit image also switches off the shared auto-build. With the default image and an unreviewed checkout (dirty, a snapshot, or not merged into `origin/main`), DIT would build a plain image of the checkout for the workers only. That image has no overlay, and a current checkout holds v5.0.0 code, which does not accept the v4.4.0 command lines DIT emits.
+- An explicit image also switches off the shared auto-build. With the default image and an unreviewed checkout (dirty, a snapshot, or not merged into `origin/main`), DIT would build a plain image of the checkout for the workers only. That image has no overlay, and a current checkout holds v5.0.0 code, which does not accept the v4.4.0 command lines DIT emits. (Read from code, not run: no encounters run has taken the auto-build path.)
 
 `--build-from-source` uses the compose service `pipe_encounters`, which exists in `encounters_pipeline` only up to v4.3.2. Against a checkout of v4.4.0 or later it fails, and even on v4.3.2 it tests older code than v4.4.0 (Python 3.8, package `pipeline`).
 
@@ -184,7 +184,8 @@ Until then, use these workflows only for questions about v4.4.0 behaviour, or as
 
 - One generation behind production (above).
 - The overlay image cannot be rebuilt from this repository.
-- No run cache, no cross-version wrapper, no parallel-slices mode.
+- No run cache, no cross-version wrapper, no parallel-slices mode. `orchestration.py` declares raw encounters as allowed to load slices in parallel, on the owner's claim (2026-11-24), not verified.
+- Cleanup is partial: every job carries the `dit_run_id` label, so `make dit-cancel RUN_ID=<id>` cancels a run's Dataflow jobs, but without a run cache no `dit_runs` row records the output tables, so they are left for dropping by hand.
 - The AIS cohort is too sparse for the merged comparison; a denser cohort would be needed (the `dit.cohorts` proposal).
 - VMS read access for `automated-testing@` is not verified.
 - Upstream items found during onboarding (labels without a `None` guard, a pre-write delete that is not awaited) were found in v4.4.0 and not checked against v5.0.0.

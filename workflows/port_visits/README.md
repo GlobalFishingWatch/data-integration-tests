@@ -19,14 +19,14 @@ Port visits is the generation half of the port-visit events. The product step (`
 
 | | version | CLI | source |
 |---|---|---|---|
-| Production, AIS v5 DAG (`core.ais.v5`) | pipe-anchorages **v5.0.1** since 2026-11-04 (v5.0.0 from 2026-10-26) | `port-state-transitions` / `port-visits` | drift check at composer `origin/main` 85700ebc3, 2026-11-25 |
+| Production, AIS v5 DAG (`core.ais.v5`) | pipe-anchorages **v5.0.1** since 2026-11-04 (v5.0.0 from 2026-10-26) | `port-state-transitions` / `port-visits` | drift check at composer `origin/main` 85700ebc3, run locally on 2026-11-25 (reads the checkout with `git show` only) |
 | Production, VMS v5 DAGs | v5.0.1 | same | [`docs/composer-snapshots-2026-10.md`](../../docs/composer-snapshots-2026-10.md) § 6, read 2026-11-19 |
 | Production, AIS v3 and VMS v3 DAGs | v4.6.4 | old v4 CLI (`thin_port_messages` / `port_visits`) | same, read 2026-11-19 |
 | **DIT default** | **v5.0.1**, as DIT's temp-dataset overlay image | v5 CLI only | `ais.DEFAULT_PIPELINE_VERSION`, `ais.DEFAULT_OVERLAY_IMAGE` |
 
 DIT dropped the v4 CLI and the `--pipeline-cli` switch on 2026-11-19. Passing `--pipeline-cli` now fails with the reason.
 
-The drift check (`composer_drift.py`, run by `workflows/composer_drift.py`) reports port visits **in sync** with the AIS v5 DAG: version, commands and flags of both steps, and all twelve fields of the production-baseline target. Three differences are accepted with reasons in the spec: step 1's messages table (DIT reads its staging cohort by design), `--no-rich-logging` and `--wait_for_job`.
+The drift check (`composer_drift.py`, run by `workflows/composer_drift.py`) reports port visits **in sync** with the AIS v5 DAG (run locally on 2026-11-25 against composer `origin/main` 85700ebc3, `git show` only): version, commands and flags of both steps, and all twelve fields of the production-baseline target. Three differences are accepted with reasons in the spec: step 1's messages table (DIT reads its staging cohort by design), `--no-rich-logging` and `--wait_for_job`.
 
 ### The default image
 
@@ -89,12 +89,22 @@ Output tables go to `--dest-dataset` (default `tech_great_expectations`, env `DI
 
 ### `6_parallel`
 
+*This section is the canonical description of `6_parallel` and of the parallel-slices test. Other pages, the repository README included, link here.*
+
+Some steps may load several date slices at once; others carry state from one run to the next and must run in order. DIT declares which is which per step in `workflows/<pkg>/orchestration.py` (`dit.orchestration`): parallel slices allowed, forbidden or unknown, whether a run depends on the previous one, and the evidence (`verified` with a Cloud Build id, `claimed` with its source, `untested`). The declarations were seeded on 2026-11-24 from the owner's statements, all `claimed` and none verified: `raw_port_events` (port visits step 1) and raw encounters allowed; the segmenter, incremental fishing events and (probably) gaps forbidden. How they map to Airflow (`depends_on_past`, `max_active_runs`): [`docs/plan.md`](../../docs/plan.md) § "Orchestration capabilities". `6_parallel` is the test of such a declaration.
+
+Slices are an expression (`dit.slices`): `--slices day|week|month|<N>d`, or a JSON list of `[first, last]` date pairs, inclusive. The default is `month`, so on the staging year the mode submits the 12 months of 2020 as 12 concurrent jobs into one table. The daily tails of the other modes, here and in the segmenter, use the same generators. `--max-concurrent-slices` caps how many run at once (default: no cap).
+
 Each slice is its own Dataflow job with its own job name and `dit_slice_start` / `dit_slice_end` labels. All are submitted before any is awaited. A failed slice does not stop the others.
 
 The outcome is judged against `thin_port_messages`' declaration in `orchestration.py`, which today says parallel loading is **allowed**, as claimed by the owner on 2026-11-24 (status `claimed`, not `verified`). So:
 
 - slices succeed and the table equals `1_bf`'s: pass (exit 0);
 - the tables differ, or a slice failed: fail.
+
+A step declared forbidden would be run too, as a negative test: a difference is then reported "as declared", and no difference as "the declaration may be too strict". No port-visits step is declared forbidden today.
+
+`--dry-run` prints every job and the worker bound (slices in flight times `--max-num-workers`), and creates nothing.
 
 Refused before any cloud call:
 
@@ -163,7 +173,16 @@ dit run "$DIT/workflows/port_visits/ais.py" --image-tag <image> --worker-image <
 dit run "$DIT/workflows/port_visits/ais.py" --runner docker --build-from-source --modes 1_bf --start 2020-01-01 --end 2020-01-07
 ```
 
-In Cloud Build: `make dit-cloud PIPELINE=anchorages_pipeline WORKFLOW=workflows/port_visits/ais.py ARGS="..."`. The Makefile sets the Beam pin (2.76.0) for this pipeline.
+In Cloud Build, `make dit-cloud` from this repository's checkout. The Makefile sets the Beam pin (2.76.0) for this pipeline. The 2026-11-19 staging smoke (build `5f87695c`, run history below) as a pasteable command, with `PROJECTS` pointing at a directory holding a fresh, clean clone of `anchorages_pipeline` (so no untracked local files are uploaded) and `REF=v5.0.1`, a reviewed tag that therefore runs the default v5.0.1 overlay image:
+
+```bash
+CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT= make dit-cloud \
+    PROJECTS=/path/to/clean-clones PIPELINE=anchorages_pipeline REF=v5.0.1 \
+    WORKFLOW=workflows/port_visits/ais.py \
+    ARGS="--parallel --experiment-id pv-v501-smoke --worker-machine-type e2-standard-2 --disk-size-gb 25"
+```
+
+Run it as your own account (the empty `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=`), and check `gcloud builds list` afterwards: a hung submission has been retried into a duplicate build before.
 
 ### Reading the result
 
@@ -208,7 +227,7 @@ Bindings run in parallel (`--sequential-bindings` opts out); their log lines are
 What is specific to port visits:
 
 - The run shape is fixed to production's: `--steps port_visits`, `--modes 1_bf`, `--start 2012-01-01`, `--end D`. Other values are refused, because open visits take their end and confidence from the end date.
-- The target (`ProductionTarget` in `cross_version_ais.py`) is hand-written from composer and checked field by field by the drift check (12 fields, all matching on 2026-11-25).
+- The target (`ProductionTarget` in `cross_version_ais.py`) is hand-written from composer and checked field by field by the drift check (12 fields, all matching in the local drift check of 2026-11-25 at composer `origin/main` 85700ebc3).
 - Since v5.0.1, production's port-visits table requires a partition filter on `end_timestamp`. The pins and table-check handle it. Hand-written SQL on a v5.0.1 output, DIT's included, needs `WHERE (end_timestamp IS NULL OR end_timestamp IS NOT NULL)` to read every row.
 - Production's job for D runs about three days after D. `segment_info`'s 48-hour time travel sets the deadline. The run refuses to start if the pins would expire within `--production-margin-hours` (default 6).
 - A full-history candidate run reads about 1.3 TB through the views, so it needs `--pin-max-gb 1300` and, to match production's speed, `--max-num-workers 100`. Both need the owner's go-ahead.
@@ -226,11 +245,11 @@ Evidence recorded in this repository. Builds are Cloud Build ids; "run" is DIT's
 | 2026-10 | staging cross-version, main b36aed6 vs PR 14b4be8 | build `1f7447b4` | step 1 identical; visits differ in 2 of 10,292 rows (same-second ties, intended by #176) |
 | 2026-10 | September 2026, main vs PR | build `2a984881` | DIFFERENT, consistent with #176 |
 | 2026-10 | Q3 2026, v4.6.4 vs PR | builds `0c6a46a6`, `77c967ef` | DIFFERENT, consistent with #176 |
-| 2026-10-23 | September 2026 three-way, v4.6.4 on the same pins | build `ec8b6dae` | main alone changes about 1,100 visits; the PR about 4,000 |
+| 2026-10-23 | September 2026 three-way, v4.6.4 on the same pins | build `ec8b6dae` | v4.6.4 vs main changes about 1,100 visits (mostly zero-duration ones), v4.6.4 vs the PR about 4,000. Rows with a duplicate `visit_id`: 2,302 for v4.6.4, 2,658 for main, 0 for the PR |
 | 2026-10-23 | determinism, September, PR twice with `--no-cache` | build `8a1348d1` | three runs IDENTICAL (3,869,516 rows) |
 | 2026-10-23 | production baseline dry run as `automated-testing@` | build `947240a8` | job found, all four time-travel reads dry-run |
-| 2026-10-23 | production baseline, PR #176 vs production's 2026-10-20 output, full history | build `7781dd48` | DIFFERENT, consistent with #176 (detail in the baseline doc) |
-| 2026-11-19 | staging smoke on today's default image (`v5.0.1-767770f-temp-dataset-905dc761`), three modes, both steps, experiment `pv-v501-smoke`, e2-standard-2 / 25 GB | build `5f87695c` | 18 Dataflow jobs done; 10,596 visits per mode; all three pairs IDENTICAL. Also showed private worker IPs and `automated-testing@` reading the v20260302 named-anchorages table |
+| 2026-10-23 | production baseline, PR #176 vs production's 2026-10-20 output, full history | build `7781dd48` | DIFFERENT, consistent with #176. Production 412,190,532 rows (2,801 with a duplicate `visit_id`), the PR 412,181,996, all unique; 9,789 rows only in production (6,849 of them zero-duration), 1,361 only in the PR; 2,715 shared visits changed, 2,342 of them longer. Dataflow took 99 minutes at 100 × e2-standard-2. Breakdown in the baseline doc |
+| 2026-11-19 | staging smoke on today's default image (`v5.0.1-767770f-temp-dataset-905dc761`), three modes, both steps, experiment `pv-v501-smoke`, e2-standard-2 / 25 GB passed explicitly (`--worker-machine-type`, `--disk-size-gb`) for this staging run, smaller than the production-mirrored default of e2-highmem-4 / 50 GB | build `5f87695c` | 18 Dataflow jobs done; 10,596 visits per mode; all three pairs IDENTICAL. Also showed private worker IPs and `automated-testing@` reading the v20260302 named-anchorages table |
 
 The October runs predate v5.0.1 and used the October overlay images; the 2026-11-19 smoke is the one run on today's default image.
 
@@ -243,6 +262,7 @@ The October runs predate v5.0.1 and used the October overlay images; the 2026-11
 
 - A default run compares step 2's output only; step 1's incremental table is compared only with `--steps thin_port_messages`.
 - `(identifier, timestamp)` as step 1's key is unique in practice, not by construction.
+- Recorded open on 2026-10-23: table-check had no multiset comparison, so duplicate `visit_id`s in a baseline showed up as duplicate-key warnings rather than counted differences. Not rechecked against table-check v0.3.1, which fixed a pairing bug with duplicated keys.
 - `thin_port_messages` is declared parallel-safe on the owner's claim; `port_visits` is `unknown` and not testable in slices.
 - The drift check runs only when someone runs it.
 - Production targets are hand-written; the core AIS v3 target is not built.
