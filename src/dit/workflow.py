@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from dit.cache import (
+    STATUS_FAILED,
     STATUS_SUCCEEDED,
     CachedRun,
     CacheKey,
@@ -905,6 +906,7 @@ def run_with_cache(
     extra_output_tables: Sequence[str] = (),
     log_label: str = "",
     use_cache: bool = True,
+    record_failures: tuple[type[BaseException], ...] = (),
 ) -> str:
     """Wrap an ``execute_*`` call with cache lookup + record-on-miss.
 
@@ -939,6 +941,13 @@ def run_with_cache(
     recomputes; the row is still written, so cleanup and provenance see the
     run, and as the newest row for its key it is what later lookups return.
 
+    ``record_failures`` (default none): exception types after which the row
+    is still written, with ``status='failed'``, before the exception is
+    re-raised. For an execution that can fail after writing part of its
+    tables (port visits' parallel slices): ``cancel_run`` finds the row by
+    run id and drops them. ``read_cache`` returns succeeded rows only, so a
+    failed row is never a hit. Any other exception writes no row, as before.
+
     The caller builds the :class:`CacheKey` (using its own
     ``canonical_params_dict`` + workflow-file sha1) and passes it in, so this
     wrapper has no dependency on a workflow-specific argparse namespace.
@@ -970,10 +979,6 @@ def run_with_cache(
             label, key_short, reason,
         )
 
-    started_at = datetime.now(timezone.utc)
-    execute_fn(**execute_kwargs)
-    finished_at = datetime.now(timezone.utc)
-
     # Comparison FQN first (output_tables[0] is what a future hit returns),
     # then any extra artefacts (deduped, order-preserving) so cleanup can drop
     # every table this run produced -- not just the comparison target.
@@ -981,7 +986,47 @@ def run_with_cache(
     for fqn in extra_output_tables:
         if fqn not in output_tables:
             output_tables.append(fqn)
-    row = CachedRun(
+
+    def record(status: str, started_at: datetime) -> None:
+        write_cache(_cached_run(
+            ctx=ctx, computed_key=computed_key, workflow=workflow, pipeline=pipeline,
+            experiment_id=experiment_id, cache_key=cache_key, output_tables=output_tables,
+            started_at=started_at, status=status,
+        ))
+
+    started_at = datetime.now(timezone.utc)
+    try:
+        execute_fn(**execute_kwargs)
+    except record_failures:
+        # The run may have written part of its tables. A failed row is never
+        # a cache hit (read_cache takes succeeded rows only), but cancel_run
+        # finds it by run id, so `make dit-cancel` can drop those tables.
+        record(STATUS_FAILED, started_at)
+        logger.info("cache FAILED %skey=%s -> wrote run %s (status=%s)",
+                    label, key_short, ctx.run_id, STATUS_FAILED)
+        raise
+    record(STATUS_SUCCEEDED, started_at)
+    logger.info(
+        "cache MISS %skey=%s -> wrote run %s",
+        label, key_short, ctx.run_id,
+    )
+    return output_fqn
+
+
+def _cached_run(
+    *,
+    ctx: RunContext,
+    computed_key: str,
+    workflow: str,
+    pipeline: str,
+    experiment_id: str,
+    cache_key: CacheKey,
+    output_tables: list[str],
+    started_at: datetime,
+    status: str,
+) -> CachedRun:
+    """The ``dit_runs`` row of one finished execution (``run_with_cache``)."""
+    return CachedRun(
         run_id=ctx.run_id,
         cache_key=computed_key,
         workflow=workflow,
@@ -1003,13 +1048,7 @@ def run_with_cache(
         dataflow_job_ids=[],
         cloud_build_id=os.environ.get("BUILD_ID"),
         started_at=started_at,
-        finished_at=finished_at,
-        status=STATUS_SUCCEEDED,
+        finished_at=datetime.now(timezone.utc),
+        status=status,
         expires_at=expires_at_for(output_tables),
     )
-    write_cache(row)
-    logger.info(
-        "cache MISS %skey=%s -> wrote run %s",
-        label, key_short, ctx.run_id,
-    )
-    return output_fqn

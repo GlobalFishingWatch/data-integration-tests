@@ -56,9 +56,44 @@ def test_default_slices_are_the_12_months_of_the_default_window() -> None:
 
 
 def test_day_slices_over_january() -> None:
+    # 31 slices at once x 4 workers = 124, above the bound: allowed explicitly.
     args = mod.parse_args([*_PARALLEL, "--slices", "day", "--start", "2020-01-01",
-                           "--end", "2020-01-31"])
+                           "--end", "2020-01-31", "--allow-many-workers"])
     assert len(args.parallel_slices) == 31
+
+
+# --- the bound on workers across concurrent slices -------------------------------
+
+_JANUARY_BY_DAY = [*_PARALLEL, "--slices", "day", "--start", "2020-01-01", "--end", "2020-01-31"]
+
+
+def test_more_than_100_workers_across_slices_is_refused_at_parse_time() -> None:
+    with pytest.raises(SystemExit) as exc:
+        mod.parse_args(_JANUARY_BY_DAY)  # 31 x 4 = 124
+    message = str(exc.value)
+    assert "31 slice(s) in flight x --max-num-workers 4 = up to 124" in message
+    assert "shares its regional Dataflow quota with production" in message
+    assert "--allow-many-workers" in message
+
+
+@pytest.mark.parametrize("extra", [
+    ("--max-concurrent-slices", "25"),        # 25 x 4 = 100: at the bound
+    ("--max-num-workers", "3"),               # 31 x 3 = 93
+    ("--allow-many-workers",),                # 124, allowed
+])
+def test_the_worker_bound_allows(extra: tuple[str, ...]) -> None:
+    assert len(mod.parse_args([*_JANUARY_BY_DAY, *extra]).parallel_slices) == 31
+
+
+def test_allow_many_workers_without_the_mode_is_refused() -> None:
+    with pytest.raises(SystemExit, match="--allow-many-workers needs 6_parallel"):
+        mod.parse_args(["--allow-many-workers"])
+
+
+def test_the_plan_states_the_worker_bound() -> None:
+    lines = mod.describe_plan(_args(*_PARALLEL, "--max-concurrent-slices", "5"))
+    assert ("workers: 5 slice(s) in flight x --max-num-workers 4 = up to 20 at once "
+            "(refused above 100 without --allow-many-workers)") in lines
 
 
 def test_step_2_is_refused_with_the_reason() -> None:
@@ -218,6 +253,43 @@ def test_cache_key_holds_the_slices_and_the_mode_never_reads_the_cache() -> None
         read.assert_called_once()
 
 
+def test_a_failed_parallel_run_still_writes_its_row_for_cleanup() -> None:
+    """The table may hold the slices that succeeded: the row, status failed,
+    lets ``make dit-cancel`` find and drop it. The failure is re-raised."""
+    args = _args(*_PARALLEL)
+
+    def fail(**kwargs):
+        raise mod.ParallelSlicesFailed(["slice 1/12: boom"], 12)
+
+    with (
+        patch.object(dit_workflow, "read_cache"),
+        patch.object(dit_workflow, "write_cache") as write,
+        patch.object(dit_workflow, "expires_at_for"),
+        pytest.raises(mod.ParallelSlicesFailed),
+    ):
+        mod._run_with_cache(args, mod.MODE_PARALLEL, _SUFFIX, fail)
+
+    (row,) = [call.args[0] for call in write.call_args_list]
+    assert row.status == dit_workflow.STATUS_FAILED
+    assert row.run_id == "rid01"
+    assert row.output_tables == [mod._output_table(args, _SUFFIX, mod.MODE_PARALLEL)]
+
+
+def test_a_failure_of_a_sequential_mode_writes_no_row() -> None:
+    args = _args(*_PARALLEL)
+
+    def fail(**kwargs):
+        raise RuntimeError("slice failed")
+
+    with (
+        patch.object(dit_workflow, "read_cache", return_value=None),
+        patch.object(dit_workflow, "write_cache") as write,
+        pytest.raises(RuntimeError),
+    ):
+        mod._run_with_cache(args, mod.MODE_BF, _SUFFIX, fail)
+    write.assert_not_called()
+
+
 # --- main: judgement against the declaration -------------------------------------------
 
 def _main(*cli: str, compare_rc: int = 0, fail_slice: bool = False, declaration=None):
@@ -273,6 +345,15 @@ def test_forbidden_and_different_is_as_declared(caplog) -> None:
     caplog.set_level("INFO")
     assert _main(compare_rc=1, declaration=_forbidden())[0] == 0
     assert "as declared" in caplog.text
+
+
+def test_forbidden_and_failed_is_as_declared_but_logged_as_a_warning(caplog) -> None:
+    caplog.set_level("INFO")
+    assert _main(fail_slice=True, declaration=_forbidden())[0] == 0
+    (record,) = [r for r in caplog.records if "quota or permissions" in r.getMessage()
+                 and "6_parallel:" in r.getMessage()]
+    assert record.levelname == "WARNING"
+    assert "as declared" in record.getMessage()
 
 
 def test_forbidden_and_identical_warns_the_declaration_may_be_too_strict(caplog) -> None:

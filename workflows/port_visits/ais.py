@@ -29,8 +29,13 @@ end):
   Step 2 is refused: it writes its whole table with WRITE_TRUNCATE
   (pipe-anchorages v5.0.1 ``pipelines/port_visits/main.py``), so slices would
   replace each other's output. The mode never reads the run cache (a hit
-  would report an older run's concurrency as this one's); its row is still
-  written for cleanup.
+  would report an older run's concurrency as this one's); its ``dit_runs``
+  row is still written, for cleanup: with ``status='succeeded'`` when every
+  slice succeeded, and with ``status='failed'`` when a slice failed
+  (``ParallelSlicesFailed``), so ``make dit-cancel RUN_ID=<run id>`` drops a
+  partly filled table too. The parallel jobs together may use ``slices in
+  flight x --max-num-workers`` workers; above 100 the run is refused unless
+  ``--allow-many-workers`` (:func:`check_total_workers`).
 
 There is no ``_4_mutate_recover`` mode here -- that was pipe-gaps' Bug A
 trigger and doesn't apply to port-visits. The numbers 4 and 5 are taken by
@@ -671,10 +676,13 @@ def validate_parallel(
     steps: Sequence[str],
     slices: Optional[str],
     max_concurrent_slices: Optional[int],
-    start: date,
-    end: date,
+    window: Optional[tuple[date, date]],
 ) -> tuple[dit_slices.Slice, ...]:
     """The slices of ``6_parallel``, or ``()`` when it is not selected. Pure.
+
+    ``window`` is the inclusive ``(start, end)`` of the run; ``None`` when the
+    mode is not selected, since the dates are then not needed (``ValueError``
+    if the mode is selected without them: a caller's error).
 
     ``SystemExit`` when the selection cannot test anything: step 2 selected,
     no ``1_bf`` to compare with, a spec that does not cover the window exactly
@@ -695,6 +703,9 @@ def validate_parallel(
             f"{MODE_PARALLEL} is compared with {MODE_BF} (one job over the window): add "
             f"{MODE_BF} to --modes"
         )
+    if window is None:
+        raise ValueError(f"{MODE_PARALLEL} is selected but no window was given")
+    start, end = window
     if end < start:
         raise SystemExit(f"--end {end} is before --start {start}")
     try:
@@ -708,6 +719,47 @@ def validate_parallel(
             f"{MODE_BF}, so nothing would be tested. Choose a spec with at least two slices."
         )
     return planned
+
+
+#: Most Dataflow workers the parallel slices may ask for together without
+#: ``--allow-many-workers`` (owner-proposed threshold, 2026-11-25; adjustable).
+#: ``world-fishing-827`` shares its regional Dataflow quota with production.
+PARALLEL_MAX_TOTAL_WORKERS = 100
+
+
+def slices_in_flight(slices: Sequence[dit_slices.Slice], max_concurrent: Optional[int]) -> int:
+    """How many slices of ``6_parallel`` run at a time. Pure."""
+    return min(len(slices), max_concurrent or len(slices))
+
+
+def describe_parallel_workers(in_flight: int, max_num_workers: int) -> str:
+    """The parallel slices' worker bound, as one line for the plan. Pure."""
+    total = in_flight * max_num_workers
+    return (
+        f"workers: {in_flight} slice(s) in flight x --max-num-workers {max_num_workers} = "
+        f"up to {total} at once (refused above {PARALLEL_MAX_TOTAL_WORKERS} without "
+        f"--allow-many-workers)"
+    )
+
+
+def check_total_workers(*, in_flight: int, max_num_workers: int, allow: bool) -> None:
+    """Refuse a ``6_parallel`` run whose slices together may ask for more than
+    ``PARALLEL_MAX_TOTAL_WORKERS`` Dataflow workers, unless ``allow``. Pure.
+
+    Each slice is its own job with ``--max-num-workers``, so the bound is
+    their product. Other modes run with ``--parallel`` add one job each on top.
+    """
+    total = in_flight * max_num_workers
+    if total <= PARALLEL_MAX_TOTAL_WORKERS or allow:
+        return
+    raise SystemExit(
+        f"{MODE_PARALLEL}: {in_flight} slice(s) in flight x --max-num-workers "
+        f"{max_num_workers} = up to {total} Dataflow workers at once, above "
+        f"{PARALLEL_MAX_TOTAL_WORKERS}. world-fishing-827 shares its regional Dataflow quota "
+        f"with production, so a run this wide could slow production's jobs. Lower "
+        f"--max-concurrent-slices or --max-num-workers, or pass --allow-many-workers if "
+        f"you mean it."
+    )
 
 
 def _last_step(args: argparse.Namespace) -> str:
@@ -1140,8 +1192,11 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
         log_label=mode,
         # The parallel mode tests concurrent loads, whose outcome need not
         # repeat: a hit would report an older run's result as this run's. It
-        # never reads the cache; its row is still written, for cleanup.
+        # never reads the cache; its row is still written, for cleanup, also
+        # when a slice failed (status 'failed'), since the table then holds
+        # the slices that succeeded.
         use_cache=not args.no_cache and mode != MODE_PARALLEL,
+        record_failures=(ParallelSlicesFailed,) if mode == MODE_PARALLEL else (),
     )
 
 
@@ -1336,11 +1391,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--slices", default=None,
                    help=f"With {MODE_PARALLEL} only: how the window is cut into slices loaded in "
                         f"parallel. {dit_slices.SPEC_HELP} Default {DEFAULT_SLICES}. The slices "
-                        f"must cover the window exactly once and be at least two.")
+                        f"must cover the window exactly once and be at least two. Slices that "
+                        f"share a month partition run their deletes and inserts on it "
+                        f"concurrently, and BigQuery may fail some when its DML queue fills.")
     p.add_argument("--max-concurrent-slices", type=_positive_int, default=None,
                    help=f"With {MODE_PARALLEL} only: how many slices run at a time. Default: all "
                         f"of them, which is what the test is about; a cap makes later slices "
                         f"wait for earlier ones.")
+    p.add_argument("--allow-many-workers", action="store_true",
+                   help=f"With {MODE_PARALLEL} only: allow the slices in flight together to ask "
+                        f"for more than {PARALLEL_MAX_TOTAL_WORKERS} Dataflow workers (slices in "
+                        f"flight x --max-num-workers). Refused without it: world-fishing-827 "
+                        f"shares its regional Dataflow quota with production.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the configuration and every mode's jobs, then stop. Nothing is "
                         "resolved, pinned, built, submitted or compared; the pipeline commit "
@@ -1362,20 +1424,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.steps, choices=SELECTABLE_STEPS, flag="--steps", noun="step",
     )
     validate_steps(args.steps, args.thinned_message_table)
-    if MODE_PARALLEL in args.modes:
-        try:
-            window = (_parse_date(args.start), _parse_date(args.end))
-        except ValueError as exc:
-            raise SystemExit(f"--start / --end: {exc}") from None
-    else:
-        window = (date.min, date.min)  # unused without the mode
+    try:
+        window = (
+            (_parse_date(args.start), _parse_date(args.end)) if MODE_PARALLEL in args.modes
+            else None
+        )
+    except ValueError as exc:
+        raise SystemExit(f"--start / --end: {exc}") from None
     args.parallel_slices = validate_parallel(
         modes=args.modes, steps=args.steps, slices=args.slices,
-        max_concurrent_slices=args.max_concurrent_slices, start=window[0], end=window[1],
+        max_concurrent_slices=args.max_concurrent_slices, window=window,
     )
     # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
     args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
     args.max_num_workers = args.worker_cap.workers
+    if args.parallel_slices:
+        check_total_workers(
+            in_flight=slices_in_flight(args.parallel_slices, args.max_concurrent_slices),
+            max_num_workers=args.max_num_workers, allow=args.allow_many_workers,
+        )
+    elif args.allow_many_workers:
+        raise SystemExit(f"--allow-many-workers needs {MODE_PARALLEL} in --modes")
     # Per step and field: flag > production's sizing (resolve_worker_sizing).
     args.cli_worker_sizing = worker_sizing_from_args(args)
     args.worker_sizings = {
@@ -1480,6 +1549,10 @@ def describe_plan(args: argparse.Namespace) -> list[str]:
             f"{_last_step(args)} parallel slices {declaration.parallel_slices} "
             f"({declaration.status}, {declaration.source or 'no source'})",
             f"slices ({args.slices or DEFAULT_SLICES}): {dit_slices.describe(args.parallel_slices)}",
+            describe_parallel_workers(
+                slices_in_flight(args.parallel_slices, args.max_concurrent_slices),
+                args.max_num_workers,
+            ),
         ]
     return lines
 
@@ -1618,6 +1691,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if MODE_PARALLEL in args.modes:
         logger.info("%s slices (%s): %s", MODE_PARALLEL, args.slices or DEFAULT_SLICES,
                     dit_slices.describe(args.parallel_slices))
+        logger.info("%s %s", MODE_PARALLEL, describe_parallel_workers(
+            slices_in_flight(args.parallel_slices, args.max_concurrent_slices),
+            args.max_num_workers,
+        ))
     parallel_failure: Optional[ParallelSlicesFailed] = None
 
     def run_mode(mode: str, fn) -> str:

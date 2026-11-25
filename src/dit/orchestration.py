@@ -32,7 +32,7 @@ allowed            identical   pass                                  0
 allowed            different   fail                                  1
 allowed            failed      fail                                  1
 forbidden          different   as declared                           0
-forbidden          failed      as declared                           0
+forbidden          failed      as declared (logged as a warning)     0
 forbidden          identical   declaration may be too strict         0
 unknown            identical   no difference (declaration unknown)   0
 unknown            different   difference (declaration unknown)      1
@@ -181,12 +181,15 @@ def judge(declaration: StepOrchestration, outcome: str) -> Judgement:
             f"carries between runs. Not changed automatically."
         ))
     if forbidden:
+        # A failed job reads as declared, but the failure may have nothing to
+        # do with concurrency: hence a warning, not a quiet pass.
+        failed = outcome == OUTCOME_FAILED
         failed_note = (
-            " Check the jobs' errors: a failure for another reason (quota, permissions) "
-            "also reads as declared here."
-            if outcome == OUTCOME_FAILED else ""
+            " WARNING: the failure may be quota or permissions rather than the concurrent "
+            "loads. Check the jobs' errors before reading it as the declared behaviour."
+            if failed else ""
         )
-        return Judgement(VERDICT_AS_DECLARED, 0, False, (
+        return Judgement(VERDICT_AS_DECLARED, 0, failed, (
             f"{head}. As declared: this step must not load slices in parallel.{failed_note}"
         ))
     exit_code = 0 if outcome == OUTCOME_IDENTICAL else 1
