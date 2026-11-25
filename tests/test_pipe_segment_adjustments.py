@@ -533,31 +533,134 @@ def test_without_binding_images_every_binding_asks_for_the_image_tag() -> None:
     assert _run_binding(args, "before", "v5.0.3")[0] == "registry.invalid/p:custom"
 
 
-def _mismatch_warnings(caplog, args, name, ref, **kwargs) -> list[str]:
+def _check_versions(caplog, args, versions: dict[str, tuple[int, int, int] | None]):
+    """``_check_image_versions`` over bindings of the given stated versions:
+    ``(SystemExit or None, the warnings logged)``."""
+    refs = dict(args.bindings)
+    sides = {
+        name: SimpleNamespace(binding=adjust.BindingInfo(name=name, ref=refs[name], version=v))
+        for name, v in versions.items()
+    }
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger=mod.logger.name):
-        _run_binding(args, name, ref, **kwargs)
-    return [r.getMessage() for r in caplog.records if "is tagged pipe-segment" in r.getMessage()]
+        try:
+            mod._check_image_versions(args, sides)
+            refused = None
+        except SystemExit as exc:
+            refused = exc
+    return refused, [r.getMessage() for r in caplog.records]
 
 
-def test_a_binding_that_runs_an_image_of_another_version_gets_a_warning(caplog) -> None:
-    """A ref merged into origin/main runs --image-tag whatever its version."""
-    args = _args(None)
-    (warning,) = _mismatch_warnings(caplog, args, "before", "v5.0.3")
+def test_a_tagged_ref_on_an_image_of_another_version_is_refused_before_pinning(caplog) -> None:
+    """The scenario of the review: ``before=v5.0.3`` without its own image
+    would run the default v5.1.0 image with v5.0.3's flags, and the run would
+    report v5.1.0 code as v5.0.3."""
+    refused, warnings = _check_versions(
+        caplog, _args(None), {"before": (5, 0, 3), "after": (5, 1, 0)})
 
-    assert "is tagged pipe-segment v5.1.0, and the binding's ref v5.0.3 states v5.0.3" in warning
-    assert "--binding-image before=<image of the ref>" in warning
-    # Its own image of its own version, a binding at the default version, an
-    # image whose tag names no version, an unknown version: nothing to say.
-    with_image = _args(None, "--binding-image", f"before={V503_IMAGE}")
-    assert _mismatch_warnings(caplog, with_image, "before", "v5.0.3") == []
-    assert _mismatch_warnings(caplog, args, "after", "v5.1.0") == []
-    assert _mismatch_warnings(caplog, args, "before", "v5.0.3",
-                              resolved="registry.invalid/p:dit-abc") == []
-    assert _mismatch_warnings(caplog, _args(None, bindings=("x=HEAD",)), "x", "HEAD") == []
+    assert refused is not None and warnings == []
+    message = str(refused)
+    assert "binding before: the image" in message and "tagged pipe-segment v5.1.0" in message
+    assert "ref v5.0.3 states v5.0.3" in message
+    assert "--binding-image before=<overlay image of v5.0.3>" in message
+    assert "binding after" not in message
+    # An image older than the ref is refused as well.
+    older = _args(None, "--image-tag", V503_IMAGE, "--binding-image", f"before={V503_IMAGE}")
+    refused, _ = _check_versions(caplog, older, {"before": (5, 0, 3), "after": (5, 1, 0)})
+    assert refused is not None and "binding after" in str(refused)
+
+
+@pytest.mark.parametrize("extra, runner, bindings, versions", [
+    # Its own image of its own version.
+    (("--binding-image", f"before={V503_IMAGE}"), "dataflow",
+     ("before=v5.0.3", "after=v5.1.0"), {"before": (5, 0, 3), "after": (5, 1, 0)}),
+    # Its own image whose tag names no version.
+    (("--binding-image", "before=registry.invalid/p:dit-abc"), "dataflow",
+     ("before=v5.0.3", "after=v5.1.0"), {"before": (5, 0, 3), "after": (5, 1, 0)}),
+    # A ref whose version cannot be read.
+    ((), "dataflow", ("x=HEAD",), {"x": None}),
     # On the docker runner with --build-from-source no image runs.
-    local = _args(None, "--build-from-source", runner="DirectRunner")
-    assert _mismatch_warnings(caplog, local, "before", "v5.0.3") == []
+    (("--build-from-source",), "DirectRunner",
+     ("before=v5.0.3", "after=v5.1.0"), {"before": (5, 0, 3), "after": (5, 1, 0)}),
+])
+def test_image_versions_allowed_without_a_word(caplog, extra, runner, bindings, versions) -> None:
+    refused, warnings = _check_versions(
+        caplog, _args(None, *extra, runner=runner, bindings=bindings), versions)
+    assert refused is None and warnings == []
+
+
+def test_an_unreleased_head_on_the_next_release_gets_a_warning_only(caplog) -> None:
+    """A branch whose code still states v5.0.3 on an image tagged v5.1.0, the
+    release right after: taken as an unreleased head (the head of the PR that
+    became v5.1.0 states v5.0.3)."""
+    args = _args(None, "--binding-image", f"before={V503_IMAGE}",
+                 bindings=("before=v5.0.3", "after=pr-227-head"))
+    refused, warnings = _check_versions(caplog, args, {"before": (5, 0, 3), "after": (5, 0, 3)})
+
+    assert refused is None
+    (warning,) = warnings
+    assert "binding after" in warning and "the release after the v5.0.3" in warning
+    assert "unreleased head" in warning
+    # Two releases ahead, or the ref written as a tag: refused.
+    two_ahead = _check_versions(caplog, args, {"before": (5, 0, 3), "after": (4, 9, 0)})[0]
+    assert two_ahead is not None and "binding after" in str(two_ahead)
+
+
+def test_the_preflight_reads_the_versions_from_the_refs_and_refuses(checkout, caplog) -> None:
+    """End to end through ``_preflight``, with the versions read from each
+    ref's own source: ``before=v5.0.3`` on the default image is refused;
+    with its own v5.0.3 image it passes; the ``unreleased`` branch (code
+    stating 5.0.3, the incremental flags declared) on the default v5.1.0
+    image only warns."""
+    def preflight(*extra: str, bindings=("before=v5.0.3", "after=v5.1.0")):
+        args = _args(checkout, *extra, bindings=bindings)
+        return mod._preflight(args, _suffixes(args))
+
+    with pytest.raises(SystemExit, match="binding before: the image .* tagged pipe-segment v5.1.0"):
+        preflight()
+    assert set(preflight("--binding-image", f"before={V503_IMAGE}")) == {"before", "after"}
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        preflight("--binding-image", f"before={V503_IMAGE}",
+                  bindings=("before=v5.0.3", "head=unreleased"))
+    assert any("binding head" in r.getMessage() and "unreleased head" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_the_base_interface_names_its_bare_flags() -> None:
+    """Every flag without a value in the base argvs is in ``bare``, so that
+    removing one never takes the token after it."""
+    args = _args(None)
+    interface = mod._base_interface(args, binding_name="before", suffix="s", worker_image="img")
+    valueless = {
+        token for tokens in interface.steps.values() for token in tokens
+        if token.startswith("--") and "=" not in token
+    }
+
+    assert valueless == interface.bare == mod.BARE_FLAGS
+    assert interface.multi == frozenset()
+
+
+def test_removing_a_bare_flag_followed_by_a_positional_keeps_the_positional() -> None:
+    interface = mod._base_interface(
+        _args(None), binding_name="before", suffix="s", worker_image="img")
+    tokens = ("segment", "--incremental", "positional", "--x=1")
+    remove = adjust.remove("--incremental")
+
+    assert remove.change(tokens, interface.bare, interface.multi) == (
+        "segment", "positional", "--x=1")
+    # Without the hint the positional would be read as the flag's value.
+    assert remove.change(tokens, frozenset(), frozenset()) == ("segment", "--x=1")
+
+
+def test_the_version_check_runs_in_the_preflight_and_not_in_run_binding(caplog) -> None:
+    """The check refuses before pinning; ``_run_binding`` logs nothing about
+    versions any more."""
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        _run_binding(_args(None), "before", "v5.0.3")
+    assert not [r for r in caplog.records if "tagged pipe-segment" in r.getMessage()]
+    assert not hasattr(mod, "_warn_on_version_mismatch")
 
 
 def test_the_same_gpsdio_pin_is_refused_unless_allowed(caplog) -> None:
@@ -668,7 +771,9 @@ def _main(checkout: str, *extra: str, **kwargs: Any) -> dict[str, Any]:
         *(t for b in kwargs.get("bindings", ("before=v5.0.3", "after=v5.1.0"))
           for t in ("--binding", b)),
         "--date-range", "2020-01-01,2020-01-02", "--dest-dataset", "ds",
-        "--pipeline-dir", checkout, "--allow-same-gpsdio-pin", *extra,
+        "--pipeline-dir", checkout, "--allow-same-gpsdio-pin",
+        # v5.0.3 gets its own image, as the version check requires.
+        "--binding-image", f"before={V503_IMAGE}", *extra,
     ]
     with (
         patch.object(mod, "_verify_distinct_gpsdio_pins"),

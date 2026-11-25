@@ -342,6 +342,8 @@ def _main(*extra: str) -> dict[str, Any]:
         rc = mod.main([
             "--experiment-id", "test01",
             "--binding", "before=v5.0.3", "--binding", "after=exp-branch",
+            # v5.0.3 gets its own image, as the version check requires.
+            "--binding-image", "before=reg.invalid/pipe-segment:v5.0.3-overlay",
             "--date-range", "2020-01-01,2020-01-01",
             *extra,
         ])

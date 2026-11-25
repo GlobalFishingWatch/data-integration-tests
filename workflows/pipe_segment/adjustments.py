@@ -250,7 +250,13 @@ def flag_problems(
     """What stops the binding's argv from being trusted, one sentence each:
     a step whose command module was not read at the ref, and every pipeline
     flag a step passes that its command does not declare there. Empty when
-    every flag is accounted for."""
+    every flag is accounted for.
+
+    Best effort: a command's declared flags are read statically
+    (``dit.adjust.declared_flags``), so any quoted flag literal anywhere in
+    the module counts as declared, a help text or a dead branch included,
+    and a flag whose name is built at run time is missed. It catches a flag
+    the ref has never heard of, not every flag the command would ignore."""
     def problems(step: str, tokens: Sequence[str]) -> list[str]:
         declared = None if binding.declared is None else binding.declared.get(step)
         if declared is None:

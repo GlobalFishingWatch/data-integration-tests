@@ -1582,6 +1582,14 @@ def _incremental_flags(*, dest_dataset: str, suffix: str) -> list[str]:
     ]
 
 
+#: The flags without a value that the steps' argvs carry: ``--incremental``
+#: (``segment``), ``--wait_for_job`` and ``--no_use_public_ips`` (the two Beam
+#: steps). Handed to ``dit.adjust`` so that an edit or the diff never reads
+#: the token after one of them as its value. No step takes a flag with several
+#: values, so ``multi`` stays empty.
+BARE_FLAGS = frozenset({"--incremental", "--wait_for_job", NO_PUBLIC_IPS_OPTION})
+
+
 def _base_interface(
     args: argparse.Namespace,
     *,
@@ -1642,6 +1650,7 @@ def _base_interface(
     steps = STEPS[:1] if args.skip_downstream else STEPS
     return adjust.Interface(
         steps={step: builders[step]() for step in steps},
+        bare=BARE_FLAGS,
         inputs=(source,),
         outputs=tuple(
             adjust.Output(
@@ -1829,32 +1838,91 @@ def _verify_gpsdio_segment(worktree_dir: str, *, binding_name: str) -> str:
     )
 
 
-def _warn_on_version_mismatch(
-    name: str, binding: adjust.BindingInfo, image: str, args: argparse.Namespace,
-) -> None:
-    """Warn when the image a binding runs is tagged another pipe-segment
-    version than the binding's ref states.
+def _next_releases(version: tuple[int, ...]) -> frozenset[tuple[int, ...]]:
+    """The versions one release after ``version``: the next patch, minor or
+    major. ``(5, 0, 3)`` gives ``(5, 0, 4)``, ``(5, 1, 0)`` and ``(6, 0, 0)``."""
+    major, minor, patch_ = version[:3]
+    return frozenset({(major, minor, patch_ + 1), (major, minor + 1, 0), (major + 1, 0, 0)})
 
-    The binding's flags are chosen and checked for its ref. The image is what
-    runs. They can differ: a ref merged into ``origin/main`` runs
-    ``--image-tag`` whatever its version, unless the binding has its own
-    ``--binding-image``. On the docker runner with ``--build-from-source`` no
-    image runs, so there is nothing to compare.
+
+def _version_problem(
+    name: str, binding: adjust.BindingInfo, image: str,
+) -> tuple[str, str] | None:
+    """Whether the image a binding runs is tagged another pipe-segment version
+    than its ref states: ``None`` when not, else ``("warning" | "refuse",
+    message)``.
+
+    The binding's flags are chosen and checked for its ref; the image is what
+    runs. Without its own ``--binding-image`` a binding runs ``--image-tag``,
+    the v5.1.0 overlay by default, whatever version its ref is. So
+    ``--binding before=v5.0.3`` would get its ref's flags (no ``--incremental``)
+    and run v5.1.0 code, and the run would report v5.1.0 as v5.0.3.
+
+    Nothing to say when no version can be read from the image's tag or from
+    the ref's code, or when they agree.
+
+    Only a warning for what looks like an unreleased head: the ref is not
+    written as a version tag (a branch or a commit), and the image's tag
+    names the release right after the version the ref's code states. An
+    unreleased head still states the release before it, and its image may
+    carry the version it will be released as (``v5.1.0-pr227`` for the head
+    of the PR that became v5.1.0). The rule reads names and versions only, so
+    a branch that really is at the older release also gets only the warning.
+    """
+    in_image = adjustments.image_pipeline_version(image)
+    if in_image is None or binding.version is None or in_image == binding.version:
+        return None
+    stated = adjustments.version_text(binding.version)
+    tagged = adjustments.version_text(in_image)
+    head_like = (
+        adjustments.ref_version(binding.ref or "") is None
+        and in_image in _next_releases(binding.version)
+    )
+    if head_like:
+        return "warning", (
+            f"binding {name}: the image {image} is tagged pipe-segment {tagged}, the release "
+            f"after the {stated} that the binding's ref {binding.ref} states. Taken as an "
+            f"unreleased head, which still states the release before it. The binding's "
+            f"flags were chosen and checked for the ref; if the image holds other code than "
+            f"the ref, give the binding its own: --binding-image {name}=<image of the ref>."
+        )
+    return "refuse", (
+        f"binding {name}: the image {image} is tagged pipe-segment {tagged}, and the "
+        f"binding's ref {binding.ref} states {stated}. The binding's flags were chosen and "
+        f"checked for the ref, but the image is what runs, so the run would report "
+        f"{tagged} code as {stated}. Give the binding an image of its ref: "
+        f"--binding-image {name}=<overlay image of {binding.ref}> "
+        f"({OVERLAY_DIR}/build.sh)."
+    )
+
+
+def _check_image_versions(
+    args: argparse.Namespace, sides: Mapping[str, adjust.Adjusted],
+) -> None:
+    """Refuse a binding whose image is tagged another pipe-segment version
+    than its ref states (:func:`_version_problem`), before anything is
+    pinned; log the unreleased-head case as a warning. On the docker runner
+    with ``--build-from-source`` no image runs, so there is nothing to
+    compare.
+
+    The image is the one the binding asks for (:func:`_binding_image`). The
+    harness runs exactly that image: ``check_images`` replaces its auto-build,
+    so it never substitutes another one.
     """
     if args.build_from_source and args.runner != "dataflow":
         return
-    in_image = adjustments.image_pipeline_version(image)
-    if in_image is None or binding.version is None or in_image == binding.version:
-        return
-    logger.warning(
-        "[%s] the image %s is tagged pipe-segment %s, and the binding's ref %s states %s. "
-        "The binding's flags were chosen and checked for the ref, and the image is what "
-        "runs. If the image holds other code than the ref, give the binding its own: "
-        "--binding-image %s=<image of the ref>. For an unreleased head, which still states "
-        "the version of the release before it, this is expected.",
-        name, image, adjustments.version_text(in_image), binding.ref,
-        adjustments.version_text(binding.version), name,
-    )
+    problems = [
+        problem for name, side in sides.items()
+        if (problem := _version_problem(name, side.binding, _binding_image(args, name)))
+    ]
+    for _, message in (p for p in problems if p[0] == "warning"):
+        logger.warning("%s", message)
+    refused = [message for kind, message in problems if kind == "refuse"]
+    if refused:
+        raise SystemExit(
+            "error: a binding would run an image of another pipe-segment version than its "
+            "ref:\n" + "\n".join(f"  {m}" for m in refused) + "\nNothing was pinned or run."
+        )
 
 
 def _run_binding(
@@ -1905,12 +1973,13 @@ def _run_binding(
             build_from_source=args.build_from_source,
             check_images=functools.partial(check_images, args, name),
         )
+        # The image asked for (``check_images`` replaces the auto-build, so the
+        # harness substitutes none): the one the preflight checked.
         image_tag = ctx.worker_image
         logger.info("[%s] commit=%s%s image=%s",
                     name, ctx.pipeline_commit,
                     " (UNREVIEWED)" if ctx.unreviewed else "",
                     image_tag)
-        _warn_on_version_mismatch(name, binding, image_tag, args)
 
         if args.dry_run:
             logger.info("[%s] --dry-run set; skipping pipe-segment invocations.", name)
@@ -1964,9 +2033,11 @@ def _sides(
     the rules know about each binding (:func:`_binding_infos`); a binding
     missing from it is known offline only (:func:`_binding_info`).
 
-    The image in a step's ``--sdk_container_image`` is the one asked for. The
-    harness may replace it per binding at run time; no rule and no check here
-    reads its value.
+    The image in a step's ``--sdk_container_image`` is the one asked for
+    (:func:`_binding_image`), the same that ``_run_binding`` runs:
+    ``resolve_run_context`` hands it back unchanged, because ``check_images``
+    replaces its auto-build. No rule and no flag check reads its value;
+    :func:`_check_image_versions` reads its tag.
     """
     return {
         name: _adjusted(
@@ -2098,7 +2169,7 @@ def _check_flags(sides: Mapping[str, adjust.Adjusted]) -> None:
     Beam's options on the two Beam steps (``adjustments.BEAM_OPTIONS``).
 
     The check reads the ref. It assumes the image a binding runs holds that
-    ref's code; :func:`_warn_on_version_mismatch` warns when the image's tag
+    ref's code; :func:`_check_image_versions` refuses when the image's tag
     says otherwise.
     """
     problems = [
@@ -2165,6 +2236,8 @@ def _preflight(
       hoc edit that finds nothing to change);
     * a placeholder that names no output and no input of its binding;
     * a flag a binding's pipe-segment does not declare (:func:`_check_flags`);
+    * an image tagged another version than its binding's ref states, unless it
+      looks like an unreleased head (:func:`_check_image_versions`);
     * two bindings that would be compared on different keys.
     """
     try:
@@ -2185,6 +2258,7 @@ def _preflight(
                 f"{', '.join('{' + p + '}' for p in known)}. Nothing was pinned or run."
             )
     _check_flags(sides)
+    _check_image_versions(args, sides)
     for a, b in itertools.combinations(sides, 2):
         try:
             adjust.check_keys(adjust.pair_outputs(sides[a].interface, sides[b].interface))
