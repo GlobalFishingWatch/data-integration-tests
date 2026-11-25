@@ -368,7 +368,7 @@ DEFAULT_MAX_NUM_WORKERS = 4
 STEP_WORKER_SIZING = {STEP: imk.STEP_WORKER_SIZING[STEP]}
 
 #: The pipe-segment version the default image holds, the overlay directory and
-#: the default overlay image (not built yet): one definition for both
+#: the default overlay image (built 2026-11-24): one definition for both
 #: pipe-segment workflows, in ``identity_match_key.py``, which holds the
 #: citations. ``composer_drift.py`` compares the version with the image tag of
 #: the DAG's task.
