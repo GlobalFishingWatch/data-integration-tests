@@ -59,8 +59,8 @@ THREE DIFFERENCES FROM ais.py THAT CHANGE HOW YOU RUN THIS
    destination into the source's org.
 
 3. **``--temp_dataset`` support is still required**, exactly as for ais.py:
-   point ``--worker-image`` at a dit overlay image until the upstream patch
-   lands. See :mod:`workflows.encounters.ais` for the standing tag.
+   pass the dit overlay image as both ``--image-tag`` and ``--worker-image``.
+   See :mod:`workflows.encounters.ais` for the standing tag.
 
 Everything else -- modes, ``encounter_id`` comparison over both the raw and
 merged tables, destination-table bootstrap with MONTH partitioning, the
