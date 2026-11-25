@@ -2,7 +2,9 @@
 
 Test-only patch that lets DIT run pipe-anchorages on Dataflow as `automated-testing@`. It is **never** proposed upstream (decision 2026-10-22, PIPELINE-4699; confirmed 2026-11-19).
 
-Since 2026-11-19 an overlay image is the **default image** of the port-visits workflows: `workflows/port_visits/ais.py` runs the overlay of pipe-anchorages v5.0.1, the version production runs, as both submitter and worker. See "Default image" below.
+Since 2026-11-19 an overlay image is the **default image** of the port-visits workflows: `workflows/port_visits/ais.py` runs the overlay of pipe-anchorages v5.0.1, the version production runs, as both submitter and worker. See "Default image" below, and [`workflows/port_visits/README.md`](../../../workflows/port_visits/README.md) for how the workflows use it.
+
+**Status (2026-11-25):** the default image is built and self-checked, but no Dataflow job has run on it yet. The images that have run on Dataflow are the two October images below (PIPELINE-4690).
 
 ## Why it exists
 
@@ -32,7 +34,7 @@ Unset, the image behaves exactly like the commit it was built from. The argument
 
 ## How it differs from the encounters overlay
 
-The encounters overlay copies patched files over a published image (`docs/conventions.md`, overlay images). Here the commit under test is usually a PR branch with no published image, so `build.sh` builds from the commit's own source instead: `git archive <commit>`, `git apply` the patch, `docker build --target prod`. Baseline and candidate are built the same way, so the only difference between them is the change under test.
+The encounters overlay (`dit/encounters:v4.4.0-temp-dataset-d2536aaf`) copies patched files over a published image (`docs/conventions.md`, overlay images). Its build files and patch are not in this repository, so it cannot be rebuilt from here; see [`workflows/encounters/README.md`](../../../workflows/encounters/README.md). Here the commit under test is usually a PR branch with no published image, so `build.sh` builds from the commit's own source instead: `git archive <commit>`, `git apply` the patch, `docker build --target prod`. Baseline and candidate are built the same way, so the only difference between them is the change under test.
 
 ## Build
 

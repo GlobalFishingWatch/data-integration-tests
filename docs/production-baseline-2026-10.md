@@ -1,5 +1,10 @@
 # Production baseline: a candidate against production's own output (2026-10)
 
+> **Status note (2026-11-25).** This is a dated record of how the production baseline was built and first run; it is kept as written, with the 2026-11-19 update below. The current state:
+> - The mechanics are unchanged. The target `ais-v5-datalake` still matches production's AIS v5 DAG field by field (drift check at composer `origin/main` 85700ebc3), at pipe-anchorages v5.0.1.
+> - **No live production-baseline run has been made since production moved to v5.0.1.** The only live run is the one of 2026-10-23 below, against v4.6.4.
+> - How to use the mode for port visits today, next to the other port-visits workflows: [`workflows/port_visits/README.md`](../workflows/port_visits/README.md) § "Production baseline".
+
 **Jira:** [PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703) (epic [PIPELINE-4698](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4698)).
 **Status:** verified live on 2026-10-23 (Cloud Build `7781dd48`, PR #176 against production's 2026-10-20 run; see "First live run" below). That followed dry runs on the laptop and in Cloud Build as `automated-testing@` (build `947240a8`).
 **Entry point:** `workflows/port_visits/cross_version_ais.py --baseline-production <target> --production-date D`.

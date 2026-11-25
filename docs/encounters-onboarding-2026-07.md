@@ -1,5 +1,13 @@
 # Onboarding `encounters_pipeline` into dit — audit + workflow plan (2026-07-30)
 
+> **Status note (2026-11-25).** A dated record of the July 2026 onboarding, kept as written. The current state is in [`workflows/encounters/README.md`](../workflows/encounters/README.md). What has changed since:
+> - **Production moved on.** The AIS and VMS v5 DAGs run pipe-encounters **v5.0.0** (`partial-encounters` / `encounters`, hyphenated flags, exclusive `--end-date`). The section "Version axes" below (no encounters in `core/ais/v5.py`) no longer holds. DIT still drives **v4.4.0**; the drift check reports it.
+> - **`--binding-name` landed** on both encounters workflows on 2026-07-31. The section "Known gap: no `--binding-name`" is resolved; there is still no encounters cross-version wrapper.
+> - **The interpolation boundary** was made configurable upstream in v4.6.0 (`--max_gap_seconds_inclusive`; `--max-gap-seconds-inclusive` in v5, which VMS production passes). The local fix branch listed under "Upstream asks" is probably superseded. Neither v4.6.0 nor v5.0.0 has a staging-dataset option, so the overlay is still needed.
+> - **The overlay image's build files are not in this repository** ("Resolution: overlay image" says it was built from a scratch directory). It can be pulled, not rebuilt from DIT.
+> - **`--build-from-source`** uses the compose service `pipe_encounters`, which exists only up to v4.3.2. It fails on a checkout of v4.4.0 or later.
+> - **Superseded statements below:** "Blocker 1" (the overlay unblocked Dataflow on 2026-07-30); the audit's "the pipeline creates with `CREATE_IF_NEEDED`" (DIT pre-creates both tables, see "First-smoke findings"); the "27 tests" and "30 unit tests" counts.
+
 Step 1 of [`pipeline-contract.md`](pipeline-contract.md) § "Process: adding a new pipeline to dit's scope", for **encounters**. Records the prod orchestration + parameters (read out of `composer-dags-production`), the contract audit (matrix column added in the same commit), staging-cohort readiness, and the proposed workflow shape.
 
 **Status (2026-07-30)**: audit complete; **`workflows/encounters/ais.py` written** (30 unit tests) and **runs end-to-end on a laptop** (`--runner docker`, published v4.4.0 image) after six defects found by seven smokes (§ First-smoke findings). **Partially validated**: the RAW comparison is genuine (4 rows vs 4 rows, identical); the MERGED comparison is still 0-vs-0 because this cohort's only vessel pair involves a bad segment (§ Cohort sparsity). Cloud run remains blocked upstream (§ Blockers).
