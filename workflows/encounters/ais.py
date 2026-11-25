@@ -70,10 +70,11 @@ tie-break and pipe-events' ``ARRAY_AGG``-without-``ORDER BY``, both of which
 dit caught. Check it first.
 
 Date semantics: ``--start`` / ``--end`` are **inclusive on both ends**,
-matching the encounters CLI (``--end_date`` help says "Last date (inclusive)"
-on both steps). Verified against the flag help; re-verify against the SQL
-before trusting a first live run -- the pipe-gaps off-by-one (PR #69) came
-from trusting a flag name over the query.
+matching the v4.4.0 encounters CLI: ``--end_date`` help says "Last date
+(inclusive)" on both steps, and both steps' queries filter with ``BETWEEN``
+(read in the v4.4.0 source). pipe-encounters v5, which production runs, has
+an exclusive ``--end-date`` and other command names; this workflow drives
+v4.4.0 only (see ``workflows/encounters/README.md``).
 
 ``--temp_dataset`` and the overlay image
 ----------------------------------------
@@ -84,13 +85,15 @@ workers are that SA dies on a 403 ``POST /datasets`` raised from inside the
 job -- this is not a Cloud-Build-only problem. (Laptop DirectRunner escapes it
 because the dataset is then created under the user's own ADC.)
 
-Published ``pipe-encounters`` does not expose ``--temp_dataset``. Until that
-lands upstream, point ``--worker-image`` at the dit overlay image, which is
-the published v4.4.0 with the patch layered over site-packages -- same Beam
-version, same entrypoint, so it serves as both submitter and
+Published ``pipe-encounters`` does not expose ``--temp_dataset`` (neither
+v4.4.0 nor v5.0.0). Pass the dit overlay image, the published v4.4.0 with
+the patch layered over site-packages, as BOTH ``--image-tag`` and
+``--worker-image``: the submitter parses ``--temp_dataset`` too. Same Beam
+version, same entrypoint, so one image serves as submitter and
 ``sdk_container_image``::
 
-    --worker-image gcr.io/world-fishing-827/dit/encounters:v4.4.0-temp-dataset-<sha>
+    --image-tag    gcr.io/world-fishing-827/dit/encounters:v4.4.0-temp-dataset-d2536aaf
+    --worker-image gcr.io/world-fishing-827/dit/encounters:v4.4.0-temp-dataset-d2536aaf
 
 ``--bq-temp-dataset`` is emitted unconditionally (mirroring
 ``workflows/port_visits/ais.py``); against a stock image the flag is simply

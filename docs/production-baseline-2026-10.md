@@ -1,5 +1,10 @@
 # Production baseline: a candidate against production's own output (2026-10)
 
+> **Status note (2026-11-25).** This is a dated record of how the production baseline was built and first run; it is kept as written, with the 2026-11-19 update below. The current state:
+> - The mechanics are unchanged. The target `ais-v5-datalake` still matches production's AIS v5 DAG field by field, at pipe-anchorages v5.0.1: all 12 fields, in the drift check run locally on 2026-11-25 against composer `origin/main` 85700ebc3 (`git show` only, no cloud call). This supersedes the 2026-11-19 re-check at 9f214877b recorded below.
+> - **No live production-baseline run has been made since production moved to v5.0.1.** The only live run is the one of 2026-10-23 below, against v4.6.4.
+> - How to use the mode for port visits today, next to the other port-visits workflows: [`workflows/port_visits/README.md`](../workflows/port_visits/README.md) § "Production baseline".
+
 **Jira:** [PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703) (epic [PIPELINE-4698](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4698)).
 **Status:** verified live on 2026-10-23 (Cloud Build `7781dd48`, PR #176 against production's 2026-10-20 run; see "First live run" below). That followed dry runs on the laptop and in Cloud Build as `automated-testing@` (build `947240a8`).
 **Entry point:** `workflows/port_visits/cross_version_ais.py --baseline-production <target> --production-date D`.
@@ -49,7 +54,7 @@ Production reprocesses daily, so its inputs and its output both move. The compar
 
 ## Targets
 
-One target today, hand-written from `composer-dags-production` (`dags/core/ais/v5.py`, `gfw/pipes/core/anchorages/v5.py`), last re-checked at origin/main 9f214877b (2026-11-19). `workflows/port_visits/composer_drift.py` checks every field against the rendered DAG. Reading targets from composer as data belongs to [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700).
+One target today, hand-written from `composer-dags-production` (`dags/core/ais/v5.py`, `gfw/pipes/core/anchorages/v5.py`), last re-checked at origin/main 85700ebc3 (drift check run locally, 2026-11-25; before that 9f214877b, 2026-11-19). `workflows/port_visits/composer_drift.py` checks every field against the rendered DAG. Reading targets from composer as data belongs to [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700).
 
 **`ais-v5-datalake`**: pipe-anchorages v5.0.1, v5 CLI (`port-visits`; v4.6.4 and the v4 CLI until 2026-10-26). Dataflow in `world-fishing-827`, `us-central1`, 100 × e2-highmem-4 with 50 GB disks and private IPs (the sizing from the rendered snapshot `tests/render_dags/snapshots/core_ais_v5.py`, task `port_visits.detect_port_visits`). Job name `core-ais-v5--port-visits-detect-port-visits--YYYYMMDD`.
 

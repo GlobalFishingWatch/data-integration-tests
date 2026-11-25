@@ -1,52 +1,83 @@
-# `workflows/` — per-pipeline integration-test workflows
+# `workflows/` — the index of DIT's integration-test workflows
 
-Each subdirectory holds one pipeline's dit workflow(s). A workflow is plain
-importable Python with a `main(argv=None) -> int` entry point (the CLI / Cloud
-Build runtime is one consumer); it composes the `dit.*` library (runners,
-compare, dates, the shared `dit.workflow` harness) into a pipeline-specific
-mode-equivalence test.
+A workflow is an importable Python file with a `main(argv=None) -> int` entry point. `dit run <file>` and `make dit-cloud WORKFLOW=<file>` are two ways to call it. How runners, the run cache, pinning and Cloud Build work is explained in the top-level [`README.md`](../README.md) and [`docs/architecture.md`](../docs/architecture.md).
 
-| Workflow | Pipeline | Runner | Compare shape | Cache |
-|---|---|---|---|---|
-| `pipe_gaps/mode_equivalence.py` | pipe-gaps (detect-gaps) | Beam **in-process** (`dit.runners.dataflow`) | SCD-2 (`_last_versions`, keyed by gap key) | yes (`dit_runs`) |
-| `pipe_gaps/outage_recovery.py` | pipe-gaps (detect-gaps) | Beam **in-process** (`dit.runners.dataflow`) | SCD-2 (`_last_versions`, `gap_id` + `start_timestamp`): staged outage-and-recovery run vs a single-shot oracle | yes (`dit_runs`) |
-| `port_visits/ais.py` | anchorages_pipeline (port-visits) | Beam **via container** (`dit.runners.docker`). Opt-in `6_parallel` (step 1 only): the window cut by `--slices`, all slices submitted at once into one table | truncate (`view_suffix=""`, `visit_id`; `(identifier, timestamp)` with `--steps thin_port_messages`). `6_parallel` is compared with `1_bf` only and judged against the step's declaration (`orchestration.py`) | yes (`dit_runs`); `6_parallel` never reads it |
-| `port_visits/cross_version_ais.py` | anchorages_pipeline (port-visits) | N per-binding subprocess invocations of `ais.py`, each from a `git worktree` at that binding's ref; with `--baseline-production`, the candidate binding only, diffed against production's own output | truncate, same keys as `ais.py`, pairwise across bindings | via each binding's `ais.py` |
-| `pipe_events/fishing.py` | pipe-events (fishing events) | **BQ-SQL via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `event_id`) | no (deferred) |
-| `pipe_events/cross_version_fishing.py` | pipe-events (fishing events) | N per-binding subprocess invocations of `fishing.py` (each with its own **BQ-SQL via container** runtime, from a `git worktree` at that binding's ref) | truncate (`view_suffix=""`, `event_id`) across BOTH `_fishing_events` and `_product_events_fishing` views | no (deferred with `fishing.py`) |
-| `pipe_segment/identity_match_key.py` | pipe-segment (cross-version, gpsdio-segment match key) | **via container** (`dit.runners.docker`), one binding at a time, each from a `git worktree` at that binding's ref. Six steps, as in production's segment group: two Beam jobs (`segment`, `segment_identity`), then four **BQ-SQL** steps (`segment_vessel_daily`, `segment_info`, `vessel_info`, `segment_vessel`) | truncate (`view_suffix=""`), per-table keys (`COMPARE_KEYS`) over eight output tables, pairwise across bindings | no |
-| `pipe_segment/ais.py` | pipe-segment (mode equivalence of the `segment` step) | Beam **via container** (`dit.runners.docker`). The unit is a (mode, segmenter) variant: modes `1_bf`, `2_bfd`, `3_bftruncate` and the opt-in `4_daily` (every day its own job); segmenters `incremental` (pipe-segment's `--incremental`, v5.1.0; the default, as the AIS DAG's task passes it) and `full-history`. Each variant has its own tables and runs its jobs in order. The default run is full history in one job against three incremental shapes | truncate (`view_suffix=""`), on `segments` (`seg_id`, `frag_id`; the discriminating one), `messages_segmented` (`msgid`) and `fragments` (`frag_id`), pairwise across variants | no |
-| `encounters/ais.py` | encounters_pipeline (encounters generation) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `encounter_id`) on both the raw and merged tables | no |
-| `encounters/vms.py` | encounters_pipeline (encounters generation, VMS) | same execution as `encounters/ais.py` (`ais.run(args)`); only defaults and help differ | same as `encounters/ais.py` | no |
+Each pipeline has an entry page with versions, modes, commands and run history:
+
+| Pipeline | Entry page | DIT's default version | Production's version |
+|---|---|---|---|
+| pipe-gaps (gap detection) | [`pipe_gaps/README.md`](pipe_gaps/README.md) | v0.10.0, `detect` | v0.17.1, `raw-gaps` (AIS v5 DAG). **DIT is behind** |
+| pipe-events (fishing events) | [`pipe_events/README.md`](pipe_events/README.md) | v4.2.17, entrypoint `pipe` | v9.0.0, entrypoint `pipe-events` (AIS v5 DAG). **DIT is behind** |
+| pipe-anchorages (port visits) | [`port_visits/README.md`](port_visits/README.md) | v5.0.1, DIT overlay image | v5.0.1 (AIS v5 DAG) |
+| encounters_pipeline | [`encounters/README.md`](encounters/README.md) | v4.4.0, old CLI | v5.0.0 (AIS and VMS v5 DAGs). **DIT is behind** |
+| pipe-segment | [`pipe_segment/README.md`](pipe_segment/README.md) | v5.1.0, DIT overlay image | v5.1.0 (AIS v3 DAG) |
+
+This table is the source of truth for DIT's default version against production's; other pages (the per-pipeline pages, [`docs/pipeline-contract.md`](../docs/pipeline-contract.md)) defer to it, so update it first when either side moves. Production versions are those of composer-dags-production's rendered DAGs as read by the drift check (2026-11-19 and 2026-11-20). [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md) § 8d has the detail.
+
+## Pick a workflow
+
+| You want to know | Run |
+|---|---|
+| Does a backfill give the same output as the daily schedule? | the pipeline's mode-equivalence workflow: `pipe_gaps/mode_equivalence.py`, `pipe_events/fishing.py`, `port_visits/ais.py`, `encounters/ais.py` (VMS: `encounters/vms.py`), `pipe_segment/ais.py` |
+| Does a change alter the output? (two refs, same inputs) | a cross-version wrapper: `port_visits/cross_version_ais.py`, `pipe_events/cross_version_fishing.py`, `pipe_segment/identity_match_key.py` |
+| Does my change match what production wrote? | `port_visits/cross_version_ais.py --baseline-production` (port visits only) |
+| Does a recovery backfill after an outage end in the clean state? | `pipe_gaps/outage_recovery.py --synthetic-outage` |
+| Can a step load slices of a window in parallel? | `port_visits/ais.py --modes 1_bf,6_parallel --steps thin_port_messages` (the only test of an orchestration declaration so far) |
+| Does DIT still run what production runs? | `workflows/composer_drift.py` (reads composer, runs nothing) |
+
+For pipe-gaps, encounters and pipe-events, a mode-equivalence run tests the old version DIT drives, not production's. Read the entry page first.
+
+## All workflows
+
+| Workflow | Compares | Modes or bindings | Pinning | Run cache | Drift spec | Orchestration declared |
+|---|---|---|---|---|---|---|
+| [`pipe_gaps/mode_equivalence.py`](pipe_gaps/mode_equivalence.py) | modes pairwise, on the `_last_versions` view, keys `gap_id`, `start_timestamp` | `1_bf`, `2_bfd`, `3_bftruncate`; opt-in `4_mutate_recover` (`--enable-pipeline-4`) | none (reads the live staging tables) | yes | `pipe_gaps/mode_equivalence`, not in sync | `detect`: parallel forbidden (claimed) |
+| [`pipe_gaps/outage_recovery.py`](pipe_gaps/outage_recovery.py) | three-stage outage and recovery against a single-shot oracle, same view and keys | one fixed shape (3 stages + oracle) | by copy: messages over the run's window, segments whole | yes | none | same step as above |
+| [`pipe_events/fishing.py`](pipe_events/fishing.py) | modes pairwise, on the `_fishing_events` and `_product_events_fishing` views, key `event_id` | `1_bf`, `2_bfd`, `3_bftruncate` | none | no | `pipe_events/fishing`, not in sync | `incremental_events`: forbidden (claimed); three steps unknown |
+| [`pipe_events/cross_version_fishing.py`](pipe_events/cross_version_fishing.py) | bindings pairwise, same views and key | `--binding name=ref`, repeatable; `--modes` per binding | by copy: seven of its eight inputs (`spatial_measures_20201105` is not pinned) | no | none | as above |
+| [`port_visits/ais.py`](port_visits/ais.py) | modes pairwise, key `visit_id` (or `identifier`, `timestamp` for step 1 alone) | `1_bf`, `2_bfd`, `3_bftruncate`; opt-in `6_parallel` (step 1 only, compared with `1_bf` and judged against the declaration) | none | yes; `6_parallel` never reads it | `port_visits/ais`, in sync | `thin_port_messages`: allowed (claimed); `port_visits`: unknown |
+| [`port_visits/cross_version_ais.py`](port_visits/cross_version_ais.py) | bindings pairwise, same keys; with `--baseline-production`, one candidate against production's own output | `--binding name=ref` | by copy; time-travel views with `--baseline-production` | through each binding's `ais.py` | none | as above |
+| [`encounters/ais.py`](encounters/ais.py) | modes pairwise on the raw and the merged table, key `encounter_id` | `1_bf`, `2_bfd`, `3_bftruncate` | none | no | `encounters/ais`, not in sync | `create_raw_encounters`: allowed (claimed); `merge_encounters`: unknown |
+| [`encounters/vms.py`](encounters/vms.py) | as `encounters/ais.py` (same code, VMS defaults) | as above | none | no | `encounters/vms`, not in sync | as above |
+| [`pipe_segment/identity_match_key.py`](pipe_segment/identity_match_key.py) | bindings pairwise over eight output tables of the six-step segment group, per-table keys | `--binding name=ref` | by copy: `normalized_messages` over the run's dates | no | `pipe_segment/identity_match_key`, in sync; plus a frozen spec for v5.0.3 | `segment`: forbidden (claimed); five steps unknown |
+| [`pipe_segment/ais.py`](pipe_segment/ais.py) | (mode, segmenter) variants pairwise on `segments`, `messages_segmented`, `fragments` | `1_bf`, `2_bfd`, `3_bftruncate`, opt-in `4_daily`; segmenter `incremental` or `full-history` | by copy, as above | no | `pipe_segment/ais`, in sync | as above |
+
+Notes on the columns:
+
+- **Exit codes.** Mode-equivalence workflows and `outage_recovery.py` fail (exit 1) on any difference: the outputs must be equal. Cross-version wrappers report differences and fail only when a binding fails: a difference there is information.
+- **Run cache** means a mode with unchanged code, image and parameters reuses its earlier output table (`dit_runs`); `--no-cache` recomputes.
+- **Cancelling.** `make dit-cancel RUN_ID=<id>` finds Dataflow jobs by their `dit_run_id` label. The pipe-gaps, port-visits and encounters workflows and `pipe_segment/ais.py` stamp it; `pipe_segment/identity_match_key.py` does not; the pipe-events workflows run no Dataflow jobs.
+- **Runtime.** pipe-gaps submits Beam in-process (`dit.runners.dataflow`). Port visits, encounters and pipe-segment run Beam inside the pipeline's container (`dit.runners.docker`). pipe-events runs BigQuery SQL inside its container; pipe-segment's last four steps do too.
 
 ## Orchestration declarations (`orchestration.py`)
 
-Each package has an `orchestration.py` declaring, per pipeline step, whether slices of a window may load in parallel, whether a run depends on the previous one, and on what evidence (`verified` with a Cloud Build id, `claimed` with its source, `untested`). The type and the judgement of a test outcome live in `dit.orchestration`; how the declarations map to Airflow (`depends_on_past`, `max_active_runs`) is in [`docs/plan.md`](../docs/plan.md) § "Orchestration capabilities". Seeded 2026-11-24 from the owner's statements, all `claimed`; no declaration is `verified` yet. A run's result is recorded by editing the file, never automatically.
+Each package has an `orchestration.py` declaring, per pipeline step, whether slices of a window may load in parallel, whether a run depends on the previous one, and on what evidence (`verified` with a Cloud Build id, `claimed` with its source, `untested`). The type and the judgement of a test outcome live in `dit.orchestration`; how the declarations map to Airflow (`depends_on_past`, `max_active_runs`) is in [`docs/plan.md`](../docs/plan.md) § "Orchestration capabilities". Seeded 2026-11-24 from the owner's statements; no declaration is `verified` yet. A run's result is recorded by editing the file, never automatically.
 
 | File | Steps declared | Tested by |
 |---|---|---|
-| `port_visits/orchestration.py` | `thin_port_messages` (allowed), `port_visits` (unknown) | `port_visits/ais.py --modes 1_bf,6_parallel --steps thin_port_messages` |
-| `encounters/orchestration.py` | `create_raw_encounters` (allowed), `merge_encounters` (unknown) | nothing yet |
-| `pipe_events/orchestration.py` | `incremental_events` (forbidden), three more (unknown) | nothing yet |
-| `pipe_gaps/orchestration.py` | `detect` (forbidden, "probably") | nothing yet |
-| `pipe_segment/orchestration.py` | `segment` (forbidden), five more (unknown) | nothing yet |
+| `port_visits/orchestration.py` | `thin_port_messages` (allowed, claimed), `port_visits` (unknown) | `port_visits/ais.py --modes 1_bf,6_parallel --steps thin_port_messages` |
+| `encounters/orchestration.py` | `create_raw_encounters` (allowed, claimed), `merge_encounters` (unknown) | nothing yet |
+| `pipe_events/orchestration.py` | `incremental_events` (forbidden, claimed), three more (unknown) | nothing yet |
+| `pipe_gaps/orchestration.py` | `detect` (forbidden, claimed with "probably") | nothing yet |
+| `pipe_segment/orchestration.py` | `segment` (forbidden, claimed), five more (unknown) | nothing yet |
 
 ## Drift check against production (`composer_drift.py`)
 
 The `composer_drift.py` files are not test workflows. They are a read-only check that compares what each workflow would run with production's rendered DAG in composer-dags-production. Nothing runs on GCP or in docker ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700), [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md) § 8).
 
-- `composer_drift.py` (this directory) is the runner: `dit run workflows/composer_drift.py --composer-dir <checkout>`. It prints one row per workflow step (version, command, flag counts); `--detail` adds the full reports, which contain production values and are for local reading only.
+- `composer_drift.py` (this directory) is the runner: `dit run workflows/composer_drift.py --composer-dir <checkout>`. It prints one row per workflow step (version, command, flag counts); `--detail` adds the full reports, which contain production values and are for local reading only. `--frozen` adds the frozen specs.
 - `<pkg>/composer_drift.py` holds the spec of each workflow in that package: the composer snapshot and tasks it mirrors, and what may differ.
 
 | Spec | Workflow | Composer snapshot | Expected in sync today |
 |---|---|---|---|
 | `port_visits/ais` | `port_visits/ais.py` | `core_ais_v5` | yes |
-| `encounters/ais` | `encounters/ais.py` | `core_ais_v5` | no: the workflow drives an older CLI generation |
+| `encounters/ais` | `encounters/ais.py` | `core_ais_v5` | no: older CLI generation |
 | `encounters/vms` | `encounters/vms.py` | `core_vms_v5_daily` | no: same |
 | `pipe_events/fishing` | `pipe_events/fishing.py` | `core_ais_v5` | no: older CLI generation |
 | `pipe_gaps/mode_equivalence` | `pipe_gaps/mode_equivalence.py` | `core_ais_v5` | no: older pipe-gaps generation |
-| `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | yes (since 2026-11-19; all six tasks of the segment group). Re-synced on 2026-11-20, when the DAG moved to v5.1.0: the default image is the v5.1.0 overlay, and the DAG's `--incremental` is an accepted difference of the `segment` step, because every binding runs full history |
-| `pipe_segment/ais` | `pipe_segment/ais.py` | `core_ais_v3` | yes (since 2026-11-20). Two steps mirror the one `segment` task: the default, incremental job, whose `--incremental` is compared with the DAG's and whose two table flags are DIT's own; and the full-history reference job, which leaves the flag out on purpose |
+| `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | yes, all six tasks of the segment group, at v5.1.0 with `--incremental` |
+| `pipe_segment/identity_match_key@v5.0.3` (frozen, `--frozen`) | the same workflow for a binding at v5.0.3 (its declared adjustment removes `--incremental`) | `core_ais_v3` at composer `cb0c9a3b7930`, the last commit at which production ran v5.0.3 | yes; a regression test of DIT, not of production |
+| `pipe_segment/ais` | `pipe_segment/ais.py` | `core_ais_v3` | yes. Two steps mirror the one `segment` task: the default incremental job, and the full-history reference job, which leaves `--incremental` out on purpose |
 
 The two cross-version wrappers and `pipe_gaps/outage_recovery.py` have no spec of their own. A workflow that is ported to what production runs gets its spec updated in the same change, and `in_sync=True` once the check passes. A new workflow gets a spec when it lands.
 

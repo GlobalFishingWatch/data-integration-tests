@@ -24,6 +24,10 @@ override:
 * ``pipe3`` async (full prod cohort, 2012 -> 2025-05-04, 15-day tail):
   add ``--end 2025-05-04 --tail-days 15`` to the override above.
 
+Not verified: whether those two datasets hold the tables the chain reads. The
+pipe3 scripts at v4.2.17 pass ``--source_pipe_dataset`` to the generate
+script, which rejects it, so they do not settle it. Check before a pipe3 run.
+
 The staging script is the **default first run** per pipe-events' own
 ``CLAUDE.md`` ("Always run staging first; only run pipe3 for final
 validation"). Production-scale runs are deliberately gated behind explicit
@@ -51,9 +55,10 @@ consumers:
 
 **Image resolution (symmetric with Beam consumers).** Default ``--image-tag``
 is the canonical published pipe-events image
-(``us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/...:vX.Y.Z``,
-matching what composer-dags-production pins in prod; readable but not
-writable by dit per the absolute prod-infra boundary). For *reviewed* code at
+(``us-central1-docker.pkg.dev/gfw-int-infrastructure/publication/...:v4.2.17``,
+the AIS v3 DAG's pin when this workflow was written; production has moved on
+since, see ``workflows/pipe_events/README.md``; readable but not writable by
+dit per the absolute prod-infra boundary). For *reviewed* code at
 the default version the docker runner pulls that canonical image directly.
 For *unreviewed* code (snapshot / dirty / unmerged) the harness auto-builds
 a content-addressable ``gcr.io/world-fishing-827/dit/pipe-events:dit-<commit>``
@@ -164,10 +169,13 @@ DEFAULT_START = "2020-01-01"   # inclusive
 DEFAULT_END = "2021-01-01"     # exclusive
 DEFAULT_TAIL_DAYS = 3
 
-# Canonical published pipe-events image, pinned at the prod version that
-# composer-dags-production currently runs (``Versions.PIPE_EVENTS = "v4.2.17"``
-# in ``dags/core/ais/v3.py``). Read-only to dit by IAM per the absolute
-# prod-infra boundary; the docker runner pulls from here for reviewed code.
+# Canonical published pipe-events image, pinned at v4.2.17: the version
+# composer-dags-production's AIS v3 DAG ran when this workflow was written
+# (``Versions.PIPE_EVENTS`` in ``dags/core/ais/v3.py``, 2026-05). Production
+# runs later versions now (v9.0.0 in the AIS v5 DAG on 2026-11-19); see
+# workflows/pipe_events/README.md for what catching up needs. Read-only to
+# dit by IAM per the absolute prod-infra boundary; the docker runner pulls
+# from here for reviewed code.
 # ``--build-from-source`` short-circuits this entirely (the runner builds the
 # compose ``pipeline`` service from the mounted working tree instead).
 DEFAULT_IMAGE_TAG = (
