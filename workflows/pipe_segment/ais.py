@@ -259,7 +259,7 @@ from google.cloud.exceptions import NotFound
 from dit import adjust
 from dit import bq as dit_bq
 from dit import compare as dit_compare
-from dit import dates as dit_dates
+from dit import slices as dit_slices
 from dit import workflow as dit_workflow
 from dit.job_names import make_job_name
 from dit.runners import docker as dit_docker
@@ -502,18 +502,18 @@ def parse_variants(raw_modes: str, raw_segmenters: str) -> list[Variant]:
 # The plan: which jobs a variant runs, over which days
 # --------------------------------------------------------------------------
 
-Slice = tuple[date, date]  # first and last day of one job, both included
+Slice = dit_slices.Slice  # first and last day of one job, both included
 
-
-def _days(first: date, last: date) -> list[date]:
-    """Every day from ``first`` to ``last``, both included."""
-    # dit.dates.daterange_inclusive is half-open despite its name.
-    return list(dit_dates.daterange_inclusive(first, last + timedelta(days=1)))
+#: Every day from ``first`` to ``last``, both included (``dit.slices.days``).
+_days = dit_slices.days
 
 
 def plan_slices(mode: str, start: date, end: date, tail_days: int) -> tuple[Slice, ...]:
-    """The date range of each job of ``mode`` over ``[start, end]``, in run order. Pure."""
-    tail = tuple((day, day) for day in _days(end - timedelta(days=tail_days - 1), end))
+    """The date range of each job of ``mode`` over ``[start, end]``, in run order. Pure.
+
+    The daily slices come from ``dit.slices.by_day``, the generator port
+    visits' ``--slices day`` uses too."""
+    tail = dit_slices.by_day(end - timedelta(days=tail_days - 1), end)
     if mode == MODE_BF:
         return ((start, end),)
     if mode == MODE_BFD:
@@ -521,7 +521,7 @@ def plan_slices(mode: str, start: date, end: date, tail_days: int) -> tuple[Slic
     if mode == MODE_BFTRUNCATE:
         return ((start, end), *tail)
     if mode == MODE_DAILY:
-        return tuple((day, day) for day in _days(start, end))
+        return dit_slices.by_day(start, end)
     raise ValueError(f"unknown mode {mode!r}")
 
 

@@ -17,8 +17,34 @@ end):
   per-day re-runs as ``_2_bfd``. Tests that re-running already-processed days
   truncates partitions cleanly.
 
+* ``_6_parallel`` (opt-in, step 1 only): the window cut into slices
+  (``--slices``, default ``month``), every slice its own Dataflow job, all
+  submitted at once into the one table of the mode, then compared with
+  ``_1_bf``. It tests whether ``thin_port_messages`` may load slices in
+  parallel, as a backfill with several concurrent intervals would. The
+  verdict is judged against the step's declaration in
+  ``workflows/port_visits/orchestration.py`` (``dit.orchestration.judge``):
+  allowed and identical passes; allowed and different, or a failed slice,
+  fails. Needs ``--steps thin_port_messages`` and ``1_bf`` in ``--modes``.
+  Step 2 is refused: it writes its whole table with WRITE_TRUNCATE
+  (pipe-anchorages v5.0.1 ``pipelines/port_visits/main.py``), so slices would
+  replace each other's output. The mode never reads the run cache (a hit
+  would report an older run's concurrency as this one's); its ``dit_runs``
+  row is still written, for cleanup: with ``status='succeeded'`` when every
+  slice succeeded, and with ``status='failed'`` when a slice failed
+  (``ParallelSlicesFailed``), so ``make dit-cancel RUN_ID=<run id>`` drops a
+  partly filled table too. The parallel jobs together may use ``slices in
+  flight x --max-num-workers`` workers; above 100 the run is refused unless
+  ``--allow-many-workers`` (:func:`check_total_workers`).
+
 There is no ``_4_mutate_recover`` mode here -- that was pipe-gaps' Bug A
-trigger and doesn't apply to port-visits.
+trigger and doesn't apply to port-visits. The numbers 4 and 5 are taken by
+modes of other workflows (pipe-gaps, pipe-segment), so the parallel mode is 6
+everywhere.
+
+``--dry-run`` prints the configuration and every mode's jobs (slice, job name)
+and returns before anything is resolved, pinned, built or submitted. It does
+not read the pipeline commit and does not run the image guard.
 
 Steps (``--steps``, default both, in pipeline order):
 
@@ -100,7 +126,8 @@ from datetime import date, datetime, timedelta
 from typing import Optional, Sequence
 
 from dit import compare as dit_compare
-from dit import dates as dit_dates
+from dit import orchestration as dit_orchestration
+from dit import slices as dit_slices
 from dit import workflow as dit_workflow
 from dit.cache import CacheKey, resolve_worker_image_to_digest, sha1_of_workflow_file
 from dit.dataflow_paths import dataflow_staging_location, dataflow_temp_location
@@ -127,6 +154,7 @@ from dit.workflow import (
     worker_sizing_from_args,
     worker_sizing_options,
 )
+from workflows.port_visits import orchestration as pv_orchestration
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +173,10 @@ WORKFLOW_NAME = "workflows/port_visits/ais.py"
 MODE_BF = "1_bf"
 MODE_BFD = "2_bfd"
 MODE_BFTRUNCATE = "3_bftruncate"
+#: N slices submitted at once into one table, compared with MODE_BF. Step 1
+#: only. Numbered 6 so it clashes with no mode of another workflow
+#: (pipe-gaps' 4_mutate_recover and 5_outage_*, pipe-segment's 4_daily).
+MODE_PARALLEL = "6_parallel"
 
 #: Modes whose output depends on ``tail_days`` (the daily-slice modes).
 #: ``MODE_BF`` runs a single big range and ignores it, so ``tail_days`` must
@@ -153,7 +185,19 @@ MODE_BFTRUNCATE = "3_bftruncate"
 _MODES_USING_TAIL = frozenset({MODE_BFD, MODE_BFTRUNCATE})
 
 #: Modes selectable via --modes, in canonical order.
-SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
+SELECTABLE_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE, MODE_PARALLEL)
+
+#: What a run without --modes executes: the parallel mode is opt-in (it needs
+#: --steps thin_port_messages).
+DEFAULT_MODES = (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
+
+#: The modes compared pairwise with each other. MODE_PARALLEL is compared with
+#: MODE_BF only, and judged against the step's declaration.
+SEQUENTIAL_MODES = DEFAULT_MODES
+
+#: --slices when 6_parallel is selected and the flag is not given: the 12
+#: calendar months of the default window.
+DEFAULT_SLICES = dit_slices.KIND_MONTH
 
 # Step names (DIT's standard, kept from the pipe-anchorages v4 CLI; the
 # pipeline's own commands are port-state-transitions and port-visits). Also
@@ -607,6 +651,117 @@ def validate_steps(steps: Sequence[str], thinned_message_table: Optional[str]) -
         )
 
 
+#: Why 6_parallel is refused for step 2; read, not run, at pipe-anchorages v5.0.1.
+PARALLEL_STEP2_REFUSED = (
+    f"{MODE_PARALLEL} is defined for {STEP_THIN} only: pass --steps {STEP_THIN}. "
+    f"{STEP_VISITS} reads its input from the start date on and writes its whole output "
+    f"table with WRITE_TRUNCATE (pipe-anchorages v5.0.1, pipelines/port_visits/main.py), "
+    f"so slices loaded in parallel would each replace the others' output."
+)
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
+
+
+def validate_parallel(
+    *,
+    modes: Sequence[str],
+    steps: Sequence[str],
+    slices: Optional[str],
+    max_concurrent_slices: Optional[int],
+    window: Optional[tuple[date, date]],
+) -> tuple[dit_slices.Slice, ...]:
+    """The slices of ``6_parallel``, or ``()`` when it is not selected. Pure.
+
+    ``window`` is the inclusive ``(start, end)`` of the run; ``None`` when the
+    mode is not selected, since the dates are then not needed (``ValueError``
+    if the mode is selected without them: a caller's error).
+
+    ``SystemExit`` when the selection cannot test anything: step 2 selected,
+    no ``1_bf`` to compare with, a spec that does not cover the window exactly
+    once, a single slice (the same job as ``1_bf``), or the parallel flags
+    without the mode (they would read as if slices had been tested).
+    """
+    if MODE_PARALLEL not in modes:
+        given = [flag for flag, value in (("--slices", slices),
+                                          ("--max-concurrent-slices", max_concurrent_slices))
+                 if value is not None]
+        if given:
+            raise SystemExit(f"{' and '.join(given)} need {MODE_PARALLEL} in --modes")
+        return ()
+    if list(steps) != [STEP_THIN]:
+        raise SystemExit(PARALLEL_STEP2_REFUSED)
+    if MODE_BF not in modes:
+        raise SystemExit(
+            f"{MODE_PARALLEL} is compared with {MODE_BF} (one job over the window): add "
+            f"{MODE_BF} to --modes"
+        )
+    if window is None:
+        raise ValueError(f"{MODE_PARALLEL} is selected but no window was given")
+    start, end = window
+    if end < start:
+        raise SystemExit(f"--end {end} is before --start {start}")
+    try:
+        planned = dit_slices.plan(dit_slices.parse_spec(slices or DEFAULT_SLICES), start, end)
+        dit_slices.check_partition(planned, start=start, end=end)
+    except ValueError as exc:
+        raise SystemExit(f"--slices: {exc}") from None
+    if len(planned) < 2:
+        raise SystemExit(
+            f"--slices gives one slice over [{start}, {end}]: that is the same job as "
+            f"{MODE_BF}, so nothing would be tested. Choose a spec with at least two slices."
+        )
+    return planned
+
+
+#: Most Dataflow workers the parallel slices may ask for together without
+#: ``--allow-many-workers`` (owner-proposed threshold, 2026-11-25; adjustable).
+#: ``world-fishing-827`` shares its regional Dataflow quota with production.
+PARALLEL_MAX_TOTAL_WORKERS = 100
+
+
+def slices_in_flight(slices: Sequence[dit_slices.Slice], max_concurrent: Optional[int]) -> int:
+    """How many slices of ``6_parallel`` run at a time. Pure."""
+    return min(len(slices), max_concurrent or len(slices))
+
+
+def describe_parallel_workers(in_flight: int, max_num_workers: int) -> str:
+    """The parallel slices' worker bound, as one line for the plan. Pure."""
+    total = in_flight * max_num_workers
+    return (
+        f"workers: {in_flight} slice(s) in flight x --max-num-workers {max_num_workers} = "
+        f"up to {total} at once (refused above {PARALLEL_MAX_TOTAL_WORKERS} without "
+        f"--allow-many-workers)"
+    )
+
+
+def check_total_workers(*, in_flight: int, max_num_workers: int, allow: bool) -> None:
+    """Refuse a ``6_parallel`` run whose slices together may ask for more than
+    ``PARALLEL_MAX_TOTAL_WORKERS`` Dataflow workers, unless ``allow``. Pure.
+
+    Each slice is its own job with ``--max-num-workers``, so the bound is
+    their product. Other modes run with ``--parallel`` add one job each on top.
+    """
+    total = in_flight * max_num_workers
+    if total <= PARALLEL_MAX_TOTAL_WORKERS or allow:
+        return
+    raise SystemExit(
+        f"{MODE_PARALLEL}: {in_flight} slice(s) in flight x --max-num-workers "
+        f"{max_num_workers} = up to {total} Dataflow workers at once, above "
+        f"{PARALLEL_MAX_TOTAL_WORKERS}. world-fishing-827 shares its regional Dataflow quota "
+        f"with production, so a run this wide could slow production's jobs. Lower "
+        f"--max-concurrent-slices or --max-num-workers, or pass --allow-many-workers if "
+        f"you mean it."
+    )
+
+
 def _last_step(args: argparse.Namespace) -> str:
     """The step whose output a run produces and compares."""
     return args.steps[-1]
@@ -764,42 +919,103 @@ def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
+def mode_slices(
+    mode: str, start: date, end: date, tail_days: int,
+    parallel_slices: Sequence[dit_slices.Slice] = (),
+) -> tuple[dit_slices.Slice, ...]:
+    """The inclusive date range of each job of ``mode`` over ``[start, end]``. Pure.
+
+    The sequential modes run their slices in this order; ``6_parallel``'s
+    slices (``parallel_slices``, from ``--slices``) are submitted at once.
+    The daily tails come from ``dit.slices.by_day``.
+    """
+    tail = dit_slices.by_day(end - timedelta(days=tail_days - 1), end)
+    if mode == MODE_BF:
+        return ((start, end),)
+    if mode == MODE_BFD:
+        return ((start, end - timedelta(days=tail_days)), *tail)
+    if mode == MODE_BFTRUNCATE:
+        return ((start, end), *tail)
+    if mode == MODE_PARALLEL:
+        return tuple(parallel_slices)
+    raise ValueError(f"unknown mode {mode!r}")
+
+
+def _slices_of(args: argparse.Namespace, mode: str) -> tuple[dit_slices.Slice, ...]:
+    return mode_slices(
+        mode, _parse_date(args.start), _parse_date(args.end), args.tail_days,
+        getattr(args, "parallel_slices", ()),
+    )
+
+
+def _run_in_order(args: argparse.Namespace, suffix: str, mode: str) -> None:
+    """Run ``mode``'s slices one after the other; the first failure stops it."""
+    slices = _slices_of(args, mode)
+    for iteration, (first, last) in enumerate(slices, start=1):
+        _run_slice(args, mode=mode, slice_start=first, slice_end=last, suffix=suffix,
+                   iteration=iteration, total_iterations=len(slices))
+
+
 def execute_bf(args: argparse.Namespace, suffix: str) -> None:
-    start = _parse_date(args.start)
-    end = _parse_date(args.end)
-    _run_slice(args, mode=MODE_BF, slice_start=start, slice_end=end, suffix=suffix,
-               iteration=1, total_iterations=1)
+    _run_in_order(args, suffix, MODE_BF)
 
 
 def execute_bfd(args: argparse.Namespace, suffix: str) -> None:
-    start = _parse_date(args.start)
-    end = _parse_date(args.end)
-    initial_end = end - timedelta(days=args.tail_days)
-    total = 1 + args.tail_days
-    _run_slice(args, mode=MODE_BFD, slice_start=start, slice_end=initial_end, suffix=suffix,
-               iteration=1, total_iterations=total)
-    # daterange_inclusive is half-open per dit.dates contract; +1 day on end
-    # to include the final `end` date.
-    for i, d in enumerate(
-        dit_dates.daterange_inclusive(initial_end + timedelta(days=1), end + timedelta(days=1)),
-        start=2,
-    ):
-        _run_slice(args, mode=MODE_BFD, slice_start=d, slice_end=d, suffix=suffix,
-                   iteration=i, total_iterations=total)
+    _run_in_order(args, suffix, MODE_BFD)
 
 
 def execute_bftruncate(args: argparse.Namespace, suffix: str) -> None:
-    start = _parse_date(args.start)
-    end = _parse_date(args.end)
-    total = 1 + args.tail_days
-    _run_slice(args, mode=MODE_BFTRUNCATE, slice_start=start, slice_end=end, suffix=suffix,
-               iteration=1, total_iterations=total)
-    for i, d in enumerate(
-        dit_dates.daterange_inclusive(end - timedelta(days=args.tail_days - 1), end + timedelta(days=1)),
-        start=2,
-    ):
-        _run_slice(args, mode=MODE_BFTRUNCATE, slice_start=d, slice_end=d, suffix=suffix,
-                   iteration=i, total_iterations=total)
+    _run_in_order(args, suffix, MODE_BFTRUNCATE)
+
+
+class ParallelSlicesFailed(Exception):
+    """At least one slice of ``6_parallel`` failed. Every slice was awaited;
+    ``failures`` describes each failed one."""
+
+    def __init__(self, failures: Sequence[str], total: int) -> None:
+        self.failures = tuple(failures)
+        self.total = total
+        super().__init__(
+            f"{len(self.failures)} of {total} parallel slice(s) failed: " + "; ".join(self.failures)
+        )
+
+
+def execute_parallel(args: argparse.Namespace, suffix: str) -> None:
+    """Submit every slice of ``6_parallel`` at once, then await them all.
+
+    Each slice is its own ``thin_port_messages`` job (own job name, slice
+    labels, ``--max-num-workers`` each), writing into the mode's one table.
+    ``--max-concurrent-slices`` caps how many run at a time; by default all
+    do, which is the point of the test. A failed slice does not stop the
+    others; once all are done, ``ParallelSlicesFailed`` lists the failures.
+    """
+    slices = _slices_of(args, MODE_PARALLEL)
+    total = len(slices)
+    concurrent_slices = min(total, getattr(args, "max_concurrent_slices", None) or total)
+    logger.info(
+        "%s: %d slice(s), %d submitted at once%s", MODE_PARALLEL, total, concurrent_slices,
+        "" if concurrent_slices == total else " (capped by --max-concurrent-slices)",
+    )
+
+    def one(iteration: int, piece: dit_slices.Slice) -> None:
+        _run_slice(args, mode=MODE_PARALLEL, slice_start=piece[0], slice_end=piece[1],
+                   suffix=suffix, iteration=iteration, total_iterations=total)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_slices) as pool:
+        futures = {
+            pool.submit(one, iteration, piece): (iteration, piece)
+            for iteration, piece in enumerate(slices, start=1)
+        }
+        concurrent.futures.wait(futures)
+    failures = [
+        f"slice {iteration}/{total} [{piece[0]}, {piece[1]}]: {future.exception()}"
+        for future, (iteration, piece) in sorted(futures.items(), key=lambda item: item[1][0])
+        if future.exception() is not None
+    ]
+    for failure in failures:
+        logger.error("%s %s", MODE_PARALLEL, failure)
+    if failures:
+        raise ParallelSlicesFailed(failures, total)
 
 
 # --------------------------------------------------------------------------
@@ -915,6 +1131,12 @@ def canonical_params_dict(args: argparse.Namespace, mode: str) -> dict:
         params["steps"] = list(args.steps)
     if mode in _MODES_USING_TAIL:
         params["tail_days"] = args.tail_days
+    if mode == MODE_PARALLEL:
+        # The slices decide the jobs; the concurrency cap does not change what
+        # is written, only how many jobs overlap, so it stays out.
+        params["slices"] = [
+            [first.isoformat(), last.isoformat()] for first, last in _slices_of(args, mode)
+        ]
     # No pipeline-CLI field: there is one CLI. Until 2026-11-19 v5 rows carried
     # ``pipeline_cli: v5`` to keep them apart from v4 rows. Dropping it cannot
     # make a new run hit an old v4 row: the key also holds this file's sha1,
@@ -968,7 +1190,13 @@ def _run_with_cache(args: argparse.Namespace, mode: str, suffix: str, execute_fn
         execute_kwargs={"args": args, "suffix": suffix},
         extra_output_tables=extra_output_tables,
         log_label=mode,
-        use_cache=not args.no_cache,
+        # The parallel mode tests concurrent loads, whose outcome need not
+        # repeat: a hit would report an older run's result as this run's. It
+        # never reads the cache; its row is still written, for cleanup, also
+        # when a slice failed (status 'failed'), since the table then holds
+        # the slices that succeeded.
+        use_cache=not args.no_cache and mode != MODE_PARALLEL,
+        record_failures=(ParallelSlicesFailed,) if mode == MODE_PARALLEL else (),
     )
 
 
@@ -1017,6 +1245,34 @@ def compare_all(
         logger.info("compare %s vs %s -> rc=%s", a, b, rc)
         overall = overall or rc
     return overall
+
+
+def judge_parallel(
+    args: argparse.Namespace,
+    mode_fqns: dict[str, str],
+    failure: Optional[ParallelSlicesFailed],
+) -> dit_orchestration.Judgement:
+    """Compare ``6_parallel`` with ``1_bf`` and judge the outcome against the
+    declaration of the step it ran (``workflows/port_visits/orchestration.py``).
+
+    A failed slice skips the comparison (the table holds only part of the
+    window) and is judged as such, also under ``--skip-comparisons``.
+    """
+    declaration = pv_orchestration.ORCHESTRATION.step(_last_step(args))
+    compare_rc = None
+    if failure is None:
+        compare_rc = dit_compare.compare_tables(
+            mode_fqns[MODE_BF], mode_fqns[MODE_PARALLEL],
+            keys=COMPARE_KEYS_BY_STEP[_last_step(args)], view_suffix=COMPARE_VIEW_SUFFIX,
+        )
+        logger.info("compare %s vs %s -> rc=%s", MODE_BF, MODE_PARALLEL, compare_rc)
+    outcome = dit_orchestration.outcome_of(slices_failed=failure is not None, compare_rc=compare_rc)
+    judgement = dit_orchestration.judge(declaration, outcome)
+    log = logger.warning if judgement.warning or judgement.exit_code else logger.info
+    log("%s: %s -- %s", MODE_PARALLEL, judgement.verdict, judgement.message)
+    log("%s: Airflow, as declared: %s", MODE_PARALLEL,
+        dit_orchestration.airflow_guidance(declaration))
+    return judgement
 
 
 # --------------------------------------------------------------------------
@@ -1132,8 +1388,31 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Run the three modes' pipelines in parallel threads (each submits Dataflow concurrently).")
     # Infra knobs: --dest-dataset, --service-account, --dataflow-region,
     # --dataflow-temp-bucket, --dataflow-subnetwork (identical to both workflows).
+    p.add_argument("--slices", default=None,
+                   help=f"With {MODE_PARALLEL} only: how the window is cut into slices loaded in "
+                        f"parallel. {dit_slices.SPEC_HELP} Default {DEFAULT_SLICES}. The slices "
+                        f"must cover the window exactly once and be at least two. Slices that "
+                        f"share a month partition run their deletes and inserts on it "
+                        f"concurrently, and BigQuery may fail some when its DML queue fills.")
+    p.add_argument("--max-concurrent-slices", type=_positive_int, default=None,
+                   help=f"With {MODE_PARALLEL} only: how many slices run at a time. Default: all "
+                        f"of them, which is what the test is about; a cap makes later slices "
+                        f"wait for earlier ones.")
+    p.add_argument("--allow-many-workers", action="store_true",
+                   help=f"With {MODE_PARALLEL} only: allow the slices in flight together to ask "
+                        f"for more than {PARALLEL_MAX_TOTAL_WORKERS} Dataflow workers (slices in "
+                        f"flight x --max-num-workers). Refused without it: world-fishing-827 "
+                        f"shares its regional Dataflow quota with production.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print the configuration and every mode's jobs, then stop. Nothing is "
+                        "resolved, pinned, built, submitted or compared; the pipeline commit "
+                        "is not read and the image guard does not run.")
     add_infra_args(p)
-    add_modes_arg(p, choices=SELECTABLE_MODES)
+    add_modes_arg(
+        p, choices=SELECTABLE_MODES, default=DEFAULT_MODES,
+        help_suffix=f"{MODE_PARALLEL} is opt-in: it needs --steps {STEP_THIN} and {MODE_BF}, "
+                    f"and is compared with {MODE_BF} only.",
+    )
     args = p.parse_args(argv)
     if args.pipeline_cli is not None:
         raise SystemExit(PIPELINE_CLI_REMOVED)
@@ -1145,9 +1424,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.steps, choices=SELECTABLE_STEPS, flag="--steps", noun="step",
     )
     validate_steps(args.steps, args.thinned_message_table)
+    try:
+        window = (
+            (_parse_date(args.start), _parse_date(args.end)) if MODE_PARALLEL in args.modes
+            else None
+        )
+    except ValueError as exc:
+        raise SystemExit(f"--start / --end: {exc}") from None
+    args.parallel_slices = validate_parallel(
+        modes=args.modes, steps=args.steps, slices=args.slices,
+        max_concurrent_slices=args.max_concurrent_slices, window=window,
+    )
     # Flag > ceiling env var > default; see dit.workflow.resolve_max_num_workers.
     args.worker_cap = worker_cap(args.max_num_workers, default=DEFAULT_MAX_NUM_WORKERS)
     args.max_num_workers = args.worker_cap.workers
+    if args.parallel_slices:
+        check_total_workers(
+            in_flight=slices_in_flight(args.parallel_slices, args.max_concurrent_slices),
+            max_num_workers=args.max_num_workers, allow=args.allow_many_workers,
+        )
+    elif args.allow_many_workers:
+        raise SystemExit(f"--allow-many-workers needs {MODE_PARALLEL} in --modes")
     # Per step and field: flag > production's sizing (resolve_worker_sizing).
     args.cli_worker_sizing = worker_sizing_from_args(args)
     args.worker_sizings = {
@@ -1224,6 +1521,52 @@ def _source_tables_read(args: argparse.Namespace) -> list[str | None]:
     ]
 
 
+def describe_plan(args: argparse.Namespace) -> list[str]:
+    """Every selected mode's jobs and the comparisons that follow, as lines. Pure."""
+    def jobs(mode: str) -> list[str]:
+        slices = _slices_of(args, mode)
+        how = ("submitted at once, " if mode == MODE_PARALLEL else "in order, ") + (
+            f"{len(slices)} job(s) per step")
+        return [f"mode {mode}: {how}"] + [
+            f"  {iteration}/{len(slices)} [{first}, {last}] "
+            + " ".join(
+                _make_job_name(args, step=step, mode=mode, iteration=iteration,
+                               total_iterations=len(slices))
+                for step in args.steps
+            )
+            for iteration, (first, last) in enumerate(slices, start=1)
+        ]
+
+    sequential = [mode for mode in args.modes if mode in SEQUENTIAL_MODES]
+    pairs = list(itertools.combinations(sequential, 2))
+    keys = ",".join(COMPARE_KEYS_BY_STEP[_last_step(args)])
+    lines = [line for mode in args.modes for line in jobs(mode)]
+    lines += [f"compare {a} vs {b} on {keys}" for a, b in pairs]
+    if MODE_PARALLEL in args.modes:
+        declaration = pv_orchestration.ORCHESTRATION.step(_last_step(args))
+        lines += [
+            f"compare {MODE_BF} vs {MODE_PARALLEL} on {keys}, judged against the declaration: "
+            f"{_last_step(args)} parallel slices {declaration.parallel_slices} "
+            f"({declaration.status}, {declaration.source or 'no source'})",
+            f"slices ({args.slices or DEFAULT_SLICES}): {dit_slices.describe(args.parallel_slices)}",
+            describe_parallel_workers(
+                slices_in_flight(args.parallel_slices, args.max_concurrent_slices),
+                args.max_num_workers,
+            ),
+        ]
+    return lines
+
+
+def _dry_run(args: argparse.Namespace) -> int:
+    """Log the plan; create nothing (no commit, image, pin, job or comparison)."""
+    logger.info("dry run: nothing is resolved or created")
+    logger.info("experiment_id: %s; steps: %s; window (inclusive): %s -> %s; runner: %s",
+                args.experiment_id, ",".join(args.steps), args.start, args.end, args.runner)
+    for line in describe_plan(args):
+        logger.info("%s", line)
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
@@ -1234,6 +1577,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Negative values produce nonsensical iteration counts and invert "
             "the daily-tail date range."
         )
+
+    if args.dry_run:
+        return _dry_run(args)
 
     repo_dir = os.getcwd()
 
@@ -1340,9 +1686,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the user pre-populated those tables, so we compare them directly without
     # consulting the cache.
     mode_fqns: dict[str, str] = {
-        mode: _output_table(args, suffix, mode)
-        for mode in (MODE_BF, MODE_BFD, MODE_BFTRUNCATE)
+        mode: _output_table(args, suffix, mode) for mode in SELECTABLE_MODES
     }
+    if MODE_PARALLEL in args.modes:
+        logger.info("%s slices (%s): %s", MODE_PARALLEL, args.slices or DEFAULT_SLICES,
+                    dit_slices.describe(args.parallel_slices))
+        logger.info("%s %s", MODE_PARALLEL, describe_parallel_workers(
+            slices_in_flight(args.parallel_slices, args.max_concurrent_slices),
+            args.max_num_workers,
+        ))
+    parallel_failure: Optional[ParallelSlicesFailed] = None
+
+    def run_mode(mode: str, fn) -> str:
+        """The mode's table to compare. A failed parallel slice is recorded,
+        not raised: it is an outcome judged against the declaration."""
+        nonlocal parallel_failure
+        try:
+            return _run_with_cache(args, mode, suffix, fn)
+        except ParallelSlicesFailed as exc:
+            parallel_failure = exc
+            return mode_fqns[mode]
 
     if not args.skip_pipelines:
         # Each mode flows through the run cache: an identical
@@ -1357,6 +1720,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             MODE_BF: execute_bf,
             MODE_BFD: execute_bfd,
             MODE_BFTRUNCATE: execute_bftruncate,
+            MODE_PARALLEL: execute_parallel,
         }
         mode_execs = [(m, _execs_by_mode[m]) for m in args.modes]
         skipped = [m for m in SELECTABLE_MODES if m not in args.modes]
@@ -1368,18 +1732,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.parallel:
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(mode_execs)) as pool:
                 future_to_mode = {
-                    pool.submit(_run_with_cache, args, mode, suffix, fn): mode
+                    pool.submit(run_mode, mode, fn): mode
                     for mode, fn in mode_execs
                 }
                 for fut in concurrent.futures.as_completed(future_to_mode):
                     mode_fqns[future_to_mode[fut]] = fut.result()
         else:
             for mode, fn in mode_execs:
-                mode_fqns[mode] = _run_with_cache(args, mode, suffix, fn)
+                mode_fqns[mode] = run_mode(mode, fn)
 
+    judgement = (
+        judge_parallel(args, mode_fqns, parallel_failure)
+        if MODE_PARALLEL in args.modes and (parallel_failure or not args.skip_comparisons)
+        else None
+    )
+    parallel_rc = judgement.exit_code if judgement else 0
     if args.skip_comparisons:
-        return 0
-    return compare_all(mode_fqns, args.modes, keys=COMPARE_KEYS_BY_STEP[_last_step(args)])
+        return parallel_rc
+    sequential = [mode for mode in args.modes if mode in SEQUENTIAL_MODES]
+    sequential_rc = (
+        compare_all(mode_fqns, sequential, keys=COMPARE_KEYS_BY_STEP[_last_step(args)])
+        if len(sequential) > 1 or MODE_PARALLEL not in args.modes else 0
+    )
+    return sequential_rc or parallel_rc
 
 
 if __name__ == "__main__":

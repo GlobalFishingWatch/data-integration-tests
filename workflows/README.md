@@ -10,7 +10,7 @@ mode-equivalence test.
 |---|---|---|---|---|
 | `pipe_gaps/mode_equivalence.py` | pipe-gaps (detect-gaps) | Beam **in-process** (`dit.runners.dataflow`) | SCD-2 (`_last_versions`, keyed by gap key) | yes (`dit_runs`) |
 | `pipe_gaps/outage_recovery.py` | pipe-gaps (detect-gaps) | Beam **in-process** (`dit.runners.dataflow`) | SCD-2 (`_last_versions`, `gap_id` + `start_timestamp`): staged outage-and-recovery run vs a single-shot oracle | yes (`dit_runs`) |
-| `port_visits/ais.py` | anchorages_pipeline (port-visits) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `visit_id`; `(identifier, timestamp)` with `--steps thin_port_messages`) | yes (`dit_runs`) |
+| `port_visits/ais.py` | anchorages_pipeline (port-visits) | Beam **via container** (`dit.runners.docker`). Opt-in `6_parallel` (step 1 only): the window cut by `--slices`, all slices submitted at once into one table | truncate (`view_suffix=""`, `visit_id`; `(identifier, timestamp)` with `--steps thin_port_messages`). `6_parallel` is compared with `1_bf` only and judged against the step's declaration (`orchestration.py`) | yes (`dit_runs`); `6_parallel` never reads it |
 | `port_visits/cross_version_ais.py` | anchorages_pipeline (port-visits) | N per-binding subprocess invocations of `ais.py`, each from a `git worktree` at that binding's ref; with `--baseline-production`, the candidate binding only, diffed against production's own output | truncate, same keys as `ais.py`, pairwise across bindings | via each binding's `ais.py` |
 | `pipe_events/fishing.py` | pipe-events (fishing events) | **BQ-SQL via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `event_id`) | no (deferred) |
 | `pipe_events/cross_version_fishing.py` | pipe-events (fishing events) | N per-binding subprocess invocations of `fishing.py` (each with its own **BQ-SQL via container** runtime, from a `git worktree` at that binding's ref) | truncate (`view_suffix=""`, `event_id`) across BOTH `_fishing_events` and `_product_events_fishing` views | no (deferred with `fishing.py`) |
@@ -18,6 +18,18 @@ mode-equivalence test.
 | `pipe_segment/ais.py` | pipe-segment (mode equivalence of the `segment` step) | Beam **via container** (`dit.runners.docker`). The unit is a (mode, segmenter) variant: modes `1_bf`, `2_bfd`, `3_bftruncate` and the opt-in `4_daily` (every day its own job); segmenters `incremental` (pipe-segment's `--incremental`, v5.1.0; the default, as the AIS DAG's task passes it) and `full-history`. Each variant has its own tables and runs its jobs in order. The default run is full history in one job against three incremental shapes | truncate (`view_suffix=""`), on `segments` (`seg_id`, `frag_id`; the discriminating one), `messages_segmented` (`msgid`) and `fragments` (`frag_id`), pairwise across variants | no |
 | `encounters/ais.py` | encounters_pipeline (encounters generation) | Beam **via container** (`dit.runners.docker`) | truncate (`view_suffix=""`, `encounter_id`) on both the raw and merged tables | no |
 | `encounters/vms.py` | encounters_pipeline (encounters generation, VMS) | same execution as `encounters/ais.py` (`ais.run(args)`); only defaults and help differ | same as `encounters/ais.py` | no |
+
+## Orchestration declarations (`orchestration.py`)
+
+Each package has an `orchestration.py` declaring, per pipeline step, whether slices of a window may load in parallel, whether a run depends on the previous one, and on what evidence (`verified` with a Cloud Build id, `claimed` with its source, `untested`). The type and the judgement of a test outcome live in `dit.orchestration`; how the declarations map to Airflow (`depends_on_past`, `max_active_runs`) is in [`docs/plan.md`](../docs/plan.md) § "Orchestration capabilities". Seeded 2026-11-24 from the owner's statements, all `claimed`; no declaration is `verified` yet. A run's result is recorded by editing the file, never automatically.
+
+| File | Steps declared | Tested by |
+|---|---|---|
+| `port_visits/orchestration.py` | `thin_port_messages` (allowed), `port_visits` (unknown) | `port_visits/ais.py --modes 1_bf,6_parallel --steps thin_port_messages` |
+| `encounters/orchestration.py` | `create_raw_encounters` (allowed), `merge_encounters` (unknown) | nothing yet |
+| `pipe_events/orchestration.py` | `incremental_events` (forbidden), three more (unknown) | nothing yet |
+| `pipe_gaps/orchestration.py` | `detect` (forbidden, "probably") | nothing yet |
+| `pipe_segment/orchestration.py` | `segment` (forbidden), five more (unknown) | nothing yet |
 
 ## Drift check against production (`composer_drift.py`)
 
@@ -119,3 +131,16 @@ is the form a shared `dit.phases` would take. It also copies port visits' image
 guard (`check_images`, `_default_images_executed`): two workflows now default to a
 DIT overlay image and refuse unreviewed code on it. Neither is extracted here;
 both are candidates for the extraction above.
+
+### Update (2026-11-24): date slicing extracted as `dit.slices`
+
+The slice generators are now one library module, `dit.slices` (days, calendar
+weeks, calendar months, N-day chunks, an explicit list; a spec string selects
+one; `check_partition` checks that slices cover a window exactly once). Its
+consumers: `pipe_segment/ais.py` (the daily tails and `4_daily`, through
+`by_day`; `plan_slices` and `check_chain` stay in the workflow, unchanged in
+behaviour), and `port_visits/ais.py` (the daily tails, through a pure
+`mode_slices`, and the slices of `6_parallel`, from `--slices`). `encounters/ais.py`
+still slices on its own. What was extracted is the date arithmetic only; how a
+slice is executed stays in each workflow, as planned above. `dit.phases` as a
+mode framework is still not extracted.

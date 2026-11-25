@@ -6,6 +6,16 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: parallel slices, review fixes
+
+#### Changed
+- **`6_parallel` refuses more than 100 Dataflow workers across its concurrent slices** unless `--allow-many-workers` is passed (`workflows/port_visits/ais.py`). Each slice is its own job with `--max-num-workers`, so the bound is slices in flight x `--max-num-workers`; it is logged with the plan and in `--dry-run`. Why: `world-fishing-827` shares its regional Dataflow quota with production. The threshold is the owner's proposal and may move. Example: `--slices day` over January with the default 4 workers (124) now needs `--max-concurrent-slices 25`, `--max-num-workers 3` or the flag.
+- **A forbidden step whose slices failed is logged as a warning**, saying that quota or permissions may be the cause. The verdict and exit code (as declared, 0) are unchanged.
+
+#### Fixed
+- **A failed `6_parallel` run is recorded in `dit_runs`** (status `failed`), so `make dit-cancel RUN_ID=<id>` finds and drops its partly filled table. Before, the row was written only after success, though the docstring said otherwise. A failed row is never a cache hit. Shared helper: `dit.workflow.run_with_cache(record_failures=...)`, default unchanged for every other workflow.
+- `--slices` help says that slices sharing a month partition run their deletes and inserts on it concurrently, and BigQuery may fail some when its DML queue fills.
+
 ### 2026-11-25: per-side adjustments, review fixes
 
 #### Changed
@@ -38,6 +48,21 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   - **Now:** rows of a duplicated key pair one-to-one: identical rows first, then the leftovers in row order. Surplus rows count as only in A or only in B.
   - **The case that found it:** the pipe-segment v5.0.3 against v5.1.0 `messages_segmented` comparison (one duplicated `msgid`, 81M rows) reported 2 differences and failed; it now reports IDENTICAL.
   - **To refresh earlier results:** rerun them with `--skip-pipelines` after the ditbox rebuild.
+
+### 2026-11-24: parallel slices, and per-step orchestration declarations
+
+#### Added
+- **`dit.slices`:** date slices over an inclusive window. Days, calendar weeks (Monday to Sunday), calendar months, chunks of N days, or an explicit list, selected by one spec string (`day`, `week`, `month`, `<N>d`, or a JSON list of `[first, last]` pairs). `check_partition` checks that slices cover a window exactly once.
+- **`dit.orchestration` and `workflows/<pkg>/orchestration.py`:** per pipeline step, whether slices may load in parallel (`allowed` / `forbidden` / `unknown`), whether a run depends on the previous one, and the evidence (`verified` with a Cloud Build id, `claimed` with its source, `untested`). `judge` turns a test outcome into a verdict and an exit code; a forbidden step is still run, as a negative test. Seeded from the owner's statements of 2026-11-24, all `claimed`. Nothing writes `verified`: a result is recorded by editing the file.
+- **`workflows/port_visits/ais.py`: mode `6_parallel`**, with `--slices` (default `month`) and `--max-concurrent-slices` (default: no cap). Step 1 only (`--steps thin_port_messages`) and only next to `1_bf`. Every slice is its own Dataflow job (own job name, `dit_slice_start` / `dit_slice_end` labels, `--max-num-workers` each), all submitted before any is awaited, into one table. The table is compared with `1_bf` and the outcome judged against `thin_port_messages`' declaration. A failed slice does not stop the others; all are awaited and reported. The mode never reads the run cache. Refused, before any cloud call: step 2 (it writes its whole table with WRITE_TRUNCATE), no `1_bf`, slices that do not cover the window exactly once, a single slice, and the two flags without the mode.
+- **`workflows/port_visits/ais.py --dry-run`:** prints every mode's jobs (slice, job name) and the comparisons, and stops before the commit is read, an image checked, or anything is created.
+
+#### Changed
+- `workflows/pipe_segment/ais.py` and `workflows/port_visits/ais.py` build their daily slices with `dit.slices`. The plans are unchanged (the existing tests pass unedited).
+- `workflows/port_visits/cross_version_ais.py` refuses `--modes 6_parallel`; diffing it across bindings is not defined.
+
+#### Not verified
+- Nothing ran: no Dataflow job, Cloud Build, docker build or BigQuery job. The claims about pipe-anchorages (step 1 reads exactly its slice and processes each segment-day on its own; step 2 truncates its table) were read in its code at v5.0.1.
 
 ### 2026-11-24: per-side adjustments in cross-version runs; the segmenter A/B passes production's `--incremental`
 
