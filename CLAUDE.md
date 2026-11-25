@@ -80,6 +80,18 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-25 — Review fixes on PR #97 (per-side adjustments)
+
+**The version check refuses, before pinning.** `_warn_on_version_mismatch` warned in `_run_binding`, after the copy, when a binding's image was tagged another version than its ref states. Scenario from the review: `--binding before=v5.0.3 --binding after=v5.1.0` without `--binding-image` ran v5.1.0 code with v5.0.3's flags and reported v5.1.0 full history against v5.1.0 incremental as v5.0.3 against v5.1.0. Now `_check_image_versions` in `_preflight` refuses when both versions are known and differ.
+
+**Decision: how an unreleased head is told apart (warning, not refusal).** The ref is not written as a version tag (`adjustments.ref_version` reads none from its name), and the image is tagged the next patch, minor or major release after the version the ref's code states (`_next_releases`). An unreleased head still states the release before it, and its image may carry the version it will be released as. The rule reads names and versions only; a branch genuinely at the older release gets the warning too. Recorded in the module docstring and `RUN_INSTRUCTIONS.md` § 4.
+
+**Per-binding image policy after the merge of #96.** `check_images` (from #96) now reads the binding's own image (`_binding_image`: `--binding-image`, else `--image-tag`), so a binding with its own image is exempt and the refusal names `--binding-image`. Because `check_images` replaces the auto-build, the harness never substitutes an image: the preflight's `--sdk_container_image` and the image `_run_binding` runs are the same (commented in `_sides` and `_run_binding`).
+
+**Nits.** `_base_interface` sets `bare` to `BARE_FLAGS` (`--incremental`, `--wait_for_job`, `--no_use_public_ips`, every valueless flag the argvs carry; a test pins that); `flag_problems` says the check is best effort (any quoted flag literal in the module counts as declared). `multi` stays empty: no step passes a multi-valued flag.
+
+**Sections moved.** `workflows/pipe_segment/identity_match_key.py` (module docstring § "Bindings that differ in their interface"; `_next_releases`, `_version_problem`, `_check_image_versions`, `_binding_image`, `BARE_FLAGS`; `_preflight`, `_check_flags`, `_sides`, `_run_binding`, `check_images`); `workflows/pipe_segment/adjustments.py` (`flag_problems`); tests (`tests/test_pipe_segment_adjustments.py`, `tests/test_pipe_segment_identity_match_key.py`); `RUN_INSTRUCTIONS.md` §§ 4, 8, troubleshooting; overlay README; README Features and Roadmap 7e; CHANGELOG § 2026-11-25.
+
 ### 2026-11-25 — Review fixes on PR #96 (segmenter mode equivalence); overlay images and runs recorded
 
 **Images and runs.** Both pipe-segment overlay images were built and pushed on 2026-11-24 by the operator (digests in the overlay README), and `ais.py` ran in Cloud Build: default run `2e57a93b`, PR #227 with the v5.0.3 base `4bb84ec0`, DirectRunner check `967b1030`, ten days of production input `56af531e` with the compare-only rerun `de4e5831`, all IDENTICAL once table-check v0.3.1 fixed the duplicated-key pairing. The docs that said "not built" or "not run" now record this.

@@ -6,6 +6,15 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: per-side adjustments, review fixes
+
+#### Changed
+- **`workflows/pipe_segment/identity_match_key.py` refuses a binding whose image is tagged another pipe-segment version than its ref states**, before anything is pinned. It only warned, after the copy. Example: `--binding before=v5.0.3 --binding after=v5.1.0` without `--binding-image` gave `before` v5.0.3's flags (no `--incremental`) on the default v5.1.0 image, so the run compared v5.1.0 full history with v5.1.0 incremental and reported it as v5.0.3 against v5.1.0. Pass `--binding-image before=<v5.0.3 overlay>`.
+  - Still only a warning: a ref that is not written as a version tag (a branch, a commit) on an image tagged the release right after the version its code states, which is how an unreleased head looks.
+  - Not checked when no version can be read from the image's tag or the ref's code.
+- **The unreviewed-binding refusal is per binding**: a binding's own `--binding-image` exempts it, and the message names `--binding-image <name>=<image>`.
+- The base interface tells `dit.adjust` which flags take no value (`--incremental`, `--wait_for_job`, `--no_use_public_ips`), so removing one never takes the token after it.
+
 ### 2026-11-25: pipe-segment overlay images built; the segmenter workflow has run; review fixes
 
 #### Verified
