@@ -6,6 +6,15 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: table-check pinned to v0.3.1
+
+#### Fixed
+- **Duplicated keys no longer report false differences** (`table-identical-checks` v0.3.1, table_identical_checks#20).
+  - **Before:** the key join paired every row of a duplicated key with every row of it on the other side, so the crossed pairs read as value differences. Two tables holding the same rows could therefore fail.
+  - **Now:** rows of a duplicated key pair one-to-one: identical rows first, then the leftovers in row order. Surplus rows count as only in A or only in B.
+  - **The case that found it:** the pipe-segment v5.0.3 against v5.1.0 `messages_segmented` comparison (one duplicated `msgid`, 81M rows) reported 2 differences and failed; it now reports IDENTICAL.
+  - **To refresh earlier results:** rerun them with `--skip-pipelines` after the ditbox rebuild.
+
 ### 2026-11-24: PR reviews by an independent Sonnet subagent
 
 #### Changed
