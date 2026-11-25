@@ -6,6 +6,16 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: parallel slices, review fixes
+
+#### Changed
+- **`6_parallel` refuses more than 100 Dataflow workers across its concurrent slices** unless `--allow-many-workers` is passed (`workflows/port_visits/ais.py`). Each slice is its own job with `--max-num-workers`, so the bound is slices in flight x `--max-num-workers`; it is logged with the plan and in `--dry-run`. Why: `world-fishing-827` shares its regional Dataflow quota with production. The threshold is the owner's proposal and may move. Example: `--slices day` over January with the default 4 workers (124) now needs `--max-concurrent-slices 25`, `--max-num-workers 3` or the flag.
+- **A forbidden step whose slices failed is logged as a warning**, saying that quota or permissions may be the cause. The verdict and exit code (as declared, 0) are unchanged.
+
+#### Fixed
+- **A failed `6_parallel` run is recorded in `dit_runs`** (status `failed`), so `make dit-cancel RUN_ID=<id>` finds and drops its partly filled table. Before, the row was written only after success, though the docstring said otherwise. A failed row is never a cache hit. Shared helper: `dit.workflow.run_with_cache(record_failures=...)`, default unchanged for every other workflow.
+- `--slices` help says that slices sharing a month partition run their deletes and inserts on it concurrently, and BigQuery may fail some when its DML queue fills.
+
 ### 2026-11-25: pipe-segment overlay images built; the segmenter workflow has run; review fixes
 
 #### Verified

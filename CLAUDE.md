@@ -80,6 +80,16 @@ Notes:
 
 Most-recent-first: prepend new entries above the existing ones. Each entry is one commit's worth of plan-doc changes; cite which sections moved.
 
+### 2026-11-25 — Review fixes on PR #99 (parallel slices)
+
+**A failed parallel run is recorded.** `run_with_cache` wrote the `dit_runs` row only after `execute_fn` returned, so a `6_parallel` run with a failed slice left a partly filled table that `make dit-cancel` could not find; the module docstring claimed the row was written. `run_with_cache` gains `record_failures`: for those exception types the row is written with `status='failed'` (an existing value of `dit.cache`; no schema change) before re-raising. `read_cache` takes succeeded rows only, so a failed row is never a hit; `read_rows_for_run` (cleanup) does not filter on status. Port visits passes `(ParallelSlicesFailed,)` for `6_parallel` only. Additive library change: default `()` keeps every other caller as it was.
+
+**A bound on workers across concurrent slices.** `check_total_workers` refuses at parse time when slices in flight x `--max-num-workers` exceeds `PARALLEL_MAX_TOTAL_WORKERS` (100, owner-proposed, adjustable), unless `--allow-many-workers`. Reason in the message: `world-fishing-827` shares its regional Dataflow quota with production. The bound is logged with the plan and in the dry run (`describe_parallel_workers`). Other modes run with `--parallel` add one job each and are not counted; noted in the docstring. The proposed runs of Roadmap 7f stay under it (5 x 4 and 12 x 4).
+
+**Nits.** A forbidden step whose slices failed gets `warning=True` in `dit.orchestration.judge`, so `judge_parallel` logs it at warning level, and the message says quota or permissions may be the cause. `--slices` help names the DML-queue risk of slices sharing a month partition. `validate_parallel` takes `window: Optional[(start, end)]` instead of a `date.min` placeholder.
+
+**Sections moved.** `src/dit/workflow.py` (`run_with_cache`, new `_cached_run`); `src/dit/orchestration.py` (`judge`, docstring table); `workflows/port_visits/ais.py` (docstring, `PARALLEL_MAX_TOTAL_WORKERS`, `slices_in_flight`, `describe_parallel_workers`, `check_total_workers`, `validate_parallel`, `_run_with_cache`, `parse_args`, `describe_plan`, `main`); tests (`tests/test_port_visits_parallel.py`, `tests/test_orchestration.py`); README Features ("Parallel slices"); `docs/plan.md` § "Orchestration capabilities"; CHANGELOG § 2026-11-25.
+
 ### 2026-11-25 — Review fixes on PR #96 (segmenter mode equivalence); overlay images and runs recorded
 
 **Images and runs.** Both pipe-segment overlay images were built and pushed on 2026-11-24 by the operator (digests in the overlay README), and `ais.py` ran in Cloud Build: default run `2e57a93b`, PR #227 with the v5.0.3 base `4bb84ec0`, DirectRunner check `967b1030`, ten days of production input `56af531e` with the compare-only rerun `de4e5831`, all IDENTICAL once table-check v0.3.1 fixed the duplicated-key pairing. The docs that said "not built" or "not run" now record this.
