@@ -672,6 +672,7 @@ def _main(checkout: str, *extra: str, **kwargs: Any) -> dict[str, Any]:
     ]
     with (
         patch.object(mod, "_verify_distinct_gpsdio_pins"),
+        patch.object(mod, "_preflight_images"),
         patch.object(mod.dit_bq, "pin_source_into_experiment",
                      side_effect=lambda source, **kw: f"{_GE}.copy_of_{source.split('.')[-1]}"
                      ) as pin,

@@ -85,8 +85,8 @@ Examples:
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:v5.0.1-767770f-temp-dataset-905dc761` (source-built overlay; the port-visits default)
 - `gcr.io/world-fishing-827/dit/pipe-anchorages:pipeline-4690-14b4be8-temp-dataset-905dc761` (source-built overlay of a PR head; cross-version, per-binding)
 - `gcr.io/world-fishing-827/dit/pipe-events:dit-<pipeline_commit>` (auto-built for unreviewed docker-runner code)
-- `gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` (source-built overlay; the default of both pipe-segment workflows; not built yet on 2026-11-20)
-- `gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` (source-built overlay of the version the VMS DAG pins; not built yet)
+- `gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` (source-built overlay; the default of both pipe-segment workflows; built and pushed 2026-11-24, `sha256:f785658b99d8caea217be4575fb951336bfeab8c36d253d3b3309026ffadf8eb`)
+- `gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` (source-built overlay of the version the VMS DAG pins; built and pushed 2026-11-24, `sha256:96ac0dbc7103412e1017d0d27e78dc8630ee01ad2e0068abc93f2653bd13de9c`)
 
 Canonical upstream defaults the workflows pin (read-only to dit):
 
