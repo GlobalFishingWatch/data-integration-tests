@@ -260,8 +260,21 @@ The workflow resolves a per-binding image via `dit.workflow.resolve_run_context`
   binding its own image, as submitter and as Dataflow worker; it wins over
   `--image-tag` for that binding. An A/B of two pipe-segment versions needs
   it, since a reviewed ref otherwise runs the default image whatever version
-  the ref is. A warning says when the image's tag names another version than
-  the ref states. The v5.0.3 overlay image is not built yet.
+  the ref is. The v5.0.3 overlay image is built (2026-11-24).
+- **Image version against ref version (since 2026-11-25)**: a binding whose
+  image is tagged another pipe-segment version than its ref states is
+  **refused before anything is pinned**. `--binding before=v5.0.3` without
+  `--binding-image` would run the default v5.1.0 image with v5.0.3's flags
+  (no `--incremental`) and be reported as v5.0.3. Pass
+  `--binding-image before=<v5.0.3 overlay>`. Not checked when no version can
+  be read from the image's tag (`dit-<commit>`, a branch name) or from the
+  ref's code.
+  - **Only a warning** for what looks like an unreleased head: the ref is not
+    written as a version tag (a branch or a commit), and the image is tagged
+    the release right after the version its code states (a PR head stating
+    5.0.3 on a `v5.1.0-…` image). The rule reads names and versions only, so
+    a branch that really sits at the older release also gets only the
+    warning; read it.
 - **Laptop fast-iter**: `--build-from-source` bypasses the default image —
   compose builds the `dev` service from the worktree's working tree.
 
@@ -448,6 +461,7 @@ label, so `make dit-cancel` finds nothing for it.
 | `gpsdio-segment pin -> …` identical across bindings | The "after" branch wasn't pushed, or the worktree didn't pick it up. Re-fetch the pipe-segment refs (`git -C ~/git/pipe-segment fetch origin`). |
 | All output-table diffs IDENTICAL | `--image-tag` was set to a single image, so both bindings ran the same code. |
 | `binding '…' is unreviewed …` | The binding's ref is not merged into `origin/main` and would run on the default image (section 4). Pass an overlay image of the commit, or use `--runner DirectRunner --build-from-source`. |
+| `a binding would run an image of another pipe-segment version than its ref` | The binding runs `--image-tag` (or its `--binding-image`) and that image is tagged another version than its ref states (section 4). Give it `--binding-image NAME=<overlay image of the ref>`. |
 | `rows_only_in_a` / `rows_only_in_b` non-zero on `messages_segmented` | The bindings did not read the same copy, e.g. they ran in two invocations without `--reuse-pin`. Re-run them in one invocation, or the second with the first's `--reuse-pin <stamp>`. |
 | `rows_only_in_a` / `rows_only_in_b` non-zero on `vessel_info` or `segment_vessel` | Expected when identities change: `vessel_id` is in the key (section 8). |
 | A step fails with `TypeError: 'NoneType' object is not iterable` in `BigQueryHelper` | The step got no `--labels`. The workflow passes them on every step; check for a hand-built command line. |

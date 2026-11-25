@@ -194,8 +194,12 @@ full-history segmenter, the only one it has. What this means for an A/B:
   ignores it (``cli/main.py``, ``parse_known_args``), so a wrong flag would
   not fail: the job would run without it. Beam's own options on the two Beam
   steps are exempt (``adjustments.BEAM_OPTIONS`` lists them and says why).
+  Best effort: a quoted flag literal anywhere in the module counts as
+  declared.
 * An adjustment that finds nothing to change is an error, not a no-op.
 * Two bindings must be compared on the same keys.
+* A binding's image must be tagged the pipe-segment version its ref states
+  (:func:`_check_image_versions`; "Images" below).
 
 The run log prints, per binding, the edits applied with their reasons, then
 per pair of bindings the flag differences of each step.
@@ -204,8 +208,20 @@ per pair of bindings the flag differences of each step.
 as submitter and as Dataflow worker. Two bindings of different pipe-segment
 versions need it: a ref merged into ``origin/main`` otherwise runs
 ``--image-tag``, whatever version the ref is. The flag check reads the ref,
-and the image is what runs; a warning says when the image's tag names another
-version than the ref states.
+and the image is what runs, so a binding whose image is tagged another
+version than its ref states is refused before anything is pinned:
+``--binding before=v5.0.3`` without ``--binding-image`` would run the default
+v5.1.0 image with v5.0.3's flags and be reported as v5.0.3. Nothing is said
+when no version can be read from the image's tag or from the ref's code. One
+exception, logged as a warning: a ref that is not written as a version tag
+(a branch, a commit) on an image tagged the release right after the version
+its code states. That is taken as an unreleased head, which still states the
+release before it (the head of pipe-segment PR #227 stated 5.0.3). The rule
+reads names and versions only, so a branch that really sits at the older
+release also gets only the warning.
+
+An unreviewed binding (not merged into ``origin/main``) on the default image
+is refused too (``check_images``): nothing is auto-built.
 
 **Tables.** An adjustment may also change a binding's inputs and outputs
 (``dit.adjust``: two inputs become one, an output is renamed). The union of
