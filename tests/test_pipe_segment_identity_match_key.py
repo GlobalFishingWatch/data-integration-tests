@@ -327,6 +327,9 @@ def _main(*extra: str) -> dict[str, Any]:
     with (
         patch.object(mod, "_verify_refs"),
         patch.object(mod, "_verify_distinct_gpsdio_pins"),
+        # The two git reads of the preflight (tests/test_pipe_segment_adjustments.py).
+        patch.object(mod, "_binding_infos", return_value={}),
+        patch.object(mod, "_check_flags"),
         patch.object(mod, "_preflight_images"),
         patch.object(mod.dit_bq, "pin_source_into_experiment",
                      return_value=f"{_GE}.copy") as pin,
@@ -339,6 +342,8 @@ def _main(*extra: str) -> dict[str, Any]:
         rc = mod.main([
             "--experiment-id", "test01",
             "--binding", "before=v5.0.3", "--binding", "after=exp-branch",
+            # v5.0.3 gets its own image, as the version check requires.
+            "--binding-image", "before=reg.invalid/pipe-segment:v5.0.3-overlay",
             "--date-range", "2020-01-01,2020-01-01",
             *extra,
         ])
@@ -802,6 +807,14 @@ def test_check_images_allows(runner: str, extra: tuple[str, ...], unreviewed: bo
     mod.check_images(_run_args(runner, *extra), "after", "abc1234", unreviewed)
 
 
+def test_a_binding_image_exempts_that_binding_only() -> None:
+    args = _run_args("dataflow", "--binding-image", "before=reg.invalid/ps:overlay")
+
+    mod.check_images(args, "before", "abc1234", True)
+    with pytest.raises(SystemExit, match="--binding-image other=<image>"):
+        mod.check_images(args, "other", "abc1234", True)
+
+
 def test_preflight_checks_every_binding_before_anything_is_pinned() -> None:
     """``main`` refuses before the copy: no BigQuery call for a run that
     cannot start."""
@@ -850,20 +863,23 @@ def test_run_binding_hands_its_check_to_the_harness_in_place_of_the_auto_build()
     check("abc1234", False)
 
 
-# -- No --incremental: an accepted difference from the AIS DAG ---------------
+# -- --incremental follows the binding's pipe-segment ------------------------
 
 @pytest.mark.parametrize("runner", RUNNERS)
-def test_no_binding_passes_incremental(runner: str) -> None:
-    """The AIS DAG passes ``--incremental`` since 2026-11-20. A binding may be a
-    ref that does not know the flag and would ignore it silently, so the
-    cross-version A/B stays on full history for every binding."""
+def test_a_binding_below_v5_1_0_passes_no_incremental(runner: str) -> None:
+    """The AIS DAG passes ``--incremental`` since 2026-11-20, and so does the
+    base interface. This file's binding is ``before=v5.0.3``, which does not
+    know the flag and would ignore it silently: the declared adjustment takes
+    it out, with its two table flags. That is why every argv pinned above is
+    what it was before the base changed. Bindings at v5.1.0 or later are in
+    ``tests/test_pipe_segment_adjustments.py``."""
     _, calls = _run_binding(_run_args(runner))
     tokens = [token for _, argv, _ in calls for token in argv]
 
     assert not any(token.split("=")[0] in {
         "--incremental", "--in_segments_table", "--in_fragments_table",
     } for token in tokens)
-    assert "No ``--incremental`` here" in (mod.__doc__ or "")
+    assert "``--incremental`` follows the binding's pipe-segment" in (mod.__doc__ or "")
 
 
 def test_run_binding_stops_at_the_first_failing_step() -> None:

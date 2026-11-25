@@ -31,6 +31,15 @@ values on purpose: outputs, job names, labels, service account, GCS paths.
 *Accepted* differences are production flags DIT leaves out, or values DIT sets
 differently, each with a written reason. Anything else that differs is drift.
 
+**Frozen specs.** A spec may name its own composer commit
+(:attr:`WorkflowSpec.composer_ref`). It is then read there, whatever ref the
+run asks for. A workflow that can run an older pipeline version (its base plus
+a declared adjustment, :mod:`dit.adjust`) uses this to check that older layer
+against the last commit at which production ran that version. Checking only
+the newest interface against production would leave the older layers
+unchecked. A frozen spec cannot drift because production moved, only because
+DIT changed, so it is a regression test of DIT.
+
 Stdlib and :mod:`dit.composer` only. Nothing here runs a pipeline, docker or a
 cloud call. The reports print production's argv values, so they are for local
 reading; this repository is public.
@@ -140,6 +149,14 @@ class WorkflowSpec:
     ``ProductionTarget`` fields), printed under ``fields_title``. ``bare`` and
     ``multi_value`` are :func:`dit.composer.parse_argv` hints, applied to both
     sides.
+
+    ``composer_ref`` freezes the spec at one composer commit: it is read
+    there, whatever ref the run asks for. That is for a workflow's older
+    layer (its base plus the adjustment for an earlier pipeline version,
+    :mod:`dit.adjust`), checked against the last commit at which production
+    ran that version. Production cannot move such a spec; only a change in
+    DIT can, so its drift is a regression of DIT. Left ``None``, the spec is
+    read at the run's ref and says whether DIT mirrors production today.
     """
 
     name: str
@@ -155,6 +172,12 @@ class WorkflowSpec:
     fields_title: str = "Fields"
     in_sync: bool = False
     note: str = ""
+    composer_ref: str | None = None
+
+    @property
+    def frozen(self) -> bool:
+        """Read at its own composer commit, not at the run's ref."""
+        return self.composer_ref is not None
 
     def expected(self, step: StepSpec) -> frozenset[str]:
         """Every flag expected to differ in ``step``; a difference elsewhere is drift."""
@@ -389,28 +412,45 @@ def _describe(exc: Exception) -> str:
 def run_specs(
     specs: Iterable[WorkflowSpec], composer_dir: Path, ref: str = composer.DEFAULT_REF,
 ) -> tuple[tuple[WorkflowReport, ...], tuple[WorkflowError, ...]]:
-    """Check each spec against its snapshot at ``ref``: ``(reports, errors)``.
+    """Check each spec against its snapshot: ``(reports, errors)``.
 
-    ``ref`` is resolved once, so every snapshot is read at the same commit, and
-    each snapshot is loaded once however many specs mirror it. A spec whose
-    snapshot or task cannot be read becomes an error and the others still run.
+    A spec is read at ``ref``, or at its own ``composer_ref`` when it has one
+    (a frozen spec). Each ref is resolved once, so every snapshot read at it
+    comes from one commit, and each snapshot is loaded once per commit however
+    many specs mirror it. A spec whose ref, snapshot or task cannot be read
+    becomes an error and the others still run.
     """
     specs = tuple(specs)
-    try:
-        commit = composer.resolve_ref(composer_dir, ref)
-    except RuntimeError as exc:
-        return (), tuple(WorkflowError(spec, str(exc)) for spec in specs)
 
-    def load(snapshot: str) -> composer.RenderedDag | str:
+    def wanted(spec: WorkflowSpec) -> str:
+        return spec.composer_ref or ref
+
+    def resolve(name: str) -> tuple[str | None, str]:
+        """``(commit, "")``, or ``(None, why not)``."""
+        try:
+            return composer.resolve_ref(composer_dir, name), ""
+        except RuntimeError as exc:
+            return None, str(exc)
+
+    commits = {name: resolve(name) for name in dict.fromkeys(map(wanted, specs))}
+
+    def load(commit: str, snapshot: str) -> composer.RenderedDag | str:
         try:
             return composer.load_dag(composer_dir, snapshot, commit)
         except READ_ERRORS as exc:
             return _describe(exc)
 
-    dags = {name: load(name) for name in dict.fromkeys(spec.snapshot for spec in specs)}
+    keys = dict.fromkeys((commits[wanted(spec)][0], spec.snapshot) for spec in specs)
+    dags = {
+        (commit, snapshot): load(commit, snapshot)
+        for commit, snapshot in keys if commit is not None
+    }
 
     def check(spec: WorkflowSpec) -> WorkflowReport | WorkflowError:
-        dag = dags[spec.snapshot]
+        commit, unresolved = commits[wanted(spec)]
+        if commit is None:
+            return WorkflowError(spec, unresolved)
+        dag = dags[commit, spec.snapshot]
         if isinstance(dag, str):
             return WorkflowError(spec, dag)
         try:
@@ -525,6 +565,7 @@ def format_report(report: WorkflowReport) -> str:
         f"{spec.name} ({spec.workflow})",
         f"composer-dags-production @ {(dag.commit or 'unknown')[:12]}, snapshot {dag.snapshot} "
         f"({dag.dag_id}), run [{interval.start.isoformat()}, {interval.end.isoformat()})",
+        *(["frozen: read at this commit whatever ref the run asks for"] if spec.frozen else []),
         *([f"note: {spec.note}"] if spec.note else []),
     ]
     if report.fields:
@@ -587,7 +628,11 @@ def _workflow_line(report: WorkflowReport) -> str:
         f"; {len(report.fields)} field checks, {bad_fields} differ" if report.fields else ""
     )
     note = f". Note: {report.spec.note}" if report.spec.note and report.drift else ""
-    return f"{report.spec.name}: {verdict(report)}{fields}{note}"
+    frozen = (
+        f"; frozen at composer {(report.dag.commit or 'unknown')[:12]}"
+        if report.spec.frozen else ""
+    )
+    return f"{report.spec.name}: {verdict(report)}{fields}{frozen}{note}"
 
 
 def format_summary(

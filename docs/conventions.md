@@ -35,6 +35,19 @@ The worker cap (`--max-num-workers`), the worker machine type (`--worker-machine
 
 The boundary is mechanically enforced by IAM. `christian.homberg@globalfishingwatch.org` has `uploadArtifacts` on `world-fishing-827` only; trying to push to `gfw-int-infrastructure` fails with a permission error. If you find yourself wanting to elevate permissions to make something work, the design is probably wrong — re-route through a dit-namespaced path first.
 
+## Bindings that differ in their interface
+
+In a cross-version workflow every binding gets the base interface by default: the same command line, inputs and outputs, mirroring production today. Where a binding's pipeline differs, it gets adjustments (`dit.adjust`); see `docs/plan.md` § "Per-side adjustments". Since 2026-11-24, first in `workflows/pipe_segment/identity_match_key.py`.
+
+- **Shared in a run, never adjusted:** the DIT checkout, experiment id, date window, pin stamp, destination dataset, and the comparison tool.
+- **Declared adjustments live next to the workflow** (`workflows/<pkg>/adjustments.py`), each with a `reason` that says what differs in the pipeline. Its `applies` asks the ref's own CLI source first (an unreleased head carries the previous version number), its version second.
+- **Ad hoc edits** (`--binding-adjust NAME=<step>:<op>:<flag>[=<value>]`) are flag edits only and are for refs not released yet. A change that holds for a version range becomes a declared adjustment.
+- **An edit that finds nothing to change is an error.** Do not catch it to make a rule optional; a stale rule must be loud.
+- **Every declared adjustment for an older version names a composer commit** at which production last ran that version, and gets a frozen drift spec (`WorkflowSpec.composer_ref`) checked in `tests/test_composer_drift_live.py`.
+- **Preflight against the ref's CLI source** before anything is pinned: a pipeline that hands unknown flags to Beam ignores a wrong flag silently. Beam's options are exempt on Beam steps only, from a hand-written list next to the workflow that says how it was worked out.
+- **Removal:** keep an adjustment and its frozen spec only while their version is production's current or previous one (owner decision, 2026-11-24).
+- **Later, the pipeline repos define their own interface** ([PIPELINE-4819](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4819)); DIT's version-range table becomes the fallback for older refs. See `docs/plan.md` § "Per-side adjustments".
+
 ## Image namespace
 
 All dit container images live under **`gcr.io/world-fishing-827/dit/`**. Path-within-existing-repo, not a new repo. Only `uploadArtifacts` needed (project-level grant we already have).

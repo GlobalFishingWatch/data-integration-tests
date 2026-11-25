@@ -97,7 +97,7 @@ Both pipe-segment workflows default to the row marked **default** above (`DEFAUL
 
 `workflows/pipe_segment/identity_match_key.py` follows the same rules per binding (since 2026-11-25; it auto-built a plain image and only warned before):
 
-- **An unreviewed binding on the default image is refused** before anything is pinned, with the same two ways out: an overlay image of the commit as `--image-tag`, or `--runner DirectRunner --build-from-source`. The workflow has one `--image-tag` for every binding, so an overlay image fits a run whose unreviewed bindings share one commit. Per-binding images are a follow-up.
+- **An unreviewed binding on the default image is refused** before anything is pinned, with the same two ways out: an overlay image of the commit for that binding (`--binding-image NAME=IMAGE`, or `--image-tag` for every binding), or `--runner DirectRunner --build-from-source`.
 
 When the AIS DAG's pipe-segment version moves:
 

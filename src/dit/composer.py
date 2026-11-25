@@ -356,33 +356,75 @@ def _is_flag(token: str) -> bool:
     return token.startswith("-") and len(token) > 1 and not _NEGATIVE_NUMBER.match(token)
 
 
-def _argv_items(
+@dataclasses.dataclass(frozen=True)
+class ArgvSpan:
+    """The tokens ``[start, stop)`` of an argv that make up one positional or
+    one mention of a flag.
+
+    ``name`` is ``None`` for a positional, whose one value is the token. For a
+    flag, ``values`` holds its values in order: one for ``--name=value`` and
+    ``--name value``, several for a multi-value flag, and ``(None,)`` for a
+    bare flag. A ``--`` separator belongs to no span.
+    """
+
+    start: int
+    stop: int
+    name: str | None
+    values: tuple[str | None, ...]
+
+
+def _argv_spans(
     tokens: Sequence[str], bare: Collection[str], multi: Collection[str],
-) -> Iterator[str | Flag]:
-    """Yield positionals (``str``) and :class:`Flag` items in argv order."""
+) -> Iterator[ArgvSpan]:
+    """Yield the spans of ``tokens`` in argv order; see :func:`parse_argv` for the rules."""
     i = 0
     while i < len(tokens):
         token = tokens[i]
         if token == "--":
-            yield from tokens[i + 1:]
+            yield from (
+                ArgvSpan(j, j + 1, None, (tokens[j],)) for j in range(i + 1, len(tokens))
+            )
             return
         if not _is_flag(token):
-            yield token
+            yield ArgvSpan(i, i + 1, None, (token,))
             i += 1
         elif "=" in token:
             name, value = token.split("=", 1)
-            yield Flag(name, value)
+            yield ArgvSpan(i, i + 1, name, (value,))
             i += 1
         elif token in multi:
             values = tuple(takewhile(lambda t: not _is_flag(t), tokens[i + 1:]))
-            yield from (Flag(token, v) for v in values) if values else (Flag(token, None),)
+            yield ArgvSpan(i, i + 1 + len(values), token, values or (None,))
             i += 1 + len(values)
         elif token not in bare and i + 1 < len(tokens) and not _is_flag(tokens[i + 1]):
-            yield Flag(token, tokens[i + 1])
+            yield ArgvSpan(i, i + 2, token, (tokens[i + 1],))
             i += 2
         else:
-            yield Flag(token, None)
+            yield ArgvSpan(i, i + 1, token, (None,))
             i += 1
+
+
+def argv_spans(
+    tokens: Sequence[str], *, bare: Collection[str] = (), multi: Collection[str] = (),
+) -> tuple[ArgvSpan, ...]:
+    """Where each positional and each flag mention sits in ``tokens``.
+
+    The same rules and hints as :func:`parse_argv`, which is built on this.
+    For code that edits an argv in place and must keep every other token as it
+    was written (:mod:`dit.adjust`).
+    """
+    return tuple(_argv_spans(tokens, frozenset(bare), frozenset(multi)))
+
+
+def _argv_items(
+    tokens: Sequence[str], bare: Collection[str], multi: Collection[str],
+) -> Iterator[str | Flag]:
+    """Yield positionals (``str``) and :class:`Flag` items in argv order."""
+    for span in _argv_spans(tokens, bare, multi):
+        if span.name is None:
+            yield str(span.values[0])
+        else:
+            yield from (Flag(span.name, value) for value in span.values)
 
 
 def parse_argv(
