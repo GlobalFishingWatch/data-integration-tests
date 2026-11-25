@@ -378,7 +378,7 @@ A step that recomputes its whole history on every run (port visits' step 2 write
 **The test: a parallel-slices mode.** The window is cut into slices by `dit.slices` (`--slices day|week|month|<N>d|<JSON list>`), every slice is its own job, all are submitted before any is awaited, and they write into one table. That table is compared with one job over the window (`1_bf`). The outcome (identical, different, or failed jobs) is judged against the declaration (`dit.orchestration.judge`):
 
 - allowed: identical passes; a difference or a failed slice fails (exit 1);
-- forbidden: the step is still run, as a negative test. A difference or failed jobs is "as declared" (exit 0); no difference is reported as "the declaration may be too strict" (exit 0, with a warning);
+- forbidden: the step is still run, as a negative test. A difference or failed jobs is "as declared" (exit 0; failed jobs are logged as a warning, since quota or permissions can fail them too); no difference is reported as "the declaration may be too strict" (exit 0, with a warning);
 - unknown: the outcome is reported and the workflow's normal rule applies (a difference fails).
 
 **First consumer:** `workflows/port_visits/ais.py`, mode `6_parallel`, step 1 only. Numbered 6 so it clashes with no mode of another workflow (4 and 5 are taken by pipe-gaps and pipe-segment). Step 2 is refused: it writes its whole table with WRITE_TRUNCATE (pipe-anchorages v5.0.1, `pipelines/port_visits/main.py`, read, not run), so slices would replace each other's output.
