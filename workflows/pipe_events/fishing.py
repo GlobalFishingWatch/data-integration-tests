@@ -173,8 +173,9 @@ DEFAULT_TAIL_DAYS = 3
 # composer-dags-production's AIS v3 DAG ran when this workflow was written
 # (``Versions.PIPE_EVENTS`` in ``dags/core/ais/v3.py``, 2026-05). Production
 # runs later versions now (v9.0.0 in the AIS v5 DAG on 2026-11-19); see
-# workflows/pipe_events/README.md for what catching up needs. Read-only to dit by IAM per the absolute
-# prod-infra boundary; the docker runner pulls from here for reviewed code.
+# workflows/pipe_events/README.md for what catching up needs. Read-only to
+# dit by IAM per the absolute prod-infra boundary; the docker runner pulls
+# from here for reviewed code.
 # ``--build-from-source`` short-circuits this entirely (the runner builds the
 # compose ``pipeline`` service from the mounted working tree instead).
 DEFAULT_IMAGE_TAG = (

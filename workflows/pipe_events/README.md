@@ -64,7 +64,7 @@ Port of pipe-events' three bash integration scripts (`integration_tests/staging-
 
 Runs `fishing.py` once per `--binding name=ref` (each from a `git worktree` of `--pipeline-dir`, default `$PROJECTS/pipe-events`), on pinned copies of the inputs, and compares both views pairwise across bindings. Bindings run in parallel unless `--sequential-bindings`.
 
-- **Pinning** (by copy since 2026-11-19, PIPELINE-4705). Seven inputs are copied into `world-fishing-827.tech_great_expectations`: `research_messages` over `[--start - 1 day, --end)`, the other six whole. Views (on the staging cohort: `identity_core`, `identity_authorization`, `event_regions`) are copied as plain tables. `spatial_measures_20201105` is not copied: its name carries its version, and every binding reads the same table. Estimated 5.96 GB per default run (dry runs, 2026-11-19). `--reuse-pin <stamp>`, `--pin-max-gb`, `--pin-expiration-days`, `--dry-run` work as in the other pinning workflows.
+- **Pinning** (by copy since 2026-11-19, PIPELINE-4705). Seven of the eight inputs are pinned, copied into `world-fishing-827.tech_great_expectations` (the eighth, `spatial_measures_20201105`, is not pinned; see below): `research_messages` over `[--start - 1 day, --end)`, the other six whole. Views (on the staging cohort: `identity_core`, `identity_authorization`, `event_regions`) are copied as plain tables. `spatial_measures_20201105` is not copied: its name carries its version, and every binding reads the same table. Estimated 5.96 GB per default run (dry runs, 2026-11-19). `--reuse-pin <stamp>`, `--pin-max-gb`, `--pin-expiration-days`, `--dry-run` work as in the other pinning workflows.
 - **The wrapper owns** `--start`, `--end`, `--tail-days`, `--modes`, `--suffix`, `--dest-dataset` and every source flag; it drops them from the extras it passes to `fishing.py`. It also drops `--image-tag` and `--build-from-source`, so each binding's image comes from its own ref.
 - **Each binding's image.** An unreviewed ref (not merged into pipe-events `origin/main`) gets an auto-built `gcr.io/world-fishing-827/dit/pipe-events:dit-<sha>`. A **reviewed** ref runs the default image, v4.2.17, whatever its commit (read from `dit.worker_image.ensure_pipeline_image`). So `--binding main=main` compares against v4.2.17, not against `main`. See "Known limits".
 - Exit code: non-zero when a binding fails. Differences are reported and do not fail the run.
@@ -106,12 +106,10 @@ make -C $DIT dit-cloud PIPELINE=pipe-events \
     ARGS="--parallel"
 ```
 
-Laptop. Authenticate once into a docker volume; the container reads it at `/root/.config`:
+Laptop. The container reads GCP credentials from the `gcp` docker volume at `/root/.config`; how to create and fill it once is in [`docs/usage.md`](../../docs/usage.md) § "Run a workflow".
 
 ```bash
 cd $PROJECTS/pipe-events
-docker volume create gcp
-docker compose run gcloud auth application-default login
 
 # Cheapest smoke: one mode, image built from this checkout.
 dit run $DIT/workflows/pipe_events/fishing.py --modes 1_bf --build-from-source

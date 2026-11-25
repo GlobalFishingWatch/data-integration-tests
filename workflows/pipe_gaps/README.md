@@ -45,10 +45,10 @@ The delete has no upper bound. A run over `[D, D+15]` deletes every gap from `D`
 
 ## Workflows
 
-| Workflow | Use it to | Jobs per default run |
+| Workflow | Use it to | Jobs per run, at defaults |
 |---|---|---|
-| [`mode_equivalence.py`](mode_equivalence.py) | check that a backfill and the daily-incremental schedule produce the same gaps | 11 Dataflow jobs (3 modes) |
-| [`outage_recovery.py`](outage_recovery.py) | check that an outage followed by a recovery backfill ends in the same state as a clean backfill | 4 Dataflow jobs |
+| [`mode_equivalence.py`](mode_equivalence.py) | check that a backfill and the daily-incremental schedule produce the same gaps | 11 Dataflow jobs at defaults (3 modes, `--tail-days 4`) |
+| [`outage_recovery.py`](outage_recovery.py) | check that an outage followed by a recovery backfill ends in the same state as a clean backfill | 4 Dataflow jobs at defaults |
 
 Both run on Dataflow by default, submitted **in-process** from the Python process that runs the workflow (`dit.runners.dataflow`). `--runner docker` instead runs `pipe-gaps detect` locally with Beam's DirectRunner, in the `dev` service of the pipe-gaps checkout's docker compose file, built from that checkout.
 
@@ -87,7 +87,7 @@ Simulates production's daily DAG, an outage, and the recovery backfill an on-cal
 - The three stages write to one table; the oracle writes to its own. The two `_last_versions` views are compared.
 - Without `--synthetic-outage` the outage is only a gap in the schedule. On the frozen 2020 cohort the stages then read the full source, and the staged run matches the oracle by construction. **Use `--synthetic-outage` for a meaningful test.** It derives a view of the messages with the outage days removed; stages 1 and 2 read the view, stage 3 and the oracle read the unfiltered table.
 - `--recovery-buffer-days 0` (the default) is the setting that discriminates. A buffer of 1 or more widens the recovery's delete enough to hide the bug class (MAP-1676) this workflow was built for.
-- **Pinning.** The sources are copied at run start into `world-fishing-827.tech_great_expectations` (since 2026-11-19, PIPELINE-4705): the messages over `[--start - lookback, --end]` (4.41 GB on the default run, the whole staging table) and the segments whole (4.1 MB). `--reuse-pin <stamp>` reuses an earlier run's copies, `--no-pin` reads the live sources, `--dry-run` reports each copy's size and stops. Sources must be tables, not views.
+- **Pinning.** The sources are copied at run start into `world-fishing-827.tech_great_expectations` (since 2026-11-19, PIPELINE-4705): the messages over `[--start - lookback, --end]` (4.41 GB on the default run, the whole staging table) and the segments whole (4.1 MB). `--reuse-pin <stamp>` reuses an earlier run's copies, `--no-pin` reads the live sources, `--dry-run` reports each copy's size and stops. Sources must be tables, not views. With `--synthetic-outage` the filtered view is derived over the pinned copy. The run cache is keyed on the copies' names, so a `--reuse-pin` rerun hits and a new pin misses. The flags of snapshot pinning (`--pin-at`, `--pin-source-at`, `--snapshot-dest-project`, `--snapshot-expiration-days`, `--skip-snapshots`, `--no-snapshot`) are rejected, each with what replaces it. The copies were checked with BigQuery dry runs; no copy has been created by this workflow and no pipeline has run on one.
 - `--parallel` runs the oracle beside the three stages; the stages stay in order.
 - Exit code: 0 when the staged view equals the oracle's, 1 otherwise.
 

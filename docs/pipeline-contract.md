@@ -113,7 +113,7 @@ A flag that prints the generated queries or pipeline graph without executing. Us
 
 ## Adoption matrix
 
-Each column says which version it was read at. That is the version DIT drives, which for three pipelines is older than production's:
+Each column says which version it was read at. That is the version DIT drives, which for three pipelines is older than production's. The "Read at" column records the audit; for DIT's current default version against production's, the table in [`workflows/README.md`](../workflows/README.md) is the source of truth:
 
 | Column | Read at | Production (composer, 2026-11-19/20) | Notes |
 |---|---|---|---|

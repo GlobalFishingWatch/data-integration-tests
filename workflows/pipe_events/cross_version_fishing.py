@@ -97,9 +97,10 @@ via kaniko for unreviewed refs (or reuses the canonical published image for
 merged refs). That published image is ``fishing.py``'s default, v4.2.17,
 whatever the merged ref's commit: a binding such as ``main=main`` (as in the
 example above) therefore runs v4.2.17, not ``main``, and ``--image-tag`` is
-stripped from the extras, so it cannot be redirected. ``--build-from-source`` is ALWAYS stripped from user extras
--- it makes the docker runner ignore ``--image-tag`` and build from the
-mounted compose file's working tree, defeating per-binding image identity.
+stripped from the extras, so it cannot be redirected. ``--build-from-source``
+is ALWAYS stripped from user extras -- it makes the docker runner ignore
+``--image-tag`` and build from the mounted compose file's working tree,
+defeating per-binding image identity.
 
 If a binding's ref cannot auto-build (broken Dockerfile, kaniko permission
 failure), pre-build and push its image manually to
