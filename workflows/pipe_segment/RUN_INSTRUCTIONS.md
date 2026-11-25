@@ -33,8 +33,11 @@ docker compose -f "$PROJECTS/anchorages_pipeline/docker-compose.yaml" \
     run --rm gcloud auth application-default login
 ```
 
-pipe-segment's own `docker-compose.yaml` has no `gcloud` service, so use
-another pipeline checkout that has one.
+At v5.0.3 and v5.1.0 (and on pipe-segment `origin/main` as of 2026-11-25),
+pipe-segment's `docker-compose.yaml` has no `gcloud` service, so use another
+pipeline checkout that has one. Releases up to v5.0.2 shipped a `compose.yaml`
+with a `gcloud` service, and some newer branches carry it too, so an older or
+feature-branch checkout of pipe-segment may offer one.
 
 **Cloud Build runs** (`make dit-cloud`) need no volume: the docker runner
 attaches the container to the build's network instead. Run `make dit-cloud`
@@ -165,6 +168,8 @@ jobs on Dataflow.
 - Refused with `--runner docker`, where it would change nothing.
 - Not tested: memory on the build machine when `--parallel` runs many local
   jobs at once.
+- The choice per job is made by the shared helper
+  `dit.workflow.runner_for_days`.
 
 ## A5. Commands
 
@@ -263,7 +268,7 @@ make dit-cloud PIPELINE=pipe-segment REF=v5.0.3 \
 
 Not run yet.
 
-**Cost.** None measured. Rough estimates: the default run about USD 1, the
+**Cost.** None measured. Rough estimates, not billed figures: the default run about USD 1, the
 PR #227 test a few USD (startup-dominated jobs of a few worker-minutes each).
 The production machine type (e2-standard-4) is more than the staging cohort
 needs; the run logs a `cost hint:` and `--worker-machine-type` lowers it.
@@ -436,7 +441,14 @@ With git reads of `--pipeline-dir` only:
 - on Dataflow, each binding name fits the job name (at most 27 characters).
 
 The run log then prints, per binding, the edits applied and why, and per pair
-the flag differences of each step.
+the flag differences of each step. When bindings read different input tables,
+it also prints a note naming them: the two sides then share their lineage only
+by the operator's claim.
+
+**Table edits** (different inputs or outputs per side, pinning the union of the
+inputs, comparing by output name) are built in `dit.adjust` but have no real
+case yet: no pipe-segment version changes its tables. They are tested with
+synthetic interfaces only.
 
 ## B6. Drift spec
 
@@ -451,8 +463,8 @@ spec is frozen and shows only with the drift runner's `--frozen` and in the
 opt-in live test:
 
 ```bash
-python workflows/composer_drift.py --frozen      # every spec, frozen ones included
-python workflows/composer_drift.py --workflow pipe_segment/identity_match_key@v5.0.3
+dit run workflows/composer_drift.py --frozen      # every spec, frozen ones included
+dit run workflows/composer_drift.py --workflow pipe_segment/identity_match_key@v5.0.3
 ```
 
 ## B7. Commands

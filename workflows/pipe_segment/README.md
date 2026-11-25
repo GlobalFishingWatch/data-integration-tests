@@ -52,6 +52,20 @@ ran.
 DIT mirrors the AIS v3 segment group. No DIT workflow mirrors the VMS segment
 stage.
 
+**The drift check caught the move to v5.1.0.** Composer PR #3145 merged on
+2026-11-20 at 17:26 UTC; hours later the drift runner exited 1, with both
+pipe-segment specs reporting the version on every step and `--incremental` on
+`segment`. DIT followed the same day: the default image became the v5.1.0
+overlay and `ais.py` defaults to the incremental segmenter. Since 2026-11-24
+both specs compare `--incremental` (the base command line passes it, as the
+DAG's task does) and accept the two table flags an incremental job adds as
+DIT's own; `ais.py`'s full-history reference job leaves the flag out on
+purpose. Before 2026-11-24 `identity_match_key` accepted `--incremental` as a
+difference, because every binding ran full history. Each accepted difference
+has its reason in [`composer_drift.py`](composer_drift.py). This is what the
+DAG is configured for; whether a production run has executed with it was not
+checked.
+
 ## DIT's default image
 
 Both workflows default to **DIT's temp-dataset overlay of pipe-segment
@@ -96,6 +110,10 @@ Both read a pinned copy of the source, so a difference comes from the code.
 Neither uses the run cache.
 
 ## No satellite timing offsets in DIT
+
+*This section is the canonical statement of the decision and its figures.
+Other pages, such as `RUN_INSTRUCTIONS.md`, only summarise it; when the
+decision or its figures change, update this section first.*
 
 **DIT's segmenter workflows do not run pipe-segment's satellite timing
 offsets** (owner decision, 2026-11-20). Production's `segment` task works out,
@@ -144,10 +162,10 @@ instead of computing one. Not planned work.
 
 ## Sources and sizes
 
-| Source | Used by | Size | Notes |
+| Source | Used by | Size (estimates from BigQuery dry runs, not billed bytes) | Notes |
 |---|---|---|---|
-| `world-fishing-827.pipe_ais_test_202408290000_internal.normalized_messages` (staging cohort, the default) | both | 10.7 MB for one day, 363 MB for January 2020, 3.78 GB for 2020 (dry runs, 2026-11-19/20) | 142 vessels; data is 2020 only, despite the 2024 snapshot date in the name. Partitioned by day on `timestamp`. Each day of January 2020 has 66,000 to 90,000 rows. |
-| Production's normalized AIS messages (AIS datalake) | `ais.py` run `56af531e`, via `--source-normalized-table` | 13.3 GB pinned for the 10 days (dry run, 2026-11-24); 8.2 to 8.6 million messages a day | December 2012, 10 days: 81,357,979 rows in `messages_segmented` per variant. |
+| `world-fishing-827.pipe_ais_test_202408290000_internal.normalized_messages` (staging cohort, the default) | both | Estimated: 10.7 MB for one day, 363 MB for January 2020, 3.78 GB for 2020 (dry runs, 2026-11-19/20) | 142 vessels; data is 2020 only, despite the 2024 snapshot date in the name. Partitioned by day on `timestamp`. Each day of January 2020 has 66,000 to 90,000 rows. |
+| Production's normalized AIS messages (AIS datalake) | `ais.py` run `56af531e`, via `--source-normalized-table` | Estimated: 13.3 GB pinned for the 10 days (dry run, 2026-11-24); measured: 8.2 to 8.6 million messages a day | December 2012, 10 days: 81,357,979 rows in `messages_segmented` per variant. |
 
 `--source-normalized-table` must be one table partitioned on `timestamp`: not a
 view and not date-sharded tables. The incremental segmenter fails on a day
