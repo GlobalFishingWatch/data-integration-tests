@@ -26,7 +26,7 @@ Port visits is the generation half of the port-visit events. The product step (`
 
 DIT dropped the v4 CLI and the `--pipeline-cli` switch on 2026-11-19. Passing `--pipeline-cli` now fails with the reason.
 
-The drift check (`composer_drift.py`, run by `workflows/composer_drift.py`) reports port visits **in sync** with the AIS v5 DAG (run locally on 2026-11-25 against composer `origin/main` 85700ebc3, `git show` only): version, commands and flags of both steps, and all twelve fields of the production-baseline target. Three differences are accepted with reasons in the spec: step 1's messages table (DIT reads its staging cohort by design), `--no-rich-logging` and `--wait_for_job`.
+The drift check (`composer_drift.py`, run by `workflows/composer_drift.py`) reports port visits **in sync** with the AIS v5 DAG (run locally on 2026-11-25 against composer `origin/main` 85700ebc3, `git show` only): version, commands and flags of both steps, and all twelve fields of the production-baseline target. Three differences are accepted with reasons in the spec: step 1's messages table (DIT reads its staging cohort by design), `--no-rich-logging` and `--wait_for_job` (the last two accepted by owner decision, 2026-11-19). The port-visits spec also keeps a command line of its own, `dit run workflows/port_visits/composer_drift.py`, with `--target` and `--snapshot` (the latter to compare against the backfill DAG's snapshot instead of the daily one).
 
 ### The default image
 
