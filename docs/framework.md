@@ -380,11 +380,11 @@ The ceiling only lowers a default. Each run logs its cap and where it came from.
 
 | Workflow | Default worker cap | Default sizing |
 |---|---|---|
-| Port visits | 4 | e2-highmem-4, 50 GB |
-| Encounters (AIS, VMS) | 50 | e2-highmem-4, 50 GB |
-| pipe-gaps | 50 | e2-custom-2-3072, 25 GB |
-| pipe-segment, cross-version | 50 per Beam step | e2-standard-4, 50 GB |
-| pipe-segment, mode equivalence | 4 | e2-standard-4, 50 GB |
+| Port visits | 4 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/port_visits/ais.py`) | e2-highmem-4, 50 GB (`STEP_WORKER_SIZING`, same file) |
+| Encounters (AIS, VMS) | 50 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/encounters/ais.py`; `vms.py` reuses it) | e2-highmem-4, 50 GB (`STEP_WORKER_SIZING`, same file) |
+| pipe-gaps | 50 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/pipe_gaps/mode_equivalence.py`; `outage_recovery.py` imports it) | e2-custom-2-3072, 25 GB (`DEFAULT_WORKER_SIZING`, wrapped as `STEP_WORKER_SIZING`, same file) |
+| pipe-segment, cross-version | 50 per Beam step (`STEP_MAX_NUM_WORKERS`, `workflows/pipe_segment/identity_match_key.py`) | e2-standard-4, 50 GB (`STEP_WORKER_SIZING`, same file) |
+| pipe-segment, mode equivalence | 4 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/pipe_segment/ais.py`) | e2-standard-4, 50 GB (`STEP_WORKER_SIZING`, same file, taken from `identity_match_key.py`'s `segment` entry) |
 
 Output must not depend on the cap or the sizing. They are never in a cache key. Rules for a new workflow: [`conventions.md`](conventions.md) § Runner-only Dataflow knobs.
 
@@ -412,7 +412,17 @@ Most have a matching flag. `.envrc.example` documents the infrastructure ones. W
 - **Dataflow job name.** `dit-<repo>-<step>-<experiment>-<binding>-<mode>-<n>-<of>` (`dit.job_names.make_job_name`). At most 63 characters. When the name is too long the experiment id is shortened, never the tail. If nothing can be shortened it raises.
 - **Labels.** `dit_run_id` on Dataflow jobs is what cleanup searches for. Workflows add their own (`dit_repo`, `dit_step`, `dit_experiment_id`, `dit_binding`, `dit_mode`). Pinned sources carry `dit_artifact`, `dit_experiment_id`, `dit_role`, `dit_pin` and `dit_source_table`.
 
-Not every workflow stamps `dit_run_id`. The list is in [`workflow-notes.md`](workflow-notes.md) § Run cleanup coverage.
+Not every workflow stamps `dit_run_id`, and only the workflows with a run cache record their tables in `dit_runs`, so `make dit-cancel` (§ 6, Cleanup) covers them unevenly. State of 2026-11-25:
+
+| Workflow | Stamps `dit_run_id` on its jobs | Records its tables in `dit_runs` |
+|---|---|---|
+| `pipe_gaps/mode_equivalence.py` | yes | yes |
+| `pipe_gaps/outage_recovery.py` | yes | yes |
+| `port_visits/ais.py` (and `cross_version_ais.py` through it) | yes | yes |
+| `encounters/ais.py` (and `encounters/vms.py` through it) | yes | no (no run cache) |
+| `pipe_segment/ais.py` | yes | no (no run cache). A cancel stops its jobs and leaves its tables. |
+| `pipe_segment/identity_match_key.py` | no | no |
+| `pipe_events/fishing.py`, `cross_version_fishing.py` | no Dataflow jobs | no |
 
 ---
 
@@ -660,7 +670,7 @@ Things the code itself says are unverified, and that matter when you rely on the
 - `dataflow.jobs.cancel` and table deletion by `cancel_run` under the Cloud Build identity are tested with mocks.
 - The SIGTERM trap looks for jobs in one region only.
 
-Per-workflow gaps are in [`workflow-notes.md`](workflow-notes.md) and in [`README.md`](../README.md) § Roadmap.
+Per-workflow gaps are in each pipeline's page (§ "Known limits and open items" of [`pipe_segment`](../workflows/pipe_segment/README.md), [`port_visits`](../workflows/port_visits/README.md), [`encounters`](../workflows/encounters/README.md), [`pipe_gaps`](../workflows/pipe_gaps/README.md), [`pipe_events`](../workflows/pipe_events/README.md); index: [`workflows/README.md`](../workflows/README.md)) and in [`README.md`](../README.md) § Roadmap.
 
 ---
 

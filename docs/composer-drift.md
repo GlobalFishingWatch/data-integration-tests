@@ -24,7 +24,7 @@ This page explains how the check works and how to use it. The dated findings of 
 git -C ../composer-dags-production fetch origin      # the check never fetches
 dit run workflows/composer_drift.py
 dit run workflows/composer_drift.py --workflow port_visits/ais --detail
-python -m workflows.composer_drift --strict
+dit run workflows/composer_drift.py --strict
 ```
 
 | Option | Meaning |
@@ -278,7 +278,7 @@ A future checked-in parameter file would need an allow-list for the same reason:
 **2026-11-20: production's move to pipe-segment v5.1.0.**
 
 - On 2026-11-20 at 17:26 UTC, composer-dags-production PR #3145 was merged. It set the AIS v3 DAG's segment group to pipe-segment v5.1.0 and added `--incremental` to the `segment` task.
-- That evening the check exited 1. Both pipe-segment specs reported `DIFF v5.0.3 -> v5.1.0` on every step and one production-only flag on `segment`.
+- That evening the check exited 1. Both pipe-segment specs reported the version `v5.0.3 -> v5.1.0` on every step and `--incremental` as a production-only flag on `segment`. The record of that run is the Plan-changelog entry "2026-11-20 — Mode equivalence for the segmenter" in [`CLAUDE.md`](../CLAUDE.md); the run's output was not kept, so the wording here is reconstructed from that entry, not copied from the output.
 - DIT followed the same day. Both pipe-segment workflows now default to an overlay image of v5.1.0, and the specs are in sync again.
 
 Two limits of that story:
