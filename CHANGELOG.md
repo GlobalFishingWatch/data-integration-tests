@@ -6,6 +6,21 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: pipe-segment overlay images built; the segmenter workflow has run; review fixes
+
+#### Verified
+- **Both pipe-segment overlay images are built and pushed** (2026-11-24), each self-checked inside the image:
+  - `gcr.io/world-fishing-827/dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` @ `sha256:f785658b99d8caea217be4575fb951336bfeab8c36d253d3b3309026ffadf8eb` (the default; 5 BigQuery reads, all patched);
+  - `gcr.io/world-fishing-827/dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8` @ `sha256:96ac0dbc7103412e1017d0d27e78dc8630ee01ad2e0068abc93f2653bd13de9c`.
+- **`workflows/pipe_segment/ais.py` ran in Cloud Build** (2026-11-24/25):
+  - default run (`2e57a93b`): 10 Dataflow jobs, 9 comparisons IDENTICAL;
+  - pipe-segment PR #227 with the v5.0.3 base (`4bb84ec0`): 45 jobs, 15 comparisons IDENTICAL;
+  - production input, 2012-12-01..10, v5.0.3 against v5.1.0 (`56af531e`, then the compare-only rerun `de4e5831` with table-check v0.3.1): all 9 comparisons IDENTICAL.
+
+#### Changed
+- **`workflows/pipe_segment/identity_match_key.py` refuses an unreviewed binding on the default image**, before anything is pinned. It used to auto-build a plain image of the commit, which has no temp-dataset overlay, and only warned. The message names the ways out: an overlay image of the commit as `--image-tag`, or `--runner DirectRunner --build-from-source`. As a consequence, an A/B against an unmerged experiment branch runs on DirectRunner only until the workflow can take an image per binding.
+- `workflows/pipe_segment/ais.py`: the compose project name holds the experiment id (`dit-pipe-segment-<experiment id>-<variant>`); `--parallel`'s help says that when one variant fails the others' jobs still run to completion before the error is raised.
+
 ### 2026-11-25: table-check pinned to v0.3.1
 
 #### Fixed
@@ -47,7 +62,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ### 2026-11-20: mode equivalence for the segmenter; pipe-segment temp-dataset overlay
 
-A new workflow runs pipe-segment's `segment` step in several shapes and compares the outputs. Its first use is pipe-segment PR #227 (`--incremental`, v5.1.0), which claims that incremental day-by-day runs equal full history. **Nothing has run yet**, and the overlay images are not built.
+A new workflow runs pipe-segment's `segment` step in several shapes and compares the outputs. Its first use is pipe-segment PR #227 (`--incremental`, v5.1.0), which claims that incremental day-by-day runs equal full history. **Nothing had run yet**, and the overlay images were not built (both followed on 2026-11-24; see the 2026-11-25 block).
 
 **The AIS DAG changed the same day, and the defaults follow it.** composer-dags-production PR #3145 (merged 2026-11-20, 17:26 UTC) set the AIS v3 DAG's segment group to pipe-segment v5.1.0 and added `--incremental` to its `segment` task. The VMS v5 DAG still pins v5.0.3 and passes no such flag. DIT's drift check reported the change within hours (exit 1: the version on six steps, the flag on one). So both pipe-segment workflows default to the overlay image of v5.1.0, and the new workflow defaults to the incremental segmenter. This follows what the DAG is configured for; whether a production run has executed with it was not checked.
 
@@ -72,7 +87,7 @@ A new workflow runs pipe-segment's `segment` step in several shapes and compares
   - Two patches, because the read sites differ between versions: `temp_dataset.patch` for v5.1.0 (five BigQuery reads) and `temp_dataset_v5.0.3.patch` for v5.0.3 (four). Each applies to its own tag only.
   - `build.sh <repo> <commit> <label> [--push]` applies the first patch that fits and builds `gcr.io/world-fishing-827/dit/pipe-segment:<label>-<commit7>-temp-dataset-<patch8>`.
   - `verify_overlay.py` counts the BigQuery reads per module inside the image and fails the build if one is added upstream or left unpatched.
-  - **No image is built or pushed yet.** Until `dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` exists, a default run of either pipe-segment workflow fails at the image pull. The v5.0.3 image (`dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8`) is for the version the VMS DAG pins.
+  - **No image was built or pushed yet** (both were on 2026-11-24, see the 2026-11-25 block). Until `dit/pipe-segment:v5.1.0-4ddde03-temp-dataset-04b40b54` existed, a default run of either pipe-segment workflow failed at the image pull. The v5.0.3 image (`dit/pipe-segment:v5.0.3-f4d39fe-temp-dataset-82b7f0a8`) is for the version the VMS DAG pins.
 - **Drift spec `pipe_segment/ais`** (`workflows/pipe_segment/composer_drift.py`), in sync. Two steps mirror the DAG's one `segment` task:
   - the default, incremental job. Its `--incremental` is compared with the DAG's; `--in_segments_table` and `--in_fragments_table` are DIT's own and accepted;
   - the full-history reference job, where the DAG's `--incremental` is an accepted difference.
