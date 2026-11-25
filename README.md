@@ -1,154 +1,186 @@
 # data_integration_tests
 
-Cross-pipeline integration-test framework for GFW data pipelines (`pipe-gaps`, `anchorages_pipeline`/port-visits, `pipe-events`/fishing).
+`dit` is a framework for integration tests of GFW data pipelines. It runs a real pipeline on real BigQuery data several times, in ways that should agree, and compares the output tables.
 
-The `dit` CLI drives Python workflow files that orchestrate phases (pipeline invocations) across modes (trigger patterns: bf / bfd / bftruncate / mutate-recover) and assert equivalence on the resulting BQ tables via `table-check summary`.
+Five pipelines have workflows today: pipe-gaps, port visits (pipe-anchorages), fishing events (pipe-events), pipe-segment and encounters.
 
-**Development is tracked in Jira epic [PIPELINE-4698](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4698) (DIT development).** dit is still a proof of concept: there have been successful runs, but it is not yet routinely applicable. New work items go under that epic.
+**Status: proof of concept.** There have been successful runs, some of which found real defects. DIT is not yet a routine gate on pull requests. Development is tracked in Jira epic [PIPELINE-4698](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4698); new work items go under it.
 
-## Features
+- [DIT in one page](#dit-in-one-page)
+- [Documentation](#documentation)
+- [Quick start](#quick-start)
+- [Features](#features)
+- [Source data targets](#source-data-targets)
+- [Roadmap](#roadmap)
 
-The framework is intentionally thin — a small library plus per-pipeline workflow files. Capabilities, in scope today:
+## DIT in one page
 
-- **Pipeline-agnostic runners** (`dit.runners.docker`, `dit.runners.dataflow`). The docker runner invokes a published or locally-built image; the dataflow runner submits an in-process Beam pipeline with lock-split submit/wait. Both used by Phase 1; the docker runner doubles for "Beam-in-container submits to Dataflow" workflows (port-visits' shape) and for **BQ-SQL-in-container** workflows (pipe-events' shape — `entrypoint`, `volumes` for a GCP auth named volume, configurable compose `service`).
-- **Ten workflows across five pipelines today**: `pipe_gaps/mode_equivalence.py` (detect-gaps; in-process Beam; SCD-2 compare) and `pipe_gaps/outage_recovery.py`; `port_visits/ais.py` (Beam-via-container; truncate compare on `visit_id`) and `port_visits/cross_version_ais.py`; `pipe_events/fishing.py` (fishing events; **BQ-SQL-via-container**; truncate compare on `event_id`) and `pipe_events/cross_version_fishing.py` (the fishing-events sibling of port-visits' cross-version wrapper — docker-native, no `--binding-image` needed since each binding's image comes from its worktree's HEAD); `pipe_segment/identity_match_key.py` (cross-version A/B over all six commands of production's segment group: two Beam jobs, then four BigQuery SQL steps; per-table compare keys; **without satellite timing offsets**, see the entry after next) and `pipe_segment/ais.py` (mode equivalence of the `segment` step, see the next entry); and `encounters/ais.py` + `encounters/vms.py` (encounters **generation**; truncate compare on `encounter_id` over both the raw and merged tables). Most are faithful ports of that pipeline's bash/CLI mode-equivalence test plus the automated cross-mode comparison. `encounters/vms.py` is the first workflow to target VMS rather than the AIS staging cohort, and shares its entire execution path with `encounters/ais.py` via `ais.run(args)` — the two differ only in defaults and help text. See [`workflows/README.md`](workflows/README.md).
-- **Mode equivalence for the segmenter** (`workflows/pipe_segment/ais.py`, 2026-11-20). Runs pipe-segment's `segment` step over one window in several shapes and compares `segments`, `messages_segmented` and `fragments` across them. **Run in Cloud Build** (2026-11-24/25) on both overlay images, built 2026-11-24: the default run, the PR #227 test against the v5.0.3 base (45 jobs, 15 comparisons) and ten days of production input (v5.0.3 against v5.1.0) all IDENTICAL; results in [`RUN_INSTRUCTIONS.md`](workflows/pipe_segment/RUN_INSTRUCTIONS.md#mode-equivalence-of-the-segment-step-aispy).
-  - **The unit is a (mode, segmenter) variant.** Modes: `1_bf` (one job), `2_bfd` (backfill, then one job per tail day), `3_bftruncate` (full backfill, then the tail days rerun in order) and `4_daily` (every day its own job; opt-in). Segmenters: `incremental`, pipe-segment's `--incremental` (v5.1.0), and `full-history`, pipe-segment's own default. A `--modes` entry is a mode, run with every segmenter of `--segmenter`, or `mode:segmenter` for exactly that pair.
-  - **The default follows the AIS DAG.** Since 2026-11-20 the AIS v3 DAG's `segment` task is configured for v5.1.0 and passes `--incremental` (composer-dags-production PR #3145; the VMS v5 DAG still pins v5.0.3 and passes no such flag). So the default segmenter is `incremental`, and a run without `--modes` is `1_bf:full-history,1_bf,2_bfd,3_bftruncate`: full history in one job as the reference, against three incremental shapes. Four variants, ten jobs on the default window, 363 MB pinned.
-  - **A base version next to the head** (2026-11-24). A `--modes` entry ending in `@base` runs on `--base-image`, an overlay image of an earlier pipe-segment version; the others run on the run's own images. So one run holds the base, the head in the base's mode and the head in its new mode (`--modes 1_bf:full-history@base,1_bf:full-history,1_bf:incremental`). Both sides read the same pinned copy and get the same flags; a base whose command line differs in more than the `incremental` flags would need per-side adjustments, which so far only the cross-version workflow `identity_match_key.py` has (see "Per-side adjustments" below). No default base image; a base variant is the reference when selected.
-  - **Short jobs on DirectRunner** (2026-11-24): `--direct-runner-max-days N` runs every job of N days or fewer on DirectRunner in the container, longer ones on Dataflow. For the staging cohort's daily jobs, where Dataflow's start-up and shutdown take about four of six minutes. Set by hand. Ran inside Cloud Build on 2026-11-24 (build `967b1030`): three one-day jobs on DirectRunner, about 1.5 min each, IDENTICAL to a Dataflow reference on all three tables. The shared helper is `dit.workflow.runner_for_days`.
-  - **Each variant has its own three tables, which must start empty.** A job reads its own fragments and segments tables as its history, so a run refuses tables that already hold rows. Jobs of a variant are consecutive days with no gap.
-  - **`segments` is the discriminating comparison:** it holds the segment id carried from day to day and the cumulative values. `fragments` are built per vessel and day, so they detect chaining errors only weakly.
-  - **`incremental` needs an image of v5.1.0 or later** and is refused before any cloud call otherwise: on older code pipe-segment would ignore the flag silently and the comparison would pass without testing anything. The default image is one; a run on the v5.0.3 overlay must select `--segmenter full-history`.
-  - **Images:** both pipe-segment workflows default to a DIT overlay of v5.1.0 ([`docker/overlays/pipe-segment-temp-dataset/`](docker/overlays/pipe-segment-temp-dataset/README.md)), because pipe-segment cannot be told where Beam stages query results. The directory also holds the patch for v5.0.3. For `ais.py`: no auto-build, and unreviewed code on a default image is refused, as for port visits. `identity_match_key.py` hands the overlay its dataset too. Since 2026-11-24 it passes the DAG's `--incremental` to every binding whose pipe-segment declares it, and removes it for older ones (next entry).
-- **Per-side adjustments in cross-version runs** (`dit.adjust`, 2026-11-24; first consumer `pipe_segment/identity_match_key.py`). By default every binding gets the same command line, inputs and outputs: a base that mirrors production. A binding whose pipeline differs gets edits on top, in layers, a later one winning: declared adjustments for a range of versions (`workflows/pipe_segment/adjustments.py`, chosen by what the binding's ref declares, then by its version), then ad hoc `--binding-adjust NAME=<step>:<op>:<flag>[=<value>]` for one run (`remove`, `add`, `rename`, `set`; placeholders `{out.<name>}`, `{in.<role>}`). No adjustment means byte-identical argv; an edit that finds nothing to change is an error.
-  - **Today's one declared adjustment:** below v5.1.0, `segment` loses `--incremental`, `--in_segments_table` and `--in_fragments_table`.
-  - **Preflight before pinning:** every pipeline flag of each binding's argv must be declared by that ref's CLI source (`git show`), Beam's options exempt on the Beam steps. pipe-segment hands unknown flags to Beam, which ignores them, so a wrong flag would otherwise do nothing silently.
-  - **Logged per run:** each binding's edits with their reason, the flag difference per step between bindings, and a note naming the tables when bindings read different inputs (lineage is then the operator's claim).
-  - **Also new on `identity_match_key.py`:** `--binding-image NAME=IMAGE` (that binding's submitter and worker image) and `--allow-same-gpsdio-pin` (for two pipe-segment versions with the same gpsdio-segment). A binding whose image is tagged another pipe-segment version than its ref states is refused before pinning (2026-11-25), except an unreleased head on the next release, which is only warned about.
-  - **Older layers are drift-checked too:** a spec can be frozen at the composer commit where production last ran that version (`WorkflowSpec.composer_ref`). The pipe-segment v5.0.3 layer is in sync at composer `cb0c9a3b7930`; checked in the opt-in live test and with `workflows/composer_drift.py --frozen`, not in the default output.
-  - **Table edits** (inputs and outputs per side, pinning the union, comparing by output name) are built but have **no real case yet**: no pipeline changes its tables between versions today, so they are tested with synthetic interfaces only.
-  - **Not run:** no binding has run with adjustments; the checks are reads of code and composer snapshots.
-  - No run cache. `--dry-run` reports the pin estimate, the planned jobs and the comparisons, and creates nothing. Commands: [`workflows/pipe_segment/RUN_INSTRUCTIONS.md`](workflows/pipe_segment/RUN_INSTRUCTIONS.md) § "Mode equivalence of the segment step".
-- **No satellite timing offsets in DIT** (owner decision, 2026-11-20). DIT's segmenter workflows do not run pipe-segment's satellite timing offsets. Production's `segment` task works out how far each satellite's clock is off and drops the messages of the affected hours; a DIT `segment` run does neither. `--include-satellite-offsets` is removed and rejected.
-  - **Why:** the offsets must be computed from the full message feed, not from a test cohort (computed from the staging cohort's 142 vessels they come out different and noisy); the full feed is too large to read on every test run (about 4.1 TB for 2020); and pipe-segment has no option to read precomputed offsets.
-  - **What it means:** on the 2020 staging cohort, DIT's `messages_segmented` keeps the messages the correction would drop (1,361 receiver-hours in 2020, by the cohort's own offsets table). For those hours DIT's output is not comparable with production's historical output. Comparisons between two DIT runs are not affected: both sides run without the correction.
-  - The current feed carries no satellite receiver IDs (since 2026-04-22), so production computes no offsets for current data either.
-  - Full statement and figures: [`workflows/pipe_segment/RUN_INSTRUCTIONS.md`](workflows/pipe_segment/RUN_INSTRUCTIONS.md) § "No satellite timing offsets in DIT".
-- **Parallel slices, and per-step orchestration declarations** (2026-11-24). Some steps may load several date slices at once; others carry state from one run to the next and must run in order. DIT now declares which is which per step and tests it.
-  - **Declarations:** `workflows/<pkg>/orchestration.py` for every onboarded pipeline (`dit.orchestration`): parallel slices allowed / forbidden / unknown, whether a run depends on the previous one, and the evidence (`verified` with a Cloud Build id, `claimed` with its source, `untested`). Seeded from the owner's statements, all `claimed` and none verified: `raw_port_events` (port visits step 1) and raw encounters allowed; the segmenter, incremental fishing events and (probably) gaps forbidden. How they map to Airflow (`depends_on_past`, `max_active_runs`): [`docs/plan.md`](docs/plan.md) § "Orchestration capabilities".
-  - **The test:** `workflows/port_visits/ais.py --steps thin_port_messages --modes 1_bf,6_parallel --slices month` submits the 12 months of 2020 as 12 concurrent Dataflow jobs into one table and compares it with one job over the year. The outcome is judged against the declaration: allowed and identical passes; a difference or a failed slice fails. A forbidden step would be run too, as a negative test (a difference is "as declared"; none is reported as "the declaration may be too strict"). `6_parallel` is refused for step 2, which rewrites its whole table on every run. `--max-concurrent-slices` caps the overlap (default: none). Slices in flight x `--max-num-workers` is logged and refused above 100 workers unless `--allow-many-workers` (world-fishing-827 shares its regional Dataflow quota with production; 2026-11-25). A failed run still writes its `dit_runs` row (status `failed`), so `make dit-cancel` drops its partly filled table. `--dry-run` prints every job and the worker bound, and creates nothing.
-  - **Slices are an expression** (`dit.slices`): `--slices day|week|month|<N>d`, or a JSON list of `[first, last]` pairs, inclusive. The segmenter's `4_daily` and daily tails, and port visits' daily tails, use the same generators, with unchanged plans.
-  - **Not run.** Nothing has been submitted; the proposed first run is in Roadmap 7f.
-- **Port-visits step selection** (`workflows/port_visits/ais.py` and `cross_version_ais.py --steps`, 2026-10-22). Default runs both steps (`thin_port_messages,port_visits`) and compares visits on `visit_id`, unchanged. `--steps port_visits --thinned-message-table <FQN>` runs step 2 alone on a given input, e.g. production's `raw_port_events`. `--steps thin_port_messages` runs step 1 alone and compares the thinned tables on `(identifier, timestamp)`; that key was unique on the staging cohort but is not guaranteed. The cross-version wrapper pins only what the selected steps read. `--thinned-message-table` no longer implies skipping step 1 by itself.
-- **Production baseline for port visits** (`workflows/port_visits/cross_version_ais.py --baseline-production ais-v5-datalake --production-date D`, 2026-10-23, [PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703)). Runs only the candidate binding and diffs it, on `visit_id`, against the table production wrote; production is not re-run. The candidate reads exactly what production read. Inputs are pinned as time-travel views as of production's Dataflow job start, and the output as of its end (`dit.production.find_dataflow_job`, `dit.bq.pin_view_into_experiment`). The run refuses if a pin would leave its source's time-travel window during the run, or if an input changed while production ran. See [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
-- **Production DAGs as data** (`dit.composer`, `dit composer-dag <snapshot>`, `workflows/port_visits/composer_drift.py`, 2026-10-23 spike, [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700)). Reads composer-dags-production's CI-checked render snapshots with `git show` and `ast.literal_eval`, never importing or running composer code. Gives each task's image, version, command and argv, maps the run's dates back to placeholders, and diffs argvs. Findings: [`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md).
-- **Drift check for every workflow** (`dit.drift`, `dit run workflows/composer_drift.py`, 2026-11-19, [PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700)). Compares what each workflow would run with what production's DAG runs, and changes nothing. Read-only and offline: no Dataflow, docker or BigQuery, only `git show` on a fetched composer checkout.
-  - **One spec per workflow**, next to it (`workflows/<pkg>/composer_drift.py`): the composer snapshot and tasks it mirrors, the flags DIT sets to its own values, and the accepted differences with a reason each. Specs exist for `port_visits/ais`, `encounters/ais`, `encounters/vms`, `pipe_events/fishing`, `pipe_gaps/mode_equivalence`, `pipe_segment/identity_match_key` and `pipe_segment/ais`.
-  - **Three levels per step**, reported separately: the pipeline version, the command, and the flags by name and value. When the command differs, the flag differences are marked indicative only.
-  - **Output:** a summary with one row per workflow step; `--detail` adds each workflow's full report. The detail prints production's argv values, so it is for local reading only.
-  - **Exit codes:** 0 when every workflow marked as expected in sync has no drift, 1 when one drifts (`--strict`: when any workflow drifts), 2 when a snapshot or task cannot be read.
-  - **Today** (2026-11-20, composer `origin/main` e4cb29361): port visits and both pipe-segment workflows are in sync.
-    - **The check caught a change the same day.** The AIS v3 DAG moved its segment group from pipe-segment v5.0.3 to v5.1.0 and added `--incremental` to `segment` (composer-dags-production PR #3145, merged 17:26 UTC). Hours later the runner exited 1: both pipe-segment specs reported the version on every step and the flag on `segment`. DIT followed: the default image is the v5.1.0 overlay, and `ais.py` defaults to the incremental segmenter.
-    - **What the specs accept now.** `pipe_segment/ais`: its default job passes `--incremental` as the DAG's task does, so that flag is compared; its two table flags are DIT's own; its full-history reference job leaves the flag out on purpose. `pipe_segment/identity_match_key`: `--incremental` is an accepted difference, because every binding runs full history. Each has its reason in the spec.
-    - This is what the DAG is configured for. Whether a production run has executed with it was not checked.
-  - Encounters, pipe-events and pipe-gaps differ from production in version, command and flags. Those specs are the acceptance tests for porting the workflows. Details and how to add a spec: [`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md) § 8.
-  - The port-visits spec also checks `ProductionTarget` field by field, and keeps its own command line (`workflows/port_visits/composer_drift.py`, with `--snapshot` for the backfill DAG). It accepts two production-only flags, `--no-rich-logging` and `--wait_for_job` (owner decision, 2026-11-19).
-- **Port visits on the pipe-anchorages version production runs** (`workflows/port_visits/ais.py`, `cross_version_ais.py`; 2026-11-19, following [PIPELINE-4699](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4699)). The workflows drive one CLI, that of pipe-anchorages v5.0.1 (`port-state-transitions` / `port-visits`, exclusive `--end-date`, required labels), which production's `core.ais.v5` runs since 2026-11-04. The v4 CLI and `--pipeline-cli` are removed. DIT's step names (`thin_port_messages`, `port_visits`) and the inclusive `--start` / `--end` are unchanged.
-  - **Default image.** `--image-tag` and `--worker-image` default to DIT's **temp-dataset overlay** of v5.0.1 ([`docker/overlays/pipe-anchorages-temp-dataset/`](docker/overlays/pipe-anchorages-temp-dataset/README.md)). Upstream has no way to name Beam's BigQuery staging dataset, so production's own image cannot run as DIT's service account. The image must be rebuilt at every production version bump.
-  - **No auto-build, and a guard.** A reviewed checkout (clean, merged into pipe-anchorages `origin/main`) runs the default image. For unreviewed code, a run that would execute a default image refuses to start, before any cloud call, and names the overlay build command. Pass an overlay image of the commit as both `--image-tag` and `--worker-image` (cross-version: `--binding-image-tag` and `--binding-worker-image`).
-- **Comparison shim** (`dit.compare.compare_tables`) — thin wrapper over `table-check summary` from the [`table_identical_checks`](https://github.com/GlobalFishingWatch/table_identical_checks) repo. Per-column tolerances, `view_suffix` for SCD-2 last-versions vs. truncate-shape, `keys` for the comparison join.
-- **BQ + date utilities** (`dit.bq`, `dit.dates`) — drop tables by prefix, query for restricted ssvids, snapshot a table or whole dataset for source-data pinning across cross-version runs, half-open date iteration. Used by workflows that need pre/post-run setup or computed inputs.
-- **Library-first**: anything you can do via `dit run …` you can also do by importing `dit.*` from a pytest target or another Python script. The CLI is one consumer of the library, not the only one.
-- **Workflow file conventions**: per-pipeline workflows live in `workflows/<pipeline>/<name>.py` and expose `main(argv) -> int`. Output tables tagged with `<experiment_id>_<commit>_<uuid>` for provenance; `--experiment-id` / `DIT_EXPERIMENT_ID` clusters N runs (e.g. `pipe-gaps@main` vs `@pr-NNN`) under one BQ-prefix-scannable slug, defaulting to `solo_<6-hex>` when unset. Every run executes a committed git ref — a dirty tree is auto-snapshotted to a pushed `refs/dit-snapshots/<pipeline>/<sha>` ref and run reproducibly (no `--allow-dirty-tree`; see [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md)).
-- **Three install modes** per pipeline: editable (fast inner loop), specific-ref (`REF=<sha-or-branch>`), and snapshot (`git stash create` → anchored on a `dit-snapshot-<epoch>` branch). See Usage § Install modes below.
-- **Per-user infra knobs via `DIT_*` env vars**: `DIT_DEST_DATASET`, `DIT_DATAFLOW_SA`, `DIT_DATAFLOW_REGION`, `DIT_DATAFLOW_TEMP_BUCKET`, `DIT_DATAFLOW_SUBNETWORK`, `DIT_BQ_TEMP_DATASET`. Plays cleanly with direnv via `.envrc.example`. Whatever the bucket, dit's Dataflow temp and staging objects go under `gs://<bucket>/dit/` (`dit.dataflow_paths`), because the default bucket is shared with production.
-- **Dataflow worker cap on every Dataflow workflow** (`--max-num-workers`, 2026-10-23, [PIPELINE-4701](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4701)). `world-fishing-827` also runs production's Dataflow jobs, so an unbounded dit run could take regional quota from them. One shared flag, resolution and emission (`dit.workflow.add_max_num_workers_arg`, `worker_cap`, `max_num_workers_options`). Defaults: port visits 4, encounters 50, pipe-gaps 50 (below gfw-common's own 100), pipe-segment 50 for each of its two Beam steps (its four SQL steps have no cap), pipe-segment's mode-equivalence workflow 4 (sized for the staging cohort). The more specific setting wins: an explicit `--max-num-workers N` (every step, even above the ceiling), else `min(default, DIT_MAX_NUM_WORKERS_CEILING)` when that env var is set (a global ceiling that only lowers defaults), else the default. Each run logs its cap and where it came from. Dataflow runner only and never in a cache key. A `make dit-cloud` build does not see a local ceiling; pass `--max-num-workers` in `ARGS` there.
-- **Private worker IPs and production-mirrored worker sizing on every Dataflow workflow** (2026-10-23). Every DIT Dataflow job runs with private worker IPs, as production does (`--no_use_public_ips`; pipe-gaps already gets it from gfw-common's default). Machine type and disk default to **production's for each step** (hand-written `STEP_WORKER_SIZING` constants citing composer's rendered snapshots): port visits and encounters e2-highmem-4 / 50 GB, pipe-gaps e2-custom-2-3072 / 25 GB (the daily detect step), pipe-segment `segment` and `segment_identity` e2-standard-4 / 50 GB (its four SQL steps are not Dataflow jobs and take no Dataflow option, like production). `--worker-machine-type` / `--disk-size-gb` override them field by field (`dit.workflow.add_worker_sizing_args`, `resolve_worker_sizing`, `worker_sizing_options`). **Production machine types cost more per worker-hour than a staging run needs:** a Dataflow run on the AIS staging cohort that keeps them logs a `cost hint:` warning, and overriding is encouraged there. With `--baseline-production`, every binding gets the production target's sizing unless a flag overrides it. Output must not depend on machine type or disk: they change speed and out-of-memory behaviour only, so they are runner-only and never in a cache key. Worker caps are separate (above).
-- **Pipeline integration contract** ([`docs/pipeline-contract.md`](docs/pipeline-contract.md)) — what a pipeline must expose to be cleanly testable by `dit`, with an adoption matrix tracking where each current pipeline stands.
-- **Cross-version experiments** — pin source data, run a workflow at N pipeline-version bindings (git refs in the pipeline checkout), then diff corresponding output tables pairwise. Two consumers today: `workflows/port_visits/cross_version_ais.py` (port-visits, keyed on `visit_id`, Dataflow-shaped with `--binding-image-tag` and `--binding-worker-image` for per-binding code; a binding without them runs the default v5.0.1 overlay image) and `workflows/pipe_events/cross_version_fishing.py` (fishing events, keyed on `event_id` over both the `_fishing_events` and `_product_events_fishing` views, docker-native — per-binding container image comes free from the worktree's HEAD via `ensure_pipeline_image`, no `--binding-image` flag needed). Foundation for PR-validation comparisons (`pipe-anchorages@main` vs `@pr-NNN`; `pipe-events@main` vs `@refactor/*`). **Pinning:** both wrappers copy their sources at run start (`dit.bq.pin_source_into_experiment`; `cross_version_ais.py` since 2026-10-22, `cross_version_fishing.py` since 2026-11-19, [PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705)). The copies keep the sources' partitioning and clustering, read across organisations, and are dry-run against a 1 TB cap per copy. `--reuse-pin <stamp>` reruns on them, and `--dry-run` reports each copy's estimated bytes without creating anything. Each wrapper owns the run's dates, so no binding runs outside its copies. What `cross_version_fishing.py` copies:
-  - `research_messages` over `[--start - 1 day, --end)`, the dates pipe-events reads (one day before each slice, for the merge with the previous day's open events);
-  - `segs_activity`, `segment_vessel`, `product_vessel_info_summary`, `identity_core`, `identity_authorization` and `event_regions` whole, since pipe-events reads them without a date filter;
-  - not `spatial_measures_20201105`, whose dated name fixes its content.
+### The idea
 
-  A source that is a view is copied too, as a plain table of the rows it returned (BigQuery refuses `LIKE` and snapshots on views). On the staging cohort that is `identity_core`, `identity_authorization` and `event_regions`. Not yet run live: the fishing wrapper's copies are checked with BigQuery dry runs only.
-- **Pinned copies for pipe-gaps outage recovery and pipe-segment** (2026-11-19, [PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705)). `pipe_gaps/outage_recovery.py` and `pipe_segment/identity_match_key.py` pin by copy at run start too, with the same flags: `--reuse-pin <stamp>`, `--pin-max-gb`, `--pin-expiration-days`, and a `--dry-run` that reports each copy's bytes against the cap.
-  - **What is copied** is what the pipeline reads. Outage recovery: the messages over `[--start minus pipe-gaps' lookback, --end]` and the segments whole. pipe-segment: `normalized_messages` over the run's `--date-range`.
-  - **Outage recovery extras:** `--no-pin` reads the live sources (for sources that do not change). `--synthetic-outage` filters the pinned copy for stages 1 and 2. The run cache is keyed on the copies' names, so a `--reuse-pin` rerun hits and a new pin misses.
-  - **Gone:** `--pin-at`, `--pin-source-at`, `--snapshot-dest-project`, `--snapshot-expiration-days`, `--skip-snapshots`, `--no-snapshot`. Each is rejected with what replaces it.
-  - **pipe-segment's `--include-satellite-offsets` is removed:** DIT runs no satellite timing offsets (see the entry above).
-  - Checked with BigQuery dry runs on the staging sources. No copy was created and no pipeline ran.
-- **Content-addressable run cache** (`dit.cache` + `world-fishing-827.tech_great_expectations.dit_runs`) — every `execute_*` mode hashes `(pipeline_commit, worker_image_digest, workflow_file_sha1, params)` and looks up the run-cache table. On hit (output tables still present), the workflow skips Dataflow entirely and uses the cached FQN for downstream comparisons; on miss, it runs and inserts a row with output tables + provenance. The same table also serves as registry + cleanup source for `make dit-cancel`. `--no-cache` skips the lookup and recomputes (still recording the run), e.g. for a determinism re-run on the same inputs; without it, a repeat run returns the earlier table. **Wired into three workflows** — `pipe_gaps/mode_equivalence.py` (2026-05-22), `port_visits/ais.py` (M5b, 2026-05-29; `cross_version_ais.py` reaches it through each binding's `ais.py` run) and `pipe_gaps/outage_recovery.py` (2026-06-03). The others have no run cache yet. Design: [`docs/run-cache.md`](docs/run-cache.md); milestone tracker: [`docs/run-cache-impl.md`](docs/run-cache-impl.md).
-- **Run cleanup control plane** (`dit cache-cancel RUN_ID` / `make dit-cancel RUN_ID=<id>`, `dit.cache.cancel_run`) — cancel all sibling modes of a run together: discovers the run's Dataflow jobs **by the `dit_run_id` label** (the stored `dataflow_job_ids` are always empty). The label is stamped by `pipe_gaps/mode_equivalence.py`, `pipe_gaps/outage_recovery.py`, `port_visits/ais.py` and `encounters/ais.py`, so also by `port_visits/cross_version_ais.py` and `encounters/vms.py`, which run through those; `pipe_segment/ais.py` stamps it too, without recording its tables in `dit_runs` (it has no run cache), so a cancel stops its jobs and leaves its tables; `pipe_segment/identity_match_key.py` does not stamp it, and the pipe-events workflows submit no Dataflow jobs. The command then cancels the still-running jobs, deletes the recorded output tables (**table-level only** — dataset-shaped or malformed values are skipped), and marks the rows `cancelled`. Idempotent. Landed M5a, 2026-05-29. The table-level guard is also the structural enforcer of the policy that **dit BQ artifacts belong in the canonical `world-fishing-827.tech_great_expectations` dataset** (the Cloud Build SA `automated-testing@` lacks `bigquery.datasets.create` by design): the cancel path categorically refuses to escalate a delete to dataset scope, so even a future workflow that accidentally tried to provision a fresh dataset couldn't have its dataset removed automatically. No workflow creates per-experiment `dit_exp_*` datasets any more: the five-PR migration (M1-M5, see `CLAUDE.md` Plan changelog 2026-06-08 / 06-09) moved every snapshot into the canonical dataset as per-table-TTL tables.
-- **Centralised Dataflow job-name builder** (`dit.job_names.make_job_name`) — single source of truth for the `dit-<repo>-<step>-<exp>-<binding?>-<mode?>-<N?>-<M?>` shape, with 63-char truncation that preserves the load-bearing tail. Both workflows use it; the prefix lets a single label-filter find every dit-launched Dataflow job in the UI.
-- **Auto-built worker images** (`dit.worker_image.ensure_worker_image`) — Dataflow runs load pipeline code from two sources (submitter from `/workspace`, workers from the `--worker-image` container). When a run executes unreviewed code against the default worker image, the workers would otherwise run the stale published code; `ensure_worker_image` builds a content-addressable worker image (`gcr.io/world-fishing-827/dit/<pipeline>:dit-<commit>`) from the source via a kaniko Cloud Build and points the run at it. Idempotent (existing tag → skip); no-op for reviewed code, an explicit `--worker-image`, or the docker runner. **Port visits does not use it** (2026-11-19): its default image is an overlay build, which a plain auto-build cannot replace, so that workflow refuses unreviewed code on a default image instead. Replaces the old `warn_if_worker_image_misses_dirty_tree` warning (M-pivot-4) — closing the gap rather than flagging it.
-- **Cloud Build ad-hoc runtime** (`cloudbuild-dit.yaml`, `make dit-cloud`, `make publish-ditbox`) — submit a workflow run to Cloud Build with one command. The pipeline checkout flows through as the build source; dit is cloned fresh per run at a configurable ref. ditbox builds via kaniko with a registry-backed layer cache; per-run pipeline installs use `uv` (~10× faster than pip). `make dit-cloud` is **fire-and-forget by default** (`gcloud builds submit --async`): it snapshots (if dirty), uploads the source, and triggers the build, returning a build id in seconds — the worker-image build + Dataflow run happen cloud-side. Pass `WAIT=1` to stream logs and block on the result (for CI exit codes or live debugging). The `_BEAM_VERSION` substitution pins apache-beam to match the worker image's SDK (per-pipeline defaults in the Makefile: `pipe-gaps=2.71.0`, `anchorages_pipeline=2.76.0` for pipe-anchorages v5.0.1). Validated end-to-end 2026-05-22 — caught a real `pipe-gaps:v0.9.6` mode-equivalence bug and verified the fix against a custom-published worker image. PR-trigger integration in each pipeline repo comes as a follow-up.
+A unit test checks a function. DIT checks a claim about a whole pipeline:
 
-Pipeline-shape primitives (`Phase`/`Mode`/`Mutation`/`Oracle` dataclasses, mutation library, phase-sharing via BQ COPY, golden-table regression mode) are **deliberately not extracted yet** — and the Phase 3 three-consumer review (2026-05-29) made the call explicit for the date-slice helpers too: the three `execute_bf/bfd/bftruncate` are <20% similar in execution and even their date math diverges (different daily-window conventions), so `dit.phases` stays deferred. Reasoning recorded in [`workflows/README.md`](workflows/README.md). See Roadmap below for why and when.
+- a backfill and a backfill followed by daily runs write the same table;
+- a pull request changes these rows and no others;
+- a candidate version reproduces what production wrote.
 
-## Read first
+DIT is a small library (`src/dit/`) plus one or two workflow files per pipeline (`workflows/<pipeline>/`). A workflow is a plain Python file with a `main(argv) -> int`. `dit run <file>` calls it; so can a test.
 
-- [`docs/architecture.md`](docs/architecture.md) — visual reference: repo ownership, run modes, workflow flows, Cloud Build runtime, image namespace. Mermaid diagrams that render on GitHub.
-- [`docs/plan.md`](docs/plan.md) — implementation plan, three-repo split, public API contracts, Phase 1 task breakdown.
-- [`docs/conventions.md`](docs/conventions.md) — prod-infra boundary, dit image namespace (`gcr.io/world-fishing-827/dit/*`), standard build-and-push workflow.
-- [`docs/pipeline-contract.md`](docs/pipeline-contract.md) — what a GFW pipeline must expose to be cleanly integration-testable; adoption matrix for the three current pipelines. Audience: pipeline maintainers.
-- [`docs/context.md`](docs/context.md) — background, source bugs the framework caught, branch state at handoff.
-- [`docs/framework-vision.md`](docs/framework-vision.md) — long-term shape (don't optimise for it; Phase 1 stays imperative).
-- [`CLAUDE.md`](CLAUDE.md) — working agreements and Plan changelog.
+### A run, step by step
 
-## Usage
+1. Parse and check the arguments. Everything that can fail without a cloud call fails here.
+2. Resolve the run context: which commit of the pipeline runs, whether it is reviewed, which image runs it.
+3. Pin the sources, where the test needs fixed inputs.
+4. Run the pipeline, once or many times, in a container or on Dataflow.
+5. Compare the output tables with `table-check`.
+6. State the verdict and return an exit code.
 
-### Install
+### What a workflow can ask
+
+| Shape | Question | A difference means |
+|---|---|---|
+| Mode equivalence | Do different ways of loading one window (`1_bf` backfill, `2_bfd` backfill + daily, `3_bftruncate` backfill + truncate, daily) give the same table? | Failure: non-zero exit |
+| Cross-version | What does this change do to the output? Two or more git refs ("bindings") on the same pinned input. | Information: the exit code is non-zero only if a binding failed |
+| Production baseline | Does the candidate reproduce what production wrote? Production's inputs and output are read through time-travel views. | Information, as above |
+| Parallel slices | May this step load several date slices at once? | Judged against the step's declaration |
+
+### Where the edges are
+
+| Rule | Meaning |
+|---|---|
+| Three repos, three owners | Pipeline repos own pipeline code. `composer-dags-production` owns what production runs; DIT reads it as data and never imports it. This repo owns the tests. |
+| Library first | Everything is importable Python. The CLI is one consumer. |
+| The comparison is not ours | `dit.compare` is a thin shim over [`table-check`](https://github.com/GlobalFishingWatch/table_identical_checks). Comparison features go there. |
+| Writes stay in DIT's namespaces | Images under `gcr.io/world-fishing-827/dit/`. Tables, cache rows and pinned sources in `world-fishing-827.tech_great_expectations`. Reads are unrestricted. DIT never writes to production infrastructure. |
+| A default run is cheap | Three source targets (AIS staging, VMS, AIS production). A run without flags uses a small cohort or a narrow window. |
+
+### The building blocks
+
+| Block | What it does | Read |
+|---|---|---|
+| Source pinning | Copies what a pipeline reads at run start, so all jobs of a run see the same data. Pin stamps, `--reuse-pin`, a size cap. | [`docs/framework.md`](docs/framework.md) § 5 |
+| Run cache | One table, `dit_runs`: skips work already done, records what a run wrote, answers "which commit produced this table". `make dit-cancel` cleans a run up. | § 6 |
+| Run context | Every run executes a committed ref. A dirty checkout is snapshotted to `refs/dit-snapshots/*`, scanned for secrets, and pushed. | § 7 |
+| Images | Default images, images built automatically for unreviewed code, and overlay images that carry a test-only patch. | § 7 |
+| Dataflow knobs | A worker cap with a global ceiling, sizing that mirrors production, private IPs, job names and labels. | § 8 |
+| Cloud runtime | `make dit-cloud` runs a workflow in Cloud Build, in the `ditbox` image. | § 9 |
+| Drift check | Compares what each workflow would run with what production's DAG runs: version, command, flags. | [`docs/composer-drift.md`](docs/composer-drift.md) |
+| Per-side adjustments | Lets the bindings of a cross-version run differ in their command line or tables, by declared rules. | [`docs/framework.md`](docs/framework.md) § 10 |
+| Orchestration declarations | Records per step whether date slices may load in parallel, and tests it. | § 11 |
+
+## Documentation
+
+Start with the first two.
+
+| Doc | What it is |
+|---|---|
+| [`docs/framework.md`](docs/framework.md) | The framework guide: concepts, building blocks, the cloud runtime, how to add a pipeline. |
+| [`docs/architecture.md`](docs/architecture.md) | Diagrams: repos, modules, run flows, Cloud Build, image namespace. |
+| [`docs/usage.md`](docs/usage.md) | Install modes, running a workflow, scenarios, snapshot safety, cleanup. |
+| [`docs/composer-drift.md`](docs/composer-drift.md) | The drift check against production's DAGs, in full. |
+| [`docs/conventions.md`](docs/conventions.md) | Rules: the prod-infra boundary, image naming, Dataflow knobs, credentials in Cloud Build. |
+| [`docs/pipeline-contract.md`](docs/pipeline-contract.md) | What a pipeline must expose to be testable, and where each pipeline stands. For pipeline maintainers. |
+| [`workflows/README.md`](workflows/README.md) | The workflows, per pipeline. Per-pipeline docs sit next to the workflows (`workflows/<pkg>/`). |
+| [`docs/workflow-notes.md`](docs/workflow-notes.md) | Per-workflow notes and run records that were moved out of this README. |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed for users. |
+| [`CLAUDE.md`](CLAUDE.md) | Working agreements, and the Plan changelog: every design decision, newest first. |
+
+Design records and dated analyses, for when you need the reasoning:
+
+| Doc | Topic |
+|---|---|
+| [`docs/plan.md`](docs/plan.md) | The design record: decisions, API contracts, scope of each phase. Does not track status. |
+| [`docs/framework-vision.md`](docs/framework-vision.md) | The long-term shape, and how today's code compares with it. |
+| [`docs/context.md`](docs/context.md) | Historical: why the repo was started, and the two bugs the first test found. |
+| [`docs/run-cache.md`](docs/run-cache.md), [`docs/run-cache-impl.md`](docs/run-cache-impl.md) | The run cache: design and milestones. |
+| [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md) | Why every run executes a committed ref. |
+| [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md) | Comparing a candidate with production's own output. |
+| [`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md) | The composer spike and the drift check's result per workflow. |
+| [`docs/pr-triggers-2026-06.md`](docs/pr-triggers-2026-06.md), [`docs/llm-pr-gating.md`](docs/llm-pr-gating.md) | Pull-request triggers: plan and pre-filter. |
+| [`docs/encounters-onboarding-2026-07.md`](docs/encounters-onboarding-2026-07.md) | A worked onboarding audit. |
+| `docs/*-2026-06.md` | Point-in-time reviews: workflow structure, snapshots, source mutation. |
+
+## Quick start
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
-make install-pipe-gaps      # or install-port-visits / install-pipe-events / install-all
-```
+make install-pipe-gaps            # or install-port-visits / install-pipe-events / install-pipe-segment
 
-`dit` is pipeline-agnostic; workflow dependencies (`pipe-gaps`, `anchorages_pipeline`, `pipe-events`) are not in `dit`'s base `requirements.txt`. By default the Makefile assumes sibling checkouts (`$(realpath ..)`). If yours live elsewhere, prepend `PROJECTS=/path` to any target or copy `.envrc.example` → `.envrc` (gitignored; loaded by [direnv](https://direnv.net/)).
-
-For the framework only (no workflow deps), `make install` works — but the dataflow runner won't load without a workflow install bringing `apache-beam[gcp]` transitively.
-
-### Install modes
-
-| When | Target | What happens |
-|---|---|---|
-| Active dev on a pipeline (fast inner loop) | `make install-<pipeline>` | `pip install -e <pipeline-dir>` — working-tree edits picked up immediately. |
-| Reproducible run against a specific committed ref | `make install-<pipeline>-ref REF=<sha-or-branch>` | `pip install --force-reinstall --no-deps git+file://...@<ref>` — non-editable, exactly that commit, ~5-10s per ref. |
-| Test what's currently in the working tree, reproducibly | `make snapshot-<pipeline>` | Builds a deterministic orphan commit from the dirty tracked-files (temp-index `git write-tree` + `git commit-tree` with frozen dates/identity) → pushes to `refs/dit-snapshots/<pipeline>/<commit-short-sha>` on origin → installs from that ref. Identical tree → identical SHA → cache hits on repeat invocations. Parent SHA recorded in the commit message. |
-| Pipeline's transitive deps changed in target ref | add `FULLDEPS=1` | Drops `--no-deps`, lets pip reinstall the full dep tree (slower; only needed when the target ref bumped or added a dep). |
-| Remove a specific snapshot ref (secret-leak remediation only) | `make clean-snapshot PIPELINE=<name> REF=<sha-or-full-ref>` | Deletes the ref locally and on origin in one step. Snapshots otherwise live forever by design (bytes-scale, hidden namespace). |
-
-Notes on snapshot mode: only files **already tracked in HEAD** are captured (modifications + deletions). Untracked files — including files you `git add`-ed but haven't `git commit`-ed — are **not** included; commit a new file first if you want it in the snapshot. This is the deliberate safety default (see § Safety in Scenario B below); auto-push goes to the pipeline's origin (potentially public), so the capture boundary is "things you've explicitly chosen to track" rather than "anything in the working tree". Requires `git push` permission on the pipeline's origin and `gitleaks` on `PATH` (or `DIT_SKIP_SECRET_SCAN=1` to bypass with a loud banner).
-
-### Run a workflow
-
-```bash
-dit run workflows/<pipeline>/<workflow>.py [workflow-args...]
-```
-
-The CLI loads the Python module at the given path and invokes its `main(argv) -> int` entry point. Workflows can also be imported directly from a pytest target — `dit` is library-first, CLI-second.
-
-Example (Phase 2 AIS-staging, the mode-equivalence test for port-visits; run it from a clean pipe-anchorages checkout of a commit merged into `origin/main`, and it executes DIT's overlay image of v5.0.1):
-
-```bash
+dit run workflows/<pipeline>/<workflow>.py --help
 dit run workflows/port_visits/ais.py --runner dataflow --parallel
+
+# The same in Cloud Build; returns a build id in seconds:
+make dit-cloud PIPELINE=anchorages_pipeline WORKFLOW=workflows/port_visits/ais.py \
+    ARGS="--runner dataflow --parallel"
+
+# Does DIT still run what production runs?
+dit run workflows/composer_drift.py
 ```
 
-Example (Phase 3 pipe-events fishing events — a BQ-SQL pipeline run via docker; modes are `_SESSION`-isolated so `--parallel` is safe):
+The Makefile expects the pipeline checkouts next to this repo; set `PROJECTS=/path` otherwise. Install modes, scenarios (uncommitted code, a named ref, two refs compared, cancelling a run) and the safety rules for snapshots are in [`docs/usage.md`](docs/usage.md).
 
-```bash
-# One-time GCP auth into the shared docker named volume (in the pipe-events checkout):
-docker volume create gcp
-docker compose run gcloud auth application-default login
+## Features
 
-# Then run the three-mode equivalence test (compares the _fishing_events views on event_id):
-dit run workflows/pipe_events/fishing.py --parallel --build-from-source
-```
+What exists today. One line each; the linked doc has the detail. This section and the Roadmap are kept current with every change.
 
-The workflow authenticates by mounting that `gcp` named volume at `/root/.config` (via the docker runner's `volumes` param). It runs the 4-step incremental fishing-events chain per mode and asserts the three modes (`1_bf` / `2_bfd` / `3_bftruncate`) produce identical `_fishing_events` (and `_product_events_fishing`) output — the comparison the original bash never had.
+### Framework
 
-When the same workflow runs **inside Cloud Build** (`make dit-cloud`), there is no `gcp` named volume to mount; instead the docker runner picks up `DIT_CLOUD_MODE=1` (set by `cloudbuild-dit.yaml`) and adds `--network=cloudbuild` so the inner container attaches to Cloud Build's per-build `cloudbuild` docker network, where a fake metadata server returns OAuth tokens for the build SA (`automated-testing@`). google-auth's ADC chain finds the metadata server and gets a fresh token — same mechanism prod uses via GKE Workload Identity, no on-disk credentials. The workflow code is unchanged across laptop / cloud — see [`docs/conventions.md`](docs/conventions.md) § "Auth in the cloud path (ditbox)" for the three-context table.
+| Feature | Where | Since | Doc |
+|---|---|---|---|
+| `dit run <workflow>`; workflows as importable Python | `dit.cli` | 2026-05 | [`framework.md`](docs/framework.md) § 3 |
+| Two runners: a container (published image or built from source), and in-process Dataflow submission | `dit.runners.docker`, `dit.runners.dataflow` | 2026-05 | § 3 |
+| Table comparison through `table-check`, for SCD-2 and rewritten tables | `dit.compare` | 2026-05 | § 3 |
+| Mode selection (`--modes`), validated before any cloud call | `dit.workflow.parse_modes` | 2026-06-11 | § 4 |
+| Cross-version runs: bindings, worktrees, pairwise diffs | the `cross_version_*` and `identity_match_key` workflows | 2026-05-15 | § 4 |
+| Production baseline through time-travel views | `dit.production`, `dit.bq.pin_view_into_experiment` | 2026-10-23 | § 4 |
+| Source pinning by copy, including view sources; `--reuse-pin`, a 1 TB cap per copy, dry runs | `dit.bq.pin_source_into_experiment` | 2026-10-22; views 2026-11-19 | § 5 |
+| Whole-table pins of tables that require a partition filter | `dit.bq.all_rows_predicate` | 2026-11-19 | § 5 |
+| Derived source views (synthetic outages) | `dit.bq.derived_source_into_experiment` | 2026-06 | § 5 |
+| Run cache, `--no-cache`; wired into `pipe_gaps/mode_equivalence.py` (2026-05-22), `port_visits/ais.py` (2026-05-29) and `pipe_gaps/outage_recovery.py` (2026-06-03) | `dit.cache`, `dit.workflow.run_with_cache` | 2026-05-22 | § 6 |
+| Run cleanup: `make dit-cancel RUN_ID=...`, and a SIGTERM trap in `dit run` | `dit.cache.cancel_run`, `dit.cli` | 2026-05-29; trap 2026-06-11 | § 6 |
+| Every run executes a committed ref; automatic snapshots of dirty trees, with a secret scan | `dit.snapshot`, `scripts/snapshot.sh` | 2026-05 | § 7 |
+| Images built automatically for unreviewed code | `dit.worker_image` | 2026-05; docker runner 2026-06-02 | § 7 |
+| Overlay images, and the refusal of unreviewed code on an overlay default | `docker/overlays/`, `check_images` | 2026-10-22; default 2026-11-19 | § 7 |
+| Experiment ids, structured Dataflow job names, labels | `dit.workflow`, `dit.job_names` | 2026-05 | § 8 |
+| Worker cap on every Dataflow workflow, with a global ceiling ([PIPELINE-4701](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4701)) | `dit.workflow` | 2026-10-23 | § 8 |
+| Private worker IPs; worker sizing that mirrors production; a cost hint on staging data | `dit.workflow` | 2026-10-23 | § 8 |
+| Short jobs on DirectRunner (`--direct-runner-max-days`) | `dit.workflow.runner_for_days` | 2026-11-24 | § 8 |
+| Dataflow temp and staging paths under `gs://<bucket>/dit/` | `dit.dataflow_paths` | 2026-10-22 | § 8 |
+| Per-user settings through `DIT_*` environment variables | `dit.workflow`, `.envrc.example` | 2026-05-14 | § 8 |
+| Cloud Build runtime: `make dit-cloud`, `ditbox`, `make publish-ditbox` | `cloudbuild-dit.yaml`, `docker/ditbox/` | 2026-05-15 | § 9 |
+| Credentials in Cloud Build without a key file (`--network=cloudbuild`) | `dit.runners.docker` | 2026-06-03 | § 9 |
+| Production DAGs read as data; `dit composer-dag <snapshot>` ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700)) | `dit.composer` | 2026-10-23 | [`composer-drift.md`](docs/composer-drift.md) |
+| Drift check for every workflow, with frozen specs for older versions | `dit.drift`, `workflows/composer_drift.py` | 2026-11-19; frozen 2026-11-24 | [`composer-drift.md`](docs/composer-drift.md) |
+| Per-side adjustments in cross-version runs; preflight against the ref's source. Not yet used in a run. | `dit.adjust` | 2026-11-24 | [`framework.md`](docs/framework.md) § 10 |
+| Orchestration declarations per step; date slices; a parallel-slices mode. Not yet run. | `dit.orchestration`, `dit.slices` | 2026-11-24 | § 11 |
+| Pipeline integration contract and adoption matrix | [`docs/pipeline-contract.md`](docs/pipeline-contract.md) | | [`framework.md`](docs/framework.md) § 12 |
+
+### Workflows
+
+Ten workflows across five pipelines. What each one does, how to run it and what its results were: [`workflows/README.md`](workflows/README.md) and the docs next to each workflow. Notes that used to be listed here are in [`docs/workflow-notes.md`](docs/workflow-notes.md).
+
+| Pipeline | Workflow | Shape | Mirrors production today (drift check, 2026-11-20) |
+|---|---|---|---|
+| pipe-gaps | `pipe_gaps/mode_equivalence.py` | Mode equivalence | No: older version and command line |
+| pipe-gaps | `pipe_gaps/outage_recovery.py` | A staged outage and recovery against one full run | No spec of its own |
+| Port visits | `port_visits/ais.py` | Mode equivalence; parallel slices for step 1 | Yes |
+| Port visits | `port_visits/cross_version_ais.py` | Cross-version; production baseline | Runs `ais.py` |
+| Fishing events | `pipe_events/fishing.py` | Mode equivalence | No: older version and command line |
+| Fishing events | `pipe_events/cross_version_fishing.py` | Cross-version | Runs `fishing.py` |
+| pipe-segment | `pipe_segment/ais.py` | Mode equivalence of the `segment` step | Yes |
+| pipe-segment | `pipe_segment/identity_match_key.py` | Cross-version over the six segment steps, with per-side adjustments | Yes |
+| Encounters | `encounters/ais.py` | Mode equivalence, AIS staging | No: older version and command line |
+| Encounters | `encounters/vms.py` | Mode equivalence, VMS | No: older version and command line |
+
+Two things hold for every workflow and are easy to miss:
+
+- **DIT's segmenter workflows run no satellite timing offsets** (owner decision, 2026-11-20). Their output is not comparable with production's historical output for the affected hours. Two DIT runs compare fairly. See "No satellite timing offsets in DIT" under Source data targets.
+- **An IDENTICAL result is only as good as the data.** Check that the target could have shown a difference at all. See "Where target 1 runs out of road" under Source data targets.
+
+### Not built, on purpose
+
+- **No shared `Phase` / `Mode` / `Mutation` / `Oracle` types, and no shared mode loops.** The workflows' backfill and daily loops were compared side by side and are written out per workflow. Reasoning and the planned order of extraction: [`workflows/README.md`](workflows/README.md); the long-term picture: [`docs/framework-vision.md`](docs/framework-vision.md).
+- **No support for date-sharded input tables.**
+- **No pull-request triggers yet.** Runs are started by hand (Roadmap).
 
 ## Source data targets
 
@@ -225,168 +257,6 @@ Keeping these defaults in sync is manual today; detecting such drift automatical
 - So DIT's `messages_segmented` on the cohort keeps the messages of the 1,361 receiver-hours that table lists for 2020 (27 receivers, 173 days). For those hours it is not comparable with production's historical output. Two DIT runs compare fairly.
 - Details: [`workflows/pipe_segment/RUN_INSTRUCTIONS.md`](workflows/pipe_segment/RUN_INSTRUCTIONS.md) § "No satellite timing offsets in DIT".
 
-## Usage scenarios
-
-dit covers a small set of orthogonal axes, summarised first, then walked through as concrete scenarios. **Best-practice paths are flagged ⭐.**
-
-### The orthogonal axes
-
-| Axis | Choices |
-|---|---|
-| **Where** | local (`dit run …`) / Cloud Build (`make dit-cloud …`) |
-| **Pipeline ref** | clean HEAD of pipeline checkout / auto-created snapshot under `refs/dit-snapshots/<pipeline>/<commit-short-sha>` (content-addressable; one ref per distinct working-tree state) / a specific committed ref (`make install-<pipeline>-ref REF=…` or `make dit-cloud REF=…`) / a PR head SHA (automated, future) |
-| **Worker image** | published default (e.g. `pipe-gaps:v0.9.6`) / custom-built from a ref (for changes that touch worker code) |
-| **Single vs cross-version** | one ref / N refs compared (`workflows/port_visits/cross_version_ais.py`) |
-| **Trigger** | manual CLI / PR event (automated, future) / scheduled (future) |
-
-> **No-dirty-tree policy** (see [`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md)): **every dit run executes a committed git ref.** If your working tree is dirty when you invoke dit, the workflow auto-snapshots to `refs/dit-snapshots/<pipeline>/<commit-short-sha>` (content-addressable — identical tree state always produces the same SHA, so repeat runs of unchanged uncommitted code hit the cache), auto-pushes, and uses that ref — no `--allow-dirty-tree` flag, no special-case logic, every cache row reproducible. Unreviewed code (snapshot / unmerged branch) also auto-builds a matching Dataflow worker image so the workers actually run it.
-
-### Scenarios
-
-#### ⭐ Scenario A — PR validation (the canonical automated path)
-
-You're working on a pipeline change; you commit it; push to a branch; open a PR. dit fires automatically and compares the PR against `main`'s cached output.
-
-```
-$ cd $PROJECTS/pipe-gaps
-$ git checkout -b fix/PIPELINE-1465-tiebreaker
-$ git commit -am "Add deterministic tiebreaker to message sort"
-$ git push -u origin fix/PIPELINE-1465-tiebreaker
-$ gh pr create --title "Fix PIPELINE-1465 tiebreaker" --body "..."
-                          # ← dit triggers here, automatically
-                          # ← Check Run appears on the PR with the verdict
-```
-
-When to use: **default for any pipeline change you intend to land.** No commands beyond your normal git workflow. dit hits the cache for main's side (it's already been computed), runs the PR side fresh, posts the diff as a Check Run.
-
-#### Scenario B — Iterating on uncommitted code (auto-snapshot)
-
-You're mid-development; you want feedback before opening a PR. dit detects the dirty tree, auto-snapshots, auto-pushes, runs against the snapshot. Your working tree is untouched.
-
-```
-$ cd $PROJECTS/pipe-gaps && vim src/...   # edits, not committed
-$ cd $PROJECTS/data_integration_tests
-$ make dit-cloud PIPELINE=pipe-gaps WORKFLOW=workflows/pipe_gaps/mode_equivalence.py
-                          # auto-snapshots → refs/dit-snapshots/pipe-gaps/<commit-short-sha>
-                          # auto-pushes
-                          # runs against the snapshot
-```
-
-When to use: **iterating on a fix that isn't PR-ready** (e.g. making a pipeline idempotent across modes). Each edit produces a fresh snapshot (new cache key, new MISS, full Dataflow workload). Once you're happy, commit + push the same code to a real branch + open a PR (Scenario A).
-
-Caveats printed at snapshot time:
-- First run against each new tree-state is a cache MISS; **repeat runs of an unchanged tree are a HIT** (snapshot SHA is content-addressable — derived from `git write-tree` with frozen author/committer dates, so identical tree → identical SHA → identical cache key).
-- Only **tracked modifications + deletions** are captured. Untracked files (and files you `git add`-ed but haven't `git commit`-ed yet) are **never** in the snapshot — see § "Safety: auto-push and credential leakage" below for why this is the deliberate default. Commit a new file before running dit if you want it included.
-- The cache row is tagged `unreviewed_code=TRUE` so PR-validation queries skip it.
-- If your changes touch worker code, build+push a custom worker image too (`--worker-image=…`).
-- **Requires `git push` permission on the pipeline repo.** If you're a read-only viewer, dit will fail at push time with a clear error pointing at `make install-<pipeline>-ref REF=<committed-ref>` or asking you to commit + push the changes via a normal branch first.
-
-> **⚠ Safety: auto-push and credential leakage.** `make dit-cloud` pushes the snapshot to the pipeline repo's origin automatically. The pipeline repo may be a **public GitHub repository**. Treat every snapshot as potentially publicly visible.
->
-> Three defense layers, smallest blast radius first:
->
-> 1. **`git add -u` (tracked-only) is the default.** Only modifications + deletions to files already in HEAD enter the snapshot. Untracked files (and files you `git add`-ed but haven't `git commit`-ed yet) stay out. Rogue `.env`, downloaded `sa.json`, one-off `query_results.csv`, etc. are not captured.
-> 2. **Pre-push banner shows you the changed paths** before the push happens. Visual review is the last-line-of-defence; if anything surprises you, Ctrl-C immediately.
-> 3. **Pre-push secret scanner (gitleaks).** Before each push, the script extracts the snapshot tree to a temp dir and runs `gitleaks detect`. A finding aborts the snapshot. Required by default: if gitleaks isn't installed and no bypass env var is set, the snapshot refuses to proceed (`brew install gitleaks` / one-line install instructions in the error). Override is `export DIT_SKIP_SECRET_SCAN=1` and emits a loud `WARNING: secret scan BYPASSED` banner — for false positives only, never as a "make this work" shortcut. Ditbox has gitleaks pre-baked.
->
-> Remediation if a snapshot containing secrets has already landed on origin:
->
-> 1. **Rotate the credential.** Load-bearing step. Anything ever pushed to a public-shaped repo must be treated as compromised (history snapshots, forks, mirrors, indexers all make untoward pushes effectively permanent).
-> 2. **`make clean-snapshot PIPELINE=<name> REF=<sha>`** — deletes the ref locally + on origin. Necessary but **not** sufficient on its own.
->
-> If a tracked file contains a secret (the scanner caught one, or you noticed in the banner), the structural fix is `git rm --cached <file>` + add to `.gitignore` + commit the removal — then the next snapshot won't include it.
-
-#### Scenario C — Running against any committed ref (testing main, a colleague's branch, an old commit)
-
-You want to test a specific committed ref without changing what's installed.
-
-```
-$ make dit-cloud PIPELINE=pipe-gaps REF=main WORKFLOW=workflows/pipe_gaps/mode_equivalence.py
-# or:
-$ make dit-cloud PIPELINE=pipe-gaps REF=fix/PIPELINE-1465-tiebreaker WORKFLOW=...
-# or to install locally and run from your venv (e.g. for ad-hoc inspection, or to drive Dataflow without Cloud Build):
-$ make install-pipe-gaps-ref REF=fix/PIPELINE-1465-tiebreaker
-$ dit run workflows/pipe_gaps/mode_equivalence.py --runner dataflow ...
-```
-
-When to use: testing main as a regression baseline; reviewing a teammate's PR locally; reproducing a historical run from a `dit_runs` row's `pipeline_commit`.
-
-#### Scenario D — Cross-version testing (you want to compare two refs)
-
-You have a fix and want to verify it doesn't regress anywhere it shouldn't.
-
-```
-$ dit run workflows/port_visits/cross_version_ais.py \
-    --experiment-id pipeline-1465 \
-    --start 2020-01-01 --end 2020-12-31 \
-    --binding before=v5.0.1 \
-    --binding after=fix/PIPELINE-1465-tiebreaker \
-    --binding-image-tag after=gcr.io/world-fishing-827/dit/pipe-anchorages:<label>-<commit7>-temp-dataset-905dc761 \
-    --binding-worker-image after=gcr.io/world-fishing-827/dit/pipe-anchorages:<label>-<commit7>-temp-dataset-905dc761 \
-    --runner dataflow --parallel
-```
-
-`before` runs the default image, DIT's overlay of pipe-anchorages v5.0.1. `after` is not merged, so it needs its own overlay image, built with `docker/overlays/pipe-anchorages-temp-dataset/build.sh <repo> <ref> <label> --push`, as both submitter and worker. Without those two flags the `after` binding refuses to start.
-
-When to use: **fix-verification before PR** (or as a separate verification run alongside Scenario A). Each binding runs against the same source copies, taken at run start; outputs are diffed pairwise. The run logs its pin stamp; `--reuse-pin <stamp>` reruns on the same copies within their 7-day TTL. `--dry-run` reports what the copies would cost without creating them.
-
-Per-binding images matter because the code runs in two places, the submitter and the workers — see memory `[[submitter-vs-worker-split]]`.
-
-#### Scenario E — Reproducing a past run
-
-A previous cache row says `pipeline_commit=<sha>`. You want to rerun against that exact code.
-
-```
-$ bq query --use_legacy_sql=false --project_id=world-fishing-827 \
-    'SELECT pipeline_commit, params_json FROM `world-fishing-827.tech_great_expectations.dit_runs`
-     WHERE run_id = "<rid>"'
-$ make dit-cloud PIPELINE=pipe-gaps REF=<sha> WORKFLOW=workflows/pipe_gaps/mode_equivalence.py ARGS="..."
-```
-
-When to use: investigating a past diff; auditing a result; sanity-checking that a snapshot ref is still fetchable. Because every dit run executes a pushed ref, this works for anyone with read access to the pipeline repo — the row is genuinely portable.
-
-#### Scenario F — Cancelling a stuck or unwanted run
-
-```
-$ make dit-cancel RUN_ID=<rid>          # or: dit cache-cancel <rid> [--region <r>]
-```
-
-Discovers the run's Dataflow jobs by the `dit_run_id` label dit stamps on every Dataflow job (not the stored `dataflow_job_ids`, which are always empty), cancels the still-running ones, drops the run's recorded output tables (table-level deletes only — never a dataset), and marks all the run's `dit_runs` rows `cancelled`. Cancels all sibling modes together. Idempotent. Region defaults to `DIT_DATAFLOW_REGION` → `us-central1`.
-
-#### Scenario G — `make snapshot-<pipeline>` explicitly (advanced)
-
-You can manually invoke the snapshot step before running dit. Equivalent to letting `make dit-cloud` auto-snapshot, but useful when you want to inspect the snapshot ref before the run, or when running multiple dit invocations against the same uncommitted code base (the second run hits cache against the first).
-
-```
-$ make snapshot-pipe-gaps
-# Prints: Created refs/dit-snapshots/pipe-gaps/<commit-short-sha>; pushed to origin
-#         (or: ref already exists on origin, skipping push — content-addressable).
-$ make dit-cloud PIPELINE=pipe-gaps REF=refs/dit-snapshots/pipe-gaps/<that> ...
-```
-
-#### Cleanup
-
-Snapshots live forever by design — bytes-scale storage on origin in a hidden ref namespace, no measurable cost. There's no periodic-cleanup target.
-
-The one exception:
-
-```
-$ make clean-snapshot REF=refs/dit-snapshots/pipe-gaps/<sha>
-```
-
-Deletes the specified snapshot ref locally and on origin in one step. Intended for **secret-leak remediation** — e.g. you noticed a `.env` file or a credential was tracked in the working tree when you ran `make dit-cloud`. Surgical, user-invoked. The cache row in `dit_runs` retains `pipeline_commit_parent`, so removing the snapshot ref doesn't lose reproduce context for the rest of the row's lifetime.
-
-### Decision tree
-
-| Question | Answer | Scenario |
-|---|---|---|
-| Are you opening a PR? | Yes | **A** (best) |
-| | Not yet — iterating | **B** (auto-snapshot) |
-| | Testing an existing ref | **C** |
-| Are you comparing two refs against pinned source? | Yes | **D** |
-| Are you reproducing or auditing a past run? | Yes | **E** |
-| Need to clean up a stuck run? | Yes | **F** |
-
 ## Roadmap
 
 Each phase below is a short summary of what's planned and where we are. This section is the single status source; [`docs/plan.md`](docs/plan.md) holds the design (architecture, decisions, API contracts, phase scope) and does not track status.
@@ -398,7 +268,7 @@ Each phase below is a short summary of what's planned and where we are. This sec
 | **Cross-version experiments** | BQ snapshot helpers (`dit.bq.snapshot_table`/`snapshot_dataset`), experiment-id linkage (`--experiment-id`/`DIT_EXPERIMENT_ID`), structured Dataflow job names + dynamic labels, and an end-to-end orchestrator (`workflows/port_visits/cross_version_ais.py`) for diffing pipeline outputs across versions against pinned input. | **Landed 2026-05-15.** Validated end-to-end via the PIPELINE-1465 cross-version test + the pipe-gaps `--worker-image` flow on 2026-05-22. **Re-pinned 2026-10-22:** snapshot pinning had never worked after the June canonical-dataset migration (no `deleteSnapshot`) and cannot cross orgs; `cross_version_ais.py` now pins with copies (`dit.bq.pin_source_into_experiment`). **2026-11-19 ([PIPELINE-4705](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4705)):** `cross_version_fishing.py` pins with copies too, and the helper copies view sources; checked with dry runs, not yet run live. `identity_match_key.py` and `outage_recovery.py` pin with copies as well, so no workflow pins with snapshots any more. |
 | **Runtime & CI (Cloud Build)** | `ditbox` image + `cloudbuild-dit.yaml` + `make dit-cloud` / `make publish-ditbox` targets. Moves the orchestrator off the laptop; serves both `gcloud builds submit` ad-hoc and GitHub-webhook PR triggers. Tiered triggers (cheap AIS-staging on every PR, heavy AIS-full on label) come on top. | **Ad-hoc path battle-tested 2026-05-22** (kaniko cache, uv per-run installs, `_BEAM_VERSION` pin, `dit.job_names` centralisation, `dit.git_info` warn). Per-pipeline PR triggers pending. 30-concurrent-build slot cap is the next architectural ceiling — Cloud Run jobs flagged as the migration target if dit graduates to per-PR matrix testing. |
 | **3 — pipe-events port** | Port the bash mode-equivalence test (`pipe-events/integration_tests/pipe3-bf_bfd_bftruncate.sh`, no comparisons) to `workflows/pipe_events/fishing.py`. Add the automated comparison it lacks. Then decide whether to extract phase helpers (three-consumer evidence). | **Code complete 2026-05-29 + verified live 2026-06-03** (build `e6f06a00`, ~47 min, all 12 nested-docker invocations clean against BQ; surfaced a real pipe-events SQL non-determinism finding — `ARRAY_AGG`-without-`ORDER BY` + float-aggregation drift in JSON-encoded STRING columns — recommended upstream fix is low-priority and out of dit's scope). `workflows/pipe_events/fishing.py` lands the 4-step BQ-SQL chain + truncate-shape comparison on `event_id` (NOT SCD-2 — plan corrected). Docker runner gained `volumes`/`service`; `add_infra_args` split. Phase-helper extraction **deliberately deferred** (three-consumer review: shapes too divergent — [`workflows/README.md`](workflows/README.md)). Pending: the pipe-events-repo bash shim (a separate processing-repo change). |
-| **4 — composer-dags param sync** | `dit sync-params --from <composer-dags-checkout>` reads production DAGs and regenerates `params.yaml`. Triggered when a real prod-vs-test param drift bug shows up. | Spike 2026-10-23 ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700)): `dit.composer` reads composer's render snapshots as data; no params file yet. See [`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md). |
+| **4 — composer-dags param sync** | `dit sync-params --from <composer-dags-checkout>` reads production DAGs and regenerates `params.yaml`. Triggered when a real prod-vs-test param drift bug shows up. | Spike 2026-10-23 ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700)): `dit.composer` reads composer's render snapshots as data; no params file yet. See [`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md). 2026-11-19: a drift check for every workflow detects differences but syncs nothing ([`docs/composer-drift.md`](docs/composer-drift.md); item 7b below). |
 | **5 — Mutation library** | Promote pipe-gaps' `compute_restricted_ssvids` into `dit.mutations` along with `drop_messages`, `shift_timestamps`, `set_segment_flag`. Cap at ~5 mutations. | Not started; waits for a second consumer. |
 | **6 — Phase sharing** | Hash `(image-tag, phase-config, mutation-set)`; second invocation of an identical phase becomes a `BQ COPY` instead of a re-run. Cuts wall-clock for CI. | Not started; build only when duplicate-run cost matters operationally. |
 | **7 — Golden-table mode** | Per-workflow reference `_1_bf` table keyed by `(image-tag, params-hash, date-range)`; future runs assert byte-equivalence vs. the golden table. Cheap PR-validation regression check. Implementable on top of the cross-version snapshot machinery. | Not started. |
@@ -406,7 +276,7 @@ Each phase below is a short summary of what's planned and where we are. This sec
 **Operational next steps** (rolling, in priority order):
 
 0. **No-dirty-tree pivot — landed** ([`docs/no-dirty-tree-pivot.md`](docs/no-dirty-tree-pivot.md)). M-pivot-1..5 shipped (#22–#25 + docs): deterministic orphan snapshots + gitleaks; auto-snapshot in `make dit-cloud` (`--async`) / `dit run`; `pipeline_dirty` → `unreviewed_code` + `pipeline_commit_parent` (snapshots cacheable); auto-built worker images closing the submitter-vs-worker gap; `--allow-dirty-tree` / the warn-helper / the `_dirty` suffix removed. **Remaining follow-ups** (tracked in the pivot doc § Loose ends): pipe-gaps Dockerfile reorder PR ([GlobalFishingWatch/pipe-gaps#128](https://github.com/GlobalFishingWatch/pipe-gaps/pull/128)); drop the dual-written `pipeline_dirty` column after a release. The first real end-to-end `make dit-cloud` auto-build run is **done (2026-05-29)** — it also surfaced + fixed two `REF=` cloud-path bugs (#27) and reconfirmed the `v0.9.6` non-determinism (main 350/317/347 vs fix 0/0/0).
-1. **Run cache M5 — landed 2026-05-29** (see [`docs/run-cache-impl.md`](docs/run-cache-impl.md) § Milestone 5). **M5a** ✓: `cancel_run` + `dit cache-cancel` + `make dit-cancel` — discovers Dataflow jobs by `dit_run_id` label (stored `dataflow_job_ids` are empty), deletes the output tables (table-level only), UPDATEs status; pipe-gaps now stamps the `dit_run_id` label too. **M5b** ✓: port-visits caching wired (its own `canonical_params_dict` + `CacheKey` over the shared `dit.workflow.run_with_cache`; `ais.py` flipped to `resolve_digest=True`). **User-gated follow-up**: verify `dataflow.jobs.cancel` + BQ table-delete for the laptop user (`make dit-cancel`) and `automated-testing@` (the M6 path) against live infra — the M5 tests mock gcloud/BQ.
+1. **Run cache M5 — landed 2026-05-29** (see [`docs/run-cache-impl.md`](docs/run-cache-impl.md) § Milestone 5). **M5a**, done: `cancel_run` + `dit cache-cancel` + `make dit-cancel` — discovers Dataflow jobs by `dit_run_id` label (stored `dataflow_job_ids` are empty), deletes the output tables (table-level only), UPDATEs status; pipe-gaps now stamps the `dit_run_id` label too. **M5b**, done: port-visits caching wired (its own `canonical_params_dict` + `CacheKey` over the shared `dit.workflow.run_with_cache`; `ais.py` flipped to `resolve_digest=True`). **User-gated follow-up**: verify `dataflow.jobs.cancel` + BQ table-delete for the laptop user (`make dit-cancel`) and `automated-testing@` (the M6 path) against live infra — the M5 tests mock gcloud/BQ.
 2. **Run cache M6 — SIGTERM trap inside `dit run` — landed 2026-06-11.** Cloud Build cancellations (and, once PR triggers land, force-pushes to triggered builds) now tear down their own Dataflow jobs via `cancel_run` instead of orphaning them. New `dit.runstate` carries the `run_id` from `resolve_run_context` to the CLI handler; exits `143`; escape hatch `DIT_NO_CANCEL_ON_SIGTERM=1`. **This completes the run-cache arc (M1–M6).** Known limitation: non-default `--dataflow-region` runs need `DIT_DATAFLOW_REGION` exported too for the trap to find their jobs (the message names the manual fallback). See [`docs/run-cache-impl.md`](docs/run-cache-impl.md) § Milestone 6.
 3. **Per-pipeline PR triggers.** Wire `pipe-gaps` (most-verified) → `anchorages_pipeline` → `pipe-events` to fire dit on PRs. Trigger config lives in each pipeline repo; references `cloudbuild-dit.yaml` from the dit checkout. Path-filter on pipeline-relevant files; `dit:run` label as the escape-hatch override.
 4. **PR comment integration via Check Runs.** `dit.report` module + GitHub Check Run API call from inside `dit run`. Typed contract end-to-end (no log parsing). Design doc TBD; separately, [`docs/llm-pr-gating.md`](docs/llm-pr-gating.md) covers the negative-signal-only LLM pre-filter that gates *whether* a PR triggers dit (orthogonal concern from how the verdict is posted).
@@ -418,38 +288,22 @@ Each phase below is a short summary of what's planned and where we are. This sec
 7. PIPELINE-1465 cross-version full validation against newly-built pipe-anchorages images (parallel to the pipe-gaps validation just completed).
 
 7a. **pipe-anchorages on its current CLI ([PIPELINE-4699](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4699)).** `--pipeline-cli v5` + the temp-dataset overlay landed 2026-10-22, as an opt-in next to the v4 default.
-   - **v5 only since 2026-11-19.** Production's `core.ais.v5` moved to pipe-anchorages v5.0.0 on 2026-10-26 and v5.0.1 on 2026-11-04. The owner then dropped the v4 path: the workflows drive the v5 CLI only, the default image is DIT's overlay of v5.0.1, and `--pipeline-cli` is gone. PR #176 is part of v5.0.0, so the runs below are history.
+   - **v5 only since 2026-11-19.** Production's `core.ais.v5` moved to pipe-anchorages v5.0.0 on 2026-10-26 and v5.0.1 on 2026-11-04. The owner then dropped the v4 path: the workflows drive the v5 CLI only, the default image is DIT's overlay of v5.0.1, and `--pipeline-cli` is gone. PR #176 is part of v5.0.0, so the first consumer's runs are history.
    - **Open after that change:** no Dataflow run on the v5.0.1 overlay image yet (a staging smoke is the next step); no production-baseline run since production moved to v5.0.1 (its output pin is fixed for the table's new partition-filter requirement in #89); VMS port visits, voyages and `anchorages-visited-info` are not covered.
 
-   First consumer: the PIPELINE-4690 A/B (pipe-anchorages PR #176, one record per vessel and instant). Dataflow runs, all from October 2026, when production still ran v4.6.4:
-   - **Staging smoke**, three modes, v5 CLI, candidate overlay `…-905dc761`: passed 2026-10-22, run `99cc678ee30c`, 10,291 visits per mode, 0 differing rows.
-   - **Staging cross-version**, b36aed6 vs 14b4be8 (Cloud Build `1f7447b4`): step 1 identical; visits differ in 2 of 10,292 rows, both explained by same-second ties, which #176 intends.
-   - **September 2026**, main b36aed6 vs PR 14b4be8 (Cloud Build `2a984881`): DIFFERENT, consistent with #176. Duplicate `visit_id`s are gone and burst splits are merged.
-   - **Q3 2026**, production v4.6.4 vs PR (Cloud Builds `0c6a46a6` and `77c967ef`): DIFFERENT, consistent with #176.
-   - **September 2026 three-way**, v4.6.4 on the same pins (Cloud Build `ec8b6dae`, 2026-10-23): this separates #176 from main's other changes.
-     - Rows with a duplicate `visit_id`: 2,302 for v4.6.4, 2,658 for main, 0 for the PR.
-     - v4.6.4 vs main changes about 1,100 visits (mostly zero-duration ones); v4.6.4 vs the PR about 4,000.
-   - **Determinism**, September (Cloud Build `8a1348d1`, `--no-cache`, 2026-10-23): the PR twice, plus the 2026-10-22 run. All three are IDENTICAL (3,869,516 rows).
-   - **Production baseline** (7c), PR vs production's own 2026-10-20 output: see 7c.
-
-   Open: TIC has no multiset comparison, so baseline duplicate `visit_id`s show up as duplicate-key warnings rather than counted diffs.
+   The first consumer's run records (the PIPELINE-4690 A/B, pipe-anchorages PR #176: staging smoke, staging cross-version, September and Q3 2026, the three-way with v4.6.4, determinism) moved to [`docs/workflow-notes.md`](docs/workflow-notes.md) § "Run records: PIPELINE-4690". All are from October 2026, when production still ran v4.6.4.
 
 7b. **Keeping dit in sync with pipeline interface changes ([PIPELINE-4700](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4700)).** The v5 CLI drift went unnoticed for months because production then still pinned v4.6.4. Then the opposite happened: production moved to v5.0.1 on 2026-11-04, DIT stayed on v4.6.4, and only a manual audit on 2026-11-19 found it. Define how drift is detected, who updates dit, and how cross-version runs handle bindings on different interfaces.
    - Spike landed 2026-10-23: `dit.composer` reads composer's render snapshots as data, and `workflows/port_visits/composer_drift.py` checks the port-visits target and argv against them (owner decisions applied 2026-10-23).
    - 2026-11-19: the check is ported to the v5 CLI and now also compares the pipe-anchorages version in DIT's default image with production's image tag.
-   - 2026-11-19: the check is general. `dit.drift` plus one spec per workflow, run by `workflows/composer_drift.py`, compare version, command and flags per step ([`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md) § 8). Port visits is in sync. The specs of encounters (AIS and VMS), pipe-events and pipe-gaps report drift; each is the acceptance test for porting that workflow.
+   - 2026-11-19: the check is general. `dit.drift` plus one spec per workflow, run by `workflows/composer_drift.py`, compare version, command and flags per step (how it works: [`docs/composer-drift.md`](docs/composer-drift.md); result per workflow: [`docs/composer-snapshots-2026-10.md`](docs/composer-snapshots-2026-10.md) § 8). Port visits is in sync. The specs of encounters (AIS and VMS), pipe-events and pipe-gaps report drift; each is the acceptance test for porting that workflow.
    - 2026-11-19: pipe-segment is in sync. Its version and commands already matched and its flags did not; the flags were fixed, the three missing steps of production's segment group were added, and the spec covers all six tasks. Read from code, not confirmed by a run: a one-day DirectRunner smoke is proposed and waits for the owner's go-ahead. Dataflow runs as the test service account still need a temp-dataset overlay image.
    - 2026-11-20: the check caught its first live change. The AIS v3 DAG moved its segment group to pipe-segment v5.1.0 with `--incremental` (composer-dags-production PR #3145, merged 17:26 UTC); a run of the check that evening exited 1 and named the version on six steps and the flag on one. DIT's pipe-segment defaults followed the same day (7e), and both specs are in sync again at composer e4cb29361. The check was run by hand; nothing would have run it otherwise.
-   - 2026-11-24: bindings on different interfaces. `dit.adjust` gives each binding of a cross-version run the base interface (mirroring production) plus declared and ad hoc adjustments, checked against the ref's CLI source before pinning; first consumer `pipe_segment/identity_match_key.py`. Older layers get frozen drift specs at the composer commit where production last ran them (pipe-segment v5.0.3: in sync). Not run; the table edits have no real case yet (Features, "Per-side adjustments in cross-version runs").
+   - 2026-11-24: bindings on different interfaces. `dit.adjust` gives each binding of a cross-version run the base interface (mirroring production) plus declared and ad hoc adjustments, checked against the ref's CLI source before pinning; first consumer `pipe_segment/identity_match_key.py`. Older layers get frozen drift specs at the composer commit where production last ran them (pipe-segment v5.0.3: in sync). Not run; the table edits have no real case yet ([`docs/framework.md`](docs/framework.md) § 10; [`docs/workflow-notes.md`](docs/workflow-notes.md) § pipe-segment).
    - Next: port the drifted workflows, each against its spec, and set `in_sync=True` as each one passes. Open: nothing runs the check on a schedule yet (owner, 2026-11-19: on demand is enough for now).
 
 7c. **Candidate against production's own output ([PIPELINE-4703](https://globalfishingwatch.atlassian.net/browse/PIPELINE-4703)).** `--baseline-production ais-v5-datalake` landed 2026-10-23 (#83).
-   - **Verified live the same day** (Cloud Build `7781dd48`): PIPELINE-4690's PR (#176) against production's 2026-10-20 output, full history. Dataflow took 99 minutes at 100 × e2-standard-2.
-   - **Result:** DIFFERENT, consistent with #176.
-     - production has 412,190,532 rows (2,801 with a duplicate `visit_id`); the PR has 412,181,996, all unique;
-     - 9,789 rows exist only in production (6,849 of them zero-duration), 1,361 only in the PR;
-     - 2,715 shared visits changed, 2,342 of them longer.
-     - Breakdown: [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
+   - **Verified live the same day** (Cloud Build `7781dd48`): the PIPELINE-4690 PR against production's 2026-10-20 output, full history. Result: DIFFERENT, consistent with the PR. Figures: [`docs/workflow-notes.md`](docs/workflow-notes.md) § "Production baseline" and [`docs/production-baseline-2026-10.md`](docs/production-baseline-2026-10.md).
    - **Follow-ups:**
      - the core AIS v3 target;
      - a trigger after the production DAG;
@@ -462,24 +316,22 @@ Each phase below is a short summary of what's planned and where we are. This sec
    - **Open:**
      - retiring `snapshot_into_experiment`, `snapshot_table` and `snapshot_dataset`, now that no workflow uses them;
      - a first live run of each moved workflow. Smallest ones: a one-week `1_bf` run of the fishing wrapper, a one-day DirectRunner smoke for pipe-segment, and a short-window `--synthetic-outage` run in Cloud Build for outage recovery. All wait for the owner's go-ahead.
-   - 2026-11-20, owner decision: DIT runs no satellite timing offsets. pipe-segment's `--include-satellite-offsets` and the code behind it are removed (Features, "No satellite timing offsets in DIT"). The path back is an option in pipe-segment to read an offsets table instead of computing one; not planned work.
+   - 2026-11-20, owner decision: DIT runs no satellite timing offsets. pipe-segment's `--include-satellite-offsets` and the code behind it are removed (Source data targets, "No satellite timing offsets in DIT"). The path back is an option in pipe-segment to read an offsets table instead of computing one; not planned work.
 
-7e. **Mode equivalence for the segmenter.** `workflows/pipe_segment/ais.py` and the pipe-segment temp-dataset overlay landed 2026-11-20 (Features, "Mode equivalence for the segmenter"). First use: pipe-segment PR #227 (`--incremental`, released as v5.1.0), whose claim is that incremental day-by-day runs equal full history.
-   - **The AIS DAG adopted the flag the same day** (composer-dags-production PR #3145). The defaults follow it: the incremental segmenter, on the overlay of v5.1.0, for a run that compares three incremental shapes with full history in one job (ten jobs). `identity_match_key.py` defaults to the same image, hands it the temp dataset, and since 2026-11-24 passes `--incremental` to every binding whose pipe-segment declares it (Features, "Per-side adjustments in cross-version runs").
-   - **Run (2026-11-24/25), all measured in Cloud Build.** Both overlay images built and pushed on 2026-11-24.
-     - Default run on January 2020 (`2e57a93b`): 10 Dataflow jobs, 9 comparisons IDENTICAL.
-     - PR #227 test with the v5.0.3 base (`4bb84ec0`): 45 jobs, 15 comparisons against `1_bf:full-history@base` IDENTICAL.
-     - Short jobs on DirectRunner (`967b1030`): IDENTICAL to a Dataflow reference.
-     - Production input, 2012-12-01..10, v5.0.3 against v5.1.0 (`56af531e`): `segments` and `fragments` IDENTICAL; `messages_segmented` showed 2 differences on one msgid shared by two vessels, a table-check pairing bug fixed in v0.3.1; the compare-only rerun (`de4e5831`) is IDENTICAL on all 9.
+7e. **Mode equivalence for the segmenter.** `workflows/pipe_segment/ais.py` and the pipe-segment temp-dataset overlay landed 2026-11-20 ([`docs/workflow-notes.md`](docs/workflow-notes.md) § pipe-segment). First use: pipe-segment PR #227 (`--incremental`, released as v5.1.0), whose claim is that incremental day-by-day runs equal full history.
+   - **The AIS DAG adopted the flag the same day** (composer-dags-production PR #3145). The defaults follow it: the incremental segmenter, on the overlay of v5.1.0, for a run that compares three incremental shapes with full history in one job (ten jobs). `identity_match_key.py` defaults to the same image, hands it the temp dataset, and since 2026-11-24 passes `--incremental` to every binding whose pipe-segment declares it ([`docs/framework.md`](docs/framework.md) § 10).
+   - **Run (2026-11-24/25), all measured in Cloud Build:** the default run on January 2020 (10 jobs, 9 comparisons), the PR #227 test with the v5.0.3 base (45 jobs, 15 comparisons), short jobs on DirectRunner, and ten days of production input (v5.0.3 against v5.1.0) are all IDENTICAL. Build ids and the one table-check pairing bug found on the way: [`docs/workflow-notes.md`](docs/workflow-notes.md) § "Run records: segmenter".
    - **Open:** `identity_match_key.py` has not run on the overlay images (it takes one per binding with `--binding-image` since 2026-11-24, and refuses an unreviewed binding on the default image since 2026-11-25); the mode-equivalence workflow has no run cache and its output tables have no expiration; a cross-version wrapper for the segmenter (base against head, per mode) does not exist; the VMS segment stage (v5.0.3, full history) has no workflow of its own.
 
-7f. **Which steps may load slices in parallel.** Declarations (`workflows/<pkg>/orchestration.py`), `dit.slices` and port visits' `6_parallel` landed 2026-11-24 (Features, "Parallel slices"). Every declaration is a claim; none is verified.
+7f. **Which steps may load slices in parallel.** Declarations (`workflows/<pkg>/orchestration.py`), `dit.slices` and port visits' `6_parallel` landed 2026-11-24 ([`docs/framework.md`](docs/framework.md) § 11; [`docs/workflow-notes.md`](docs/workflow-notes.md) § Port visits). Every declaration is a claim; none is verified.
    - **Next, waiting for the owner's go-ahead** (each needs a clean pipe-anchorages checkout of a commit merged into `origin/main`, so the default v5.0.1 overlay image runs):
      1. January 2020 in calendar weeks: `--steps thin_port_messages --modes 1_bf,6_parallel --start 2020-01-01 --end 2020-01-31 --slices week`. 6 Dataflow jobs (1 + 5 concurrent), all five slices in one monthly partition, so concurrent deletes and appends on one partition and the concurrent create-table hook are exercised;
      2. the 12 months of 2020: `--slices month` on the default window. 13 jobs (1 + 12 concurrent).
    - **Then:** record the result in `port_visits/orchestration.py` by hand (status `verified`, the Cloud Build id), and give the next workflow the mode (candidates: encounters' raw step; the forbidden steps as negative tests).
 
 8. **Docs reorganisation.** This README has outgrown its shape — it now carries source-target inventories, per-workflow interpretation notes, and operational findings that belong in `docs/` or alongside the workflow they describe (`workflows/<pipeline>/README.md`, as `workflows/encounters/README.md` now does). Near-term: move content out and leave the README as an index. Longer-term this needs a **concept for storing dit outputs and analyses in a structured way** — run results, comparison summaries and their interpretation currently have no home at all, which is why they keep landing in prose. Recorded 2026-07-31.
+   - **2026-11-25, first step:** the top of this README now explains the framework in a page. New: [`docs/framework.md`](docs/framework.md), [`docs/composer-drift.md`](docs/composer-drift.md) and [`docs/usage.md`](docs/usage.md) (the install modes and scenarios that were here). The long per-workflow feature notes and the run records of items 7a, 7c and 7e moved to [`docs/workflow-notes.md`](docs/workflow-notes.md), unchanged.
+   - **Open:** folding `docs/workflow-notes.md` into the per-pipeline docs next to the workflows; moving the Source data targets inventory out; the concept for storing run results.
 9. The first dit release tag (`v0.1.0`) once per-pipeline PR triggers + caching land — that's the natural "framework is usable by outsiders" milestone.
 
 This list is the canonical status and priority list. `docs/plan.md` § Next steps keeps only the design intent of the items it numbers (it stopped tracking status on 2026-10-23), and the PR-trigger arc is sequenced in [`docs/pr-triggers-2026-06.md`](docs/pr-triggers-2026-06.md). That plan proposes tagging `v0.1.0` *before* the PR triggers, the opposite of item 9 above; the order is an open owner decision.

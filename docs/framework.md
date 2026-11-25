@@ -90,6 +90,17 @@ Most workflows follow the same steps. The pipeline-specific parts are the comman
 | 5. Compare | Pairwise table comparison on the workflow's keys. | `dit.compare.compare_tables` |
 | 6. State the verdict | Log IDENTICAL or DIFFERENT per pair and return the exit code the shape defines (section 4). | per workflow |
 
+### The comparison call
+
+```python
+compare_tables(table_a, table_b, keys=[...], view_suffix="", tolerance={...})
+```
+
+- `keys` is the join key of the comparison. Each workflow fixes it in code.
+- `view_suffix` is appended to both table names. Outputs that keep versions of a row (pipe-gaps) are compared through their `_last_versions` view. Outputs that are rewritten (port visits, fishing events) are compared directly, with `""`.
+- `tolerance` maps a column to an absolute tolerance.
+- The return value is 0 for identical and 1 for any difference. The number of differing rows is logged. It is clamped to 1 on purpose: workflows pass the value to `sys.exit`, and a raw count that is a multiple of 256 would read as success.
+
 ### Worked example
 
 ```bash
@@ -362,6 +373,8 @@ The ceiling only lowers a default. Each run logs its cap and where it came from.
 - **Machine type and disk default to production's**, per step. They are hand-written constants (`STEP_WORKER_SIZING`) that cite the composer snapshot they were read from.
 - `--worker-machine-type` and `--disk-size-gb` override them, field by field (`resolve_worker_sizing`).
 - A Dataflow run that keeps production's sizing while reading the staging cohort logs a `cost hint:` warning. It never blocks.
+- In a production-baseline run, the production target's sizing is the default for every binding.
+- Steps that are not Dataflow jobs take no Dataflow option at all (pipe-segment's four SQL steps).
 
 | Workflow | Default worker cap | Default sizing |
 |---|---|---|
