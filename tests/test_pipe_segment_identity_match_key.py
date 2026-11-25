@@ -327,6 +327,7 @@ def _main(*extra: str) -> dict[str, Any]:
     with (
         patch.object(mod, "_verify_refs"),
         patch.object(mod, "_verify_distinct_gpsdio_pins"),
+        patch.object(mod, "_preflight_images"),
         patch.object(mod.dit_bq, "pin_source_into_experiment",
                      return_value=f"{_GE}.copy") as pin,
         patch.object(mod.dit_bq, "require_pinned_source",
@@ -769,20 +770,84 @@ def test_bq_temp_dataset_reaches_the_container_and_no_argv() -> None:
     assert [argv for _, argv, _ in calls] == list(_expected("dataflow").values())
 
 
-def test_an_auto_built_image_on_dataflow_gets_a_warning_about_the_overlay(caplog) -> None:
-    def warnings(runner: str, resolved: str | None) -> list[str]:
-        caplog.clear()
-        args = _run_args(runner)
-        with caplog.at_level(logging.WARNING, logger=mod.logger.name):
-            _run_binding(args, resolved_image=resolved or args.image_tag)
-        return [r.getMessage() for r in caplog.records if "temp-dataset overlay" in r.getMessage()]
+# -- Unreviewed bindings on the default image are refused ---------------------
 
-    built = "gcr.io/world-fishing-827/dit/pipe-segment:dit-abc1234"
-    (warning,) = warnings("dataflow", built)
-    assert built in warning and f"{mod.OVERLAY_DIR}/build.sh" in warning
-    # The image as given, or a runner without workers: nothing to warn about.
-    assert warnings("dataflow", None) == []
-    assert warnings("DirectRunner", built) == []
+@pytest.mark.parametrize("runner, extra", [
+    ("dataflow", ()),
+    ("DirectRunner", ()),
+    # Dataflow workers pull the default image even when building from source.
+    ("dataflow", ("--build-from-source",)),
+])
+def test_an_unreviewed_binding_on_the_default_image_is_refused(
+    runner: str, extra: tuple[str, ...],
+) -> None:
+    args = _run_args(runner, *extra)
+
+    with pytest.raises(SystemExit) as exc:
+        mod.check_images(args, "after", "abc1234", True)
+
+    message = str(exc.value)
+    assert "'after'" in message and "abc1234" in message
+    assert mod.DEFAULT_OVERLAY_IMAGE in message
+    assert f"{mod.OVERLAY_DIR}/build.sh <pipe-segment dir> abc1234" in message
+    assert "--build-from-source" in message
+
+
+@pytest.mark.parametrize("runner, extra, unreviewed", [
+    ("dataflow", (), False),                                       # reviewed code
+    ("dataflow", ("--image-tag", "reg.invalid/ps:overlay"), True),  # an explicit image
+    ("DirectRunner", ("--build-from-source",), True),               # no image executed
+])
+def test_check_images_allows(runner: str, extra: tuple[str, ...], unreviewed: bool) -> None:
+    mod.check_images(_run_args(runner, *extra), "after", "abc1234", unreviewed)
+
+
+def test_preflight_checks_every_binding_before_anything_is_pinned() -> None:
+    """``main`` refuses before the copy: no BigQuery call for a run that
+    cannot start."""
+    reviewed = {"c-before": False, "c-after": True}
+    with (
+        patch.object(mod, "_verify_refs"),
+        patch.object(mod, "_verify_distinct_gpsdio_pins"),
+        patch.object(mod.subprocess, "run", side_effect=lambda argv, **kw: SimpleNamespace(
+            stdout=f"c-{'before' if argv[-1].startswith('v5.0.3') else 'after'}\n")),
+        patch.object(mod, "is_unreviewed", side_effect=lambda c, d: reviewed[c]) as unrev,
+        patch.object(mod.dit_bq, "pin_source_into_experiment") as pin,
+        patch.object(mod, "_run_binding") as run,
+        pytest.raises(SystemExit) as exc,
+    ):
+        mod.main([
+            "--experiment-id", "test01",
+            "--binding", "before=v5.0.3", "--binding", "after=exp-branch",
+            "--date-range", "2020-01-01,2020-01-01",
+        ])
+
+    assert "'after'" in str(exc.value) and "c-after" in str(exc.value)
+    assert [c.args[0] for c in unrev.call_args_list] == ["c-before", "c-after"]
+    pin.assert_not_called()
+    run.assert_not_called()
+
+
+def test_preflight_reads_no_git_when_the_default_image_is_not_executed() -> None:
+    with patch.object(mod.subprocess, "run") as git:
+        mod._preflight_images(_run_args("dataflow", "--image-tag", "reg.invalid/ps:overlay"))
+    git.assert_not_called()
+
+
+def test_run_binding_hands_its_check_to_the_harness_in_place_of_the_auto_build() -> None:
+    args = _run_args("dataflow")
+    with patch.object(mod, "resolve_run_context",
+                      side_effect=RuntimeError("stop")) as resolve, \
+            patch.object(mod.subprocess, "run"), \
+            patch.object(mod, "_verify_gpsdio_segment", return_value="pin"), \
+            pytest.raises(RuntimeError):
+        mod._run_binding(name="after", ref="exp-branch", args=args, suffix=SFX,
+                         pinned=mod._PinnedSources(normalized_messages="p.d.n"))
+
+    check = resolve.call_args.kwargs["check_images"]
+    with pytest.raises(SystemExit, match="'after'"):
+        check("abc1234", True)
+    check("abc1234", False)
 
 
 # -- No --incremental: an accepted difference from the AIS DAG ---------------
