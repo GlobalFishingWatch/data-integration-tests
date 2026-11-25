@@ -237,5 +237,5 @@ The total cost of these two runs was ~60 min × E2_HIGHCPU_8 + ~$10 of Dataflow,
 
 - [`docs/run-cache.md`](run-cache.md) — design that will get the `unreviewed_code` rename in M-pivot-3.
 - [`docs/run-cache-impl.md`](run-cache-impl.md) — milestone tracker; same.
-- The post-pivot README **§ Usage scenarios** section lives in [`README.md`](../README.md) alongside this plan.
+- The post-pivot usage scenarios (formerly README § Usage scenarios) live in [`usage.md`](usage.md) § Scenarios.
 - A Claude Code session memory pin (`no-dirty-tree-policy`, in `.claude/.../memory/`) carries the policy across assistant sessions; not user-facing — the canonical sources are this doc + the README sections referenced above.

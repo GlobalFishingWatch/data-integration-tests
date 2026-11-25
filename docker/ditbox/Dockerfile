@@ -5,7 +5,12 @@
 #     and pipe-events install fine on the same base)
 #   - git, make, curl, gnupg
 #   - gcloud CLI (incl. bq) for BigQuery operations in workflows
-#   - docker CLI (talks to the host /var/run/docker.sock mounted by cloudbuild-dit.yaml)
+#   - docker CLI (talks to the build VM's docker daemon through
+#     /var/run/docker.sock. cloudbuild-dit.yaml declares no volume for it:
+#     Cloud Build itself makes the daemon's socket available to every build
+#     step. Containers started this way are siblings of the build step, not
+#     nested inside it; see the `--network=cloudbuild` notes in
+#     cloudbuild-dit.yaml.)
 #   - dit's own runtime deps pre-installed (so the runtime `pip install dit` is a no-op for them)
 #
 # Deliberately NOT baked in:
