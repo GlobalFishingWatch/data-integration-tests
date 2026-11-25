@@ -679,8 +679,8 @@ job.
   tables (`--compare reference`, the default). `--compare all-pairs` gives
   30: every pair of the five.
 - Rough cost: a few USD, estimated from startup-dominated jobs of a few
-  worker-minutes each on e2-standard-4. Not measured: no pipe-segment job has
-  run from DIT on Dataflow. `--worker-machine-type` lowers it.
+  worker-minutes each on e2-standard-4. Not measured: the runs of
+  2026-11-24/25 recorded no cost. `--worker-machine-type` lowers it.
 
 ### With the base version (v5.0.3) as a third side
 
