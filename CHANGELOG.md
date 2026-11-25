@@ -6,6 +6,15 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: per-side adjustments, review fixes
+
+#### Changed
+- **`workflows/pipe_segment/identity_match_key.py` refuses a binding whose image is tagged another pipe-segment version than its ref states**, before anything is pinned. It only warned, after the copy. Example: `--binding before=v5.0.3 --binding after=v5.1.0` without `--binding-image` gave `before` v5.0.3's flags (no `--incremental`) on the default v5.1.0 image, so the run compared v5.1.0 full history with v5.1.0 incremental and reported it as v5.0.3 against v5.1.0. Pass `--binding-image before=<v5.0.3 overlay>`.
+  - Still only a warning: a ref that is not written as a version tag (a branch, a commit) on an image tagged the release right after the version its code states, which is how an unreleased head looks.
+  - Not checked when no version can be read from the image's tag or the ref's code.
+- **The unreviewed-binding refusal is per binding**: a binding's own `--binding-image` exempts it, and the message names `--binding-image <name>=<image>`.
+- The base interface tells `dit.adjust` which flags take no value (`--incremental`, `--wait_for_job`, `--no_use_public_ips`), so removing one never takes the token after it.
+
 ### 2026-11-25: pipe-segment overlay images built; the segmenter workflow has run; review fixes
 
 #### Verified
@@ -29,6 +38,29 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   - **Now:** rows of a duplicated key pair one-to-one: identical rows first, then the leftovers in row order. Surplus rows count as only in A or only in B.
   - **The case that found it:** the pipe-segment v5.0.3 against v5.1.0 `messages_segmented` comparison (one duplicated `msgid`, 81M rows) reported 2 differences and failed; it now reports IDENTICAL.
   - **To refresh earlier results:** rerun them with `--skip-pipelines` after the ditbox rebuild.
+
+### 2026-11-24: per-side adjustments in cross-version runs; the segmenter A/B passes production's `--incremental`
+
+#### Added
+- **`dit.adjust`: bindings that differ in their interface.** A cross-version workflow builds one base interface (each step's command tokens, the inputs to pin, the outputs to compare with their keys), mirroring production. A binding whose pipeline differs gets edits on top, in layers: declared adjustments for a range of versions, then the run's ad hoc edits. A later layer wins.
+  - Flag edits: `remove`, `add`, `rename`, `set`, `command`. Table edits: `add_input`, `remove_input`, `replace_inputs`, `add_output`, `remove_output`, `rename_output`, `set_keys`.
+  - With no adjustment the argv is byte-identical. An edit that finds nothing to change is an error.
+  - Placeholders `{out.<name>}` (the binding's own table) and `{in.<role>}` (the pinned copy of an input).
+  - Inputs of all sides are pinned once; outputs are compared by name, an output on one side only is listed as not compared, and a compared pair must have the same keys.
+  - **The table edits have no real case yet** (no pipeline changes its tables between versions today) and are tested with synthetic interfaces only.
+- **`workflows/pipe_segment/identity_match_key.py`, first consumer.**
+  - `--binding-adjust NAME=<step>:<op>:<flag>[=<value>]`, repeatable; `<op>` is `remove`, `add`, `rename` or `set`.
+  - `--binding-image NAME=IMAGE`: one binding's submitter and worker image, over `--image-tag`. Warns when the image's tag names another version than the ref.
+  - `--allow-same-gpsdio-pin`: lets two bindings with the same gpsdio-segment pin run (v5.0.3 and v5.1.0 share v3.0.0). Default unchanged.
+  - **Preflight before pinning:** every pipeline flag of each binding's argv must be declared by that step's command module at the binding's ref (read with `git show`); Beam's options are exempt on the two Beam steps only. pipe-segment hands unknown flags to Beam, which ignores them, so a wrong flag would otherwise have no effect and no error. Runs on `--dry-run` too.
+  - The run log prints each binding's edits with their reasons, each step's flag difference between bindings, and, when bindings read different inputs, that their lineage is the operator's claim.
+- **Frozen drift specs** (`WorkflowSpec.composer_ref`; `workflows/composer_drift.py --frozen`). A workflow's layer for an older pipeline version is checked against the composer commit where production last ran it. The pipe-segment v5.0.3 layer is in sync at composer `cb0c9a3b7930`. Not in the default output; checked in the opt-in `tests/test_composer_drift_live.py`.
+
+#### Changed
+- **`identity_match_key.py` passes `--incremental` to `segment`**, with `--in_segments_table` and `--in_fragments_table` naming the binding's own tables, as the AIS v3 DAG passes `--incremental` since 2026-11-20. A binding whose `segment` does not declare the flag (below v5.1.0) has the three removed by the one declared adjustment (`workflows/pipe_segment/adjustments.py`), and runs full history as before. The ref's CLI source decides first, the version second, so an unreleased head with the flag keeps it.
+  - The drift spec no longer accepts the DAG's `--incremental`: it is compared, and the spec stays in sync.
+  - A v5.0.3 binding against a v5.1.0 binding now compares full history with incremental as well as two refs. To hold the segmenter fixed, remove the three flags from the newer binding with `--binding-adjust`.
+- **Not run:** no binding has run with adjustments; the v5.0.3 overlay image is not built. Everything above was checked by reading pipe-segment at tags v5.0.3 and v5.1.0 and composer snapshots.
 
 ### 2026-11-24: a base version next to the head in the segmenter's mode-equivalence workflow
 

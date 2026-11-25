@@ -431,11 +431,14 @@ def test_mode_equivalence_tokens_are_one_job_over_the_runs_dates() -> None:
     # The state of the day before comes from the variant's own tables.
     assert incremental.value("--in_segments_table") == incremental.value("--out_segments_table")
     assert incremental.value("--in_fragments_table") == incremental.value("--fragments_table")
-    # Apart from the three flags, the two jobs pass the same flags as the
-    # cross-version workflow's segment step, whose builder they share.
+    # The cross-version workflow's base passes the three flags too, from the
+    # same builder: its segment step has the default job's flags.
     cross_version = _parsed("pipe_segment/identity_match_key", "segment")
-    assert set(full.names()) == set(cross_version.names())
-    assert set(incremental.names()) - INCREMENTAL_FLAGS == set(cross_version.names())
+    assert set(incremental.names()) == set(cross_version.names())
+    assert set(full.names()) == set(cross_version.names()) - INCREMENTAL_FLAGS
+    assert cross_version.value("--in_segments_table") == cross_version.value(
+        "--out_segments_table")
+    assert cross_version.value("--in_fragments_table") == cross_version.value("--fragments_table")
 
 
 def test_mode_equivalence_tokens_are_what_the_workflow_hands_the_runner() -> None:
@@ -458,26 +461,27 @@ def test_mode_equivalence_tokens_are_what_the_workflow_hands_the_runner() -> Non
 
 
 def test_who_accepts_which_incremental_flag() -> None:
-    """``--incremental`` is compared for the default mode-equivalence job and
-    accepted, with a reason, where DIT leaves it out on purpose."""
+    """``--incremental`` is compared wherever DIT passes it, and accepted,
+    with a reason, only where DIT leaves it out on purpose."""
     spec = segment_drift.MODE_EQUIVALENCE_SPEC
     incremental, full = spec.steps
     cross_version = _step("pipe_segment/identity_match_key", "segment")
 
-    # The default job passes it, as the DAG's task does: a difference is drift.
+    # The default job and the cross-version base pass it, as the DAG's task
+    # does: a difference is drift.
     assert "--incremental" not in spec.expected(incremental)
-    # Its two table flags are DIT's own; the DAG's task passes neither.
-    assert {"--in_segments_table", "--in_fragments_table"} <= spec.expected(incremental)
-    assert "variant's own tables" in spec.reasons(incremental)["--in_segments_table"]
-    # The reference variant and the cross-version A/B run full history.
+    assert "--incremental" not in segment_drift.SPEC.expected(cross_version)
+    # Their two table flags are DIT's own; the DAG's task passes neither.
+    for owner, step in ((spec, incremental), (segment_drift.SPEC, cross_version)):
+        assert {"--in_segments_table", "--in_fragments_table"} <= owner.expected(step)
+        assert "run's own tables" in owner.reasons(step)["--in_segments_table"]
+    # Only the reference variant runs full history on purpose.
     assert "reference variant" in spec.reasons(full)["--incremental"]
     assert not {"--in_segments_table", "--in_fragments_table"} & spec.expected(full)
-    reason = segment_drift.SPEC.reasons(cross_version)["--incremental"]
-    assert "older than v5.1.0" in reason and "ignore the flag silently" in reason
-    assert "pipe_segment/ais.py tests" in reason
-    # No other step of the cross-version chain accepts it.
-    assert not any(
-        "--incremental" in step.accepted for step in segment_drift.SPEC.steps[1:])
+    # No step of the cross-version chain accepts it any more: a binding below
+    # v5.1.0 loses the flag by a declared adjustment, not by an accepted difference.
+    assert not any("--incremental" in step.accepted for step in segment_drift.SPEC.steps)
+    assert not hasattr(segment_drift, "CROSS_VERSION_SEGMENT_ACCEPTED_DIFFERENCES")
     # All three keep the segment step's other accepted differences.
     for step in (incremental, full, cross_version):
         assert set(segment_drift.SEGMENT_ACCEPTED_DIFFERENCES) <= set(step.accepted)
@@ -492,30 +496,36 @@ def _segment_dag(tokens: list[str]) -> composer.RenderedDag:
         {**raw, "tasks": {"segment.segment": task}}, snapshot="synthetic")
 
 
+def _without(tokens: list[str], flags: set[str]) -> list[str]:
+    return [token for token in tokens if token.split("=", 1)[0] not in flags]
+
+
 def test_the_segment_task_with_incremental_is_in_sync_and_without_it_is_drift() -> None:
     """The DAG's task passes ``--incremental`` and no table flag for it. If it
-    drops the flag, the default mode-equivalence job no longer mirrors it."""
+    drops the flag, neither the default mode-equivalence job nor the
+    cross-version base mirrors it any more."""
     modes = segment_drift.MODE_EQUIVALENCE_SPEC
     incremental, full = modes.steps
     cross_version = _step("pipe_segment/identity_match_key", "segment")
-    # What the task passes is the cross-version step's flags plus the one flag.
-    without = list(cross_version.tokens(_RUN))
-    today = _segment_dag([*without, "--incremental"])
+    # What the task passes: the cross-version step's flags without the two
+    # table flags, which are DIT's own.
+    base = list(cross_version.tokens(_RUN))
+    today = _segment_dag(_without(base, {"--in_segments_table", "--in_fragments_table"}))
 
     assert not drift.check_step(modes, incremental, today).drift
     assert not drift.check_step(modes, full, today).drift
     assert not drift.check_step(segment_drift.SPEC, cross_version, today).drift
 
-    dropped = _segment_dag(without)
-    report = drift.check_step(modes, incremental, dropped)
-    assert report.drift and report.argv.diff.only_left == ("--incremental",)
+    dropped = _segment_dag(_without(base, INCREMENTAL_FLAGS))
+    for spec, step in ((modes, incremental), (segment_drift.SPEC, cross_version)):
+        report = drift.check_step(spec, step, dropped)
+        assert report.drift and report.argv.diff.only_left == ("--incremental",)
     assert not drift.check_step(modes, full, dropped).drift
-    assert not drift.check_step(segment_drift.SPEC, cross_version, dropped).drift
 
 
 def test_a_version_bump_of_the_segment_task_is_drift_in_both_specs() -> None:
     """What happened on 2026-11-20, with the roles of the versions swapped."""
-    tokens = [*_step("pipe_segment/identity_match_key", "segment").tokens(_RUN), "--incremental"]
+    tokens = list(_step("pipe_segment/identity_match_key", "segment").tokens(_RUN))
     raw = _port_visits_raw_dag(production_only=())
     task = {"image": "registry.example.invalid/core/pipe-segment:v5.2.0",
             "cmds": tokens[:1], "arguments": tokens[1:],
@@ -546,17 +556,22 @@ _RUN = composer.date_placeholders(
 def _mirror_task(step: drift.StepSpec, *, version: str | None = None) -> dict:
     """A production task that runs exactly DIT's tokens for the synthetic run,
     in production's own registry at DIT's version (or ``version``)."""
-    tokens = list(step.tokens(_RUN))
+    segment_task = step.task_id == segment_drift.TASK_IDS["segment"]
+    # The DAG's segment task passes neither of the two table flags of an
+    # incremental job: they are DIT's own.
+    tokens = _without(
+        list(step.tokens(_RUN)),
+        {"--in_segments_table", "--in_fragments_table"} if segment_task else set(),
+    )
     sizing = gaps_modes.DEFAULT_WORKER_SIZING
     extra = (
         [f"--worker_machine_type={sizing.machine_type}", f"--disk_size_gb={sizing.disk_size_gb}"]
         if step.task_id == gaps_drift.TASK_ID else []
     ) + (
-        # The DAG's segment task passes --incremental; the cross-version
-        # workflow, whose step is the one mirrored, leaves it out on purpose.
-        ["--incremental"]
-        if step.task_id == segment_drift.TASK_IDS["segment"] and "--incremental" not in tokens
-        else []
+        # The DAG's segment task passes --incremental. So does the
+        # cross-version workflow's step, the one mirrored; the mode-equivalence
+        # workflow's full-history step does not.
+        ["--incremental"] if segment_task and "--incremental" not in tokens else []
     )
     return {
         "image": f"registry.example.invalid/core/{step.image_name}:"

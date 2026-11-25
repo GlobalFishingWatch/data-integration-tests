@@ -345,7 +345,7 @@ Read at composer `origin/main` df5c973c7. The check exits 0: the workflows marke
   - **What DIT changed:**
     - Both workflows default to the DIT overlay image of v5.1.0 (`docker/overlays/pipe-segment-temp-dataset/`). The specs state the version, since an overlay tag is not a plain version.
     - `pipe_segment/ais.py` defaults to the incremental segmenter. Its default job passes `--incremental`, which the check compares; a second step mirrors the same task with the full-history reference job, where the flag is an accepted difference.
-    - `pipe_segment/identity_match_key.py` keeps full history for every binding, and the DAG's `--incremental` is an accepted difference of its `segment` step. A binding may be a ref that does not know the flag and would ignore it silently, and a binding is one job from empty tables.
+    - `pipe_segment/identity_match_key.py` keeps full history for every binding, and the DAG's `--incremental` is an accepted difference of its `segment` step. A binding may be a ref that does not know the flag and would ignore it silently, and a binding is one job from empty tables. *(Superseded 2026-11-24: the workflow's base now passes `--incremental`, which the check compares; a binding whose `segment` does not declare it loses it by a declared adjustment, and that older layer is checked at composer `cb0c9a3b7930` by a frozen spec. See `docs/plan.md` § "Per-side adjustments".)*
   - **Result:** both specs in sync again, runner exit 0.
   - **What it shows about the gap in item 1 of section 7:** the change was caught because someone ran the check by hand that day. Nothing would have run it otherwise.
 

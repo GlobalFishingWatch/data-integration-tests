@@ -256,9 +256,9 @@ from pathlib import Path
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 
+from dit import adjust
 from dit import bq as dit_bq
 from dit import compare as dit_compare
-from dit import composer as dit_composer
 from dit import dates as dit_dates
 from dit import workflow as dit_workflow
 from dit.job_names import make_job_name
@@ -282,6 +282,7 @@ from dit.workflow import (
     worker_cap,
     worker_sizing_from_args,
 )
+from workflows.pipe_segment import adjustments
 from workflows.pipe_segment import identity_match_key as imk
 
 logger = logging.getLogger(__name__)
@@ -347,8 +348,9 @@ SIDE_SEPARATOR = "@"
 _SEGMENTER_TAGS = {SEGMENTER_FULL_HISTORY: "full", SEGMENTER_INCREMENTAL: "inc"}
 
 #: The first pipe-segment version whose ``segment`` command knows
-#: ``--incremental`` (pipe-segment PR #227, released as v5.1.0).
-INCREMENTAL_SINCE = (5, 1, 0)
+#: ``--incremental`` (pipe-segment PR #227, released as v5.1.0). Shared with
+#: the cross-version workflow's declared adjustment.
+INCREMENTAL_SINCE = adjustments.INCREMENTAL_SINCE
 
 #: Staging cohort, January 2020: 363 MB to pin (dry run, 2026-11-20), and each
 #: of its 31 days has rows (66,000 to 90,000; partition metadata, same day).
@@ -675,12 +677,9 @@ def _segmenter_flags(args: argparse.Namespace, suffix: str, variant: Variant) ->
     """
     if variant.segmenter != SEGMENTER_INCREMENTAL:
         return []
-    tables = _tables(args, suffix, variant)
-    return [
-        "--incremental",
-        f"--in_segments_table={tables['segments']}",
-        f"--in_fragments_table={tables['fragments']}",
-    ]
+    return imk._incremental_flags(
+        dest_dataset=args.dest_dataset, suffix=f"{suffix}_{variant.tag}",
+    )
 
 
 def variant_images(args: argparse.Namespace, variant: Variant) -> tuple[str, str]:
@@ -917,21 +916,10 @@ def summarize(verdicts: Verdicts) -> str:
 # Images
 # --------------------------------------------------------------------------
 
-_VERSION_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?!\d)")
-
-
-def image_pipeline_version(image: str) -> tuple[int, int, int] | None:
-    """The pipe-segment version an image's tag starts with, or ``None``.
-
-    ``…/pipe-segment:v5.1.0-4ddde03-temp-dataset-…`` gives ``(5, 1, 0)``; so
-    does a published ``…:v5.1.0``. A tag that starts with anything else
-    (``dit-<commit>``, a branch name) names no version.
-    """
-    match = _VERSION_TAG_RE.match(dit_composer.image_version(image) or "")
-    if match is None:
-        return None
-    major, minor, patch = map(int, match.groups())
-    return major, minor, patch
+#: The pipe-segment version an image's tag starts with, or ``None``
+#: (``adjustments.image_pipeline_version``, shared with the cross-version
+#: workflow).
+image_pipeline_version = adjustments.image_pipeline_version
 
 
 def _images_executed(
@@ -1016,8 +1004,7 @@ _INCREMENTAL_WHY = (
 )
 
 
-def _version_text(version: tuple[int, int, int]) -> str:
-    return "v" + ".".join(map(str, version))
+_version_text = adjustments.version_text
 
 
 def check_base_side(args: argparse.Namespace) -> None:
@@ -1100,7 +1087,10 @@ def _check_incremental_support(
 
     if args.build_from_source:
         command_file = Path(repo_dir) / _SEGMENT_COMMAND_FILE
-        declared = command_file.is_file() and '"--incremental"' in command_file.read_text()
+        # The same static read the cross-version workflow's preflight makes of a
+        # ref (dit.adjust.declared_flags), here of the working tree's file.
+        declared = command_file.is_file() and "--incremental" in adjust.declared_flags(
+            command_file.read_text())
         if not declared:
             raise SystemExit(
                 f"error: {selected} with --build-from-source needs a pipe-segment working "

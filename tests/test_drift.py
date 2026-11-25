@@ -416,6 +416,89 @@ def test_an_unknown_ref_is_an_error_for_every_spec(composer_repo: Path) -> None:
     assert [e.spec.name for e in errors] == ["a", "b"]
 
 
+# -- frozen specs: a spec read at its own composer commit --------------------
+
+@pytest.fixture
+def moved_repo(composer_repo: Path) -> tuple[Path, str]:
+    """``composer_repo`` after production moved to v3.0.0 in a second commit.
+    Returns the repo and the commit before the move."""
+    before = composer.resolve_ref(composer_repo, "main")
+    bumped = _raw_dag({TASK: _raw_task(
+        PRODUCTION, "registry.example.invalid/core/example-pipe:v3.0.0")})
+    (composer_repo / composer.SNAPSHOT_DIR / "example_daily.py").write_text(
+        f"rendered_dag = {bumped!r}\n")
+    _git(composer_repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "commit", "-q", "-am", "production moves to v3.0.0")
+    return composer_repo, before
+
+
+def test_a_frozen_spec_is_read_at_its_own_commit_whatever_ref_is_asked_for(moved_repo) -> None:
+    repo, before = moved_repo
+    live = _spec(name="live", in_sync=True)
+    frozen = _spec(name="frozen", in_sync=True, composer_ref=before)
+
+    reports, errors = drift.run_specs([live, frozen], repo, "main")
+
+    assert errors == ()
+    assert not live.frozen and frozen.frozen
+    assert [(r.spec.name, r.drift, r.dag.commit) for r in reports] == [
+        ("live", True, composer.resolve_ref(repo, "main")),
+        ("frozen", False, before),
+    ]
+    # Production's move is drift for the live spec only.
+    assert drift.exit_code(reports[1:], ()) == 0 and drift.exit_code(reports, ()) == 1
+
+
+def test_each_snapshot_is_loaded_once_per_commit(moved_repo, monkeypatch) -> None:
+    repo, before = moved_repo
+    loaded = []
+    real = composer.load_dag
+    monkeypatch.setattr(
+        composer, "load_dag",
+        lambda r, name, ref: loaded.append((name, ref)) or real(r, name, ref))
+    specs = [
+        _spec(name="a"), _spec(name="b"),
+        _spec(name="c", composer_ref=before), _spec(name="d", composer_ref=before),
+    ]
+
+    reports, _ = drift.run_specs(specs, repo, "main")
+
+    assert loaded == [
+        ("example_daily", composer.resolve_ref(repo, "main")), ("example_daily", before)]
+    assert [r.spec.name for r in reports] == ["a", "b", "c", "d"]
+
+
+def test_a_frozen_spec_whose_commit_is_missing_is_an_error_and_the_rest_still_runs(
+    composer_repo: Path,
+) -> None:
+    specs = [_spec(name="live"), _spec(name="frozen", composer_ref="0" * 40)]
+
+    reports, errors = drift.run_specs(specs, composer_repo, "main")
+
+    assert [r.spec.name for r in reports] == ["live"]
+    assert [e.spec.name for e in errors] == ["frozen"]
+    assert "rev-parse" in errors[0].message
+    assert drift.exit_code(reports, errors) == 2
+
+
+def test_the_summary_and_the_report_say_that_a_spec_is_frozen(moved_repo) -> None:
+    repo, before = moved_repo
+    reports, _ = drift.run_specs(
+        [_spec(name="live"), _spec(name="frozen", in_sync=True, composer_ref=before)],
+        repo, "main",
+    )
+    summary = drift.format_summary(reports)
+
+    assert f"frozen: in sync; frozen at composer {before[:12]}" in summary
+    assert "live: drift (known: not expected in sync yet)" in summary
+    assert "frozen at" not in summary.split("frozen: in sync")[0]
+    # Both commits are named in the header.
+    assert before[:12] in summary.splitlines()[0]
+    assert composer.resolve_ref(repo, "main")[:12] in summary.splitlines()[0]
+    assert "frozen: read at this commit" in drift.format_report(reports[1])
+    assert "frozen: read at this commit" not in drift.format_report(reports[0])
+
+
 # --------------------------------------------------------------------------
 # formatting
 # --------------------------------------------------------------------------
