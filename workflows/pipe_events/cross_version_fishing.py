@@ -94,7 +94,10 @@ Per-binding docker image identity comes from the worktree's HEAD:
 ``resolve_run_context`` -> ``ensure_pipeline_image`` reads that worktree's
 git ref and auto-builds ``gcr.io/world-fishing-827/dit/pipe-events:dit-<sha>``
 via kaniko for unreviewed refs (or reuses the canonical published image for
-merged refs). ``--build-from-source`` is ALWAYS stripped from user extras
+merged refs). That published image is ``fishing.py``'s default, v4.2.17,
+whatever the merged ref's commit: a binding such as ``main=main`` (as in the
+example above) therefore runs v4.2.17, not ``main``, and ``--image-tag`` is
+stripped from the extras, so it cannot be redirected. ``--build-from-source`` is ALWAYS stripped from user extras
 -- it makes the docker runner ignore ``--image-tag`` and build from the
 mounted compose file's working tree, defeating per-binding image identity.
 

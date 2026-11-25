@@ -160,6 +160,7 @@ No run on the current default worker image (v0.10.0) is recorded in this reposit
 ## Known limits and open items
 
 - **Behind production** (see above). Porting to v0.17.x is the main open item.
+- **A reviewed checkout runs the default worker image.** When the checkout's commit is merged into pipe-gaps `origin/main` and `--worker-image` is not given, the Dataflow workers run v0.10.0, whatever the commit (read from `dit.worker_image.ensure_pipeline_image`). Only unreviewed code gets an auto-built worker image. Pass `--worker-image` to run another reviewed version on the workers.
 - **No guard for the reprocess contract.** Nothing rejects a stage that would stop before `--end`; review enforces it ([`CLAUDE.md`](CLAUDE.md)).
 - **Two copies of the config builder.** `outage_recovery.py` re-implements `_make_config`, `_cfg_to_cli_flags`, `_build_pipeline_for` and `_run_pipeline` from `mode_equivalence.py` (about 200 lines). Whether they have drifted is not checked.
 - **Different date conventions.** `mode_equivalence.py` is half-open, `outage_recovery.py` inclusive.
