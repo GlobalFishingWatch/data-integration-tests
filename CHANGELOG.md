@@ -6,6 +6,15 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: table-check pinned to v0.3.1
+
+#### Fixed
+- **Duplicated keys no longer report false differences** (`table-identical-checks` v0.3.1, table_identical_checks#20).
+  - **Before:** the key join paired every row of a duplicated key with every row of it on the other side, so the crossed pairs read as value differences. Two tables holding the same rows could therefore fail.
+  - **Now:** rows of a duplicated key pair one-to-one: identical rows first, then the leftovers in row order. Surplus rows count as only in A or only in B.
+  - **The case that found it:** the pipe-segment v5.0.3 against v5.1.0 `messages_segmented` comparison (one duplicated `msgid`, 81M rows) reported 2 differences and failed; it now reports IDENTICAL.
+  - **To refresh earlier results:** rerun them with `--skip-pipelines` after the ditbox rebuild.
+
 ### 2026-11-24: a base version next to the head in the segmenter's mode-equivalence workflow
 
 #### Added
@@ -20,6 +29,21 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   - Every job carries a new label, `dit_side` (`head` or `base`).
 - **`--compare reference|all-pairs`** on the same workflow, default `reference` (owner decision, 2026-11-24): each variant is compared with the reference, the first selected variant, instead of every pair. A difference between two other variants shows as a difference of at least one of them from the reference; `all-pairs` stays available to tell which of two moved. The #227 test with the base is 15 comparisons instead of 45.
   - **Not run**, like the rest of the workflow. The schema definitions of the three compared tables are unchanged between v5.0.3 and v5.1.0 (read from the code).
+
+### 2026-11-24: PR reviews by an independent Sonnet subagent
+
+#### Changed
+- **PRs are reviewed by an independent Sonnet subagent instead of Copilot**, which is no longer available. The reviewer gets only the PR and repo, not the author's conclusions. Its blocking and should-fix findings are addressed, or the reason for not doing so is recorded, before the squash-merge. See `CLAUDE.md` § Git workflow. Earlier notes that credit Copilot reviews are kept as history.
+
+### 2026-11-24: table-check pinned to v0.3.0
+
+#### Changed
+- **`table-identical-checks` is pinned to the `v0.3.0` tag instead of `master`** (`requirements.txt`). With `@master`, ditbox's kaniko layer cache (keyed on `requirements.txt`, 1-year TTL) kept the TIC commit from the first build (`c7b896e`), however often the image was rebuilt. A tag makes the image reproducible, and bumping the tag is what refreshes it.
+- **What v0.3.0 changes for DIT comparisons:**
+  - Duplicate keys no longer inflate the after-tolerance counts.
+  - Rows whose key columns contain NULLs are now matched; previously they could be reported as identical without being compared.
+  - STRUCT columns work on partition-filtered sources.
+  - `table-check summary` now exits 0 on PASS, 1 on FAIL and 2 on error. `dit.compare` keeps reading the row counts from the JSON (`check=False`), so its verdict logic is unchanged.
 
 ### 2026-11-20: mode equivalence for the segmenter; pipe-segment temp-dataset overlay
 
