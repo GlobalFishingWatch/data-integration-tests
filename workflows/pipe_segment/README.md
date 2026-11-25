@@ -147,7 +147,7 @@ instead of computing one. Not planned work.
 | Source | Used by | Size | Notes |
 |---|---|---|---|
 | `world-fishing-827.pipe_ais_test_202408290000_internal.normalized_messages` (staging cohort, the default) | both | 10.7 MB for one day, 363 MB for January 2020, 3.78 GB for 2020 (dry runs, 2026-11-19/20) | 142 vessels; data is 2020 only, despite the 2024 snapshot date in the name. Partitioned by day on `timestamp`. Each day of January 2020 has 66,000 to 90,000 rows. |
-| Production's normalized AIS messages (AIS datalake) | `ais.py` run `56af531e`, via `--source-normalized-table` | pin size not recorded | December 2012, 10 days: 81,357,979 rows in `messages_segmented` per variant. |
+| Production's normalized AIS messages (AIS datalake) | `ais.py` run `56af531e`, via `--source-normalized-table` | 13.3 GB pinned for the 10 days (dry run, 2026-11-24); 8.2 to 8.6 million messages a day | December 2012, 10 days: 81,357,979 rows in `messages_segmented` per variant. |
 
 `--source-normalized-table` must be one table partitioned on `timestamp`: not a
 view and not date-sharded tables. The incremental segmenter fails on a day
