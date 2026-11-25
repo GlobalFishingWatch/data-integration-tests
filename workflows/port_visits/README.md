@@ -230,12 +230,12 @@ Evidence recorded in this repository. Builds are Cloud Build ids; "run" is DIT's
 | 2026-10-23 | determinism, September, PR twice with `--no-cache` | build `8a1348d1` | three runs IDENTICAL (3,869,516 rows) |
 | 2026-10-23 | production baseline dry run as `automated-testing@` | build `947240a8` | job found, all four time-travel reads dry-run |
 | 2026-10-23 | production baseline, PR #176 vs production's 2026-10-20 output, full history | build `7781dd48` | DIFFERENT, consistent with #176 (detail in the baseline doc) |
+| 2026-11-19 | staging smoke on today's default image (`v5.0.1-767770f-temp-dataset-905dc761`), three modes, both steps, experiment `pv-v501-smoke`, e2-standard-2 / 25 GB | build `5f87695c` | 18 Dataflow jobs done; 10,596 visits per mode; all three pairs IDENTICAL. Also showed private worker IPs and `automated-testing@` reading the v20260302 named-anchorages table |
 
-All of the October runs predate v5.0.1 and used the October overlay images, not today's default.
+The October runs predate v5.0.1 and used the October overlay images; the 2026-11-19 smoke is the one run on today's default image.
 
 **Not run yet:**
 
-- no Dataflow job on the v5.0.1 overlay image (it was self-checked when built);
 - no production-baseline run since production moved to v5.0.1;
 - `6_parallel` has never run (code and tests only, 2026-11-24).
 
