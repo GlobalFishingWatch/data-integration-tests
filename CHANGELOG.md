@@ -6,6 +6,15 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-25: table-check pinned to v0.3.1
+
+#### Fixed
+- **Duplicated keys no longer report false differences** (`table-identical-checks` v0.3.1, table_identical_checks#20).
+  - **Before:** the key join paired every row of a duplicated key with every row of it on the other side, so the crossed pairs read as value differences. Two tables holding the same rows could therefore fail.
+  - **Now:** rows of a duplicated key pair one-to-one: identical rows first, then the leftovers in row order. Surplus rows count as only in A or only in B.
+  - **The case that found it:** the pipe-segment v5.0.3 against v5.1.0 `messages_segmented` comparison (one duplicated `msgid`, 81M rows) reported 2 differences and failed; it now reports IDENTICAL.
+  - **To refresh earlier results:** rerun them with `--skip-pipelines` after the ditbox rebuild.
+
 ### 2026-11-24: per-side adjustments in cross-version runs; the segmenter A/B passes production's `--incremental`
 
 #### Added
@@ -32,7 +41,7 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 ### 2026-11-24: a base version next to the head in the segmenter's mode-equivalence workflow
 
 #### Added
-- **`--direct-runner-max-days N` on `workflows/pipe_segment/ais.py`** (default off): with `--runner dataflow`, every job covering N days or fewer runs on DirectRunner inside the container, and longer jobs stay on Dataflow. For small inputs such as the staging cohort's daily jobs, where Dataflow's start-up and shutdown take about four minutes of a six-minute job (measured on build `4bb84ec0`). Chosen by hand; refused with `--runner docker`. `--dry-run` reports which runner each job uses. Shared helpers in `dit.workflow` (`add_direct_runner_max_days_arg`, `runner_for_days`, `check_direct_runner_max_days`) for other workflows. Not yet run inside Cloud Build.
+- **`--direct-runner-max-days N` on `workflows/pipe_segment/ais.py`** (default off): with `--runner dataflow`, every job covering N days or fewer runs on DirectRunner inside the container, and longer jobs stay on Dataflow. For small inputs such as the staging cohort's daily jobs, where Dataflow's start-up and shutdown take about four minutes of a six-minute job (measured on build `4bb84ec0`). Chosen by hand; refused with `--runner docker`. `--dry-run` reports which runner each job uses. Shared helpers in `dit.workflow` (`add_direct_runner_max_days_arg`, `runner_for_days`, `check_direct_runner_max_days`) for other workflows. Ran inside Cloud Build on 2026-11-24 (build `967b1030`): three one-day jobs on DirectRunner, about 1.5 min each, IDENTICAL to a Dataflow reference on all three tables.
 - **`workflows/pipe_segment/ais.py`: `--modes` entries ending in `@base`, and `--base-image`.** Such an entry runs on the base image, an overlay image of an earlier pipe-segment version, as submitter and worker image. Every other entry runs on the run's own images.
   - **Why:** without a base, "full history equals incremental" is tested on the new version alone. A change to code both segmenters share would go unseen.
   - **The three-sided test of pipe-segment PR #227:** `--modes 1_bf:full-history@base,1_bf:full-history,1_bf:incremental --base-image <v5.0.3 overlay>`.
@@ -43,6 +52,21 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
   - Every job carries a new label, `dit_side` (`head` or `base`).
 - **`--compare reference|all-pairs`** on the same workflow, default `reference` (owner decision, 2026-11-24): each variant is compared with the reference, the first selected variant, instead of every pair. A difference between two other variants shows as a difference of at least one of them from the reference; `all-pairs` stays available to tell which of two moved. The #227 test with the base is 15 comparisons instead of 45.
   - **Not run**, like the rest of the workflow. The schema definitions of the three compared tables are unchanged between v5.0.3 and v5.1.0 (read from the code).
+
+### 2026-11-24: PR reviews by an independent Sonnet subagent
+
+#### Changed
+- **PRs are reviewed by an independent Sonnet subagent instead of Copilot**, which is no longer available. The reviewer gets only the PR and repo, not the author's conclusions. Its blocking and should-fix findings are addressed, or the reason for not doing so is recorded, before the squash-merge. See `CLAUDE.md` § Git workflow. Earlier notes that credit Copilot reviews are kept as history.
+
+### 2026-11-24: table-check pinned to v0.3.0
+
+#### Changed
+- **`table-identical-checks` is pinned to the `v0.3.0` tag instead of `master`** (`requirements.txt`). With `@master`, ditbox's kaniko layer cache (keyed on `requirements.txt`, 1-year TTL) kept the TIC commit from the first build (`c7b896e`), however often the image was rebuilt. A tag makes the image reproducible, and bumping the tag is what refreshes it.
+- **What v0.3.0 changes for DIT comparisons:**
+  - Duplicate keys no longer inflate the after-tolerance counts.
+  - Rows whose key columns contain NULLs are now matched; previously they could be reported as identical without being compared.
+  - STRUCT columns work on partition-filtered sources.
+  - `table-check summary` now exits 0 on PASS, 1 on FAIL and 2 on error. `dit.compare` keeps reading the row counts from the JSON (`check=False`), so its verdict logic is unchanged.
 
 ### 2026-11-20: mode equivalence for the segmenter; pipe-segment temp-dataset overlay
 

@@ -257,7 +257,7 @@ Slots into [`docs/plan.md`](plan.md) § Next steps as **item 4.5 — LLM PR-rele
 
 Future related work (separate docs):
 - **Failure triage on red Check Runs** — reuses the `actions/ai-inference` step, reads `dit.report` output, posts a "likely cause" PR comment.
-- **dit's own PR review for framework-shaped concerns** — Claude Code Action with a system prompt that references `CLAUDE.md` + the plan. Complementary to (not a replacement for) `copilot-pull-request-reviewer`, which already handles generic code review.
+- **dit's own PR review for framework-shaped concerns** — Claude Code Action with a system prompt that references `CLAUDE.md` + the plan. Complementary to (not a replacement for) the independent Sonnet-subagent PR review (see `CLAUDE.md` § Git workflow), which handles generic code review. Copilot reviewed earlier PRs and is no longer used.
 
 ## Implementation plan
 

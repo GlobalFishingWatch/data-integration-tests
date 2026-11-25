@@ -599,9 +599,8 @@ ARGS="--experiment-id pr227 --modes ...,4_daily:incremental --direct-runner-max-
   variant whose daily jobs ran locally is compared with a reference on
   Dataflow.
 - `--dry-run` says which runner each job uses and how many run where.
-- Not verified yet: DirectRunner inside Cloud Build. It needs the BigQuery
-  export to GCS to work from the build step, and memory on the build machine
-  (E2_HIGHCPU_8) when `--parallel` runs several such jobs at once.
+- Ran inside Cloud Build on 2026-11-24 (build `967b1030`): three one-day jobs on DirectRunner, about 1.5 min each, IDENTICAL to a Dataflow reference on all three tables. Not tested: memory on the build machine (E2_HIGHCPU_8)
+  when `--parallel` runs many such jobs at once.
 
 ## M4. Dry run
 

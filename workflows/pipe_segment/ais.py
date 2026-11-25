@@ -201,9 +201,10 @@ Sources, images, cache
   N days or fewer runs on DirectRunner inside the container, and longer jobs
   stay on Dataflow. Set by hand: DIT does not judge when the runners agree.
   The comparison checks it whenever a short job's variant is compared with a
-  reference on Dataflow. Not verified yet: DirectRunner inside Cloud Build
-  (its BigQuery export, and memory on the build machine when ``--parallel``
-  runs several such jobs at once).
+  reference on Dataflow. Ran inside Cloud Build on 2026-11-24 (build
+  967b1030): three one-day jobs on DirectRunner, about 1.5 minutes each,
+  identical to a Dataflow reference on all three tables. Not tested: memory
+  on the build machine when ``--parallel`` runs many such jobs at once.
 * **No run cache.** A variant writes three comparison tables and the cache
   hands back one, so every run recomputes what it selects.
 
