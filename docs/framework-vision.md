@@ -1,10 +1,31 @@
 # A shared integration-testing library for GFW pipelines — vision
 
-> Exploratory design doc, not an implementation spec. Originated as a subagent's
-> response to a "what would a generalised version of pipe-gaps' three-way
-> equivalence test look like across pipelines?" prompt, with input notes from
-> the conversation that produced it (debugging the pipe-gaps Bug A / open-v1
-> seed / close-path bugs, and adding the four-mode integration test).
+> Exploratory design doc, not an implementation spec. It was written when this
+> repo was started (May 2026), as an answer to the question "what would a generalised
+> version of pipe-gaps' three-way equivalence test look like across pipelines?".
+> Sections 1 to 10 are kept as written. The rule from the working agreements
+> still holds: do not optimise for this picture; abstractions are extracted when
+> a third consumer needs them.
+>
+> For what DIT is today, read [`framework.md`](framework.md).
+
+## How today's code compares (2026-11-25)
+
+The vision names five primitives and an execution model. DIT has grown along a different axis: it kept workflows imperative and built the infrastructure around them instead.
+
+| In the vision | Today |
+|---|---|
+| **Pipeline** as a black box | As described. Run through `dit.runners.docker` or `dit.runners.dataflow`. |
+| **Phase** as a type, the unit of caching | No type. A step's command line comes from a pure function in each workflow. The unit of caching is a mode. |
+| **Mode** as a DAG of phases, built from generators (`backfill`, `daily_tail`) | Mode names are shared in spirit (`1_bf`, `2_bfd`, `3_bftruncate`), and `--modes` is a shared helper. The loops are written out per workflow. Extraction was reviewed twice and deferred ([`workflows/README.md`](../workflows/README.md)). Date slicing alone is shared since 2026-11-24 (`dit.slices`). |
+| **Mutation** library | Not built. Two one-off cases exist: pipe-gaps' ssvid restriction, and a derived view over a source for synthetic outages (`dit.bq.derived_source_into_experiment`). |
+| **Comparison** with tolerances, ignored columns and an expected-diff predicate | `dit.compare.compare_tables`, a shim over `table-check`. Per-column tolerances exist. Ignored columns and expected diffs do not; they belong upstream. |
+| **Cross-version** by docker tag or worktree | Built, and further than sketched: bindings are git refs run in worktrees, each with its own image, on pinned inputs, with per-side adjustments where the interfaces differ ([`framework.md`](framework.md) § 4 and § 10). |
+| **Phase sharing** by hash and `BQ COPY` | Replaced by the run cache, keyed per mode ([`framework.md`](framework.md) § 6). |
+| **Golden table** | Largely covered by the run cache and by the production baseline. |
+| **Runner** interface with `local`, `docker`, `dataflow` | `docker` and `dataflow`. The local Python runner was dropped on purpose. |
+
+Built, and not in the vision at all: source pinning, the cloud runtime, snapshots of dirty trees, the drift check against production's DAGs, and orchestration declarations.
 
 ## 1. Mental model
 
@@ -138,7 +159,7 @@ That's a reusable core in roughly a week, validation against two repos before ge
 
 ---
 
-## Reviewer's meta-take (Claude, not the subagent)
+## Reviewer's notes (from the original draft)
 
 - **The 5-primitive split is the right cleavage.** Today's `execute_*` functions fuse Phase + Mode + Mutation. Once you split them, today's "auto-restrict" stops being a special case and becomes "a Mutation whose value is computed from a reference Phase's output" — much less ad-hoc.
 

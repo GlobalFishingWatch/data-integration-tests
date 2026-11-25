@@ -1,7 +1,22 @@
 # Context for `data_integration_tests`
 
+> **Historical document.** This is the handover note written in May 2026, when
+> the repo was started. It is kept as written, because it records why the repo
+> exists and which bugs the first integration test found. It does not describe
+> DIT as it is now.
+>
+> What has changed since:
+>
+> - Five pipelines have workflows, not three. pipe-segment and encounters were added.
+> - Phases 1 to 3 below are done. Status is in [`README.md`](../README.md) § Roadmap.
+> - "Phase 4" took another form: production's DAGs are read as rendered snapshots and compared by a drift check ([`composer-drift.md`](composer-drift.md)). There is no `params.yaml`.
+> - Cross-version testing uses git refs in worktrees with one image per binding, not only docker tags.
+> - The local paths and branch names below are those of the author's machine and of May 2026.
+>
+> For the current picture, read [`framework.md`](framework.md).
+
 This doc captures the background behind this repo, written for whoever picks up
-the work — including future Claude sessions started in this directory.
+the work.
 
 ## What this repo is
 

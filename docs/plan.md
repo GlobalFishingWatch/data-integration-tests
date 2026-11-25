@@ -19,6 +19,8 @@ This doc is the design record: architecture, decisions, API contracts and the sc
 
 Per-commit history of plan-doc evolution lives in `CLAUDE.md` § Plan changelog. User-facing change log lives in `CHANGELOG.md`.
 
+For DIT as it is today, explained for a newcomer, read [`framework.md`](framework.md) (concepts and building blocks), [`composer-drift.md`](composer-drift.md) (the drift check) and [`usage.md`](usage.md) (install modes and scenarios, moved out of the README on 2026-11-25). This doc keeps the reasoning behind the decisions; parts of it describe plans that were later changed, and say so where they do.
+
 ## Architecture: three-repo split
 
 Integration-test infrastructure is distributed across three repos by ownership. Aligning subagents on this boundary is the single most important alignment step before code lands.
