@@ -708,8 +708,8 @@ make dit-cloud PIPELINE=pipe-segment REF=v5.1.0 \
   variants with Z, on three tables (45 with `--compare all-pairs`).
 - Z against A is the pair that tests the shared code: same mode, same flags,
   two versions.
-- It needs both overlay images built: v5.1.0 (the default) and v5.0.3. Neither
-  is built yet.
+- It needs both overlay images: v5.1.0 (the default) and v5.0.3. Both were
+  built on 2026-11-24.
 - Optional: `2_bfd:full-history@base` (4 more jobs) shows whether v5.0.3's own
   day-by-day runs equal its one-job run. Without it, a difference in B cannot
   be told apart as new or as there before the PR.
