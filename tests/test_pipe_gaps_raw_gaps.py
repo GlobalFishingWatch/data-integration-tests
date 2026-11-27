@@ -195,6 +195,77 @@ def test_mode_equivalence_windows_are_half_open_and_reach_the_end() -> None:
     ]
 
 
+def test_mode_windows_is_what_the_executors_run() -> None:
+    plan = modes.mode_windows(modes.MODE_MUTATE_RECOVER, start=date(2020, 1, 1),
+                              end=date(2021, 1, 1), tail_days=2, backfill_days_w=3)
+
+    assert plan == [
+        (date(2020, 1, 1), date(2020, 12, 30), False),
+        (date(2020, 12, 28), date(2020, 12, 31), True),
+        (date(2020, 12, 29), date(2021, 1, 1), True),
+        (date(2020, 12, 28), date(2020, 12, 31), False),
+        (date(2020, 12, 29), date(2021, 1, 1), False),
+    ]
+    captured: list[dict] = []
+    with (
+        patch.object(modes, "_make_config", side_effect=lambda **kw: captured.append(kw)),
+        patch.object(modes, "_run_pipeline"),
+    ):
+        modes.execute_mutate_recover(
+            "dataflow", base_cfg={"ssvids": ()}, start=date(2020, 1, 1), end=date(2021, 1, 1),
+            tail_days=2, backfill_days_w=3, output=VIEW, restricted_ssvids=("111",),
+            experiment_id="e", image_tag="t",
+        )
+    assert [(job["start"], job["end"], job["ssvids"] == ("111",)) for job in captured] == plan
+    assert [job["job_name"].rsplit("-", 2)[1:] for job in captured] == [
+        [str(i), "5"] for i in range(1, 6)
+    ]
+
+
+@pytest.mark.parametrize("importable", [True, False])
+def test_mode_equivalence_dry_run_creates_nothing(importable, caplog, monkeypatch) -> None:
+    def import_module(name):
+        if not importable:
+            raise ImportError(name)
+
+    # Stand-in for pipe-gaps being installed or not; nothing is imported.
+    monkeypatch.setattr(modes.importlib, "import_module", import_module)
+    caplog.set_level("INFO")
+    with (
+        patch.object(modes, "resolve_run_context") as context,
+        patch.object(modes, "_run_with_cache") as run,
+        patch.object(modes.dit_compare, "compare_tables") as compare,
+        patch.object(raw_gaps, "check_job") as check,
+    ):
+        assert modes.main(["--dry-run", "--modes", "1_bf,2_bfd"]) == 0
+
+    context.assert_not_called()
+    run.assert_not_called()
+    compare.assert_not_called()
+    jobs = 1 + (1 + modes.DEFAULT_TAIL_DAYS)  # 1_bf, then 2_bfd
+    assert f"--dry-run: {jobs} job(s)" in caplog.text
+    assert check.call_count == (jobs if importable else 0)
+
+
+def test_outage_dry_run_builds_the_four_jobs_offline(monkeypatch) -> None:
+    checked: list[SimpleNamespace] = []
+    monkeypatch.setattr(outage.importlib, "import_module", lambda name: None)
+    with (
+        patch.object(outage, "resolve_run_context") as context,
+        patch.object(raw_gaps, "check_job", side_effect=checked.append),
+        patch.object(outage.dit_compare, "compare_tables") as compare,
+    ):
+        assert outage.main(["--dry-run", "--no-pin", "--synthetic-outage"]) == 0
+
+    context.assert_not_called()
+    compare.assert_not_called()
+    assert [(c.start_date, c.end_date) for c in checked] == [
+        (date(2020, 1, 1), date(2020, 12, 29)), (date(2020, 12, 28), date(2021, 1, 1)),
+        (date(2020, 12, 29), date(2021, 1, 1)), (date(2020, 1, 1), date(2021, 1, 1)),
+    ]
+    assert all(c.labels == {"dit_run_id": "dry-run"} for c in checked)
+
+
 def test_outage_windows_convert_the_inclusive_end() -> None:
     windows = _windows(
         outage.execute_outage_recovery, module=outage, runner="dataflow", base_cfg={},

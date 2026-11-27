@@ -164,6 +164,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib
 import logging
 import math
 import os
@@ -913,7 +914,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=("Dry-run the copies only: report each copy's estimated bytes "
               "against --pin-max-gb, then stop. Nothing is created, and no "
               "pipeline and no comparison runs. With --reuse-pin it checks "
-              "that the copies exist."),
+              "that the copies exist. Where pipe-gaps v0.17.x is installed, "
+              "each job's config and DAG are also built offline."),
     )
     for removed in REMOVED_FLAGS:
         # nargs="?" so the flag is rejected with its own message whether or
@@ -1064,6 +1066,67 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return args
 
 
+def _base_cfg(
+    args: argparse.Namespace, messages: str, segments: str, *, labels: Sequence[str],
+) -> dict[str, Any]:
+    """The ``raw_gaps.make_config`` arguments every job of the run shares;
+    ``messages`` and ``segments`` are the tables the jobs read."""
+    return dict(
+        bq_in_messages=messages,
+        bq_in_segments=segments,
+        ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
+        min_gap_length=args.min_gap_length,
+        n_hours_before=args.n_hours_before,
+        window_period_d=args.window_period_d,
+        filter_good_seg=(args.filter_good_seg == "True"),
+        skip_open_gaps=args.skip_open_gaps,
+        service_account=args.service_account,
+        bq_temp_dataset=args.bq_temp_dataset or None,
+        dataflow_region=args.dataflow_region or None,
+        dataflow_temp_bucket=args.dataflow_temp_bucket or None,
+        dataflow_subnetwork=args.dataflow_subnetwork or None,
+        worker_image=args.worker_image or None,
+        labels=list(labels),
+        max_num_workers=args.max_num_workers,
+        worker_sizing=args.worker_sizing,
+    )
+
+
+#: The cleanup label of a dry run's job configs: nothing is submitted.
+DRY_RUN_LABELS = ("dit_run_id=dry-run",)
+
+
+def _check_jobs(
+    args: argparse.Namespace, messages: str, segments: str, *,
+    start: date, backfill_end: date, outage_start: date, outage_end: date, end: date,
+) -> None:
+    """``--dry-run``: build the config and DAG of the 3 + 1 jobs offline
+    (``raw_gaps.CHECK_RUNNER``), where pipe-gaps v0.17.x is installed."""
+    try:
+        importlib.import_module("pipe_gaps.pipelines.raw_gaps.factory")
+    except ImportError as exc:
+        logger.warning("--dry-run: pipe-gaps %s not importable (%s); job configs "
+                       "are not checked", raw_gaps.PIPELINE_VERSION, exc)
+        return
+    base_cfg = _base_cfg(args, messages, segments, labels=DRY_RUN_LABELS)
+    common = dict(base_cfg=base_cfg, experiment_id=args.experiment_id,
+                  image_tag=args.image_tag)
+    execute_outage_recovery(
+        raw_gaps.CHECK_RUNNER, start=start, backfill_end=backfill_end,
+        outage_start=outage_start, outage_end=outage_end, end=end,
+        recovery_buffer_days=args.recovery_buffer_days,
+        output=f"{PROJECT}.{args.dest_dataset}.outage_dry_run_{MODE_OUTAGE_RECOVERY}",
+        filtered_messages=f"{messages}_outage_filtered" if args.synthetic_outage else None,
+        **common,
+    )
+    execute_outage_oracle(
+        raw_gaps.CHECK_RUNNER, start=start, end=end,
+        output=f"{PROJECT}.{args.dest_dataset}.outage_dry_run_{MODE_OUTAGE_ORACLE}",
+        **common,
+    )
+    logger.info("--dry-run: the config and DAG of all 4 jobs were built offline")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(list(argv) if argv is not None else None)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1081,11 +1144,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.skip_pipelines:
             logger.info("--dry-run with --skip-pipelines: such a run pins nothing")
         else:
-            _resolve_sources(args)
+            src_msgs, src_segs = _resolve_sources(args)
             if args.no_pin:
                 logger.info("--dry-run with --no-pin: nothing is copied, so nothing to estimate")
             if args.synthetic_outage:
                 logger.info("--dry-run: the --synthetic-outage view is not created")
+            _check_jobs(args, src_msgs, src_segs, start=start, backfill_end=backfill_end,
+                        outage_start=outage_start, outage_end=outage_end, end=end)
         logger.info("--dry-run: no pipeline and no comparison ran")
         return 0
 
@@ -1176,25 +1241,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 outage_end=outage_end,
             )
 
-        base_cfg = dict(
-            bq_in_messages=src_msgs,
-            bq_in_segments=src_segs,
-            ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
-            min_gap_length=args.min_gap_length,
-            n_hours_before=args.n_hours_before,
-            window_period_d=args.window_period_d,
-            filter_good_seg=(args.filter_good_seg == "True"),
-            skip_open_gaps=args.skip_open_gaps,
-            service_account=args.service_account,
-            bq_temp_dataset=args.bq_temp_dataset or None,
-            dataflow_region=args.dataflow_region or None,
-            dataflow_temp_bucket=args.dataflow_temp_bucket or None,
-            dataflow_subnetwork=args.dataflow_subnetwork or None,
-            worker_image=args.worker_image or None,
-            labels=dit_labels,
-            max_num_workers=args.max_num_workers,
-            worker_sizing=args.worker_sizing,
-        )
+        base_cfg = _base_cfg(args, src_msgs, src_segs, labels=dit_labels)
         recovery_kwargs = dict(
             runner=args.runner,
             base_cfg=base_cfg,

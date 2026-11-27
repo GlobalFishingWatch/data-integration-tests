@@ -19,6 +19,7 @@ mode wrote (``raw_gaps`` module docstring, "Open gaps between jobs").
 from __future__ import annotations
 
 import argparse
+import importlib
 import itertools
 import logging
 import os
@@ -151,16 +152,70 @@ MAX_NUM_WORKERS_HELP_DETAIL = (
 COMPARE_KEYS = ("gap_id", "start_timestamp")
 
 
+def mode_windows(
+    mode: str, *, start: date, end: date, tail_days: int, backfill_days_w: int,
+) -> list[tuple[date, date, bool]]:
+    """Every job of ``mode`` in order, as ``(start, end, restricted)``.
+
+    Half-open windows, as pipe-gaps' ``--start-date`` / ``--end-date``. The
+    daily jobs end on each of the last ``tail_days`` days' next day and reach
+    back ``backfill_days_w`` days. ``restricted`` marks the jobs of
+    ``4_mutate_recover`` that run on the restricted ssvids only. Pure: the
+    executors and ``--dry-run`` both read it.
+    """
+    mid = end - timedelta(days=tail_days)
+    daily = [
+        (day_end - timedelta(days=backfill_days_w), day_end)
+        for day_end in daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1))
+    ]
+    every_day = [(s, e, False) for s, e in daily]
+    if mode == MODE_BF:
+        return [(start, end, False)]
+    if mode == MODE_BFD:
+        return [(start, mid, False), *every_day]
+    if mode == MODE_BFTRUNCATE:
+        return [(start, end, False), *every_day]
+    if mode == MODE_MUTATE_RECOVER:
+        return [(start, mid, False), *((s, e, True) for s, e in daily), *every_day]
+    raise ValueError(f"unknown mode: {mode}")
+
+
+def _execute_mode(
+    mode: str,
+    runner: str,
+    *,
+    base_cfg: dict,
+    start: date,
+    end: date,
+    output: str,
+    experiment_id: str,
+    image_tag: str,
+    tail_days: int = 0,
+    backfill_days_w: int = 0,
+    restricted_ssvids: tuple[str, ...] = (),
+) -> None:
+    """Run every job of ``mode`` in order, each into ``output``."""
+    windows = mode_windows(
+        mode, start=start, end=end, tail_days=tail_days, backfill_days_w=backfill_days_w,
+    )
+    restricted_cfg = {**base_cfg, "ssvids": restricted_ssvids}
+    for i, (job_start, job_end, restricted) in enumerate(windows, start=1):
+        cfg = _make_config(
+            start=job_start, end=job_end, bq_out_gaps=output,
+            job_name=_job_name(experiment_id, mode, i, len(windows)),
+            **(restricted_cfg if restricted else base_cfg),
+        )
+        _run_pipeline(runner, cfg, image_tag)
+
+
 def execute_bf(
     runner: str, *, base_cfg: dict, start: date, end: date, output: str,
     experiment_id: str, image_tag: str,
 ) -> None:
-    cfg = _make_config(
-        start=start, end=end, bq_out_gaps=output,
-        job_name=_job_name(experiment_id, MODE_BF, 1, 1),
-        **base_cfg,
+    _execute_mode(
+        MODE_BF, runner, base_cfg=base_cfg, start=start, end=end, output=output,
+        experiment_id=experiment_id, image_tag=image_tag,
     )
-    _run_pipeline(runner, cfg, image_tag)
 
 
 def execute_bfd(
@@ -175,25 +230,11 @@ def execute_bfd(
     experiment_id: str,
     image_tag: str,
 ) -> None:
-    mid = end - timedelta(days=tail_days)
-    daily_ends = list(daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1)))
-    total = 1 + len(daily_ends)  # initial big slice + N dailies
-
-    cfg = _make_config(
-        start=start, end=mid, bq_out_gaps=output,
-        job_name=_job_name(experiment_id, MODE_BFD, 1, total),
-        **base_cfg,
+    _execute_mode(
+        MODE_BFD, runner, base_cfg=base_cfg, start=start, end=end, output=output,
+        experiment_id=experiment_id, image_tag=image_tag,
+        tail_days=tail_days, backfill_days_w=backfill_days_w,
     )
-    _run_pipeline(runner, cfg, image_tag)
-
-    for i, day_end in enumerate(daily_ends, start=2):
-        day_start = day_end - timedelta(days=backfill_days_w)
-        cfg = _make_config(
-            start=day_start, end=day_end, bq_out_gaps=output,
-            job_name=_job_name(experiment_id, MODE_BFD, i, total),
-            **base_cfg,
-        )
-        _run_pipeline(runner, cfg, image_tag)
 
 
 def execute_bftruncate(
@@ -208,25 +249,11 @@ def execute_bftruncate(
     experiment_id: str,
     image_tag: str,
 ) -> None:
-    tail_start = end - timedelta(days=tail_days)
-    daily_ends = list(daterange_inclusive(tail_start + timedelta(days=1), end + timedelta(days=1)))
-    total = 1 + len(daily_ends)  # initial full slice + N tail-day re-runs
-
-    cfg = _make_config(
-        start=start, end=end, bq_out_gaps=output,
-        job_name=_job_name(experiment_id, MODE_BFTRUNCATE, 1, total),
-        **base_cfg,
+    _execute_mode(
+        MODE_BFTRUNCATE, runner, base_cfg=base_cfg, start=start, end=end, output=output,
+        experiment_id=experiment_id, image_tag=image_tag,
+        tail_days=tail_days, backfill_days_w=backfill_days_w,
     )
-    _run_pipeline(runner, cfg, image_tag)
-
-    for i, day_end in enumerate(daily_ends, start=2):
-        day_start = day_end - timedelta(days=backfill_days_w)
-        cfg = _make_config(
-            start=day_start, end=day_end, bq_out_gaps=output,
-            job_name=_job_name(experiment_id, MODE_BFTRUNCATE, i, total),
-            **base_cfg,
-        )
-        _run_pipeline(runner, cfg, image_tag)
 
 
 def execute_mutate_recover(
@@ -246,40 +273,12 @@ def execute_mutate_recover(
         raise ValueError(
             "execute_mutate_recover requires a non-empty restricted_ssvids tuple."
         )
-
-    mid = end - timedelta(days=tail_days)
-    daily_ends = list(daterange_inclusive(mid + timedelta(days=1), end + timedelta(days=1)))
-    # 1 initial slice + N restricted dailies + N recovery dailies.
-    total = 1 + 2 * len(daily_ends)
-
-    cfg = _make_config(
-        start=start, end=mid, bq_out_gaps=output,
-        job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, 1, total),
-        **base_cfg,
+    _execute_mode(
+        MODE_MUTATE_RECOVER, runner, base_cfg=base_cfg, start=start, end=end, output=output,
+        experiment_id=experiment_id, image_tag=image_tag,
+        tail_days=tail_days, backfill_days_w=backfill_days_w,
+        restricted_ssvids=restricted_ssvids,
     )
-    _run_pipeline(runner, cfg, image_tag)
-
-    restricted_cfg = {**base_cfg, "ssvids": restricted_ssvids}
-    iteration = 2
-    for day_end in daily_ends:
-        day_start = day_end - timedelta(days=backfill_days_w)
-        cfg = _make_config(
-            start=day_start, end=day_end, bq_out_gaps=output,
-            job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, iteration, total),
-            **restricted_cfg,
-        )
-        _run_pipeline(runner, cfg, image_tag)
-        iteration += 1
-
-    for day_end in daily_ends:
-        day_start = day_end - timedelta(days=backfill_days_w)
-        cfg = _make_config(
-            start=day_start, end=day_end, bq_out_gaps=output,
-            job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, iteration, total),
-            **base_cfg,
-        )
-        _run_pipeline(runner, cfg, image_tag)
-        iteration += 1
 
 
 # --------------------------------------------------------------------------
@@ -441,6 +440,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--restricted-ssvids", default="")
     p.add_argument("--auto-restrict", action="store_true")
     p.add_argument("--auto-restrict-seed", type=int, default=42)
+    p.add_argument("--dry-run", action="store_true",
+                   help="Log every job the run would submit (mode, window, job name, "
+                        "output view) and build each job's pipe-gaps config and DAG "
+                        "offline where pipe-gaps v0.17.x is installed, then stop. Reads "
+                        "no git state, makes no cloud call, creates nothing.")
     args = p.parse_args(argv)
     # Validate before any cloud call: a typo'd mode that silently ran
     # nothing would look exactly like a passing run.
@@ -462,9 +466,86 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return args
 
 
+def _base_cfg(args: argparse.Namespace, *, labels: Sequence[str]) -> dict[str, Any]:
+    """The ``raw_gaps.make_config`` arguments every job of the run shares."""
+    return dict(
+        bq_in_messages=args.source_messages,
+        bq_in_segments=args.source_segments,
+        ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
+        min_gap_length=args.min_gap_length,
+        n_hours_before=args.n_hours_before,
+        window_period_d=args.window_period_d,
+        filter_good_seg=(args.filter_good_seg == "True"),
+        skip_open_gaps=args.skip_open_gaps,
+        service_account=args.service_account,
+        bq_temp_dataset=args.bq_temp_dataset or None,
+        dataflow_region=args.dataflow_region or None,
+        dataflow_temp_bucket=args.dataflow_temp_bucket or None,
+        dataflow_subnetwork=args.dataflow_subnetwork or None,
+        worker_image=args.worker_image or None,
+        labels=list(labels),
+        max_num_workers=args.max_num_workers,
+        worker_sizing=args.worker_sizing,
+    )
+
+
+#: The cleanup label of a dry run's job configs: nothing is submitted, so no
+#: run id is minted.
+DRY_RUN_LABELS = ("dit_run_id=dry-run",)
+
+
+def _dry_run(args: argparse.Namespace) -> int:
+    """Log every job of the selected modes and check each job's config.
+
+    Returns before ``resolve_run_context``, which reads git state and can
+    snapshot a dirty tree or build a worker image. With pipe-gaps v0.17.x
+    importable, every job's ``RawGapsConfig`` and DAG are built offline
+    (``raw_gaps.check_job``); otherwise only the plan is logged.
+    """
+    start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
+    base_cfg = _base_cfg(args, labels=DRY_RUN_LABELS)
+    restricted = (
+        tuple(s.strip() for s in args.restricted_ssvids.split(",") if s.strip())
+        or ("<chosen from 1_bf at run time>",)
+    )
+    modes = [*args.modes, *([MODE_MUTATE_RECOVER] if args.enable_pipeline_4 else [])]
+    try:
+        importlib.import_module("pipe_gaps.pipelines.raw_gaps.factory")
+        check = raw_gaps.check_job
+    except ImportError as exc:
+        logger.warning("--dry-run: pipe-gaps %s not importable (%s); job configs "
+                       "are not checked", raw_gaps.PIPELINE_VERSION, exc)
+        check = None
+
+    n_jobs = 0
+    for mode in modes:
+        view = f"{PROJECT}.{args.dest_dataset}.three_way_<suffix>_{mode}"
+        windows = mode_windows(mode, start=start, end=end, tail_days=args.tail_days,
+                               backfill_days_w=args.backfill_days)
+        logger.info("mode %s: %d job(s) into %s (rows in <view>_%s)",
+                    mode, len(windows), view, raw_gaps.VERSIONED_SUFFIX)
+        for i, (job_start, job_end, is_restricted) in enumerate(windows, start=1):
+            cfg = _make_config(
+                start=job_start, end=job_end, bq_out_gaps=view.replace("<suffix>", "dry_run"),
+                job_name=_job_name(args.experiment_id, mode, i, len(windows)),
+                **({**base_cfg, "ssvids": restricted} if is_restricted else base_cfg),
+            )
+            logger.info("  %d/%d [%s, %s)%s  %s", i, len(windows), job_start, job_end,
+                        " restricted ssvids" if is_restricted else "", cfg.job_name)
+            if check is not None and not (is_restricted and not args.restricted_ssvids):
+                check(cfg)
+            n_jobs += 1
+    logger.info("--dry-run: %d job(s)%s; nothing was submitted or created", n_jobs,
+                ", each config and DAG built offline" if check else "")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(list(argv) if argv is not None else None)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.dry_run:
+        return _dry_run(args)
 
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
@@ -504,34 +585,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             [args.source_messages, args.source_segments],
         )
 
-    source_messages = args.source_messages
-    source_segments = args.source_segments
-
     # Per-run static labels (incl. the dit_run_id cleanup key), shared by
     # every mode's job: RawGapsConfig.labels, which gfw-common applies to the
     # Dataflow job and pipe-gaps to the BigQuery jobs of its reads.
     dit_labels = _dit_run_labels(args)
     logger.info("dit labels: %s", dit_labels)
 
-    base_cfg = dict(
-        bq_in_messages=source_messages,
-        bq_in_segments=source_segments,
-        ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
-        min_gap_length=args.min_gap_length,
-        n_hours_before=args.n_hours_before,
-        window_period_d=args.window_period_d,
-        filter_good_seg=(args.filter_good_seg == "True"),
-        skip_open_gaps=args.skip_open_gaps,
-        service_account=args.service_account,
-        bq_temp_dataset=args.bq_temp_dataset or None,
-        dataflow_region=args.dataflow_region or None,
-        dataflow_temp_bucket=args.dataflow_temp_bucket or None,
-        dataflow_subnetwork=args.dataflow_subnetwork or None,
-        worker_image=args.worker_image or None,
-        labels=dit_labels,
-        max_num_workers=args.max_num_workers,
-        worker_sizing=args.worker_sizing,
-    )
+    base_cfg = _base_cfg(args, labels=dit_labels)
 
     # Each mode's bq_out_gaps: the latest-state view pipe-gaps creates, over
     # its versioned table <view>_versioned (raw_gaps.output_tables).

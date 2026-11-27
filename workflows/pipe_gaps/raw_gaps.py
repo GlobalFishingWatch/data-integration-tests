@@ -375,6 +375,27 @@ def docker_argv(cfg: SimpleNamespace) -> list[str]:
     return [COMMAND, *cfg_to_cli_flags(cfg), "--project", PROJECT]
 
 
+def pipeline_config(cfg: SimpleNamespace, *, unknown_parsed_args: Mapping[str, Any] | None = None):
+    """``RawGapsConfig`` of ``cfg``: its pipeline attributes, without the
+    runner-only ones. ``unknown_parsed_args`` replaces the job's own Beam
+    options when given. Needs pipe-gaps v0.17.x installed."""
+    from pipe_gaps.pipelines.raw_gaps.config import RawGapsConfig
+
+    attrs = {k: v for k, v in vars(cfg).items() if k not in RUNNER_ONLY_ATTRS}
+    if unknown_parsed_args is not None:
+        attrs["unknown_parsed_args"] = dict(unknown_parsed_args)
+    return RawGapsConfig.from_namespace(SimpleNamespace(**attrs))
+
+
+def check_job(cfg: SimpleNamespace) -> None:
+    """Build the job's config and DAG offline, as a Dataflow submission would:
+    validates the config and renders the queries. Touches no BigQuery and
+    builds no Beam pipeline. Raises what pipe-gaps raises."""
+    from pipe_gaps.pipelines.raw_gaps.factory import RawGapsLinearDagFactory
+
+    RawGapsLinearDagFactory(pipeline_config(cfg)).build_dag()
+
+
 def build_pipeline_for(cfg: SimpleNamespace):
     """Return a ``pipeline_builder`` closure for ``dit.runners.dataflow``.
 
@@ -391,7 +412,6 @@ def build_pipeline_for(cfg: SimpleNamespace):
     def _build(options: Mapping[str, Any]):
         from gfw.common.beam.pipeline.factory import PipelineFactory
 
-        from pipe_gaps.pipelines.raw_gaps.config import RawGapsConfig
         from pipe_gaps.pipelines.raw_gaps.factory import RawGapsLinearDagFactory
 
         opts = dict(options)
@@ -404,14 +424,15 @@ def build_pipeline_for(cfg: SimpleNamespace):
         if cfg.job_name:
             parsed.setdefault("job_name", cfg.job_name)
 
-        pipeline_attrs = {
-            k: v for k, v in vars(cfg).items() if k not in RUNNER_ONLY_ATTRS
-        }
-        pipeline_attrs["unknown_parsed_args"] = parsed
-        config = RawGapsConfig.from_namespace(SimpleNamespace(**pipeline_attrs))
+        config = pipeline_config(cfg, unknown_parsed_args=parsed)
         return PipelineFactory(config, dag_factory=factory_cls(config)).build_pipeline()
 
     return _build
+
+
+#: Not a runner a user selects: ``--dry-run`` passes it to build each job's
+#: config and DAG offline (:func:`check_job`) instead of running the job.
+CHECK_RUNNER = "check"
 
 
 def run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
@@ -420,11 +441,16 @@ def run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
     ``docker`` runs ``pipe-gaps raw-gaps`` with Beam's DirectRunner in the
     checkout's compose ``dev`` service, built from source. ``dataflow``
     builds the pipeline in-process and submits it (``dit.runners.dataflow``).
+    :data:`CHECK_RUNNER` only builds the job's config and DAG offline.
     """
     logger.info(
         "[%s] start=%s end=%s msgs=%s out=%s",
         runner, cfg.start_date, cfg.end_date, cfg.bq_in_messages, cfg.bq_out_gaps,
     )
+    if runner == CHECK_RUNNER:
+        check_job(cfg)
+        return
+
     if runner == "docker":
         rc = dit_docker.run(
             image_tag=image_tag,

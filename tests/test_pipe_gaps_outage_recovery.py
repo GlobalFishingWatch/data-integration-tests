@@ -1004,10 +1004,12 @@ def _main(*argv: str) -> dict[str, Any]:
         patch.object(mod.dit_bq, "derived_source_into_experiment",
                      return_value="p.d.FILTERED_VIEW") as derive,
         patch.object(mod.dit_compare, "compare_tables", return_value=0) as compare,
+        # The dry run's offline config check (tests/test_pipe_gaps_raw_gaps.py).
+        patch.object(mod, "_check_jobs") as check_jobs,
     ):
         rc = mod.main(["--experiment-id", "exp01", *argv])
     return dict(rc=rc, pin=pin, require=require, derive=derive, run=runs,
-                context=context, compare=compare)
+                context=context, compare=compare, check_jobs=check_jobs)
 
 
 def _stage_messages(recovery_kwargs: dict[str, Any]) -> list[str]:
@@ -1127,6 +1129,8 @@ def test_main_dry_run_estimates_the_copies_and_runs_nothing(
     result["compare"].assert_not_called()
     assert result["run"] == {}
     assert not any("pass --reuse-pin" in m for m in caplog.messages)
+    # The jobs are checked on the copies the run would read.
+    assert result["check_jobs"].call_args.args[1:] == (_PINNED_MESSAGES, _PINNED_SEGMENTS)
 
 
 def test_main_dry_run_fails_when_a_copy_is_over_the_cap() -> None:
