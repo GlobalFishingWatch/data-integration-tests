@@ -48,8 +48,13 @@ DEPS_FLAG = $(if $(FULLDEPS),,--no-deps)
 # substitution declaration has no default value -- it's empty there and the
 # Makefile is the single source of truth. See CLAUDE.md "Beam-version pin
 # symmetry across laptop and cloud installs" under Working agreements.
-# pipe-gaps:v0.10.0 -> apache-beam==2.71.0
-PIPE_GAPS_BEAM_VERSION            := 2.71.0
+# pipe-gaps:v0.17.1 -> apache-beam==2.76.0 (its requirements.txt pins 2.76.0;
+# its pyproject.toml requires apache-beam[gcp]~=2.76, gfw-common ~=0.24.2 and
+# Python >= 3.12; its Dockerfile copies the Beam 2.76.0 SDK). v0.17.1 is what
+# the AIS v5 DAG pins and DIT's default worker image
+# (workflows/pipe_gaps/raw_gaps.py, DEFAULT_WORKER_IMAGE). Was 2.71.0 for
+# v0.10.0 until 2026-11-27.
+PIPE_GAPS_BEAM_VERSION            := 2.76.0
 # pipe-anchorages:v5.0.1 -> apache-beam==2.76.0 (its requirements.txt and the
 # Beam SDK its Dockerfile copies). v5.0.1 is what production runs and what
 # DIT's default overlay image holds (workflows/port_visits/ais.py,
@@ -83,13 +88,13 @@ install-port-visits install-port-visits-ref snapshot-port-visits:  BEAM_VERSION 
 install-pipe-segment install-pipe-segment-ref snapshot-pipe-segment: BEAM_VERSION := $(PIPE_SEGMENT_BEAM_VERSION)
 # install-all installs all four pipelines into one venv: the only one
 # whose laptop submitter actually IS the laptop venv is pipe-gaps (others
-# use docker runner), so pin to pipe-gaps' beam version. pipe-segment v5.1.0
-# requires ~=2.71 and pins 2.71.0 itself. pipe-anchorages from v5.0.0 on requires
-# apache-beam~=2.76, which 2.71.0 does not satisfy: with a pipe-anchorages
-# checkout at v5 this target fails to resolve (it resolved while the
-# checkout was at v4.6.4, ~=2.69). The port-visits workflows do not import
-# pipe_anchorages (they run it in its image), so install the other
-# pipelines one by one until this target is reworked.
+# use docker runner), so pin to pipe-gaps' beam version, 2.76.0 since
+# 2026-11-27. The other pipelines' package requirements accept it:
+# pipe-anchorages v5 requires apache-beam~=2.76, pipe-segment v5.1.0 ~=2.71
+# (its requirements.txt pins 2.71.0, but a package install reads
+# pyproject.toml). Read, not run: the conflict of the 2.71.0 pin with
+# pipe-anchorages v5 (noted here until 2026-11-27) should be gone, unless
+# pipe-events' requirements exclude 2.76.
 install-all: BEAM_VERSION := $(PIPE_GAPS_BEAM_VERSION)
 
 # Helper: write a beam==$(BEAM_VERSION) constraint file to a temp path,
@@ -243,7 +248,7 @@ publish-ditbox:
 #   REF=<sha-or-tag>  # pipeline ref to install non-editably; empty = editable from source upload
 #   DIT_REF=<ref>     # dit ref to clone (default main)
 #   BEAM_VERSION=<x.y.z>  # pin apache-beam to match the worker image's beam version
-#                          # (pipe-gaps:v0.10.0 = 2.71.0; pipe-anchorages:v5.0.1 = 2.76.0;
+#                          # (pipe-gaps:v0.17.1 = 2.76.0; pipe-anchorages:v5.0.1 = 2.76.0;
 #                          # pipe-segment:v5.1.0 = 2.71.0). Auto-defaulted below
 #                          # per PIPELINE from the constants at the top of this
 #                          # Makefile (same values the laptop install targets use).

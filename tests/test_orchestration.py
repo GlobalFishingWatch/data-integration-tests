@@ -9,7 +9,7 @@ from dit import orchestration as o
 from workflows.encounters import orchestration as encounters_o
 from workflows.pipe_events import fishing
 from workflows.pipe_events import orchestration as events_o
-from workflows.pipe_gaps import mode_equivalence as gaps
+from workflows.pipe_gaps import raw_gaps as gaps
 from workflows.pipe_gaps import orchestration as gaps_o
 from workflows.pipe_segment import identity_match_key as imk
 from workflows.pipe_segment import orchestration as segment_o
@@ -115,6 +115,7 @@ def test_declared_steps_are_the_workflows_steps() -> None:
     assert [s.step for s in port_visits_o.ORCHESTRATION.steps] == list(port_visits.SELECTABLE_STEPS)
     assert [s.step for s in segment_o.ORCHESTRATION.steps] == list(imk.STEPS)
     assert [s.step for s in gaps_o.ORCHESTRATION.steps] == [gaps.STEP_NAME]
+    assert gaps_o.ORCHESTRATION.step(gaps.STEP_NAME).command == gaps.COMMAND
     assert [s.step for s in encounters_o.ORCHESTRATION.steps] == [
         "create_raw_encounters", "merge_encounters"]
     assert [s.step for s in events_o.ORCHESTRATION.steps] == [

@@ -33,6 +33,7 @@ from workflows.pipe_events import composer_drift as events_drift
 from workflows.pipe_events import fishing
 from workflows.pipe_gaps import composer_drift as gaps_drift
 from workflows.pipe_gaps import mode_equivalence as gaps_modes
+from workflows.pipe_gaps import raw_gaps
 from workflows.pipe_segment import ais as segment_modes
 from workflows.pipe_segment import composer_drift as segment_drift
 from workflows.pipe_segment import identity_match_key as segment
@@ -66,7 +67,7 @@ COMMANDS = {
     ("pipe_events/fishing", "auth_and_regions_fishing_events"):
         ("pipe", "auth_and_regions_fishing_events"),
     ("pipe_events/fishing", "fishing_restrictive"): ("pipe", "fishing_restrictive"),
-    ("pipe_gaps/mode_equivalence", "detect"): ("pipe-gaps", "detect"),
+    ("pipe_gaps/mode_equivalence", "detect"): ("pipe-gaps", "raw-gaps"),
     ("pipe_segment/identity_match_key", "segment"): ("pipe-segment", "segment"),
     ("pipe_segment/identity_match_key", "segment_identity"):
         ("pipe-segment", "segment_identity"),
@@ -80,7 +81,10 @@ COMMANDS = {
 }
 
 #: The workflows marked in sync with production: drift in one of them exits 1.
-IN_SYNC = ["port_visits/ais", "pipe_segment/identity_match_key", "pipe_segment/ais"]
+IN_SYNC = [
+    "port_visits/ais", "pipe_gaps/mode_equivalence", "pipe_segment/identity_match_key",
+    "pipe_segment/ais",
+]
 
 
 def _steps() -> list[tuple[str, str]]:
@@ -113,7 +117,7 @@ def offline(monkeypatch):
 # the registry
 # --------------------------------------------------------------------------
 
-def test_every_workflow_has_a_spec_and_three_are_marked_in_sync() -> None:
+def test_every_workflow_has_a_spec_and_four_are_marked_in_sync() -> None:
     assert [spec.name for spec in runner.SPECS] == [
         "port_visits/ais", "encounters/ais", "encounters/vms", "pipe_events/fishing",
         "pipe_gaps/mode_equivalence", "pipe_segment/identity_match_key", "pipe_segment/ais",
@@ -233,22 +237,32 @@ def test_pipe_events_tokens_carry_the_runs_half_open_window() -> None:
 
 def test_pipe_gaps_tokens_are_the_docker_runners_argv() -> None:
     args = gaps_modes.parse_args(["--runner", "docker", "--experiment-id", "composer-drift"])
-    cfg = gaps_modes._make_config(
-        start=PLACEHOLDERS["start_date"], end=PLACEHOLDERS["end_date_exclusive"],
-        bq_output_gaps=f"{gaps_modes.PROJECT}.{args.dest_dataset}.three_way_drift_1_bf",
+    start, end = gaps_drift.daily_window(PLACEHOLDERS, args.backfill_days)
+    cfg = raw_gaps.make_config(
+        start=start, end=end,
+        bq_out_gaps=f"{raw_gaps.PROJECT}.{args.dest_dataset}.three_way_drift_2_bfd",
+        labels=gaps_drift.DRIFT_LABELS,
         **gaps_drift.detect_params(args),
     )
     calls = []
-    with patch.object(gaps_modes.dit_docker, "run",
+    with patch.object(raw_gaps.dit_docker, "run",
                       side_effect=lambda **kw: calls.append(kw) or 0):
-        gaps_modes._run_pipeline("docker", cfg, "local-tag")
+        raw_gaps.run_pipeline("docker", cfg, "local-tag")
 
     (call,) = calls
     tokens = gaps_drift.dit_detect_tokens(PLACEHOLDERS)
     assert [call["entrypoint"], *call["args"]] == tokens
     parsed = _parsed("pipe_gaps/mode_equivalence", "detect")
-    assert parsed.value("--date-range") == "2026-03-01,2026-03-11"
-    assert parsed.value("--bq-input-messages") == gaps_modes.DEFAULT_SOURCE_MESSAGES
+    # The daily job for the run's last day: [end - --backfill-days, end).
+    assert (parsed.value("--start-date"), parsed.value("--end-date")) == (
+        "2026-03-07", "2026-03-11",
+    )
+    assert parsed.value("--bq-in-messages") == gaps_modes.DEFAULT_SOURCE_MESSAGES
+    # Production's values, passed explicitly.
+    assert parsed.value("--versioned-suffix") == "versioned"
+    assert parsed.value("--open-gaps-start-date") == "2012-01-01"
+    assert parsed.value("--good-seg-stabilization-days") == "0"
+    assert "--eval-last" in tokens and "--filter-good-seg" in tokens
 
 
 def test_pipe_gaps_detect_params_are_the_ones_main_runs_with() -> None:
@@ -273,7 +287,7 @@ def test_pipe_gaps_detect_params_are_the_ones_main_runs_with() -> None:
 
 
 def test_pipe_gaps_sizing_is_checked_as_fields() -> None:
-    sizing = gaps_modes.DEFAULT_WORKER_SIZING
+    sizing = raw_gaps.DEFAULT_WORKER_SIZING
 
     def checks(*flags: str) -> list[tuple[str, bool]]:
         raw = {"dag_id": "example", "execution_date": "2026-03-05T00:00:00+00:00",

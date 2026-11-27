@@ -37,6 +37,7 @@ from workflows.encounters import ais as encounters_ais
 from workflows.encounters import vms as encounters_vms
 from workflows.pipe_gaps import mode_equivalence as gaps_modes
 from workflows.pipe_gaps import outage_recovery as gaps_outage
+from workflows.pipe_gaps import raw_gaps
 from workflows.pipe_segment import ais as pipe_segment_modes
 from workflows.pipe_segment import identity_match_key as pipe_segment
 from workflows.port_visits import ais as port_visits
@@ -510,7 +511,8 @@ def test_pipe_segment_hints_on_staging_data(cli, hinted, caplog):
 # pipe-gaps: in-process submission through gfw-common
 # --------------------------------------------------------------------------
 
-GAPS_MODULES = [gaps_modes, gaps_outage]
+# Both workflows run one job through raw_gaps.run_pipeline, so the runner-level
+# tests below exercise it once; the main-level tests cover each workflow.
 GAPS_DAILY_ARGS = ["--machine_type=e2-custom-2-3072", "--disk_size_gb=25"]
 
 
@@ -539,10 +541,10 @@ def _module(name, **attrs):
 @pytest.fixture
 def gaps_stack(monkeypatch):
     """Stub Beam, gfw-common and pipe_gaps (none are in dit's venv) and record
-    the namespace ``DetectGapsConfig.from_namespace`` receives."""
+    the namespace ``RawGapsConfig.from_namespace`` receives."""
     seen = {}
 
-    class DetectGapsConfig:
+    class RawGapsConfig:
         @classmethod
         def from_namespace(cls, ns, **_):
             seen["ns"] = ns
@@ -562,21 +564,20 @@ def gaps_stack(monkeypatch):
                 "apache_beam.runners.runner", PipelineState=SimpleNamespace(DONE="DONE")),
             "gfw.common.beam.pipeline.factory": _module(
                 "gfw.common.beam.pipeline.factory", PipelineFactory=PipelineFactory),
-            "pipe_gaps.pipelines.detect.config": _module(
-                "pipe_gaps.pipelines.detect.config", DetectGapsConfig=DetectGapsConfig),
-            "pipe_gaps.pipelines.detect.factory": _module(
-                "pipe_gaps.pipelines.detect.factory",
-                DetectGapsLinearDagFactory=type("F", (), {"__init__": lambda self, c: None})),
-            "pipe_gaps.version": _module("pipe_gaps.version", __version__="0"),
+            "pipe_gaps.pipelines.raw_gaps.config": _module(
+                "pipe_gaps.pipelines.raw_gaps.config", RawGapsConfig=RawGapsConfig),
+            "pipe_gaps.pipelines.raw_gaps.factory": _module(
+                "pipe_gaps.pipelines.raw_gaps.factory",
+                RawGapsLinearDagFactory=type("F", (), {"__init__": lambda self, c: None})),
         },
     )
     return seen
 
 
-def _gaps_cfg(module, sizing=None):
-    return module._make_config(
-        start=date(2020, 1, 1), end=date(2020, 1, 2), bq_input_messages="p.d.m",
-        bq_input_segments="p.d.s", bq_output_gaps="p.d.out", ssvids=(), min_gap_length=1.0,
+def _gaps_cfg(sizing=None):
+    return raw_gaps.make_config(
+        start=date(2020, 1, 1), end=date(2020, 1, 2), bq_in_messages="p.d.m",
+        bq_in_segments="p.d.s", bq_out_gaps="p.d.out", ssvids=(), min_gap_length=1.0,
         n_hours_before=12, window_period_d=2, filter_good_seg=True, skip_open_gaps=False,
         service_account="sa", bq_temp_dataset=None, dataflow_region="us-central1",
         dataflow_temp_bucket="b", dataflow_subnetwork="net", worker_image="img",
@@ -584,7 +585,6 @@ def _gaps_cfg(module, sizing=None):
     )
 
 
-@pytest.mark.parametrize("module", GAPS_MODULES)
 @pytest.mark.parametrize("sizing, expected", [
     (None, ["--max_num_workers=50", *GAPS_DAILY_ARGS]),
     (WorkerSizing("n2-standard-8", 100),
@@ -592,36 +592,34 @@ def _gaps_cfg(module, sizing=None):
     (WorkerSizing("e2-custom-2-3072", 60),
      ["--max_num_workers=50", "--machine_type=e2-custom-2-3072", "--disk_size_gb=60"]),
 ])
-def test_gaps_runner_gets_the_sizing_and_nothing_about_ips(module, sizing, expected,
-                                                           monkeypatch):
-    _install_modules(monkeypatch, **{"pipe_gaps.pipelines.detect.factory": _module(
-        "pipe_gaps.pipelines.detect.factory", DetectGapsLinearDagFactory=object)})
+def test_gaps_runner_gets_the_sizing_and_nothing_about_ips(sizing, expected, monkeypatch):
+    _install_modules(monkeypatch, **{"pipe_gaps.pipelines.raw_gaps.factory": _module(
+        "pipe_gaps.pipelines.raw_gaps.factory", RawGapsLinearDagFactory=object)})
     calls = []
-    with patch.object(module.dit_dataflow, "run", side_effect=lambda **k: calls.append(k) or 0):
-        module._run_pipeline("dataflow", _gaps_cfg(module, sizing), "local-tag")
+    with patch.object(raw_gaps.dit_dataflow, "run", side_effect=lambda **k: calls.append(k) or 0):
+        raw_gaps.run_pipeline("dataflow", _gaps_cfg(sizing), "local-tag")
 
     assert calls[0]["args"] == expected
 
 
-@pytest.mark.parametrize("module", GAPS_MODULES)
 @pytest.mark.parametrize("sizing, machine_type, disk", [
     (None, "e2-custom-2-3072", "25"),
     (WorkerSizing("n2-standard-8", 100), "n2-standard-8", "100"),
 ])
 def test_gaps_options_leave_gfw_commons_private_ip_default_alone(
-    module, sizing, machine_type, disk, gaps_stack,
+    sizing, machine_type, disk, gaps_stack,
 ):
     """gfw-common's Pipeline.default_options() has use_public_ips=False, which
     Beam renders as --no_use_public_ips. It applies only if nothing dit hands
     over carries a public-IP key; the sizing replaces gfw-common's
     machine_type / disk_size_gb keys by name."""
     with pytest.raises(_Stop):
-        module._run_pipeline("dataflow", _gaps_cfg(module, sizing), "local-tag")
+        raw_gaps.run_pipeline("dataflow", _gaps_cfg(sizing), "local-tag")
 
     ns = gaps_stack["ns"]
     options = ns.unknown_parsed_args
     assert not any("public_ips" in key for key in options)
-    # DetectGapsConfig is a dataclass built from vars(ns): a stray attribute crashes it.
+    # RawGapsConfig is a dataclass built from vars(ns): a stray attribute crashes it.
     assert not hasattr(ns, "worker_sizing")
     assert options["machine_type"] == machine_type
     assert options["disk_size_gb"] == disk
@@ -635,11 +633,10 @@ def test_gfw_commons_default_is_private_ips_when_installed():
     assert base.Pipeline.default_options()["use_public_ips"] is False
 
 
-@pytest.mark.parametrize("module", GAPS_MODULES)
-def test_gaps_docker_runner_gets_no_sizing(module):
+def test_gaps_docker_runner_gets_no_sizing():
     calls = []
-    with patch.object(module.dit_docker, "run", side_effect=lambda **k: calls.append(k) or 0):
-        module._run_pipeline("docker", _gaps_cfg(module, WorkerSizing("n2", 100)), "local-tag")
+    with patch.object(raw_gaps.dit_docker, "run", side_effect=lambda **k: calls.append(k) or 0):
+        raw_gaps.run_pipeline("docker", _gaps_cfg(WorkerSizing("n2", 100)), "local-tag")
 
     assert not any("machine" in str(a) or "disk" in str(a) for a in calls[0]["args"])
 

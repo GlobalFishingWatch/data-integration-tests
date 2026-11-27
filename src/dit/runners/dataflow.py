@@ -11,9 +11,10 @@ The runner accepts a ``pipeline_builder`` callable so it stays
 pipeline-agnostic (pipe-gaps, port-visits, pipe-events all bring their own
 pipeline factories). Pre-existing temp BQ dataset injection -- the
 ``_DagFactoryWithTempDataset`` override pattern from the source -- is
-applied here when ``bq_temp_dataset`` is set: the runner monkey-patches the
-``read_from_bigquery_factory`` of the workflow's DAG factory class to
-inject ``temp_dataset=<existing dataset>``. This avoids the
+applied here when ``bq_temp_dataset`` is set: the runner subclasses the
+workflow's DAG factory class and overrides its
+``read_from_bigquery_kwargs`` property to add
+``temp_dataset=<existing dataset>`` to every read. This avoids the
 ``bigquery.datasets.create`` permission requirement at submission time;
 Beam reuses the existing dataset and creates only a temp table inside it.
 """
@@ -67,14 +68,36 @@ def _parse_args(args: list[str]) -> dict[str, Any]:
 
 
 def _wrap_factory_with_temp_dataset(dag_factory_cls: type, bq_temp_dataset: str) -> type:
-    """Subclass ``dag_factory_cls`` to inject ``temp_dataset`` into its
-    ``read_from_bigquery_factory`` -- the ``_DagFactoryWithTempDataset``
-    pattern from ``mode_equivalence.py``.
+    """Subclass ``dag_factory_cls`` to add ``temp_dataset`` to the keyword
+    arguments of every BigQuery read its DAG builds.
+
+    The factory must expose those arguments as a ``read_from_bigquery_kwargs``
+    property, as pipe-gaps' ``RawGapsLinearDagFactory`` does from v0.17.x on
+    (it returns ``bigquery_job_labels``). Its sources and its side input pass
+    the property to gfw-common's ``ReadFromBigQuery.from_query``, which hands
+    it, unchanged, to Beam's ``ReadFromBigQuery``; the EXPORT read passes it on
+    to its BigQuery source, which then stages the query result in the given
+    dataset instead of creating ``beam_temp_dataset_<hex>`` (read in
+    gfw-common 0.24.2 and Beam 2.76.0, not run). The override keeps the
+    factory's own entries, the labels among them, and never replaces a
+    ``temp_dataset`` the factory sets itself.
+
+    A factory without that property is refused (``TypeError``) rather than
+    wrapped: the override would then reach no read, and Beam would create its
+    own dataset, which DIT's Dataflow identity may not. Before 2026-11-27 the
+    hook overrode ``read_from_bigquery_factory`` instead, which pipe-gaps
+    v0.10.0 called with all the read's arguments.
 
     Importing apache_beam happens here so callers that don't use the
     dataflow runner don't pay the import cost.
     """
-    import apache_beam as beam
+    if not isinstance(getattr(dag_factory_cls, "read_from_bigquery_kwargs", None), property):
+        raise TypeError(
+            f"{dag_factory_cls.__name__} has no read_from_bigquery_kwargs property, "
+            "so DIT cannot pass a temp dataset to its BigQuery reads. Is the pipeline "
+            "older than the version the workflow is written for?"
+        )
+
     from apache_beam.io.gcp.internal.clients import bigquery as bq_clients
 
     temp_proj, temp_ds = bq_temp_dataset.split(".", 1)
@@ -84,11 +107,10 @@ def _wrap_factory_with_temp_dataset(dag_factory_cls: type, bq_temp_dataset: str)
 
     class _DagFactoryWithTempDataset(dag_factory_cls):  # type: ignore[misc, valid-type]
         @property
-        def read_from_bigquery_factory(self):
-            def _factory(**kwargs: Any) -> Any:
-                kwargs.setdefault("temp_dataset", temp_dataset_ref)
-                return beam.io.ReadFromBigQuery(**kwargs)
-            return _factory
+        def read_from_bigquery_kwargs(self) -> dict[str, Any]:
+            kwargs = dict(super().read_from_bigquery_kwargs or {})
+            kwargs.setdefault("temp_dataset", temp_dataset_ref)
+            return kwargs
 
     return _DagFactoryWithTempDataset
 
@@ -125,9 +147,10 @@ def run(
       ``.pipeline.run()``). Workflows bring their own pipeline factory; the
       runner stays pipeline-agnostic.
     * ``dag_factory_cls`` -- optional DAG factory class. When ``bq_temp_dataset``
-      is set, the runner subclasses it to inject ``temp_dataset`` into
-      ``read_from_bigquery_factory`` (the ``_DagFactoryWithTempDataset``
-      pattern). The wrapped class is then passed to ``pipeline_builder`` via
+      is set, the runner subclasses it to add ``temp_dataset`` to its
+      ``read_from_bigquery_kwargs`` property (the ``_DagFactoryWithTempDataset``
+      pattern; a factory without the property raises ``TypeError``). The
+      wrapped class is then passed to ``pipeline_builder`` via
       the ``dag_factory_cls`` key in the options mapping. Workflows that
       don't need temp-dataset injection can omit this and ignore the key.
 

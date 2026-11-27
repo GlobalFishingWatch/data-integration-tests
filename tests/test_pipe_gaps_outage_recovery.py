@@ -549,8 +549,8 @@ def test_execute_outage_recovery_routes_filtered_messages_to_stages_1_2_only() -
         mod.execute_outage_recovery(
             "dataflow",
             base_cfg=dict(
-                bq_input_messages="proj.ds.messages_unfiltered",
-                bq_input_segments="proj.ds.segments",
+                bq_in_messages="proj.ds.messages_unfiltered",
+                bq_in_segments="proj.ds.segments",
             ),
             start=date(2020, 1, 1),
             backfill_end=date(2020, 12, 28),
@@ -565,11 +565,11 @@ def test_execute_outage_recovery_routes_filtered_messages_to_stages_1_2_only() -
         )
 
     assert len(captured) == 3
-    assert captured[0]["bq_input_messages"] == "proj.ds.messages_FILTERED"  # Stage 1
-    assert captured[1]["bq_input_messages"] == "proj.ds.messages_FILTERED"  # Stage 2
-    assert captured[2]["bq_input_messages"] == "proj.ds.messages_unfiltered"  # Stage 3
+    assert captured[0]["bq_in_messages"] == "proj.ds.messages_FILTERED"  # Stage 1
+    assert captured[1]["bq_in_messages"] == "proj.ds.messages_FILTERED"  # Stage 2
+    assert captured[2]["bq_in_messages"] == "proj.ds.messages_unfiltered"  # Stage 3
     # Segments are never filtered (known simplification).
-    assert all(c["bq_input_segments"] == "proj.ds.segments" for c in captured)
+    assert all(c["bq_in_segments"] == "proj.ds.segments" for c in captured)
 
 
 def test_execute_outage_recovery_default_no_filter_all_stages_unfiltered() -> None:
@@ -590,8 +590,8 @@ def test_execute_outage_recovery_default_no_filter_all_stages_unfiltered() -> No
         mod.execute_outage_recovery(
             "dataflow",
             base_cfg=dict(
-                bq_input_messages="proj.ds.messages",
-                bq_input_segments="proj.ds.segments",
+                bq_in_messages="proj.ds.messages",
+                bq_in_segments="proj.ds.segments",
             ),
             start=date(2020, 1, 1),
             backfill_end=date(2020, 12, 28),
@@ -605,7 +605,7 @@ def test_execute_outage_recovery_default_no_filter_all_stages_unfiltered() -> No
         )
 
     assert len(captured) == 3
-    assert all(c["bq_input_messages"] == "proj.ds.messages" for c in captured)
+    assert all(c["bq_in_messages"] == "proj.ds.messages" for c in captured)
 
 
 def _captured_stage_configs(**execute_overrides: Any) -> list[dict]:
@@ -624,8 +624,8 @@ def _captured_stage_configs(**execute_overrides: Any) -> list[dict]:
 
     kwargs: dict[str, Any] = dict(
         base_cfg=dict(
-            bq_input_messages="proj.ds.messages",
-            bq_input_segments="proj.ds.segments",
+            bq_in_messages="proj.ds.messages",
+            bq_in_segments="proj.ds.segments",
         ),
         start=date(2020, 1, 1),
         backfill_end=date(2020, 12, 28),
@@ -693,7 +693,7 @@ def test_stage2_bridges_outage_when_synthetic() -> None:
     # independent of --recovery-buffer-days.)
     assert captured[1]["start"] == date(2020, 12, 28)
     assert captured[1]["end"] == date(2021, 1, 1)
-    assert captured[1]["bq_input_messages"] == "proj.ds.messages_FILTERED"
+    assert captured[1]["bq_in_messages"] == "proj.ds.messages_FILTERED"
     # Stages 1+3 keep their schedule-skip ranges (Stage 3 with the
     # default buffer=0 starts at outage_start).
     assert captured[0]["start"] == date(2020, 1, 1)
@@ -720,8 +720,8 @@ def test_oracle_end_inclusive() -> None:
         mod.execute_outage_oracle(
             "dataflow",
             base_cfg=dict(
-                bq_input_messages="proj.ds.messages",
-                bq_input_segments="proj.ds.segments",
+                bq_in_messages="proj.ds.messages",
+                bq_in_segments="proj.ds.segments",
             ),
             start=date(2020, 1, 1),
             end=date(2020, 12, 31),
@@ -783,7 +783,7 @@ def test_messages_window_starts_pipe_gaps_lookback_before_the_start(
     n_hours_before: int, lookback_days: int,
 ) -> None:
     """pipe-gaps reads from ``start_date - ceil(n_hours_before / 24)`` days
-    (``DetectGapsConfig.messages_query_start_date`` at v0.10.0)."""
+    (``RawGapsConfig.messages_query_start_date`` at v0.17.1, as at v0.10.0)."""
     window = mod._messages_window(date(2020, 3, 1), date(2020, 3, 10), n_hours_before)
 
     assert window.column == "timestamp"
@@ -1019,7 +1019,7 @@ def _stage_messages(recovery_kwargs: dict[str, Any]) -> list[str]:
         patch.object(mod, "_run_pipeline"),
     ):
         mod.execute_outage_recovery(**recovery_kwargs)
-    return [stage["bq_input_messages"] for stage in captured]
+    return [stage["bq_in_messages"] for stage in captured]
 
 
 def test_main_runs_every_job_on_the_pinned_copies() -> None:
@@ -1031,8 +1031,8 @@ def test_main_runs_every_job_on_the_pinned_copies() -> None:
     recovery = result["run"][mod.MODE_OUTAGE_RECOVERY]["kwargs"]
     oracle = result["run"][mod.MODE_OUTAGE_ORACLE]["kwargs"]
     for kwargs in (recovery, oracle):
-        assert kwargs["base_cfg"]["bq_input_messages"] == _PINNED_MESSAGES
-        assert kwargs["base_cfg"]["bq_input_segments"] == _PINNED_SEGMENTS
+        assert kwargs["base_cfg"]["bq_in_messages"] == _PINNED_MESSAGES
+        assert kwargs["base_cfg"]["bq_in_segments"] == _PINNED_SEGMENTS
     assert recovery["filtered_messages"] is None
     assert _stage_messages(recovery) == [_PINNED_MESSAGES] * 3
 
@@ -1050,10 +1050,10 @@ def test_main_synthetic_outage_filters_the_copy_for_stages_1_and_2_only() -> Non
     assert _stage_messages(recovery) == [
         "p.d.FILTERED_VIEW", "p.d.FILTERED_VIEW", _PINNED_MESSAGES,
     ]
-    assert oracle["base_cfg"]["bq_input_messages"] == _PINNED_MESSAGES
+    assert oracle["base_cfg"]["bq_in_messages"] == _PINNED_MESSAGES
     assert "filtered_messages" not in oracle
     # The segments are never filtered.
-    assert recovery["base_cfg"]["bq_input_segments"] == _PINNED_SEGMENTS
+    assert recovery["base_cfg"]["bq_in_segments"] == _PINNED_SEGMENTS
 
 
 def test_main_puts_the_copies_in_the_cache_key_before_any_mode_runs() -> None:
@@ -1103,7 +1103,7 @@ def test_main_no_pin_reads_the_live_sources_and_filters_them_when_asked() -> Non
     assert _stage_messages(recovery["kwargs"]) == [
         "p.d.FILTERED_VIEW", "p.d.FILTERED_VIEW", live_messages,
     ]
-    assert recovery["kwargs"]["base_cfg"]["bq_input_segments"] == (
+    assert recovery["kwargs"]["base_cfg"]["bq_in_segments"] == (
         f"{_STEM}_published.segs_activity"
     )
     assert recovery["params"]["pinned_messages"] is None

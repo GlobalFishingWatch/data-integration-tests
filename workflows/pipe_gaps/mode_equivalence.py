@@ -1,9 +1,19 @@
-"""Mode equivalence integration test for the pipe-gaps detect pipeline.
+"""Mode equivalence integration test for the pipe-gaps raw-gaps pipeline.
 
 Drives the same pipeline several different ways ("modes") and asserts all
-modes produce identical output on the ``..._last_versions`` views. Ported
-from ``pipe-gaps/tests/integration/mode_equivalence.py`` onto the
-``dit.*`` library; runner / compare / dates / bq concerns now live there.
+modes produce identical output on their latest-state views (``bq_out_gaps``;
+the rows are in ``<view>_versioned``). Ported from
+``pipe-gaps/tests/integration/mode_equivalence.py`` onto the ``dit.*``
+library; runner / compare / dates / bq concerns now live there, and one
+raw-gaps job is ``workflows/pipe_gaps/raw_gaps.py``.
+
+Written for pipe-gaps v0.17.1 (``raw_gaps.DEFAULT_WORKER_IMAGE``), the
+version production's AIS v5 DAG runs. Dates are half-open ``[--start,
+--end)``, as pipe-gaps' own ``--start-date`` / ``--end-date``.
+
+The daily modes rely on how a job finds the open gaps of the jobs before it:
+it reads them from its own versioned table, which the earlier jobs of the
+mode wrote (``raw_gaps`` module docstring, "Open gaps between jobs").
 """
 
 from __future__ import annotations
@@ -12,25 +22,18 @@ import argparse
 import itertools
 import logging
 import os
-import re
 import sys
-import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
-from types import SimpleNamespace
 from typing import Any, Optional
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit import workflow as dit_workflow
-from dit.cache import CacheKey, sha1_of_workflow_file
+from dit.cache import CacheKey
 from dit.dates import daterange_inclusive
-from dit.job_names import make_job_name
-from dit.runners import dataflow as dit_dataflow
-from dit.runners import docker as dit_docker
 from dit.workflow import (
-    WorkerSizing,
     add_experiment_id_arg,
     add_infra_args,
     add_max_num_workers_arg,
@@ -40,34 +43,39 @@ from dit.workflow import (
     log_production_sizing_hint,
     log_worker_caps,
     log_worker_sizings,
-    max_num_workers_options,
     parse_modes,
     resolve_run_context,
     resolve_worker_sizing,
     worker_cap,
     worker_sizing_from_args,
-    worker_sizing_options,
 )
 
-# Pipeline repo name; used to namespace auto-snapshot refs
-# (refs/dit-snapshots/<PIPELINE_NAME>/<sha>).
-PIPELINE_NAME = "pipe-gaps"
+# One raw-gaps job (config, argv, in-process pipeline, runner dispatch) is
+# shared with outage_recovery.py: workflows/pipe_gaps/raw_gaps.py, written for
+# pipe-gaps v0.17.1.
+from workflows.pipe_gaps import raw_gaps
+from workflows.pipe_gaps.raw_gaps import (
+    DEFAULT_IMAGE_TAG,
+    DEFAULT_WORKER_IMAGE,
+    DEFAULT_WORKER_SIZING,
+    PIPELINE_NAME,
+    PROJECT,
+    STEP_WORKER_SIZING,
+)
+from workflows.pipe_gaps.raw_gaps import dit_run_labels as _dit_run_labels
+from workflows.pipe_gaps.raw_gaps import job_name as _job_name
+from workflows.pipe_gaps.raw_gaps import make_config as _make_config
+from workflows.pipe_gaps.raw_gaps import resolve_suffix as _resolve_suffix
+from workflows.pipe_gaps.raw_gaps import run_pipeline as _run_pipeline
 
-# Compute once at import time; the dit-side cache buster.
-WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
+# Compute once at import time; the dit-side cache buster. Covers raw_gaps.py
+# too, where the job's config lives.
+WORKFLOW_FILE_SHA1 = raw_gaps.workflow_sha1(__file__)
 
 logger = logging.getLogger(__name__)
 
 
-PROJECT = "world-fishing-827"
-REPO_NAME = "pipe-gaps"
-
-# Step label for Dataflow job names. Pipe-gaps' detect pipeline is a single
-# step, but the dit-shaped naming keeps the slot for symmetry with multi-step
-# workflows like port_visits/ais.py (which has thin + visits).
-STEP_NAME = "detect"
-
-# Mode labels embedded in Dataflow job names + the bq_output_gaps table
+# Mode labels embedded in Dataflow job names + the bq_out_gaps view
 # suffix. Single source of truth; execute_* helpers thread them through.
 MODE_BF = "1_bf"
 MODE_BFD = "2_bfd"
@@ -101,8 +109,15 @@ DEFAULT_SOURCE_SEGMENTS = (
     f"{PROJECT}.pipe_ais_test_202408290000_published.segs_activity"
 )
 
+# min_gap_length 1, where production passes 4: on the 142 vessels of the
+# staging cohort a lower threshold gives more gaps and more boundary cases to
+# compare (owner decision 2026-11-27; an accepted difference in the drift
+# spec). --min-gap-length 4 runs production's threshold.
 DEFAULT_MIN_GAP_LENGTH = 1.0
 DEFAULT_N_HOURS_BEFORE = 12
+# 2-day windows: production passes none, and pipe-gaps then takes the job's
+# date range, which is 2 days on production's daily job. On a long DIT job
+# the small windows give many window boundaries to process.
 DEFAULT_WINDOW_PERIOD_D = 2
 DEFAULT_FILTER_GOOD_SEG = True
 DEFAULT_BACKFILL_DAYS_W = 4
@@ -111,339 +126,29 @@ DEFAULT_START = "2020-01-01"
 DEFAULT_END = "2021-01-01"
 DEFAULT_TAIL_DAYS = 4
 
-DEFAULT_IMAGE_TAG = "gfw/pipe-gaps:dev"
-
-# Dataflow worker container image -- needs pipe_gaps installed (workers
-# unpickle DoFns from pipe_gaps.*). Published path in GFW's Artifact Registry.
-# Distinct from DEFAULT_IMAGE_TAG (which names the local image the docker
-# runner builds + runs for the submission process). Override via --worker-image
-# when you've published a custom build (e.g. cross-version testing).
-DEFAULT_WORKER_IMAGE = (
-    "us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.10.0"
-)
-
 RUNNERS = ("docker", "dataflow")
 
 # Dataflow worker cap (--max-num-workers, PIPELINE-4701): production's daily
-# detect step (core.ais.v3 detect_gaps.raw_gaps, core.ais.v5
-# gaps.detect_raw_gaps). Before the flag existed dit emitted no cap, so
-# gfw-common's Pipeline.default_options() applied (max_num_workers=100 in every
-# gfw-common pipe-gaps' ~=0.10 pin resolves to, v0.10 through v0.23); the
-# emitted cap overrides that default. Shared with outage_recovery.py.
+# raw-gaps task (core.ais.v5 gaps.detect_raw_gaps; composer b5c3496e1). Before
+# the flag existed dit emitted no cap, so gfw-common's
+# Pipeline.default_options() applied (max_num_workers=100, still so in
+# gfw-common 0.24.2); the emitted cap overrides that default. Shared with
+# outage_recovery.py.
 DEFAULT_MAX_NUM_WORKERS = 50
 MAX_NUM_WORKERS_HELP_DETAIL = (
-    "The default matches production's daily detect step, and replaces "
+    "The default matches production's daily raw-gaps task, and replaces "
     "gfw-common's own default of 100."
 )
 
-# Worker IPs and sizing. Every DIT Dataflow job runs with private worker IPs
+# Worker IPs. Every DIT Dataflow job runs with private worker IPs
 # (dit.workflow (a3)). pipe-gaps already does without any option from dit:
-# gfw-common's Pipeline.default_options() sets use_public_ips=False (every
-# version pipe-gaps' ~=0.10 pin resolves to, v0.10 through v0.23), and Beam's
+# gfw-common's Pipeline.default_options() sets use_public_ips=False (0.24.2,
+# which pipe-gaps v0.17.1 pins, as every earlier version), and Beam's
 # PipelineOptions.from_dictionary renders that as --no_use_public_ips. dit
 # passes nothing that overrides it, so it emits nothing here; a test pins
-# that. dit.runners.dataflow could only add the flag-name key
-# no_use_public_ips=True, the form Beam documents as discarded in a mapping.
-#
-# Worker sizing, mirroring production (owner rule 2026-10-23; the cap above
-# does not follow it): the same production step as the cap, the daily detect.
-# composer-dags-production origin/main 0a644da, rendered snapshots
-# core_ais_v3.py task detect_gaps.raw_gaps and core_ais_v5.py task
-# gaps.detect_raw_gaps: --worker_machine_type=e2-custom-2-3072 --disk_size_gb=25
-# (dataflow=dict(...) in dags/core/ais/v3.py and v5.py, plain values). Not
-# mirrored: core.ais.v5.backfill's year-dependent Jinja choice ("e2-highmem-2
-# if data_interval_start.year >= 2025 else e2-standard-2", 50 GB), since dit's
-# cap already mirrors the daily step and one default cannot follow a per-year
-# choice; pass those values for a production-scale backfill of 2025 or later.
-# Shared with outage_recovery.py. Hand-written until PIPELINE-4700 reads them
-# from composer. Replaces gfw-common's own e2-standard-2 / 25 GB.
-#
-# gfw-common merges options by option name, so the machine type goes in as
-# Beam's alias --machine_type: that parses to the same key as gfw-common's
-# default and replaces it, rather than sitting beside it.
-DEFAULT_WORKER_SIZING = WorkerSizing(machine_type="e2-custom-2-3072", disk_size_gb=25)
-STEP_WORKER_SIZING = {STEP_NAME: DEFAULT_WORKER_SIZING}
-GFW_COMMON_MACHINE_TYPE_OPTION = "--machine_type"
+# that. Worker sizing mirrors production: raw_gaps.DEFAULT_WORKER_SIZING.
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
-COMPARE_VIEW_SUFFIX = "_last_versions"
-
-
-# --------------------------------------------------------------------------
-# Dataflow labels
-# --------------------------------------------------------------------------
-# Mirrors port_visits/ais.py's per-run static labels. The dit_run_id label is
-# the load-bearing one: `make dit-cancel` / dit.cache.cancel_run discover this
-# run's Dataflow jobs by `labels.dit_run_id=<run_id>` (the runner never
-# captures submitted job ids back into the cache row -- dataflow_job_ids is
-# always []). The others are provenance niceties for ad-hoc filtering.
-#
-# Unlike port-visits (which forwards labels as --labels=k=v CLI flags to the
-# in-container pipe-anchorages process), pipe-gaps submits Dataflow in-process
-# via dit.runners.dataflow, so labels are threaded as a `labels` list in
-# unknown_parsed_args -> Beam's GoogleCloudOptions.labels (a list of "k=v").
-
-_UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
-
-
-def _safe_label_value(value: str) -> str:
-    """Coerce arbitrary strings into BQ-label-safe form (``[a-z0-9_-]``,
-    max 63 chars). Matches port_visits/ais.py's sanitiser."""
-    return _UNSAFE_LABEL_CHAR_RE.sub("-", value.lower())[:63]
-
-
-def _dit_run_labels(args: argparse.Namespace) -> list[str]:
-    """Per-run static Dataflow labels (``"key=value"`` strings).
-
-    Computed once from the resolved RunContext stamped on ``args``; the same
-    set is applied to every mode's Dataflow job so cleanup-by-label sweeps the
-    whole run. Free-form values pass through ``_safe_label_value`` for BQ's
-    label constraints; the hex ``run_id`` is already label-safe.
-    """
-    return [
-        f"dit_run_id={args.run_id}",
-        f"dit_commit_sha={_safe_label_value(args.pipeline_commit)}",
-        f"dit_worker_image_tag={_safe_label_value(_worker_image_tag(args.worker_image))}",
-        f"dit_launched_by={_safe_label_value(os.environ.get('USER', 'unknown'))}",
-    ]
-
-
-_DIGEST_RE = re.compile(r"@sha\d{3}:[0-9a-f]+$", re.IGNORECASE)
-
-
-def _worker_image_tag(image: str) -> str:
-    """Extract the tag portion of a docker image ref (digest stripped first).
-
-    Mirrors port_visits/ais.py._worker_image_tag: ``foo/bar:tag`` -> ``tag``;
-    ``foo/bar@sha256:..`` -> ``latest``.
-    """
-    image = _DIGEST_RE.sub("", image)
-    return image.rsplit(":", 1)[-1] if ":" in image else "latest"
-
-
-def _resolve_suffix(args: argparse.Namespace) -> str:
-    """Build the output-table suffix from the already-resolved pipeline_commit.
-
-    ``main()`` resolves ``args.pipeline_commit`` once (via
-    :func:`dit.snapshot.resolve_pipeline_commit`, which auto-snapshots a dirty
-    dataflow run) before calling this, so the suffix references the same
-    committed ref the cache records. ``--suffix`` still bypasses everything.
-    """
-    if args.suffix is not None:
-        return args.suffix
-    # Every run now executes a committed ref (real or snapshot), so the suffix
-    # is always <experiment_id>_<commit>_<uuid> -- the legacy `_dirty` marker
-    # was dropped in M-pivot-4 (provenance lives in pipeline_commit /
-    # unreviewed_code, not the table name).
-    return f"{args.experiment_id}_{args.pipeline_commit}_{uuid.uuid4().hex[:6]}"
-
-
-def _make_config(
-    *,
-    start: date,
-    end: date,
-    bq_input_messages: str,
-    bq_input_segments: str,
-    bq_output_gaps: str,
-    ssvids: tuple[str, ...],
-    min_gap_length: float,
-    n_hours_before: int,
-    window_period_d: int,
-    filter_good_seg: bool,
-    skip_open_gaps: bool,
-    service_account: Optional[str] = None,
-    bq_temp_dataset: Optional[str] = None,
-    dataflow_region: Optional[str] = None,
-    dataflow_temp_bucket: Optional[str] = None,
-    dataflow_subnetwork: Optional[str] = None,
-    worker_image: Optional[str] = None,
-    job_name: Optional[str] = None,
-    labels: Optional[Sequence[str]] = None,
-    max_num_workers: Optional[int] = None,
-    worker_sizing: WorkerSizing | None = None,
-) -> SimpleNamespace:
-    # `labels` (a list of "key=value" strings) is seeded into unknown_parsed_args
-    # so it flows into Beam's GoogleCloudOptions.labels via the PipelineFactory
-    # (which spreads **unknown_parsed_args into the Pipeline constructor). The
-    # dit_run_id label is what make dit-cancel discovers the run's jobs by.
-    unknown_parsed_args: dict[str, Any] = {"project": PROJECT}
-    if labels:
-        unknown_parsed_args["labels"] = list(labels)
-    cfg = SimpleNamespace(
-        date_range=(start.isoformat(), end.isoformat()),
-        bq_input_messages=bq_input_messages,
-        bq_input_segments=bq_input_segments,
-        bq_output_gaps=bq_output_gaps,
-        ssvids=ssvids,
-        min_gap_length=min_gap_length,
-        n_hours_before=n_hours_before,
-        window_period_d=window_period_d,
-        filter_good_seg=filter_good_seg,
-        skip_open_gaps=skip_open_gaps,
-        unknown_parsed_args=unknown_parsed_args,
-        unknown_unparsed_args=[],
-    )
-    cfg.service_account = service_account
-    cfg.bq_temp_dataset = bq_temp_dataset
-    cfg.dataflow_region = dataflow_region
-    cfg.dataflow_temp_bucket = dataflow_temp_bucket
-    cfg.dataflow_subnetwork = dataflow_subnetwork
-    cfg.worker_image = worker_image
-    cfg.job_name = job_name
-    # Runner-only: emitted by _run_pipeline (Dataflow only), stripped before
-    # DetectGapsConfig.from_namespace in _build_pipeline_for.
-    cfg.max_num_workers = max_num_workers
-    cfg.worker_sizing = DEFAULT_WORKER_SIZING if worker_sizing is None else worker_sizing
-    return cfg
-
-
-def _cfg_to_cli_flags(cfg: SimpleNamespace) -> list[str]:
-    flags: list[str] = []
-
-    def _add(name: str, value: object) -> None:
-        if value is None or value == "" or value == ():
-            return
-        flags.append(f"--{name.replace('_', '-')}")
-        flags.append(str(value))
-
-    _add("date-range", ",".join(cfg.date_range))
-    _add("bq-input-messages", cfg.bq_input_messages)
-    _add("bq-input-segments", cfg.bq_input_segments)
-    _add("bq-output-gaps", cfg.bq_output_gaps)
-    _add("min-gap-length", cfg.min_gap_length)
-    _add("n-hours-before", cfg.n_hours_before)
-    _add("window-period-d", cfg.window_period_d)
-    if cfg.filter_good_seg:
-        _add("filter-good-seg", "true")
-    if cfg.skip_open_gaps:
-        _add("skip-open-gaps", "true")
-    if cfg.ssvids:
-        _add("ssvids", ",".join(cfg.ssvids))
-    return flags
-
-
-def _build_pipeline_for(cfg: SimpleNamespace):
-    """Return a ``pipeline_builder`` closure for the given workflow cfg.
-
-    The runner contract is: ``pipeline_builder(options) -> Pipeline`` where
-    ``options`` is the merged Beam-pipeline-options mapping the runner has
-    assembled (CLI args + Dataflow knobs). When ``bq_temp_dataset`` is set,
-    the runner has already wrapped the workflow's ``dag_factory_cls`` to
-    inject ``temp_dataset`` and forwarded the wrapped class via
-    ``options["dag_factory_cls"]``; we pull it back out here.
-
-    The returned closure captures ``cfg`` (the workflow's per-call
-    SimpleNamespace), strips the runner-only attributes (service_account,
-    bq_temp_dataset, dataflow_*), threads ``options`` into
-    ``unknown_parsed_args``, builds the ``DetectGapsConfig`` from the
-    namespace, and constructs the pipeline via ``PipelineFactory``.
-    """
-    def _build(options: Mapping[str, Any]):
-        from gfw.common.beam.pipeline.factory import PipelineFactory
-
-        from pipe_gaps.pipelines.detect.config import DetectGapsConfig
-        from pipe_gaps.pipelines.detect.factory import DetectGapsLinearDagFactory
-        from pipe_gaps.version import __version__ as pipe_gaps_version
-
-        opts = dict(options)
-        factory_cls = opts.pop("dag_factory_cls", DetectGapsLinearDagFactory)
-        opts.pop("bq_temp_dataset", None)
-
-        parsed = dict(cfg.unknown_parsed_args)
-        for key, value in opts.items():
-            parsed.setdefault(key, value)
-
-        if cfg.job_name:
-            parsed.setdefault("job_name", cfg.job_name)
-
-        runner_only_attrs = {
-            "service_account",
-            "bq_temp_dataset",
-            "dataflow_region",
-            "dataflow_temp_bucket",
-            "dataflow_subnetwork",
-            "worker_image",
-            "job_name",
-            "max_num_workers",
-            "worker_sizing",
-        }
-        cfg_attrs = {k: v for k, v in vars(cfg).items() if k not in runner_only_attrs}
-        df_cfg = SimpleNamespace(**cfg_attrs)
-        df_cfg.unknown_parsed_args = parsed
-
-        config = DetectGapsConfig.from_namespace(df_cfg, version=pipe_gaps_version)
-        return PipelineFactory(config, dag_factory=factory_cls(config)).build_pipeline()
-
-    return _build
-
-
-def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
-    logger.info(
-        "[%s] start=%s end=%s out=%s",
-        runner, cfg.date_range[0], cfg.date_range[1], cfg.bq_output_gaps,
-    )
-    if runner == "docker":
-        flags = ["detect", *_cfg_to_cli_flags(cfg), "--project", PROJECT]
-        rc = dit_docker.run(
-            image_tag=image_tag,
-            args=flags,
-            build_from_source=True,
-            entrypoint="pipe-gaps",
-        )
-        if rc != 0:
-            raise RuntimeError(f"docker runner exited with {rc} for {cfg.bq_output_gaps}")
-        return
-
-    if runner == "dataflow":
-        from pipe_gaps.pipelines.detect.factory import DetectGapsLinearDagFactory
-
-        # Workers pull from a registry; the local docker tag (image_tag) is
-        # for the in-process submission image only. Require an explicit
-        # worker image -- silently falling back to image_tag reproduces the
-        # original ImagePullBackOff this split was meant to fix.
-        if not cfg.worker_image:
-            raise RuntimeError(
-                "dataflow runner requires --worker-image (or a non-empty "
-                "DEFAULT_WORKER_IMAGE). The docker runner's --image-tag "
-                "is local-only and cannot be pulled by Dataflow workers."
-            )
-        rc = dit_dataflow.run(
-            # The worker cap and sizing, if any. They reach gfw-common's
-            # Pipeline through the options mapping and override its own
-            # defaults. Nothing for worker IPs: gfw-common's default is
-            # already private (see the note above GFW_COMMON_MACHINE_TYPE_OPTION).
-            args=[
-                *max_num_workers_options(cfg.max_num_workers),
-                *worker_sizing_options(
-                    cfg.worker_sizing, machine_type_option=GFW_COMMON_MACHINE_TYPE_OPTION,
-                ),
-            ],
-            image_tag=cfg.worker_image,
-            service_account=cfg.service_account,
-            region=cfg.dataflow_region,
-            temp_bucket=cfg.dataflow_temp_bucket,
-            subnetwork=cfg.dataflow_subnetwork,
-            bq_temp_dataset=cfg.bq_temp_dataset or "",
-            pipeline_builder=_build_pipeline_for(cfg),
-            dag_factory_cls=DetectGapsLinearDagFactory,
-        )
-        if rc != 0:
-            raise RuntimeError(f"dataflow runner exited with {rc} for {cfg.bq_output_gaps}")
-        return
-
-    raise ValueError(f"unknown runner: {runner}")
-
-
-def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
-    """Workflow-local shorthand for the dit-shaped Dataflow job name."""
-    return make_job_name(
-        repo=REPO_NAME,
-        step=STEP_NAME,
-        experiment_id=experiment_id,
-        mode=mode,
-        iteration=iteration,
-        total_iterations=total,
-    )
 
 
 def execute_bf(
@@ -451,7 +156,7 @@ def execute_bf(
     experiment_id: str, image_tag: str,
 ) -> None:
     cfg = _make_config(
-        start=start, end=end, bq_output_gaps=output,
+        start=start, end=end, bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_BF, 1, 1),
         **base_cfg,
     )
@@ -475,7 +180,7 @@ def execute_bfd(
     total = 1 + len(daily_ends)  # initial big slice + N dailies
 
     cfg = _make_config(
-        start=start, end=mid, bq_output_gaps=output,
+        start=start, end=mid, bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_BFD, 1, total),
         **base_cfg,
     )
@@ -484,7 +189,7 @@ def execute_bfd(
     for i, day_end in enumerate(daily_ends, start=2):
         day_start = day_end - timedelta(days=backfill_days_w)
         cfg = _make_config(
-            start=day_start, end=day_end, bq_output_gaps=output,
+            start=day_start, end=day_end, bq_out_gaps=output,
             job_name=_job_name(experiment_id, MODE_BFD, i, total),
             **base_cfg,
         )
@@ -508,7 +213,7 @@ def execute_bftruncate(
     total = 1 + len(daily_ends)  # initial full slice + N tail-day re-runs
 
     cfg = _make_config(
-        start=start, end=end, bq_output_gaps=output,
+        start=start, end=end, bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_BFTRUNCATE, 1, total),
         **base_cfg,
     )
@@ -517,7 +222,7 @@ def execute_bftruncate(
     for i, day_end in enumerate(daily_ends, start=2):
         day_start = day_end - timedelta(days=backfill_days_w)
         cfg = _make_config(
-            start=day_start, end=day_end, bq_output_gaps=output,
+            start=day_start, end=day_end, bq_out_gaps=output,
             job_name=_job_name(experiment_id, MODE_BFTRUNCATE, i, total),
             **base_cfg,
         )
@@ -548,7 +253,7 @@ def execute_mutate_recover(
     total = 1 + 2 * len(daily_ends)
 
     cfg = _make_config(
-        start=start, end=mid, bq_output_gaps=output,
+        start=start, end=mid, bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, 1, total),
         **base_cfg,
     )
@@ -559,7 +264,7 @@ def execute_mutate_recover(
     for day_end in daily_ends:
         day_start = day_end - timedelta(days=backfill_days_w)
         cfg = _make_config(
-            start=day_start, end=day_end, bq_output_gaps=output,
+            start=day_start, end=day_end, bq_out_gaps=output,
             job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, iteration, total),
             **restricted_cfg,
         )
@@ -569,7 +274,7 @@ def execute_mutate_recover(
     for day_end in daily_ends:
         day_start = day_end - timedelta(days=backfill_days_w)
         cfg = _make_config(
-            start=day_start, end=day_end, bq_output_gaps=output,
+            start=day_start, end=day_end, bq_out_gaps=output,
             job_name=_job_name(experiment_id, MODE_MUTATE_RECOVER, iteration, total),
             **base_cfg,
         )
@@ -662,6 +367,9 @@ def _run_with_cache(
     (stamped onto ``args`` in :func:`main`) and the pipe-gaps workflow/pipeline
     identity into the generic wrapper. Keeps the call-site signature unchanged
     so :func:`main`'s ``_wrap_*`` closures don't churn.
+
+    ``output_fqn`` is the mode's latest-state view, the comparison target. Its
+    versioned table is recorded beside it, so ``cancel_run`` drops both.
     """
     cache_key = _build_cache_key(args, mode, **(cache_key_extras or {}))
     return dit_workflow.run_with_cache(
@@ -672,6 +380,8 @@ def _run_with_cache(
         experiment_id=args.experiment_id,
         cache_key=cache_key,
         output_fqn=output_fqn,
+        # The versioned table behind the view: recorded so cleanup drops it.
+        extra_output_tables=raw_gaps.output_tables(output_fqn)[1:],
         execute_kwargs=execute_kwargs,
         log_label=mode,
         use_cache=not args.no_cache,
@@ -797,15 +507,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     source_messages = args.source_messages
     source_segments = args.source_segments
 
-    # Per-run static Dataflow labels (incl. the dit_run_id cleanup key),
-    # shared by every mode's job. Threaded into the dataflow runner via cfg ->
-    # unknown_parsed_args -> GoogleCloudOptions.labels.
+    # Per-run static labels (incl. the dit_run_id cleanup key), shared by
+    # every mode's job: RawGapsConfig.labels, which gfw-common applies to the
+    # Dataflow job and pipe-gaps to the BigQuery jobs of its reads.
     dit_labels = _dit_run_labels(args)
     logger.info("dit labels: %s", dit_labels)
 
     base_cfg = dict(
-        bq_input_messages=source_messages,
-        bq_input_segments=source_segments,
+        bq_in_messages=source_messages,
+        bq_in_segments=source_segments,
         ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
         min_gap_length=args.min_gap_length,
         n_hours_before=args.n_hours_before,
@@ -823,13 +533,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         worker_sizing=args.worker_sizing,
     )
 
+    # Each mode's bq_out_gaps: the latest-state view pipe-gaps creates, over
+    # its versioned table <view>_versioned (raw_gaps.output_tables).
     base = f"{PROJECT}.{args.dest_dataset}.three_way_{suffix}"
     bf_table = f"{base}_{MODE_BF}"
     bfd_table = f"{base}_{MODE_BFD}"
     bft_table = f"{base}_{MODE_BFTRUNCATE}"
     mr_table = f"{base}_{MODE_MUTATE_RECOVER}"
 
-    logger.info("output tables:")
+    logger.info("output views (each over <view>_%s):", raw_gaps.VERSIONED_SUFFIX)
     logger.info("  %s", bf_table)
     logger.info("  %s", bfd_table)
     logger.info("  %s", bft_table)
@@ -1019,9 +731,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("=" * 80)
         logger.info("comparison: %s", label)
         logger.info("=" * 80)
-        rcs.append(dit_compare.compare_tables(
-            a, b, keys=COMPARE_KEYS, view_suffix=COMPARE_VIEW_SUFFIX,
-        ))
+        # a and b are the modes' latest-state views (bq_out_gaps).
+        rcs.append(dit_compare.compare_tables(a, b, keys=COMPARE_KEYS))
 
     n_failed = sum(1 for rc in rcs if rc != 0)
     if n_failed:
