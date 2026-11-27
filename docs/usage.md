@@ -24,7 +24,7 @@ DIT itself is pipeline-agnostic. A pipeline's package is not in DIT's `requireme
 
 - The Makefile expects the pipeline checkouts next to this repo (`PROJECTS`, default: the parent directory). If yours are elsewhere, prefix any target with `PROJECTS=/path`, or copy `.envrc.example` to `.envrc` (gitignored; loaded by [direnv](https://direnv.net/)).
 - `make install` installs the framework only. The Dataflow runner then cannot load, because `apache-beam` comes with a pipeline install.
-- `make install-all` does not resolve with a pipe-anchorages checkout at v5 or later: it pins pipe-gaps' Beam version, which pipe-anchorages v5 does not accept (comment in the [`Makefile`](../Makefile)). Install the pipelines one by one. The port-visits workflows do not import pipe-anchorages; they run it in its image.
+- `make install-all` pins pipe-gaps' Beam version, 2.76.0 since 2026-11-27. Until then it was 2.71.0, which a pipe-anchorages checkout at v5 does not accept; with 2.76.0 the pipelines' package requirements should all accept it (read, not run; comment in the [`Makefile`](../Makefile)). If it does not resolve, install the pipelines one by one. The port-visits workflows do not import pipe-anchorages; they run it in its image.
 
 ### Install modes
 
@@ -52,7 +52,7 @@ dit run workflows/<pipeline>/<workflow>.py [workflow-args...]
 
 `dit run` loads the Python file and calls its `main(argv) -> int`. A workflow can also be imported and called from a test: DIT is a library first.
 
-Every workflow has `--help`. Six of the ten have `--dry-run`, which reports what would be pinned and run and creates nothing: the cross-version wrappers, `pipe_gaps/outage_recovery.py`, `port_visits/ais.py` and both pipe-segment workflows.
+Every workflow has `--help`. Seven of the ten have `--dry-run`, which reports what would be pinned and run and creates nothing: the cross-version wrappers, both pipe-gaps workflows, `port_visits/ais.py` and both pipe-segment workflows.
 
 **Example: Beam in a container, submitting to Dataflow.** Mode equivalence for port visits on the staging cohort. Run it from a clean pipe-anchorages checkout of a commit merged into `origin/main`; it then executes DIT's default image.
 

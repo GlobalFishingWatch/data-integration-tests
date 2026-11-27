@@ -1,10 +1,13 @@
-"""Outage-recovery integration test for the pipe-gaps detect pipeline.
+"""Outage-recovery integration test for the pipe-gaps raw-gaps pipeline.
 
 Reproduces the divergence between (a) a long history of daily incremental
 runs interrupted by an outage and then "fixed" by a recovery backfill, and
-(b) a clean single-shot backfill over the same range. On current pipe-gaps
-the two states differ on ``raw_gaps_last_versions``; that difference is
-the bug this workflow locks in (RED today, GREEN once fixed).
+(b) a clean single-shot backfill over the same range. Where pipe-gaps
+mishandles the recovery, the two states differ; that difference is the bug
+class this workflow locks in.
+
+Written for pipe-gaps v0.17.1 (``raw_gaps.DEFAULT_WORKER_IMAGE``); one job is
+``workflows/pipe_gaps/raw_gaps.py``, shared with ``mode_equivalence.py``.
 
 Scenario
 --------
@@ -43,10 +46,19 @@ Stages
    Per the pipe-gaps reprocess-to-end contract
    (see ``workflows/pipe_gaps/CLAUDE.md``), this MUST extend to ``end``.
 
-All three stages write ``WRITE_APPEND`` to the same SCD-2 ``raw_gaps``
-table. The oracle is a single-shot backfill ``[start, end]`` against the
-same source. Comparison is on the ``_last_versions`` view via
-``dit.compare.compare_tables``.
+All three stages write ``WRITE_APPEND`` to the same versioned table
+(``<view>_versioned``). The oracle is a single-shot backfill ``[start, end]``
+against the same source, into its own. Comparison is on the two latest-state
+views (``bq_out_gaps``) via ``dit.compare.compare_tables``.
+
+The view drops closed gaps of ``duration_h <= min_gap_length``
+(``GapsLatestViewConfig``), "to exclude invalid gaps produced during
+reprocessing". That filter is how pipe-gaps fixed the MAP-1676 class
+(pipe-gaps fdc7336, first in v0.10.1): the sub-threshold closed gaps a
+recovery leaves behind stay in the versioned table and are hidden from the
+view. The comparison reads the views, so it checks what consumers read: a
+regression of the filter shows, leftovers in the versioned table alone do
+not.
 
 Total: 3 staged Dataflow jobs + 1 oracle = 4 jobs per run.
 
@@ -57,8 +69,9 @@ The sources are pinned by copying them at run start
 ``world-fishing-827.tech_great_expectations``. The copies keep the
 sources' partitioning and clustering, so pipe-gaps reads them as it reads
 the sources and does not know the difference. What is copied is what
-pipe-gaps reads over the whole run (read from pipe-gaps v0.10.0, the
-default worker image; ``messages.sql.j2`` is the same at v0.17.1):
+pipe-gaps reads over the whole run (read from pipe-gaps v0.17.1, the
+default worker image; ``messages.sql.j2`` and the message query are the
+same as at v0.10.0, ``git diff v0.10.0 v0.17.1``):
 
 * the messages over ``[--start - lookback, --end]``. pipe-gaps filters
   them by ``DATE(timestamp)`` and starts ``ceil(--n-hours-before / 24)``
@@ -151,26 +164,20 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib
 import logging
 import math
 import os
-import re
-import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
-from types import SimpleNamespace
 from typing import Any, Optional
 
 from dit import bq as dit_bq
 from dit import compare as dit_compare
 from dit import workflow as dit_workflow
-from dit.cache import CacheKey, sha1_of_workflow_file
-from dit.job_names import make_job_name
-from dit.runners import dataflow as dit_dataflow
-from dit.runners import docker as dit_docker
+from dit.cache import CacheKey
 from dit.workflow import (
-    WorkerSizing,
     add_experiment_id_arg,
     add_infra_args,
     add_max_num_workers_arg,
@@ -179,34 +186,40 @@ from dit.workflow import (
     log_production_sizing_hint,
     log_worker_caps,
     log_worker_sizings,
-    max_num_workers_options,
     resolve_run_context,
     resolve_worker_sizing,
     worker_cap,
     worker_sizing_from_args,
-    worker_sizing_options,
 )
 
 # Reused workflow-wide constants. See mode_equivalence.py for full doc.
 from workflows.pipe_gaps.mode_equivalence import (
     DEFAULT_BQ_TEMP_DATASET,
     DEFAULT_FILTER_GOOD_SEG,
-    DEFAULT_IMAGE_TAG,
     DEFAULT_MAX_NUM_WORKERS,
     DEFAULT_MIN_GAP_LENGTH,
     DEFAULT_N_HOURS_BEFORE,
     DEFAULT_WINDOW_PERIOD_D,
+    MAX_NUM_WORKERS_HELP_DETAIL,
+    RUNNERS,
+)
+
+# One raw-gaps job (config, argv, in-process pipeline, runner dispatch),
+# shared with mode_equivalence.py; written for pipe-gaps v0.17.1.
+from workflows.pipe_gaps import raw_gaps
+from workflows.pipe_gaps.raw_gaps import (
+    DEFAULT_IMAGE_TAG,
     DEFAULT_WORKER_IMAGE,
     DEFAULT_WORKER_SIZING,
-    GFW_COMMON_MACHINE_TYPE_OPTION,
-    MAX_NUM_WORKERS_HELP_DETAIL,
     PIPELINE_NAME,
     PROJECT,
-    REPO_NAME,
-    RUNNERS,
-    STEP_NAME,
     STEP_WORKER_SIZING,
 )
+from workflows.pipe_gaps.raw_gaps import dit_run_labels as _dit_run_labels
+from workflows.pipe_gaps.raw_gaps import job_name as _job_name
+from workflows.pipe_gaps.raw_gaps import make_config as _make_config
+from workflows.pipe_gaps.raw_gaps import resolve_suffix as _resolve_suffix
+from workflows.pipe_gaps.raw_gaps import run_pipeline as _run_pipeline
 
 # Defaults point at the dit staging cohort. Matches the staging-by-default
 # precedent set by ``workflows/pipe_gaps/mode_equivalence.py``; see also the
@@ -275,52 +288,13 @@ PIN_ROLE = "outage"
 MESSAGES_WINDOW_COLUMN = "timestamp"
 
 COMPARE_KEYS = ("gap_id", "start_timestamp")
-COMPARE_VIEW_SUFFIX = "_last_versions"
 
-# Cache buster for the dit-side run cache.
-WORKFLOW_FILE_SHA1 = sha1_of_workflow_file(__file__)
+# Cache buster for the dit-side run cache. Covers raw_gaps.py too, where the
+# job's config lives.
+WORKFLOW_FILE_SHA1 = raw_gaps.workflow_sha1(__file__)
 WORKFLOW_NAME = "workflows/pipe_gaps/outage_recovery.py"
 
 logger = logging.getLogger(__name__)
-
-
-_UNSAFE_LABEL_CHAR_RE = re.compile(r"[^a-z0-9_-]")
-_DIGEST_RE = re.compile(r"@sha\d{3}:[0-9a-f]+$", re.IGNORECASE)
-
-
-def _safe_label_value(value: str) -> str:
-    return _UNSAFE_LABEL_CHAR_RE.sub("-", value.lower())[:63]
-
-
-def _worker_image_tag(image: str) -> str:
-    image = _DIGEST_RE.sub("", image)
-    return image.rsplit(":", 1)[-1] if ":" in image else "latest"
-
-
-def _dit_run_labels(args: argparse.Namespace) -> list[str]:
-    return [
-        f"dit_run_id={args.run_id}",
-        f"dit_commit_sha={_safe_label_value(args.pipeline_commit)}",
-        f"dit_worker_image_tag={_safe_label_value(_worker_image_tag(args.worker_image))}",
-        f"dit_launched_by={_safe_label_value(os.environ.get('USER', 'unknown'))}",
-    ]
-
-
-def _resolve_suffix(args: argparse.Namespace) -> str:
-    if args.suffix is not None:
-        return args.suffix
-    return f"{args.experiment_id}_{args.pipeline_commit}_{uuid.uuid4().hex[:6]}"
-
-
-def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
-    return make_job_name(
-        repo=REPO_NAME,
-        step=STEP_NAME,
-        experiment_id=experiment_id,
-        mode=mode,
-        iteration=iteration,
-        total_iterations=total,
-    )
 
 
 # --------------------------------------------------------------------------
@@ -328,19 +302,19 @@ def _job_name(experiment_id: str, mode: str, iteration: int, total: int) -> str:
 # --------------------------------------------------------------------------
 #
 # Same shape as workflows/port_visits/cross_version_ais.py. What is copied is
-# what pipe-gaps reads over the whole run, read from pipe-gaps v0.10.0
-# (DEFAULT_WORKER_IMAGE):
+# what pipe-gaps reads over the whole run, read from pipe-gaps v0.17.1
+# (DEFAULT_WORKER_IMAGE; unchanged since v0.10.0):
 #
 # * Messages: assets/queries/messages.sql.j2 filters
 #   ``DATE(timestamp) >= start_date AND DATE(timestamp) < end_date``, and the
-#   DAG factory passes ``DetectGapsConfig.messages_query_start_date`` as the
+#   DAG factory passes ``RawGapsConfig.messages_query_start_date`` as the
 #   start: the run's start date minus ``ceil(n_hours_before / 24)`` days. So a
 #   job over ``[s, e)`` reads the messages of ``[s - lookback, e)``.
 # * Segments: the same query reads ``seg_id`` from the segments table with no
 #   date filter (only ``good_seg2``), so the whole table is read. The optional
 #   stabilization hook (``good_seg_stabilization_days``, off here) reads it
 #   whole too.
-# * The open-gaps side input reads the run's own output table, not a source.
+# * The open-gaps side input reads the run's own versioned table, not a source.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -549,197 +523,6 @@ def _derive_synthetic_outage_view(
     return filtered_fqn
 
 
-def _make_config(
-    *,
-    start: date,
-    end: date,
-    bq_input_messages: str,
-    bq_input_segments: str,
-    bq_output_gaps: str,
-    ssvids: tuple[str, ...],
-    min_gap_length: float,
-    n_hours_before: int,
-    window_period_d: int,
-    filter_good_seg: bool,
-    skip_open_gaps: bool,
-    service_account: Optional[str] = None,
-    bq_temp_dataset: Optional[str] = None,
-    dataflow_region: Optional[str] = None,
-    dataflow_temp_bucket: Optional[str] = None,
-    dataflow_subnetwork: Optional[str] = None,
-    worker_image: Optional[str] = None,
-    job_name: Optional[str] = None,
-    labels: Optional[Sequence[str]] = None,
-    max_num_workers: Optional[int] = None,
-    worker_sizing: WorkerSizing | None = None,
-) -> SimpleNamespace:
-    """Build a DetectGapsConfig-shaped namespace.
-
-    Mirrors ``mode_equivalence._make_config``; the workflow-local copy
-    exists so we can iterate the source-table FQNs per stage without
-    drifting against mode_equivalence's signature. Source-state pinning
-    is handled OUTSIDE pipe-gaps via ``dit.bq.pin_source_into_experiment``
-    (see :func:`_pin` above), so the pipe-gaps process receives ordinary
-    table FQNs and is none the wiser about the pinned copies.
-    """
-    unknown_parsed_args: dict[str, Any] = {"project": PROJECT}
-    if labels:
-        unknown_parsed_args["labels"] = list(labels)
-    cfg = SimpleNamespace(
-        date_range=(start.isoformat(), end.isoformat()),
-        bq_input_messages=bq_input_messages,
-        bq_input_segments=bq_input_segments,
-        bq_output_gaps=bq_output_gaps,
-        ssvids=ssvids,
-        min_gap_length=min_gap_length,
-        n_hours_before=n_hours_before,
-        window_period_d=window_period_d,
-        filter_good_seg=filter_good_seg,
-        skip_open_gaps=skip_open_gaps,
-        unknown_parsed_args=unknown_parsed_args,
-        unknown_unparsed_args=[],
-    )
-    cfg.service_account = service_account
-    cfg.bq_temp_dataset = bq_temp_dataset
-    cfg.dataflow_region = dataflow_region
-    cfg.dataflow_temp_bucket = dataflow_temp_bucket
-    cfg.dataflow_subnetwork = dataflow_subnetwork
-    cfg.worker_image = worker_image
-    cfg.job_name = job_name
-    # Runner-only, as in mode_equivalence._make_config.
-    cfg.max_num_workers = max_num_workers
-    cfg.worker_sizing = DEFAULT_WORKER_SIZING if worker_sizing is None else worker_sizing
-    return cfg
-
-
-def _cfg_to_cli_flags(cfg: SimpleNamespace) -> list[str]:
-    flags: list[str] = []
-
-    def _add(name: str, value: object) -> None:
-        if value is None or value == "" or value == ():
-            return
-        flags.append(f"--{name.replace('_', '-')}")
-        flags.append(str(value))
-
-    _add("date-range", ",".join(cfg.date_range))
-    _add("bq-input-messages", cfg.bq_input_messages)
-    _add("bq-input-segments", cfg.bq_input_segments)
-    _add("bq-output-gaps", cfg.bq_output_gaps)
-    _add("min-gap-length", cfg.min_gap_length)
-    _add("n-hours-before", cfg.n_hours_before)
-    _add("window-period-d", cfg.window_period_d)
-    if cfg.filter_good_seg:
-        _add("filter-good-seg", "true")
-    if cfg.skip_open_gaps:
-        _add("skip-open-gaps", "true")
-    if cfg.ssvids:
-        _add("ssvids", ",".join(cfg.ssvids))
-    return flags
-
-
-def _build_pipeline_for(cfg: SimpleNamespace):
-    """Return a ``pipeline_builder`` closure for the dataflow runner.
-
-    Mirrors ``mode_equivalence._build_pipeline_for``.
-    """
-    def _build(options: Mapping[str, Any]):
-        from gfw.common.beam.pipeline.factory import PipelineFactory
-
-        from pipe_gaps.pipelines.detect.config import DetectGapsConfig
-        from pipe_gaps.pipelines.detect.factory import DetectGapsLinearDagFactory
-        from pipe_gaps.version import __version__ as pipe_gaps_version
-
-        opts = dict(options)
-        factory_cls = opts.pop("dag_factory_cls", DetectGapsLinearDagFactory)
-        opts.pop("bq_temp_dataset", None)
-
-        parsed = dict(cfg.unknown_parsed_args)
-        for key, value in opts.items():
-            parsed.setdefault(key, value)
-
-        if cfg.job_name:
-            parsed.setdefault("job_name", cfg.job_name)
-
-        runner_only_attrs = {
-            "service_account",
-            "bq_temp_dataset",
-            "dataflow_region",
-            "dataflow_temp_bucket",
-            "dataflow_subnetwork",
-            "worker_image",
-            "job_name",
-            "max_num_workers",
-            "worker_sizing",
-        }
-        cfg_attrs = {k: v for k, v in vars(cfg).items() if k not in runner_only_attrs}
-        df_cfg = SimpleNamespace(**cfg_attrs)
-        df_cfg.unknown_parsed_args = parsed
-
-        config = DetectGapsConfig.from_namespace(df_cfg, version=pipe_gaps_version)
-        return PipelineFactory(config, dag_factory=factory_cls(config)).build_pipeline()
-
-    return _build
-
-
-def _run_pipeline(runner: str, cfg: SimpleNamespace, image_tag: str) -> None:
-    """Submit one detect run via the chosen runner.
-
-    Identical control flow to ``mode_equivalence._run_pipeline``; forked
-    here for two reasons: (1) so we can keep the workflow self-contained
-    and not import private helpers from a sibling workflow, and (2) so
-    the log line names the source table that's actually being read,
-    which differs per stage in this workflow.
-    """
-    logger.info(
-        "[%s] start=%s end=%s msgs=%s out=%s",
-        runner, cfg.date_range[0], cfg.date_range[1],
-        cfg.bq_input_messages, cfg.bq_output_gaps,
-    )
-    if runner == "docker":
-        flags = ["detect", *_cfg_to_cli_flags(cfg), "--project", PROJECT]
-        rc = dit_docker.run(
-            image_tag=image_tag,
-            args=flags,
-            build_from_source=True,
-            entrypoint="pipe-gaps",
-        )
-        if rc != 0:
-            raise RuntimeError(f"docker runner exited with {rc} for {cfg.bq_output_gaps}")
-        return
-
-    if runner == "dataflow":
-        from pipe_gaps.pipelines.detect.factory import DetectGapsLinearDagFactory
-
-        if not cfg.worker_image:
-            raise RuntimeError(
-                "dataflow runner requires --worker-image (or a non-empty "
-                "DEFAULT_WORKER_IMAGE)."
-            )
-        rc = dit_dataflow.run(
-            # The worker cap and sizing, if any, and nothing for worker IPs;
-            # see mode_equivalence._run_pipeline.
-            args=[
-                *max_num_workers_options(cfg.max_num_workers),
-                *worker_sizing_options(
-                    cfg.worker_sizing, machine_type_option=GFW_COMMON_MACHINE_TYPE_OPTION,
-                ),
-            ],
-            image_tag=cfg.worker_image,
-            service_account=cfg.service_account,
-            region=cfg.dataflow_region,
-            temp_bucket=cfg.dataflow_temp_bucket,
-            subnetwork=cfg.dataflow_subnetwork,
-            bq_temp_dataset=cfg.bq_temp_dataset or "",
-            pipeline_builder=_build_pipeline_for(cfg),
-            dag_factory_cls=DetectGapsLinearDagFactory,
-        )
-        if rc != 0:
-            raise RuntimeError(f"dataflow runner exited with {rc} for {cfg.bq_output_gaps}")
-        return
-
-    raise ValueError(f"unknown runner: {runner}")
-
-
 # --------------------------------------------------------------------------
 # Stage execution
 # --------------------------------------------------------------------------
@@ -797,7 +580,7 @@ def execute_outage_recovery(
     By default all three stages read the same source (the outage is
     simulated by skipping date ranges only), so ``base_cfg`` is a single
     kwargs dict. With ``filtered_messages`` set (the ``--synthetic-outage``
-    path, M6b), stages 1+2 read THAT as their ``bq_input_messages``
+    path, M6b), stages 1+2 read THAT as their ``bq_in_messages``
     (a derived view with the outage dates filtered out -- they see the
     source as it would have looked DURING the outage), while stage 3
     keeps ``base_cfg``'s unfiltered messages (the recovery runs after the
@@ -812,7 +595,7 @@ def execute_outage_recovery(
     # unfiltered messages.
     stage12_cfg = dict(base_cfg)
     if filtered_messages is not None:
-        stage12_cfg["bq_input_messages"] = filtered_messages
+        stage12_cfg["bq_in_messages"] = filtered_messages
 
     # All workflow-level dates are INCLUSIVE; pipe-gaps' --date-range upper
     # bound is EXCLUSIVE (messages.sql.j2 filters DATE(timestamp) <
@@ -823,7 +606,7 @@ def execute_outage_recovery(
 
     # Stage 1: initial backfill [start, backfill_end] inclusive.
     cfg = _make_config(
-        start=start, end=backfill_end + one_day, bq_output_gaps=output,
+        start=start, end=backfill_end + one_day, bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 1, 3),
         **stage12_cfg,
     )
@@ -846,7 +629,7 @@ def execute_outage_recovery(
     else:
         stage2_start = outage_end + one_day
     cfg = _make_config(
-        start=stage2_start, end=end + one_day, bq_output_gaps=output,
+        start=stage2_start, end=end + one_day, bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 2, 3),
         **stage12_cfg,
     )
@@ -855,7 +638,7 @@ def execute_outage_recovery(
     # Stage 3: recovery backfill [outage_start - buffer, end] inclusive.
     recovery_start_day = outage_start - timedelta(days=recovery_buffer_days)
     cfg = _make_config(
-        start=recovery_start_day, end=end + one_day, bq_output_gaps=output,
+        start=recovery_start_day, end=end + one_day, bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_RECOVERY, 3, 3),
         **base_cfg,
     )
@@ -882,7 +665,7 @@ def execute_outage_oracle(
     matching the staged stages.
     """
     cfg = _make_config(
-        start=start, end=end + timedelta(days=1), bq_output_gaps=output,
+        start=start, end=end + timedelta(days=1), bq_out_gaps=output,
         job_name=_job_name(experiment_id, MODE_OUTAGE_ORACLE, 1, 1),
         **base_cfg,
     )
@@ -1001,6 +784,8 @@ def _run_with_cache(
         experiment_id=args.experiment_id,
         cache_key=cache_key,
         output_fqn=output_fqn,
+        # The versioned table behind the view: recorded so cleanup drops it.
+        extra_output_tables=raw_gaps.output_tables(output_fqn)[1:],
         execute_kwargs=execute_kwargs,
         log_label=mode,
         use_cache=not args.no_cache,
@@ -1129,7 +914,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=("Dry-run the copies only: report each copy's estimated bytes "
               "against --pin-max-gb, then stop. Nothing is created, and no "
               "pipeline and no comparison runs. With --reuse-pin it checks "
-              "that the copies exist."),
+              "that the copies exist. Where pipe-gaps v0.17.x is installed, "
+              "each job's config and DAG are also built offline."),
     )
     for removed in REMOVED_FLAGS:
         # nargs="?" so the flag is rejected with its own message whether or
@@ -1280,6 +1066,67 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return args
 
 
+def _base_cfg(
+    args: argparse.Namespace, messages: str, segments: str, *, labels: Sequence[str],
+) -> dict[str, Any]:
+    """The ``raw_gaps.make_config`` arguments every job of the run shares;
+    ``messages`` and ``segments`` are the tables the jobs read."""
+    return dict(
+        bq_in_messages=messages,
+        bq_in_segments=segments,
+        ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
+        min_gap_length=args.min_gap_length,
+        n_hours_before=args.n_hours_before,
+        window_period_d=args.window_period_d,
+        filter_good_seg=(args.filter_good_seg == "True"),
+        skip_open_gaps=args.skip_open_gaps,
+        service_account=args.service_account,
+        bq_temp_dataset=args.bq_temp_dataset or None,
+        dataflow_region=args.dataflow_region or None,
+        dataflow_temp_bucket=args.dataflow_temp_bucket or None,
+        dataflow_subnetwork=args.dataflow_subnetwork or None,
+        worker_image=args.worker_image or None,
+        labels=list(labels),
+        max_num_workers=args.max_num_workers,
+        worker_sizing=args.worker_sizing,
+    )
+
+
+#: The cleanup label of a dry run's job configs: nothing is submitted.
+DRY_RUN_LABELS = ("dit_run_id=dry-run",)
+
+
+def _check_jobs(
+    args: argparse.Namespace, messages: str, segments: str, *,
+    start: date, backfill_end: date, outage_start: date, outage_end: date, end: date,
+) -> None:
+    """``--dry-run``: build the config and DAG of the 3 + 1 jobs offline
+    (``raw_gaps.CHECK_RUNNER``), where pipe-gaps v0.17.x is installed."""
+    try:
+        importlib.import_module("pipe_gaps.pipelines.raw_gaps.factory")
+    except ImportError as exc:
+        logger.warning("--dry-run: pipe-gaps %s not importable (%s); job configs "
+                       "are not checked", raw_gaps.PIPELINE_VERSION, exc)
+        return
+    base_cfg = _base_cfg(args, messages, segments, labels=DRY_RUN_LABELS)
+    common = dict(base_cfg=base_cfg, experiment_id=args.experiment_id,
+                  image_tag=args.image_tag)
+    execute_outage_recovery(
+        raw_gaps.CHECK_RUNNER, start=start, backfill_end=backfill_end,
+        outage_start=outage_start, outage_end=outage_end, end=end,
+        recovery_buffer_days=args.recovery_buffer_days,
+        output=f"{PROJECT}.{args.dest_dataset}.outage_dry_run_{MODE_OUTAGE_RECOVERY}",
+        filtered_messages=f"{messages}_outage_filtered" if args.synthetic_outage else None,
+        **common,
+    )
+    execute_outage_oracle(
+        raw_gaps.CHECK_RUNNER, start=start, end=end,
+        output=f"{PROJECT}.{args.dest_dataset}.outage_dry_run_{MODE_OUTAGE_ORACLE}",
+        **common,
+    )
+    logger.info("--dry-run: the config and DAG of all 4 jobs were built offline")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(list(argv) if argv is not None else None)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1297,11 +1144,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.skip_pipelines:
             logger.info("--dry-run with --skip-pipelines: such a run pins nothing")
         else:
-            _resolve_sources(args)
+            src_msgs, src_segs = _resolve_sources(args)
             if args.no_pin:
                 logger.info("--dry-run with --no-pin: nothing is copied, so nothing to estimate")
             if args.synthetic_outage:
                 logger.info("--dry-run: the --synthetic-outage view is not created")
+            _check_jobs(args, src_msgs, src_segs, start=start, backfill_end=backfill_end,
+                        outage_start=outage_start, outage_end=outage_end, end=end)
         logger.info("--dry-run: no pipeline and no comparison ran")
         return 0
 
@@ -1363,7 +1212,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     base = f"{PROJECT}.{args.dest_dataset}.outage_{suffix}"
     recovery_table = f"{base}_{MODE_OUTAGE_RECOVERY}"
     oracle_table = f"{base}_{MODE_OUTAGE_ORACLE}"
-    logger.info("output tables:")
+    logger.info("output views (each over <view>_%s):", raw_gaps.VERSIONED_SUFFIX)
     logger.info("  %s  (staged outage_recovery)", recovery_table)
     logger.info("  %s  (single-shot oracle)",       oracle_table)
 
@@ -1392,25 +1241,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 outage_end=outage_end,
             )
 
-        base_cfg = dict(
-            bq_input_messages=src_msgs,
-            bq_input_segments=src_segs,
-            ssvids=tuple(s.strip() for s in args.ssvids.split(",") if s.strip()),
-            min_gap_length=args.min_gap_length,
-            n_hours_before=args.n_hours_before,
-            window_period_d=args.window_period_d,
-            filter_good_seg=(args.filter_good_seg == "True"),
-            skip_open_gaps=args.skip_open_gaps,
-            service_account=args.service_account,
-            bq_temp_dataset=args.bq_temp_dataset or None,
-            dataflow_region=args.dataflow_region or None,
-            dataflow_temp_bucket=args.dataflow_temp_bucket or None,
-            dataflow_subnetwork=args.dataflow_subnetwork or None,
-            worker_image=args.worker_image or None,
-            labels=dit_labels,
-            max_num_workers=args.max_num_workers,
-            worker_sizing=args.worker_sizing,
-        )
+        base_cfg = _base_cfg(args, src_msgs, src_segs, labels=dit_labels)
         recovery_kwargs = dict(
             runner=args.runner,
             base_cfg=base_cfg,
@@ -1477,18 +1308,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     logger.info("=" * 80)
     logger.info("comparison: %s vs %s", MODE_OUTAGE_RECOVERY, MODE_OUTAGE_ORACLE)
     logger.info("=" * 80)
-    rc = dit_compare.compare_tables(
-        recovery_table, oracle_table,
-        keys=COMPARE_KEYS, view_suffix=COMPARE_VIEW_SUFFIX,
-    )
+    # Both are latest-state views (bq_out_gaps); see the module docstring for
+    # what the view's min_gap_length filter hides.
+    rc = dit_compare.compare_tables(recovery_table, oracle_table, keys=COMPARE_KEYS)
     if rc != 0:
         logger.error(
             "outage_recovery vs oracle reported differences. Two known "
             "classes (issue #59 forensics): (a) OUTAGE-CLASS LEFTOVERS -- "
             "sub-threshold closed gaps starting in the last hour before "
-            "the outage boundary, surviving the recovery (a pipe-gaps "
-            "regression; RED on pre-MAP-1676 code, fixed on main >= "
-            "81118be). Signature: asymmetric only-in-staged keys + "
+            "the outage boundary, surviving the recovery into the view (a "
+            "pipe-gaps regression; RED on pre-MAP-1676 code; since v0.10.1 "
+            "the view filters them, so here the filter regressed). "
+            "Signature: asymmetric only-in-staged keys + "
             "staged row count exceeding the oracle's. (b) CLOSE-PATH "
             "NON-DETERMINISM -- symmetric only-in counts and "
             "msgid/coordinate value diffs; a separate known pipe-gaps "

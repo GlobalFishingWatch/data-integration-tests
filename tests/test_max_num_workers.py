@@ -46,6 +46,7 @@ from workflows.encounters import ais as encounters_ais
 from workflows.encounters import vms as encounters_vms
 from workflows.pipe_gaps import mode_equivalence as gaps_modes
 from workflows.pipe_gaps import outage_recovery as gaps_outage
+from workflows.pipe_gaps import raw_gaps
 from workflows.pipe_segment import ais as pipe_segment_modes
 from workflows.pipe_segment import identity_match_key as pipe_segment
 from workflows.port_visits import ais as port_visits
@@ -430,9 +431,6 @@ def test_cross_version_bindings_inherit_the_ceiling(extra, workers, source, monk
 # pipe-gaps: in-process submission through dit.runners.dataflow
 # --------------------------------------------------------------------------
 
-GAPS_MODULES = [gaps_modes, gaps_outage]
-
-
 def _install_modules(monkeypatch, **modules):
     """Stub ``modules`` and every missing parent package in sys.modules."""
     for name, module in modules.items():
@@ -457,10 +455,10 @@ class _Stop(Exception):
 @pytest.fixture
 def stubbed_gaps_stack(monkeypatch):
     """Stub Beam, gfw-common and pipe_gaps (none are in dit's venv) and record
-    the namespace ``DetectGapsConfig.from_namespace`` receives."""
+    the namespace ``RawGapsConfig.from_namespace`` receives."""
     seen = {}
 
-    class DetectGapsConfig:
+    class RawGapsConfig:
         @classmethod
         def from_namespace(cls, ns, **_):
             seen["ns"] = ns
@@ -480,21 +478,20 @@ def stubbed_gaps_stack(monkeypatch):
                 "apache_beam.runners.runner", PipelineState=SimpleNamespace(DONE="DONE")),
             "gfw.common.beam.pipeline.factory": _module(
                 "gfw.common.beam.pipeline.factory", PipelineFactory=PipelineFactory),
-            "pipe_gaps.pipelines.detect.config": _module(
-                "pipe_gaps.pipelines.detect.config", DetectGapsConfig=DetectGapsConfig),
-            "pipe_gaps.pipelines.detect.factory": _module(
-                "pipe_gaps.pipelines.detect.factory",
-                DetectGapsLinearDagFactory=type("F", (), {"__init__": lambda self, c: None})),
-            "pipe_gaps.version": _module("pipe_gaps.version", __version__="0"),
+            "pipe_gaps.pipelines.raw_gaps.config": _module(
+                "pipe_gaps.pipelines.raw_gaps.config", RawGapsConfig=RawGapsConfig),
+            "pipe_gaps.pipelines.raw_gaps.factory": _module(
+                "pipe_gaps.pipelines.raw_gaps.factory",
+                RawGapsLinearDagFactory=type("F", (), {"__init__": lambda self, c: None})),
         },
     )
     return seen
 
 
-def _gaps_cfg(module, max_num_workers):
-    return module._make_config(
-        start=date(2020, 1, 1), end=date(2020, 1, 2), bq_input_messages="p.d.m",
-        bq_input_segments="p.d.s", bq_output_gaps="p.d.out", ssvids=(), min_gap_length=1.0,
+def _gaps_cfg(max_num_workers):
+    return raw_gaps.make_config(
+        start=date(2020, 1, 1), end=date(2020, 1, 2), bq_in_messages="p.d.m",
+        bq_in_segments="p.d.s", bq_out_gaps="p.d.out", ssvids=(), min_gap_length=1.0,
         n_hours_before=12, window_period_d=2, filter_good_seg=True, skip_open_gaps=False,
         service_account="sa", bq_temp_dataset=None, dataflow_region="us-central1",
         dataflow_temp_bucket="b", dataflow_subnetwork="net", worker_image="img",
@@ -502,40 +499,41 @@ def _gaps_cfg(module, max_num_workers):
     )
 
 
-@pytest.mark.parametrize("module", GAPS_MODULES)
+# Both workflows run one job through raw_gaps.run_pipeline, so these tests
+# exercise it once; test_gaps_main_threads_the_cap_into_every_stage_and_logs_it_once
+# covers what each workflow hands it.
+
 @pytest.mark.parametrize("cap, expected_args", [
     (None, []), (50, ["--max_num_workers=50"]), (7, ["--max_num_workers=7"]),
 ])
-def test_gaps_runner_gets_the_cap_as_beam_args(module, cap, expected_args, monkeypatch):
-    _install_modules(monkeypatch, **{"pipe_gaps.pipelines.detect.factory": _module(
-        "pipe_gaps.pipelines.detect.factory", DetectGapsLinearDagFactory=object)})
+def test_gaps_runner_gets_the_cap_as_beam_args(cap, expected_args, monkeypatch):
+    _install_modules(monkeypatch, **{"pipe_gaps.pipelines.raw_gaps.factory": _module(
+        "pipe_gaps.pipelines.raw_gaps.factory", RawGapsLinearDagFactory=object)})
     calls = []
-    with patch.object(module.dit_dataflow, "run", side_effect=lambda **k: calls.append(k) or 0):
-        module._run_pipeline("dataflow", _gaps_cfg(module, cap), "local-tag")
+    with patch.object(raw_gaps.dit_dataflow, "run", side_effect=lambda **k: calls.append(k) or 0):
+        raw_gaps.run_pipeline("dataflow", _gaps_cfg(cap), "local-tag")
 
     # The sizing tokens that follow are tests/test_worker_ips_and_sizing.py's.
     assert _cap_tokens(calls[0]["args"]) == expected_args
 
 
-@pytest.mark.parametrize("module", GAPS_MODULES)
 @pytest.mark.parametrize("cap", [None, 7])
-def test_gaps_cap_reaches_the_pipeline_options_and_not_the_config(module, cap, stubbed_gaps_stack):
+def test_gaps_cap_reaches_the_pipeline_options_and_not_the_config(cap, stubbed_gaps_stack):
     with pytest.raises(_Stop):
-        module._run_pipeline("dataflow", _gaps_cfg(module, cap), "local-tag")
+        raw_gaps.run_pipeline("dataflow", _gaps_cfg(cap), "local-tag")
 
     ns = stubbed_gaps_stack["ns"]
-    # DetectGapsConfig is a dataclass built from vars(ns): a stray attribute crashes it.
+    # RawGapsConfig is a dataclass built from vars(ns): a stray attribute crashes it.
     assert not hasattr(ns, "max_num_workers")
     # gfw-common's Pipeline gives these precedence over its own default of 100;
     # Beam's from_dictionary turns "7" into --max_num_workers=7 (type=int).
     assert ns.unknown_parsed_args.get("max_num_workers") == (None if cap is None else str(cap))
 
 
-@pytest.mark.parametrize("module", GAPS_MODULES)
-def test_gaps_docker_runner_gets_no_cap(module):
+def test_gaps_docker_runner_gets_no_cap():
     calls = []
-    with patch.object(module.dit_docker, "run", side_effect=lambda **k: calls.append(k) or 0):
-        module._run_pipeline("docker", _gaps_cfg(module, 7), "local-tag")
+    with patch.object(raw_gaps.dit_docker, "run", side_effect=lambda **k: calls.append(k) or 0):
+        raw_gaps.run_pipeline("docker", _gaps_cfg(7), "local-tag")
 
     assert not any("max" in str(a) for a in calls[0]["args"])
 

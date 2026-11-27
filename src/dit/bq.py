@@ -77,8 +77,8 @@ def drop_tables(prefix: str, *, project: str = DEFAULT_PROJECT) -> None:
     ``prefix`` is matched against ``<project>.<dataset>.<table>`` after the
     dataset has been resolved -- callers must pass at least
     ``<project>.<dataset>.<stem>`` so the dataset can be inferred. Views
-    backing the matching tables (e.g. ``<table>_last_versions``) are dropped
-    too.
+    whose names start with the prefix are dropped too (e.g. a pipe-gaps
+    latest-state view and its ``<view>_versioned`` table).
     """
     if prefix.count(".") < 2:
         raise ValueError(
@@ -107,7 +107,13 @@ def query_for_restricted_ssvids(
 ) -> list[str]:
     """Pick a ~half-size sample of ssvids whose data was 'visible' during step 2.
 
-    Reads ``{reference_table}_last_versions`` and partitions ssvids into
+    Reads ``reference_table`` exactly as given, with no suffix appended.
+    Callers pass the reference run's latest-state view (pipe-gaps v0.17.1's
+    ``bq_out_gaps``: each gap's last version, closed gaps above
+    ``min_gap_length``). Before 2026-11-27 this function appended
+    ``_last_versions`` and read pipe-gaps v0.10.0's view of that name; a
+    caller that passes a versioned table now reads every version of each gap.
+    Partitions the ssvids it reads into
 
     * **triggering** -- have a closed gap that meets all three conditions:
       ``DATE(start_timestamp) < mid - W - 1d`` (OFF predates step 3's
@@ -125,7 +131,7 @@ def query_for_restricted_ssvids(
     triggering, returns the entire non-triggering set (smaller than half)
     rather than diluting the signal. Reproducible via ``seed``.
 
-    Pre-condition: ``{reference_table}_last_versions`` already exists.
+    Pre-condition: ``reference_table`` already exists.
     """
     client = bigquery.Client(project=project)
 
@@ -134,11 +140,11 @@ def query_for_restricted_ssvids(
 
     sql = f"""
         WITH all_ssvids AS (
-            SELECT DISTINCT ssvid FROM `{reference_table}_last_versions`
+            SELECT DISTINCT ssvid FROM `{reference_table}`
         ),
         triggering AS (
             SELECT DISTINCT ssvid
-            FROM `{reference_table}_last_versions`
+            FROM `{reference_table}`
             WHERE is_closed = TRUE
               AND DATE(start_timestamp) < DATE('{off_cutoff.isoformat()}')
               AND DATE(end_timestamp) >= DATE('{end_lower.isoformat()}')

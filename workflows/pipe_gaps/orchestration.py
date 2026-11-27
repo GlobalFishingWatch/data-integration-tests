@@ -19,7 +19,7 @@ ORCHESTRATION = PipelineOrchestration(
     steps=(
         StepOrchestration(
             step="detect",
-            command="detect",
+            command="raw-gaps",
             parallel_slices=PARALLEL_FORBIDDEN,
             depends_on_previous_run=True,
             status=STATUS_CLAIMED,

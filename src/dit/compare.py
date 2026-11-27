@@ -58,8 +58,10 @@ def compare_tables(
     means something went wrong" contract.
 
     ``view_suffix`` is appended to both fully-qualified table names before
-    the call. SCD-2 consumers (pipe-gaps) pass ``"_last_versions"``;
-    truncate-shape consumers (port visits, pipe-events) pass ``""``.
+    the call. Every current consumer passes ``""``: pipe-gaps (v0.17.1)
+    compares its latest-state view by name (pipe-gaps v0.10.0, until
+    2026-11-27, passed ``"_last_versions"``), and truncate-shape consumers
+    (port visits, pipe-events) compare their tables or views directly.
     pipe-events is keyed by ``event_id`` with table-level (date-suffixed)
     versioning and no SCD-2 columns, so it compares the latest-version VIEW
     directly with ``view_suffix=""``.

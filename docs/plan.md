@@ -133,7 +133,7 @@ Source: `mode_equivalence.py` lines 286–399 (`_run_dataflow`). Submission and 
 Two parameters were added during Track 3 to make the runner pipeline-agnostic without re-importing pipe-gaps internals:
 
 * `pipeline_builder` -- required callable. Given the merged Beam options mapping, the workflow returns a built `gfw.common.beam.pipeline.Pipeline`-shaped object (exposes `_pre_hooks`, `_post_hooks`, `apply_dag()`, `.pipeline.run()`). The runner does the lock-split submit/wait around whatever pipeline the workflow built.
-* `dag_factory_cls` -- optional DAG factory class. When `bq_temp_dataset` is set, the runner subclasses it to inject `temp_dataset` into `read_from_bigquery_factory` (the `_DagFactoryWithTempDataset` pattern, ported as a generic wrapper). The wrapped class is forwarded to `pipeline_builder` via the `dag_factory_cls` key in the options mapping; workflows that don't need temp-dataset injection can omit it and ignore the key.
+* `dag_factory_cls` -- optional DAG factory class. When `bq_temp_dataset` is set, the runner subclasses it to add `temp_dataset` to the keyword arguments of its BigQuery reads (the `_DagFactoryWithTempDataset` pattern, ported as a generic wrapper). Since 2026-11-27 (pipe-gaps v0.17.1) it overrides the factory's `read_from_bigquery_kwargs` property and refuses a factory without one; until then it overrode `read_from_bigquery_factory`. The wrapped class is forwarded to `pipeline_builder` via the `dag_factory_cls` key in the options mapping; workflows that don't need temp-dataset injection can omit it and ignore the key.
 
 `env` is reserved for parity with the `Runner` protocol but logged-and-ignored: the dataflow runner is in-process so there is no subprocess to forward env to.
 

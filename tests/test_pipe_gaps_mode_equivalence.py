@@ -226,7 +226,11 @@ def test_run_with_cache_miss_runs_and_writes():
     execute_fn.assert_called_once_with(foo="bar")
     mock_write.assert_called_once()
     written_row = mock_write.call_args.args[0]
-    assert written_row.output_tables == ["proj.ds.fresh_bf_table"]
+    # The view first (the comparison target a hit returns), then its
+    # versioned table, so cancel_run drops both.
+    assert written_row.output_tables == [
+        "proj.ds.fresh_bf_table", "proj.ds.fresh_bf_table_versioned",
+    ]
     assert written_row.status == dit_workflow.STATUS_SUCCEEDED
     assert written_row.pipeline == "pipe-gaps"
     # Returns the FRESH FQN (we just computed it).
@@ -352,31 +356,4 @@ def test_dit_run_labels_full_set():
     assert "dit_worker_image_tag=v0-9-6" in labels
 
 
-def test_make_config_threads_labels_into_unknown_parsed_args():
-    from datetime import date
-
-    labels = ["dit_run_id=rid01", "dit_commit_sha=abc"]
-    cfg = mod._make_config(
-        start=date(2020, 1, 1), end=date(2020, 2, 1),
-        bq_input_messages="a", bq_input_segments="b", bq_output_gaps="c",
-        ssvids=(), min_gap_length=1.0, n_hours_before=12, window_period_d=2,
-        filter_good_seg=True, skip_open_gaps=False, labels=labels,
-    )
-    # The labels list flows into unknown_parsed_args, which the PipelineFactory
-    # spreads into the Beam Pipeline -> GoogleCloudOptions.labels.
-    assert cfg.unknown_parsed_args["labels"] == labels
-    # project is still present (not clobbered).
-    assert cfg.unknown_parsed_args["project"] == mod.PROJECT
-
-
-def test_make_config_no_labels_omits_key():
-    from datetime import date
-
-    cfg = mod._make_config(
-        start=date(2020, 1, 1), end=date(2020, 2, 1),
-        bq_input_messages="a", bq_input_segments="b", bq_output_gaps="c",
-        ssvids=(), min_gap_length=1.0, n_hours_before=12, window_period_d=2,
-        filter_good_seg=True, skip_open_gaps=False,
-    )
-    # No labels passed -> no labels key (so Beam doesn't get an empty list).
-    assert "labels" not in cfg.unknown_parsed_args
+# make_config, the argv and the real pipe-gaps config: tests/test_pipe_gaps_raw_gaps.py.

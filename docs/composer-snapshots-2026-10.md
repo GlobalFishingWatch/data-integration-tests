@@ -310,7 +310,7 @@ Read at composer `origin/main` df5c973c7. The check exits 0: the workflows marke
   - Version: DIT's default image is v4.2.17, production runs v9.0.0.
   - Command: the entrypoint is `pipe` in DIT and `pipe-events` in production, and all four commands are renamed (for example `incremental_events` to `fishing_events_incremental`).
   - Flags (indicative): only `--project` is the same. Every other flag is renamed, from single-dash names to `--bq-in-*`, `--bq-out-*`, `--score-field`, `--reference-date` and so on. Production also passes options DIT has no counterpart for: a field prefix and gear-type filters in the filter steps, a UDF dataset, a regions registry, and a nautical-time raster in the authorization step.
-- **pipe-gaps: drift on all three levels.**
+- **pipe-gaps: drift on all three levels.** (Update 2026-11-27: ported to v0.17.1 and in sync at composer b5c3496e1, apart from the accepted differences in `workflows/pipe_gaps/composer_drift.py`; see `workflows/pipe_gaps/README.md`. The bullets below are the state of 2026-11-19.)
   - Version: DIT's worker image is v0.10.0, production runs v0.17.1.
   - Command: DIT runs `detect`, production `raw-gaps`.
   - Flags (indicative): `--date-range` became `--start-date` / `--end-date`, and the table flags are renamed. Production passes four options DIT lacks (`--versioned-suffix`, `--open-gaps-start-date`, `--good-seg-stabilization-days`, `--eval-last`). DIT passes `--window-period-d`, which production does not. `--min-gap-length` differs in value, and `--filter-good-seg` is a bare flag in production.
