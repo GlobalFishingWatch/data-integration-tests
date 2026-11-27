@@ -105,6 +105,24 @@ def test_the_docker_argv_is_productions_command_and_flag_names() -> None:
     ]
 
 
+#: DIT's full per-run label set (raw_gaps.dit_run_labels).
+RUN_LABELS = raw_gaps.dit_run_labels(SimpleNamespace(
+    run_id="rid01", pipeline_commit="abc1234",
+    worker_image=raw_gaps.DEFAULT_WORKER_IMAGE,
+))
+
+
+def test_the_docker_argv_has_one_labels_flag_per_label() -> None:
+    """The shape gfw-common's ``--labels`` accumulates (see the real-parser
+    test below): every pair, ``dit_run_id`` included, as its own flag."""
+    argv = raw_gaps.docker_argv(_cfg(labels=RUN_LABELS))
+    flags = [token for token in argv if token.startswith("--labels")]
+
+    assert len(RUN_LABELS) == 4
+    assert flags == [f"--labels={label}" for label in RUN_LABELS]
+    assert "--labels=dit_run_id=rid01" in flags
+
+
 def test_boolean_flags_are_gfw_commons_on_off_pairs() -> None:
     argv = raw_gaps.cfg_to_cli_flags(_cfg(filter_good_seg=False, skip_open_gaps=True, ssvids=()))
 
@@ -430,6 +448,24 @@ def test_real_cli_parses_the_docker_argv_to_the_same_config() -> None:
         if key not in ignored:
             assert (value or False) == (from_dit[key] or False), key
     assert from_cli.unknown_unparsed_args == ["--project", raw_gaps.PROJECT]
+
+
+@real_pipe_gaps
+def test_real_cli_keeps_every_label_of_the_repeated_flags() -> None:
+    """gfw-common's ``NestedKeyValueAction`` updates the dict already on the
+    namespace, so repeated ``--labels=k=v`` flags accumulate. If it replaced
+    the dict instead, only the last label would survive and ``make
+    dit-cancel`` would no longer find the jobs by ``dit_run_id``."""
+    import pipe_gaps.cli.commands.raw_gaps as command
+    from pipe_gaps.cli import main as cli
+
+    seen = []
+    with patch.object(command, "run", side_effect=lambda config, **_: seen.append(config)):
+        cli.run(raw_gaps.docker_argv(_cfg(labels=RUN_LABELS)))
+
+    (config,) = seen
+    assert config.labels == raw_gaps.labels_dict(RUN_LABELS)
+    assert config.labels["dit_run_id"] == "rid01"
 
 
 @real_pipe_gaps

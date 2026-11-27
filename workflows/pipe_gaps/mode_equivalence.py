@@ -8,7 +8,7 @@ library; runner / compare / dates / bq concerns now live there, and one
 raw-gaps job is ``workflows/pipe_gaps/raw_gaps.py``.
 
 Written for pipe-gaps v0.17.1 (``raw_gaps.DEFAULT_WORKER_IMAGE``), the
-version production's AIS v5 DAG runs. Dates are half-open ``[--start,
+version the AIS v5 DAG is configured for (composer). Dates are half-open ``[--start,
 --end)``, as pipe-gaps' own ``--start-date`` / ``--end-date``.
 
 The daily modes rely on how a job finds the open gaps of the jobs before it:

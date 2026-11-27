@@ -8,8 +8,9 @@ differed), and porting both to pipe-gaps v0.17.1 would have edited the same
 code twice. They live here now.
 
 Written for **pipe-gaps v0.17.1** (:data:`DEFAULT_WORKER_IMAGE`), the version
-production's AIS v5 DAG pins (composer-dags-production origin/main
-b5c3496e1, task ``gaps.detect_raw_gaps``, read 2026-11-27). Read with
+the AIS v5 DAG is configured for (composer-dags-production origin/main
+b5c3496e1, task ``gaps.detect_raw_gaps``, read 2026-11-27 from the
+rendered snapshot, not from a production job). Read with
 ``git show v0.17.1:<path>`` in a pipe-gaps checkout:
 
 * **Command and classes.** ``pipe-gaps raw-gaps``;
@@ -39,8 +40,24 @@ b5c3496e1, task ``gaps.detect_raw_gaps``, read 2026-11-27). Read with
   open_gaps_start_date`` and ``skip_open_gaps`` is off. DIT passes no
   ``bq_in_open_gaps``, so each job reads the open gaps the earlier jobs wrote
   to the same versioned table, after its own pre-write delete. That is the
-  hand-over the daily modes and the outage stages rely on, and it is the same
-  self-feed as v0.10.0 (which read ``bq_input_open_gaps or bq_output_gaps``).
+  hand-over the daily modes and the outage stages rely on.
+
+  What is unchanged since v0.10.0 is the wiring (v0.10.0 read
+  ``bq_input_open_gaps or bq_output_gaps``), the pre-write delete
+  (``gaps_delete.sql.j2``) and the messages query (``messages.sql.j2``).
+  What changed is ``gaps.sql.j2``, the query behind both the side input and
+  the view, rewritten between the two tags:
+
+  - the ``start_date`` filter now comes before the dedup to each gap's last
+    version (v0.10.0 deduplicated first, then filtered);
+  - for the side input, a gap counts as open only if it has no closed row at
+    all (v0.10.0: if its last version was open);
+  - with ``min_gap_length`` set, closed gaps of ``duration_h <=
+    min_gap_length`` are dropped (``NOT is_closed OR duration_h > ...``).
+    The view sets it; the side input (``OpenGapsQuery``) leaves it unset.
+
+  So the hand-over is wired as before but reads through a different query.
+  It is verified on real data only by the first live run.
 * **Pre-write delete.** Unchanged from v0.10.0 (``gaps_delete.sql.j2``,
   ``GapsTableConfig.delete_query`` ignores the end date): see the reprocess
   contract in ``workflows/pipe_gaps/CLAUDE.md``.
@@ -100,7 +117,8 @@ PIPELINE_VERSION = "v0.17.1"
 #: change: existing job-name and label filters keep working.
 STEP_NAME = "detect"
 
-#: Entrypoint and command of the docker runner, as production's task runs it.
+#: Entrypoint and command of the docker runner, as the AIS v5 DAG's task is
+#: configured.
 CLI_ENTRYPOINT = "pipe-gaps"
 COMMAND = "raw-gaps"
 

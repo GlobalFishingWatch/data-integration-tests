@@ -107,10 +107,13 @@ def query_for_restricted_ssvids(
 ) -> list[str]:
     """Pick a ~half-size sample of ssvids whose data was 'visible' during step 2.
 
-    ``reference_table`` is the reference run's latest-state view (pipe-gaps
-    v0.17.1's ``bq_out_gaps``: each gap's last version). Before 2026-11-27 it
-    named the table and this function read ``<table>_last_versions``, the view
-    of pipe-gaps v0.10.0. Reads it and partitions ssvids into
+    Reads ``reference_table`` exactly as given, with no suffix appended.
+    Callers pass the reference run's latest-state view (pipe-gaps v0.17.1's
+    ``bq_out_gaps``: each gap's last version, closed gaps above
+    ``min_gap_length``). Before 2026-11-27 this function appended
+    ``_last_versions`` and read pipe-gaps v0.10.0's view of that name; a
+    caller that passes a versioned table now reads every version of each gap.
+    Partitions the ssvids it reads into
 
     * **triggering** -- have a closed gap that meets all three conditions:
       ``DATE(start_timestamp) < mid - W - 1d`` (OFF predates step 3's

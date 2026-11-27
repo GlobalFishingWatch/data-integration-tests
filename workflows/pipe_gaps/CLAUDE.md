@@ -22,8 +22,8 @@ WHERE (is_closed = TRUE  AND DATE(end_timestamp)   >= '<start_date>')
    OR (is_closed = FALSE AND DATE(start_timestamp) >= '<start_date>');
 ```
 
-The query is the same at v0.10.0 and at v0.17.1 (production's AIS v5 DAG,
-and DIT's default worker image since 2026-11-27), read with `git show` on
+The query is the same at v0.10.0 and at v0.17.1 (the version the AIS v5 DAG is
+configured for, and DIT's default worker image since 2026-11-27), read with `git show` on
 2026-11-25 and again on 2026-11-27 (`git diff v0.10.0 v0.17.1` is empty
 for `gaps_delete.sql.j2`). `test_real_pre_write_delete_has_no_upper_bound`
 in `tests/test_pipe_gaps_raw_gaps.py` pins it against the installed
@@ -234,5 +234,5 @@ in-process pipeline (`build_pipeline_for`) and the runner dispatch
    (`raw_gaps.workflow_sha1` hashes the workflow file and this module).
 6. **Re-read pipe-gaps when the default worker image moves**, and run
    `tests/test_pipe_gaps_raw_gaps.py` in a venv with that version
-   installed: its last five tests build the real config and pipeline
-   offline and skip everywhere else.
+   installed: its tests marked `real_pipe_gaps` build the real config,
+   parser and pipeline offline and skip everywhere else.
