@@ -6,6 +6,27 @@ The project is pre-1.0. New entries land under `[Unreleased]`; when a meaningful
 
 ## [Unreleased]
 
+### 2026-11-27: pipe-gaps workflows on v0.17.1
+
+#### Changed
+- **Both pipe-gaps workflows run pipe-gaps v0.17.1** (`raw-gaps`), the version production's AIS v5 DAG pins. Default worker image `us-central1-docker.pkg.dev/gfw-int-infrastructure/core/pipe-gaps:v0.17.1`. **v0.10.0 is dropped**, with no switch: the workflows need a pipe-gaps checkout at v0.17.x, and no longer run one older than v0.11.0.
+  - Each job is `--start-date` / `--end-date`, half-open as before: no window moved.
+  - Each mode's output is a latest-state view (`three_way_<suffix>_<mode>`, `outage_<suffix>_<mode>`) over `<view>_versioned`. The comparison reads the views; there is no `_last_versions` view any more. The run cache records view and table, so `make dit-cancel` drops both.
+  - Passed explicitly: `--eval-last`, `--open-gaps-start-date 2012-01-01`, `--versioned-suffix versioned`, `--good-seg-stabilization-days 0`. `--min-gap-length` stays 1 by default (production: 4).
+  - Labels are required by pipe-gaps; DIT's run labels go on the Dataflow job and on every BigQuery read job.
+- **`PIPE_GAPS_BEAM_VERSION` 2.71.0 → 2.76.0** (`Makefile`), v0.17.1's pin. Applies to `make install-pipe-gaps*`, `make install-all` and `make dit-cloud PIPELINE=pipe-gaps`. Recreate a laptop venv that holds pipe-gaps.
+- **`dit.runners.dataflow` passes the temp dataset through the DAG factory's `read_from_bigquery_kwargs` property**, and refuses (`TypeError`) a factory without one, where it overrode `read_from_bigquery_factory` before.
+- **`dit.bq.query_for_restricted_ssvids` reads the table or view it is given**, no longer `<table>_last_versions`.
+- **The pipe-gaps drift spec is in sync** with the AIS v5 DAG; what still differs is accepted, each with its reason.
+- Every cached pipe-gaps row misses once: the cache key now hashes the workflow file and `workflows/pipe_gaps/raw_gaps.py`.
+
+#### Added
+- **`--dry-run` on `workflows/pipe_gaps/mode_equivalence.py`**: logs every job of the selected modes and, where pipe-gaps v0.17.x is installed, builds each job's config and DAG offline. `outage_recovery.py`'s `--dry-run` does the same for its four jobs. Neither reads git state, calls the cloud or creates anything.
+- **`workflows/pipe_gaps/raw_gaps.py`**: one pipe-gaps job, shared by both workflows (the two copies of the config builder it replaces had not diverged).
+
+#### Not verified
+- No Dataflow run on v0.17.1 yet. The temp-dataset hook, the open-gap hand-over between jobs and the view comparison were read and built offline only.
+
 ### 2026-11-25: documentation rewrite
 
 Documentation only; no change to code, flags or workflow behaviour. Spans PRs #102 to #105.

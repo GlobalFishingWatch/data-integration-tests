@@ -8,28 +8,27 @@ Workflow-author rules (the reprocess contract, what the pinned copies must hold)
 
 pipe-gaps reads AIS position messages and the segments table, and writes one row per gap: a time between two consecutive messages of a vessel (`ssvid`) longer than `min_gap_length` hours. A gap with no closing message yet is an *open* gap. When later data closes it, a new row is appended. So the output table holds several versions of a gap, and a view keeps the latest state of each.
 
-DIT drives one step: gap detection (`detect` at v0.10.0). The later gap-events step (`gap-events` at v0.17.1) is not driven.
+DIT drives one step: gap detection (`raw-gaps`). The later gap-events step (`gap-events`) is not driven.
 
-## Versions: DIT is behind production
+## Versions
 
 | | pipe-gaps version | Command | Output |
 |---|---|---|---|
-| DIT default worker image | v0.10.0 | `detect` | table `<out>` plus view `<out>_last_versions` |
-| Production, AIS v5 DAG (composer, 2026-11-19) | v0.17.1 | `raw-gaps` | table `<out>_versioned` plus view `<out>` |
-| Production, AIS v3 DAG (composer, 2026-10-23) | v0.10.3 | `detect` | as v0.10.0 |
+| DIT default worker image (since 2026-11-27) | v0.17.1 | `raw-gaps` | table `<out>_versioned` plus view `<out>` |
+| Production, AIS v5 DAG (composer b5c3496e1, read 2026-11-27) | v0.17.1 | `raw-gaps` | as DIT |
+| Production, AIS v3 DAG (composer, 2026-10-23) | v0.10.3 | `detect` | table `<out>` plus view `<out>_last_versions` |
 
-DIT builds a v0.10.0 config **in-process** with the laptop's (or ditbox's) installed pipe-gaps package. The `pipelines/detect` package was renamed to `pipelines/raw_gaps` in v0.11.0 (pipe-gaps commit `38e6c14`). So today DIT can only run pipe-gaps checkouts older than v0.11.0. pipe-gaps `main` and every production v5 version cannot be tested with these workflows as they are.
+DIT builds a v0.17.1 config **in-process** with the laptop's (or ditbox's) installed pipe-gaps package: `RawGapsConfig` and `RawGapsLinearDagFactory` from `pipe_gaps.pipelines.raw_gaps`. So the checkout must be v0.17.x (pipe-gaps' `pipelines/detect` package was renamed in v0.11.0, commit `38e6c14`). v0.10.0 support was dropped on 2026-11-27 (owner decision), with no switch: the two workflows no longer run a checkout older than v0.11.0.
 
-What catching up to v0.17.x needs (read from pipe-gaps v0.17.1, nothing run):
+One job is [`raw_gaps.py`](raw_gaps.py), shared by both workflows. What it fixes, each read at v0.17.1 with `git show`:
 
-1. **Port the config builder.** `_make_config`, `_cfg_to_cli_flags` and `_build_pipeline_for` move to `RawGapsConfig` and `RawGapsLinearDagFactory`. The CLI flags are renamed (`--date-range` becomes `--start-date` / `--end-date`). `--open-gaps-start-date` and `--min-gap-length` are required. `outage_recovery.py` has its own copy of these functions; port both, or share one.
-2. **Change the comparison target.** v0.17.1 has no `_last_versions` view. It appends to `<bq-out-gaps>_versioned` and makes `<bq-out-gaps>` the latest-state view, which also drops gaps shorter than `min_gap_length`. Compare that view with `view_suffix=""`.
-3. **Bump the Beam pin in the same commit.** v0.17.1 requires `apache-beam[gcp]~=2.76`, Python 3.12 and gfw-common `~=0.24.2`. `PIPE_GAPS_BEAM_VERSION` in the `Makefile` is 2.71.0 (working agreement "Beam-version pin symmetry", [`CLAUDE.md`](../../CLAUDE.md)).
-4. **Decide the new production flags.** Production passes `--versioned-suffix`, `--open-gaps-start-date`, `--good-seg-stabilization-days` and `--eval-last`. DIT passes `--window-period-d`, which production does not, and `--min-gap-length` differs in value ([`docs/composer-snapshots-2026-10.md`](../../docs/composer-snapshots-2026-10.md) § 8d).
-5. **Re-check the pin window.** `messages.sql.j2` and the lookback (`messages_query_start_date`) are the same at v0.17.1, and the segments are still read without a date filter. Re-read them at the version you port to.
-6. **Rewrite the drift spec** (`composer_drift.py`) and set `in_sync=True` once the check passes.
-
-The reprocess contract (below) holds at v0.17.1 too: `gaps_delete.sql.j2` is the same as at v0.10.0.
+- **Dates.** `--start-date` inclusive, `--end-date` exclusive (gfw-common's `DatePipelineConfig`), the same half-open window as v0.10.0's `--date-range`. No job's window moved; a test pins the windows of every mode and stage.
+- **Labels.** Required. DIT's run labels (`dit_run_id` and three more) go into `RawGapsConfig.labels`, which gfw-common puts on the Dataflow job and pipe-gaps on every BigQuery read job.
+- **Output.** `--bq-out-gaps` names the latest-state view; rows are appended to `<view>_versioned`. The view is created after a job finishes. It keeps each gap's last version and drops closed gaps of `duration_h <= min_gap_length` (pipe-gaps' fix of the MAP-1676 class, fdc7336, first in v0.10.1). Both workflows compare the views; the run cache records the view and its table, so `make dit-cancel` drops both.
+- **Open gaps between jobs.** DIT passes no `--bq-in-open-gaps`, so each job reads the still-open gaps from its own versioned table (`bq_in_open_gaps or bq_out_gaps_versioned`), from `--open-gaps-start-date` on, after its own pre-write delete. That is how the daily modes and the outage stages hand open gaps from one job to the next, the same self-feed as v0.10.0. A test pins the side input's query against the installed pipe-gaps.
+- **Fixed values.** `--eval-last` (production's DAG makes it a required field), `--open-gaps-start-date 2012-01-01` (production's), `--versioned-suffix versioned` (production's), and `--good-seg-stabilization-days 0` (production passes 1; owner decision: the staging cohort does not change).
+- **Temp dataset.** `dit.runners.dataflow` adds `temp_dataset` to the keyword arguments of every BigQuery read, through the factory's `read_from_bigquery_kwargs` property. Built offline at v0.17.1, both reads of the graph (messages, open gaps) carry it. Not yet run on Dataflow.
+- **Beam.** v0.17.1 pins `apache-beam==2.76.0`, gfw-common 0.24.2 and Python 3.12; `PIPE_GAPS_BEAM_VERSION` in the `Makefile` is 2.76.0.
 
 ## The reprocess contract
 
@@ -41,7 +40,7 @@ WHERE (is_closed = TRUE  AND DATE(end_timestamp)   >= '<start_date>')
    OR (is_closed = FALSE AND DATE(start_timestamp) >= '<start_date>');
 ```
 
-The delete has no upper bound. A run over `[D, D+15]` deletes every gap from `D` on and re-emits only `[D, D+15]`. So a reprocess must always run to the most recent data day. This is by design. Both workflows obey it: every reprocess stage ends at `--end`. Rules and a worked example: [`CLAUDE.md`](CLAUDE.md).
+The delete has no upper bound. It is the same query at v0.10.0 and v0.17.1, and a test pins it against the installed pipe-gaps. A run over `[D, D+15]` deletes every gap from `D` on and re-emits only `[D, D+15]`. So a reprocess must always run to the most recent data day. This is by design. Both workflows obey it: every reprocess stage ends at `--end`. Rules and a worked example: [`CLAUDE.md`](CLAUDE.md).
 
 ## Workflows
 
@@ -50,7 +49,7 @@ The delete has no upper bound. A run over `[D, D+15]` deletes every gap from `D`
 | [`mode_equivalence.py`](mode_equivalence.py) | check that a backfill and the daily-incremental schedule produce the same gaps | 11 Dataflow jobs at defaults (3 modes, `--tail-days 4`) |
 | [`outage_recovery.py`](outage_recovery.py) | check that an outage followed by a recovery backfill ends in the same state as a clean backfill | 4 Dataflow jobs at defaults |
 
-Both run on Dataflow by default, submitted **in-process** from the Python process that runs the workflow (`dit.runners.dataflow`). `--runner docker` instead runs `pipe-gaps detect` locally with Beam's DirectRunner, in the `dev` service of the pipe-gaps checkout's docker compose file, built from that checkout.
+Both run on Dataflow by default, submitted **in-process** from the Python process that runs the workflow (`dit.runners.dataflow`). `--runner docker` instead runs `pipe-gaps raw-gaps` locally with Beam's DirectRunner, in the `dev` service of the pipe-gaps checkout's docker compose file, built from that checkout.
 
 Both have a run cache (`dit_runs`): a mode whose inputs, code and parameters are unchanged reuses the earlier output table. `--no-cache` recomputes. Both stamp the `dit_run_id` label on their Dataflow jobs, so `make dit-cancel RUN_ID=<id>` stops a run.
 
@@ -71,6 +70,8 @@ Runs the same detection several ways and compares the outputs pairwise. Dates ar
 - `--modes` selects among the first three (default: all three). A single mode runs and reports "no pair to compare".
 - `4_mutate_recover` is off by default. Turn it on with `--enable-pipeline-4` plus either `--restricted-ssvids a,b,c` or `--auto-restrict`. It is compared with `1_bf` only, so `1_bf` must be selected. `--auto-restrict` reads `1_bf`'s output and picks about half of the vessels whose gaps cannot trigger the bug it targets (`dit.bq.query_for_restricted_ssvids`).
 - `--parallel` runs the modes at the same time; each mode's own jobs stay in order.
+- `--dry-run` logs every job of the selected modes (window, job name, output view) and, where pipe-gaps v0.17.x is installed, builds each job's config and DAG offline. It reads no git state, makes no cloud call and creates nothing.
+- Each mode writes `three_way_<suffix>_<mode>` (the view) over `three_way_<suffix>_<mode>_versioned` (the rows).
 - Exit code: 0 when every pair is identical, 1 when any pair differs.
 
 ### `outage_recovery.py`
@@ -84,21 +85,21 @@ Simulates production's daily DAG, an outage, and the recovery backfill an on-cal
 | 3. Recovery | `[--outage-start - --recovery-buffer-days, --end]` = 2020-12-29 to 2020-12-31 | unfiltered messages |
 | Oracle | `[--start, --end]` | unfiltered messages |
 
-- The three stages write to one table; the oracle writes to its own. The two `_last_versions` views are compared.
+- The three stages write to one versioned table; the oracle writes to its own. The two latest-state views are compared. The view hides sub-threshold closed gaps (pipe-gaps' MAP-1676 fix, above), so a comparison sees what consumers read: a regression of that filter shows, leftovers in the versioned table alone do not.
 - Without `--synthetic-outage` the outage is only a gap in the schedule. On the frozen 2020 cohort the stages then read the full source, and the staged run matches the oracle by construction. **Use `--synthetic-outage` for a meaningful test.** It derives a view of the messages with the outage days removed; stages 1 and 2 read the view, stage 3 and the oracle read the unfiltered table.
 - `--recovery-buffer-days 0` (the default) is the setting that discriminates. A buffer of 1 or more widens the recovery's delete enough to hide the bug class (MAP-1676) this workflow was built for.
-- **Pinning.** The sources are copied at run start into `world-fishing-827.tech_great_expectations` (since 2026-11-19, PIPELINE-4705): the messages over `[--start - lookback, --end]` (4.41 GB on the default run, the whole staging table) and the segments whole (4.1 MB). `--reuse-pin <stamp>` reuses an earlier run's copies, `--no-pin` reads the live sources, `--dry-run` reports each copy's size and stops. Sources must be tables, not views. With `--synthetic-outage` the filtered view is derived over the pinned copy. The run cache is keyed on the copies' names, so a `--reuse-pin` rerun hits and a new pin misses. The flags of snapshot pinning (`--pin-at`, `--pin-source-at`, `--snapshot-dest-project`, `--snapshot-expiration-days`, `--skip-snapshots`, `--no-snapshot`) are rejected, each with what replaces it. The copies were checked with BigQuery dry runs; no copy has been created by this workflow and no pipeline has run on one.
+- **Pinning.** The sources are copied at run start into `world-fishing-827.tech_great_expectations` (since 2026-11-19, PIPELINE-4705): the messages over `[--start - lookback, --end]` (4.41 GB on the default run, the whole staging table) and the segments whole (4.1 MB). `--reuse-pin <stamp>` reuses an earlier run's copies, `--no-pin` reads the live sources, `--dry-run` reports each copy's size, builds the four jobs' configs and DAGs offline where pipe-gaps v0.17.x is installed, and stops. Sources must be tables, not views. With `--synthetic-outage` the filtered view is derived over the pinned copy. The run cache is keyed on the copies' names, so a `--reuse-pin` rerun hits and a new pin misses. The flags of snapshot pinning (`--pin-at`, `--pin-source-at`, `--snapshot-dest-project`, `--snapshot-expiration-days`, `--skip-snapshots`, `--no-snapshot`) are rejected, each with what replaces it. The copies were checked with BigQuery dry runs; no copy has been created by this workflow and no pipeline has run on one.
 - `--parallel` runs the oracle beside the three stages; the stages stay in order.
 - Exit code: 0 when the staged view equals the oracle's, 1 otherwise.
 
 ## What a difference means
 
-Compare keys: `(gap_id, start_timestamp)` on the `_last_versions` view, for both workflows. `gap_id` is a hash of `ssvid`, start timestamp, start latitude and start longitude (table description at v0.17.1).
+Compare keys: `(gap_id, start_timestamp)` on the latest-state view, for both workflows. `gap_id` is a hash of `ssvid`, start timestamp, start latitude and start longitude (table description at v0.17.1).
 
 | Pattern in the table-check summary | Likely cause |
 |---|---|
 | Symmetric: about as many keys only in A as only in B, plus `end_msgid` / `end_lat` / `end_lon` value differences | the known close-path non-determinism of pipe-gaps (which message closes a gap); not an outage or mode bug |
-| Asymmetric: extra keys only in the staged run, and more rows than the oracle | sub-threshold gaps that survived a reprocess (the MAP-1676 class) |
+| Asymmetric: extra keys only in the staged run, and more rows than the oracle | sub-threshold gaps that survived a reprocess into the view (the MAP-1676 class; since v0.10.1 the view filters them, so this means the filter regressed) |
 | Same `end_timestamp`, different `end_msgid` / coordinates | message-sort ties at slice boundaries (the v0.9.6 bug DIT caught in May 2026) |
 
 Attribute differences through the table-check summary before calling a red run a regression. The bugs the mode-equivalence test caught first are described in [`docs/context.md`](../../docs/context.md).
@@ -114,9 +115,9 @@ Both default to the AIS staging cohort (2020 data, 142 vessels):
 
 ## Running
 
-From a pipe-gaps checkout **older than v0.11.0** (see above), with `$DIT` the path of this repository.
+From a pipe-gaps checkout at **v0.17.x** (see above), with `$DIT` the path of this repository.
 
-Cloud Build (recommended; it pins Beam to 2.71.0 to match the worker image, and uploads the checkout at `$PROJECTS/pipe-gaps`):
+Cloud Build (recommended; it pins Beam to 2.76.0 to match the worker image, and uploads the checkout at `$PROJECTS/pipe-gaps`):
 
 ```bash
 make -C $DIT dit-cloud PIPELINE=pipe-gaps \
@@ -128,21 +129,22 @@ make -C $DIT dit-cloud PIPELINE=pipe-gaps \
     ARGS="--runner dataflow --synthetic-outage --parallel"
 ```
 
-Laptop (the venv must hold pipe-gaps of the same generation and Beam 2.71.0; `make install-pipe-gaps` pins Beam):
+Laptop (the venv must hold pipe-gaps v0.17.x and Beam 2.76.0, Python 3.12; `make install-pipe-gaps` pins Beam):
 
 ```bash
 make -C $DIT install-pipe-gaps
 cd $PROJECTS/pipe-gaps
+dit run $DIT/workflows/pipe_gaps/mode_equivalence.py --dry-run
 dit run $DIT/workflows/pipe_gaps/mode_equivalence.py --runner dataflow --modes 1_bf
 dit run $DIT/workflows/pipe_gaps/outage_recovery.py --synthetic-outage --dry-run
 ```
 
-Useful flags: `--experiment-id` (groups runs), `--worker-image` (a worker image built from your change; workers cannot see the laptop's tree), `--max-num-workers` (default 50), `--worker-machine-type` / `--disk-size-gb` (default e2-custom-2-3072 / 25 GB, production's daily detect step; on the staging cohort a smaller machine is cheaper), `--skip-pipelines` / `--skip-comparisons`.
+Useful flags: `--experiment-id` (groups runs), `--worker-image` (a worker image built from your change; workers cannot see the laptop's tree), `--max-num-workers` (default 50), `--worker-machine-type` / `--disk-size-gb` (default e2-custom-2-3072 / 25 GB, production's daily raw-gaps task; on the staging cohort a smaller machine is cheaper), `--skip-pipelines` / `--skip-comparisons`.
 
 ## Orchestration and drift
 
-- **Orchestration** ([`orchestration.py`](orchestration.py)): step `detect`, parallel slices forbidden, depends on the previous run. Status `claimed` (owner, 2026-11-24, "probably"). Nothing tests it.
-- **Drift** ([`composer_drift.py`](composer_drift.py)): `pipe_gaps/mode_equivalence` against the `gaps.detect_raw_gaps` task of `core_ais_v5`. Not expected in sync: version, command and flags differ. It compares the docker runner's argv, since the Dataflow runner has no command line. `outage_recovery.py` has no spec.
+- **Orchestration** ([`orchestration.py`](orchestration.py)): step `detect` (DIT's step id, kept from v0.10.0; command `raw-gaps`), parallel slices forbidden, depends on the previous run. Status `claimed` (owner, 2026-11-24, "probably"). Nothing tests it.
+- **Drift** ([`composer_drift.py`](composer_drift.py)): `pipe_gaps/mode_equivalence` against the `gaps.detect_raw_gaps` task of `core_ais_v5`. **In sync** since 2026-11-27 (composer b5c3496e1): version, command and every compared flag match. It compares the docker runner's argv of one daily job, since the Dataflow runner has no command line. Accepted differences, each with its reason in the spec: the staging inputs (`--bq-in-messages`, `--bq-in-segments`); `--min-gap-length` 1 against 4 and `--good-seg-stabilization-days` 0 against 1 (owner decisions, 2026-11-27); `--start-date` (a DIT daily job reads back `--backfill-days`, 4, where production's covers 2 days); `--window-period-d` (DIT passes 2; production passes none, which on its 2-day daily job is 2 as well); `--no-rich-logging` and `--wait_for_job` (no effect on output); the Dataflow options. `outage_recovery.py` runs the same job and has no spec.
 
 ## Run history
 
@@ -154,17 +156,18 @@ Useful flags: `--experiment-id` (groups runs), `--worker-image` (a worker image 
 | 2026-06-04 | `outage_recovery.py` smoke | ran on zero rows: the default dates were outside the 2020 data; fixed | not recorded |
 | 2026-06-10 | `outage_recovery.py --synthetic-outage`, four runs (issue #59) | outage class RED on pipe-gaps `6cd6706` (58 sub-threshold gaps), GREEN on `81118be` and later; the close-path non-determinism remains in all runs | not recorded |
 | 2026-11-19 | pin by copy for `outage_recovery.py` | BigQuery dry runs only | none |
+| 2026-11-27 | port to v0.17.1: both `--dry-run`s, and the offline tests against pipe-gaps v0.17.1 in a throwaway venv | every job's config and DAG built; both BigQuery reads carry the temp dataset and labels; the copies' dry runs estimate 4.41 GB and 4 MB. Nothing run on Dataflow | none |
 
-No run on the current default worker image (v0.10.0) is recorded in this repository, and no live run since pinning moved to copies.
+No run on the current default worker image (v0.17.1) is recorded in this repository, and no live run since pinning moved to copies.
 
 ## Known limits and open items
 
-- **Behind production** (see above). Porting to v0.17.x is the main open item.
-- **A reviewed checkout runs the default worker image.** When the checkout's commit is merged into pipe-gaps `origin/main` and `--worker-image` is not given, the Dataflow workers run v0.10.0, whatever the commit (read from `dit.worker_image.ensure_pipeline_image`). Only unreviewed code gets an auto-built worker image. Pass `--worker-image` to run another reviewed version on the workers.
+- **Not yet run on v0.17.1.** The port is read and built offline. The temp-dataset hook, the open-gap hand-over between jobs and the view comparison need one live run (the smallest is in the PR).
+- **A reviewed checkout runs the default worker image.** When the checkout's commit is merged into pipe-gaps `origin/main` and `--worker-image` is not given, the Dataflow workers run v0.17.1, whatever the commit (read from `dit.worker_image.ensure_pipeline_image`). Only unreviewed code gets an auto-built worker image. Pass `--worker-image` to run another reviewed version on the workers.
 - **No guard for the reprocess contract.** Nothing rejects a stage that would stop before `--end`; review enforces it ([`CLAUDE.md`](CLAUDE.md)).
-- **Two copies of the config builder.** `outage_recovery.py` re-implements `_make_config`, `_cfg_to_cli_flags`, `_build_pipeline_for` and `_run_pipeline` from `mode_equivalence.py` (about 200 lines). Whether they have drifted is not checked.
+- **One job, two workflows.** Since 2026-11-27 both run one job through [`raw_gaps.py`](raw_gaps.py). The two copies it replaced had not drifted (only a log line and an error message differed).
 - **Different date conventions.** `mode_equivalence.py` is half-open, `outage_recovery.py` inclusive.
 - **Synthetic outage filters messages only.** The segments input is not filtered.
 - **The close-path non-determinism** makes `outage_recovery.py` red even when the outage class is fixed; the comparison does not tolerate it.
 - **No parallel-slices mode** and no test of the orchestration declaration.
-- **Editing either workflow file** changes its cache key, so every cached row misses once.
+- **Editing either workflow file or `raw_gaps.py`** changes the cache key, so every cached row misses once. The port did that.

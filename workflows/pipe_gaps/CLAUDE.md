@@ -6,9 +6,10 @@ workflows.
 
 ## Reprocess-to-end contract (load-bearing)
 
-`pipe-gaps detect` is NOT designed for arbitrary mid-range backfills. Any
-reprocess implicitly commits to overwriting the `raw_gaps` SCD-2 table
-from `start_date` to `+∞`; sub-range backfills leak (rows past your
+`pipe-gaps raw-gaps` (`detect` before v0.11.0) is NOT designed for
+arbitrary mid-range backfills. Any reprocess implicitly commits to
+overwriting the versioned gaps table (`<bq_out_gaps>_versioned`) from
+`start_date` to `+∞`; sub-range backfills leak (rows past your
 chosen `end_date` get deleted but never re-emitted until the next full
 reprocess). The implementation lives in
 `pipe-gaps/src/pipe_gaps/assets/queries/gaps_delete.sql.j2` — the
@@ -21,8 +22,12 @@ WHERE (is_closed = TRUE  AND DATE(end_timestamp)   >= '<start_date>')
    OR (is_closed = FALSE AND DATE(start_timestamp) >= '<start_date>');
 ```
 
-The query is the same at v0.10.0 (DIT's default worker image) and at
-v0.17.1 (production's AIS v5 DAG), read with `git show` on 2026-11-25.
+The query is the same at v0.10.0 and at v0.17.1 (production's AIS v5 DAG,
+and DIT's default worker image since 2026-11-27), read with `git show` on
+2026-11-25 and again on 2026-11-27 (`git diff v0.10.0 v0.17.1` is empty
+for `gaps_delete.sql.j2`). `test_real_pre_write_delete_has_no_upper_bound`
+in `tests/test_pipe_gaps_raw_gaps.py` pins it against the installed
+pipe-gaps where v0.17.1 is installed.
 
 **This is by design.** Workflows here MUST respect it.
 
@@ -45,7 +50,7 @@ v0.17.1 (production's AIS v5 DAG), read with `git show` on 2026-11-25.
 3. **`outage_recovery.py` Stage 3 (recovery) must end at `--end`.**
    Today this is satisfied: the recovery range is `[outage_start -
    recovery_buffer_days, end]` (the recovery stage runs `pipe-gaps
-   detect --start_date <recovery_start> --end_date <end>` against the
+   raw-gaps --start-date <recovery_start> --end-date <end + 1>` against the
    pinned copy or, with `--no-pin`, the live source), which always
    terminates at `end`. Keep it
    that way in any redesign. The same applies to any future "recovery"
@@ -61,9 +66,9 @@ v0.17.1 (production's AIS v5 DAG), read with `git show` on 2026-11-25.
 The oracle is the "what would a clean single-shot run produce?" answer
 the staged path is compared against. Per the contract above:
 
-- The oracle is **always** `pipe-gaps detect --date-range start,end+1`
-  (single run, full range, frozen source). The workflow's `--end` is
-  INCLUSIVE; pipe-gaps' `--date-range` upper bound is EXCLUSIVE
+- The oracle is **always** `pipe-gaps raw-gaps --start-date start
+  --end-date end+1` (single run, full range, frozen source). The
+  workflow's `--end` is INCLUSIVE; pipe-gaps' `--end-date` is EXCLUSIVE
   (`messages.sql.j2` filters `DATE(timestamp) < end_date`), so
   `execute_outage_oracle` — like every staged stage — passes
   `end + 1 day`. (Before 2026-06-10 the workflow passed the inclusive
@@ -83,10 +88,10 @@ Workflow dates are inclusive; the pipeline ranges below show the
 exclusive upper bound actually passed (`inclusive end + 1`):
 
 ```
-Stage 1 (initial backfill):  pipe-gaps detect [2020-01-01, 2020-12-29)   → processes through 12-28
-Stage 2 (post-outage):       pipe-gaps detect [2020-12-30, 2021-01-01)   → processes 12-30..12-31
-Stage 3 (recovery):          pipe-gaps detect [2020-12-29, 2021-01-01)   ← reaches --end ✓
-Oracle:                      pipe-gaps detect [2020-01-01, 2021-01-01)
+Stage 1 (initial backfill):  pipe-gaps raw-gaps [2020-01-01, 2020-12-29)   → processes through 12-28
+Stage 2 (post-outage):       pipe-gaps raw-gaps [2020-12-30, 2021-01-01)   → processes 12-30..12-31
+Stage 3 (recovery):          pipe-gaps raw-gaps [2020-12-29, 2021-01-01)   ← reaches --end ✓
+Oracle:                      pipe-gaps raw-gaps [2020-01-01, 2021-01-01)
 ```
 
 Stage 3 starts at `outage_start` because the default
@@ -105,14 +110,14 @@ spanning range, filtering the source is a no-op: the stages would be
 hiding rows their date ranges never query (issue #59).
 
 Stage 3 reaches `--end` (`2020-12-31`, the most-recent-data day for
-the staging cohort). After Stage 3, `raw_gaps_last_versions` should
-equal the oracle's `_last_versions` view; any divergence is a
-detection-logic bug worth investigating.
+the staging cohort). After Stage 3, the staged run's latest-state view
+should equal the oracle's; any divergence is a detection-logic bug worth
+investigating.
 
 A counter-example that would be wrong:
 
 ```
-Stage 3 (WRONG):  pipe-gaps detect [2020-12-29, 2020-12-31)  ← stops before --end
+Stage 3 (WRONG):  pipe-gaps raw-gaps [2020-12-29, 2020-12-31)  ← stops before --end
 ```
 
 This would delete every gap whose end/start was on `2020-12-29` or
@@ -145,18 +150,18 @@ the copies. `mode_equivalence.py` does not pin.
 ### What the copies must hold
 
 The copies are windowed by what pipe-gaps reads. Read from pipe-gaps
-v0.10.0, the default worker image:
+v0.17.1, the default worker image (unchanged since v0.10.0):
 
 - **Messages.** `messages.sql.j2` filters `DATE(timestamp) >= start_date
   AND DATE(timestamp) < end_date`. The start it gets is not the run's
-  start: `DetectGapsConfig.messages_query_start_date` subtracts
+  start: `RawGapsConfig.messages_query_start_date` subtracts
   `ceil(n_hours_before / 24)` days. A job over `[s, e)` reads the
   messages of `[s - lookback, e)`.
 - **Segments.** The same query reads `seg_id` from the segments table
   with no date filter. The whole table is read, so the whole table is
   copied.
-- **Open gaps.** The side input reads the run's own output table, not a
-  source.
+- **Open gaps.** The side input reads the run's own versioned table, not
+  a source (DIT passes no `--bq-in-open-gaps`).
 
 So the messages copy covers `[--start - lookback, --end]`
 (`_messages_window`). Stage 1 and the oracle start at `--start`, and
@@ -170,8 +175,8 @@ every job ends at `--end`.
    error. `test_the_messages_window_covers_what_every_stage_and_the_oracle_read`
    checks the stages there are; extend it with any new one.
 2. **Re-read the pipe-gaps SQL when the default worker image moves.**
-   The window encodes v0.10.0's lookback. `messages.sql.j2` is the same
-   at v0.17.1, but a later change to the lookback, or a new date-less
+   The window encodes v0.17.1's lookback, the same as v0.10.0's. A later
+   change to the lookback, or a new date-less
    read of the messages, would make the copy too small.
 3. **The cache key holds the copies' names.** Anything new that changes
    what a job reads must show in the key: either through the names, or
@@ -200,3 +205,34 @@ dit_exp_<experiment>_outage_segs_activity_all_<stamp>
 `--experiment-id`, `--start`, `--end`, `--n-hours-before` and source
 table names, since all of them are in the names. The outage dates and
 the recovery buffer may differ.
+
+## One job, `raw_gaps.py` (2026-11-27, pipe-gaps v0.17.1)
+
+Both workflows run every pipe-gaps job through `raw_gaps.py`: the
+namespace (`make_config`), the CLI argv (`cfg_to_cli_flags`), the
+in-process pipeline (`build_pipeline_for`) and the runner dispatch
+(`run_pipeline`). Its module docstring records what was read at v0.17.1.
+
+### Rules for workflow authors
+
+1. **The namespace's pipeline attributes are `RawGapsConfig` fields by
+   name.** Anything only the runner reads goes in `RUNNER_ONLY_ATTRS`:
+   `RawGapsConfig.from_namespace` is a frozen dataclass built from
+   `vars(ns)`, and a stray attribute crashes it.
+2. **Labels go in `cfg.labels` (a dict), never in `unknown_parsed_args`.**
+   gfw-common's `PipelineFactory` passes `labels=config.labels` and spreads
+   `unknown_parsed_args` into the same call.
+3. **Compare the view, record both.** `bq_out_gaps` is the latest-state
+   view; the rows are in `raw_gaps.versioned_table(view)`. A run-cache row
+   lists the view first (what a hit returns) and the table after it
+   (`raw_gaps.output_tables`), so `cancel_run` drops both.
+4. **The open-gap hand-over is the job's own versioned table.** Every job
+   of a mode or of the staged outage path writes to one view, so each job
+   reads the open gaps the earlier jobs left. Giving jobs of one chain
+   different `bq_out_gaps` would break the hand-over silently.
+5. **An edit of `raw_gaps.py` changes both workflows' cache keys**
+   (`raw_gaps.workflow_sha1` hashes the workflow file and this module).
+6. **Re-read pipe-gaps when the default worker image moves**, and run
+   `tests/test_pipe_gaps_raw_gaps.py` in a venv with that version
+   installed: its last five tests build the real config and pipeline
+   offline and skip everywhere else.

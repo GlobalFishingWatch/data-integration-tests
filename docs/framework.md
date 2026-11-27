@@ -97,7 +97,7 @@ compare_tables(table_a, table_b, keys=[...], view_suffix="", tolerance={...})
 ```
 
 - `keys` is the join key of the comparison. Each workflow fixes it in code.
-- `view_suffix` is appended to both table names. Outputs that keep versions of a row (pipe-gaps) are compared through their `_last_versions` view. Outputs that are rewritten (port visits, fishing events) are compared directly, with `""`.
+- `view_suffix` is appended to both table names. Outputs that keep versions of a row are compared through a view of the latest version: pipe-gaps v0.17.1 names that view itself (`--bq-out-gaps`; the rows are in `<view>_versioned`), so the workflows pass the view and `""` (v0.10.0, until 2026-11-27, had a `_last_versions` suffix). Outputs that are rewritten (port visits, fishing events) are compared directly, with `""`.
 - `tolerance` maps a column to an absolute tolerance.
 - The return value is 0 for identical and 1 for any difference. The number of differing rows is logged. It is clamped to 1 on purpose: workflows pass the value to `sys.exit`, and a raw count that is a multiple of 256 would read as success.
 
@@ -382,7 +382,7 @@ The ceiling only lowers a default. Each run logs its cap and where it came from.
 |---|---|---|
 | Port visits | 4 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/port_visits/ais.py`) | e2-highmem-4, 50 GB (`STEP_WORKER_SIZING`, same file) |
 | Encounters (AIS, VMS) | 50 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/encounters/ais.py`; `vms.py` reuses it) | e2-highmem-4, 50 GB (`STEP_WORKER_SIZING`, same file) |
-| pipe-gaps | 50 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/pipe_gaps/mode_equivalence.py`; `outage_recovery.py` imports it) | e2-custom-2-3072, 25 GB (`DEFAULT_WORKER_SIZING`, wrapped as `STEP_WORKER_SIZING`, same file) |
+| pipe-gaps | 50 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/pipe_gaps/mode_equivalence.py`; `outage_recovery.py` imports it) | e2-custom-2-3072, 25 GB (`DEFAULT_WORKER_SIZING`, wrapped as `STEP_WORKER_SIZING`, in `workflows/pipe_gaps/raw_gaps.py`) |
 | pipe-segment, cross-version | 50 per Beam step (`STEP_MAX_NUM_WORKERS`, `workflows/pipe_segment/identity_match_key.py`) | e2-standard-4, 50 GB (`STEP_WORKER_SIZING`, same file) |
 | pipe-segment, mode equivalence | 4 (`DEFAULT_MAX_NUM_WORKERS`, `workflows/pipe_segment/ais.py`) | e2-standard-4, 50 GB (`STEP_WORKER_SIZING`, same file, taken from `identity_match_key.py`'s `segment` entry) |
 

@@ -6,13 +6,13 @@ Each pipeline has an entry page with versions, modes, commands and run history:
 
 | Pipeline | Entry page | DIT's default version | Production's version |
 |---|---|---|---|
-| pipe-gaps (gap detection) | [`pipe_gaps/README.md`](pipe_gaps/README.md) | v0.10.0, `detect` | v0.17.1, `raw-gaps` (AIS v5 DAG). **DIT is behind** |
+| pipe-gaps (gap detection) | [`pipe_gaps/README.md`](pipe_gaps/README.md) | v0.17.1, `raw-gaps` (since 2026-11-27) | v0.17.1, `raw-gaps` (AIS v5 DAG) |
 | pipe-events (fishing events) | [`pipe_events/README.md`](pipe_events/README.md) | v4.2.17, entrypoint `pipe` | v9.0.0, entrypoint `pipe-events` (AIS v5 DAG). **DIT is behind** |
 | pipe-anchorages (port visits) | [`port_visits/README.md`](port_visits/README.md) | v5.0.1, DIT overlay image | v5.0.1 (AIS v5 DAG) |
 | encounters_pipeline | [`encounters/README.md`](encounters/README.md) | v4.4.0, old CLI | v5.0.0 (AIS and VMS v5 DAGs). **DIT is behind** |
 | pipe-segment | [`pipe_segment/README.md`](pipe_segment/README.md) | v5.1.0, DIT overlay image | v5.1.0 (AIS v3 DAG) |
 
-This table is the source of truth for DIT's default version against production's; other pages (the per-pipeline pages, [`docs/pipeline-contract.md`](../docs/pipeline-contract.md)) defer to it, so update it first when either side moves. Production versions are those of composer-dags-production's rendered DAGs as read by the drift check (2026-11-19 and 2026-11-20). [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md) § 8d has the detail.
+This table is the source of truth for DIT's default version against production's; other pages (the per-pipeline pages, [`docs/pipeline-contract.md`](../docs/pipeline-contract.md)) defer to it, so update it first when either side moves. Production versions are those of composer-dags-production's rendered DAGs as read by the drift check (2026-11-19 and 2026-11-20; pipe-gaps re-read 2026-11-27 at b5c3496e1). [`docs/composer-snapshots-2026-10.md`](../docs/composer-snapshots-2026-10.md) § 8d has the detail.
 
 ## Pick a workflow
 
@@ -25,13 +25,13 @@ This table is the source of truth for DIT's default version against production's
 | Can a step load slices of a window in parallel? | `port_visits/ais.py --modes 1_bf,6_parallel --steps thin_port_messages` (the only test of an orchestration declaration so far) |
 | Does DIT still run what production runs? | `workflows/composer_drift.py` (reads composer, runs nothing) |
 
-For pipe-gaps, encounters and pipe-events, a mode-equivalence run tests the old version DIT drives, not production's. Read the entry page first.
+For encounters and pipe-events, a mode-equivalence run tests the old version DIT drives, not production's. Read the entry page first.
 
 ## All workflows
 
 | Workflow | Compares | Modes or bindings | Pinning | Run cache | Drift spec | Orchestration declared |
 |---|---|---|---|---|---|---|
-| [`pipe_gaps/mode_equivalence.py`](pipe_gaps/mode_equivalence.py) | modes pairwise, on the `_last_versions` view, keys `gap_id`, `start_timestamp` | `1_bf`, `2_bfd`, `3_bftruncate`; opt-in `4_mutate_recover` (`--enable-pipeline-4`) | none (reads the live staging tables) | yes | `pipe_gaps/mode_equivalence`, not in sync | `detect`: parallel forbidden (claimed) |
+| [`pipe_gaps/mode_equivalence.py`](pipe_gaps/mode_equivalence.py) | modes pairwise, on each mode's latest-state view (`bq_out_gaps`; rows in `<view>_versioned`), keys `gap_id`, `start_timestamp` | `1_bf`, `2_bfd`, `3_bftruncate`; opt-in `4_mutate_recover` (`--enable-pipeline-4`) | none (reads the live staging tables) | yes | `pipe_gaps/mode_equivalence`, in sync | `detect`: parallel forbidden (claimed) |
 | [`pipe_gaps/outage_recovery.py`](pipe_gaps/outage_recovery.py) | three-stage outage and recovery against a single-shot oracle, same view and keys | one fixed shape (3 stages + oracle) | by copy: messages over the run's window, segments whole | yes | none | same step as above |
 | [`pipe_events/fishing.py`](pipe_events/fishing.py) | modes pairwise, on the `_fishing_events` and `_product_events_fishing` views, key `event_id` | `1_bf`, `2_bfd`, `3_bftruncate` | none | no | `pipe_events/fishing`, not in sync | `incremental_events`: forbidden (claimed); three steps unknown |
 | [`pipe_events/cross_version_fishing.py`](pipe_events/cross_version_fishing.py) | bindings pairwise, same views and key | `--binding name=ref`, repeatable; `--modes` per binding | by copy: seven of its eight inputs (`spatial_measures_20201105` is not pinned) | no | none | as above |
@@ -74,7 +74,7 @@ The `composer_drift.py` files are not test workflows. They are a read-only check
 | `encounters/ais` | `encounters/ais.py` | `core_ais_v5` | no: older CLI generation |
 | `encounters/vms` | `encounters/vms.py` | `core_vms_v5_daily` | no: same |
 | `pipe_events/fishing` | `pipe_events/fishing.py` | `core_ais_v5` | no: older CLI generation |
-| `pipe_gaps/mode_equivalence` | `pipe_gaps/mode_equivalence.py` | `core_ais_v5` | no: older pipe-gaps generation |
+| `pipe_gaps/mode_equivalence` | `pipe_gaps/mode_equivalence.py` | `core_ais_v5` | yes, at v0.17.1, since 2026-11-27. Accepted: staging inputs, `--min-gap-length` 1, stabilization off, the daily job's start date, `--window-period-d` |
 | `pipe_segment/identity_match_key` | `pipe_segment/identity_match_key.py` | `core_ais_v3` | yes, all six tasks of the segment group, at v5.1.0 with `--incremental` |
 | `pipe_segment/identity_match_key@v5.0.3` (frozen, `--frozen`) | the same workflow for a binding at v5.0.3 (its declared adjustment removes `--incremental`) | `core_ais_v3` at composer `cb0c9a3b7930`, the last commit at which production ran v5.0.3 | yes; a regression test of DIT, not of production |
 | `pipe_segment/ais` | `pipe_segment/ais.py` | `core_ais_v3` | yes. Two steps mirror the one `segment` task: the default incremental job, and the full-history reference job, which leaves `--incremental` out on purpose |
@@ -175,3 +175,15 @@ behaviour), and `port_visits/ais.py` (the daily tails, through a pure
 still slices on its own. What was extracted is the date arithmetic only; how a
 slice is executed stays in each workflow, as planned above. `dit.phases` as a
 mode framework is still not extracted.
+
+### Update (2026-11-27): one pipe-gaps job, shared by both pipe-gaps workflows
+
+`mode_equivalence.py` and `outage_recovery.py` had two copies of the config
+builder, the argv, the in-process pipeline builder and the runner dispatch
+(`docs/workflow-reconciliation-2026-06.md` § 3-d). Compared before the port to
+pipe-gaps v0.17.1, they had not diverged: only a log line and an error message
+differed. Porting both would have edited the same code twice, so they are one
+module now, `pipe_gaps/raw_gaps.py`. It is a sibling of the two workflows, not a
+library module: it is pipe-gaps-specific. Each workflow's run-cache key hashes
+its own file and that module. `mode_equivalence.py`'s job windows are a pure
+planner (`mode_windows`), which its executors and its `--dry-run` share.
